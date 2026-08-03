@@ -264,12 +264,7 @@ pub fn parse_arg_scval(arg: &str) -> stellar_xdr::ScVal {
     let sc_string: stellar_xdr::ScString =
         stellar_xdr::StringM::try_from(value.as_bytes().to_vec())
             .map(stellar_xdr::ScString::from)
-            .unwrap_or_else(|_| {
-                stellar_xdr::ScString::from(
-                    stellar_xdr::StringM::<{ u32::MAX }>::try_from(Vec::new())
-                        .expect("empty string is always a valid ScString"),
-                )
-            });
+            .unwrap_or_default();
     stellar_xdr::ScVal::String(sc_string)
 }
 
