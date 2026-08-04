@@ -4,8 +4,12 @@
 [![Crates.io](https://img.shields.io/crates/v/soroban-cost-estimator)](https://crates.io/crates/soroban-cost-estimator)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](LICENSE)
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-blue)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-mdBook-blue)](https://aigbagbobila.github.io/soroban-cost-estimator/)
 
 **Estimate Soroban contract resource costs & track network pricing changes over time.**
+
+📚 Full documentation (concepts, command reference, architecture, and the live
+verification record): <https://aigbagbobila.github.io/soroban-cost-estimator/>
 
 This CLI tool wraps Stellar's `simulateTransaction` RPC to report real resource
 consumption (CPU instructions, memory, read/write entries/bytes, tx size, rent)
