@@ -7,4 +7,6 @@
 .idea/
 *.wasm
 !tests/fixtures/*.wasm
+docs/book/
+
 

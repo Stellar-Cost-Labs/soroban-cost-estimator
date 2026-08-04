@@ -1,0 +1,11 @@
+[book]
+title = "Soroban Cost Estimator"
+description = "Estimate Soroban contract resource costs and track network pricing changes over time."
+authors = ["aigbagbobila"]
+language = "en"
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[output.html]
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
