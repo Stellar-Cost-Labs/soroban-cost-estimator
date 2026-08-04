@@ -699,15 +699,29 @@ async fn cmd_watch(network: &str, interval: &str) -> error::AppResult<()> {
         network, interval_secs
     );
 
+    let shutting_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut first = true;
     loop {
+        let sd = shutting_down.clone();
         tokio::select! {
             signal = shutdown_signal() => {
                 signal?;
-                println!("Received stop signal — exiting cleanly.");
+                if shutting_down.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    // Second signal received while already shutting down — force exit
+                    eprintln!("Received second signal — forcing exit with code 130.");
+                    std::process::exit(130);
+                }
+                println!("Received stop signal — exiting cleanly. (Press Ctrl-C again to force exit)");
+                // Allow a brief window for the in-flight poll to be cancelled,
+                // then exit cleanly. The poll is dropped by the select!, so no
+                // partial snapshot is written.
                 return Ok(());
             }
             () = async {
+                if sd.load(std::sync::atomic::Ordering::SeqCst) {
+                    // Shutting down — don't start a new poll cycle
+                    return;
+                }
                 let _ = watch_poll_once(network, &mut first).await;
                 tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
             } => {}
