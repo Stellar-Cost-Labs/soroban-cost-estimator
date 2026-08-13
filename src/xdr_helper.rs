@@ -27,7 +27,8 @@ pub fn decode_config_entry_xdr(xdr_b64: &str) -> AppResult<stellar_xdr::ConfigSe
     }
 }
 
-/// Populate timestamp + ledger fields on the snapshot.
+/// Initialize a snapshot with the network, timestamp, and ledger set; all
+/// config entries start empty.
 pub fn begin_snapshot(network: &str, ledger: u32) -> ConfigSnapshot {
     use chrono::Utc;
     ConfigSnapshot {

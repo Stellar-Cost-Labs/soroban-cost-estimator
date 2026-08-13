@@ -62,7 +62,7 @@ impl RpcClient {
             );
         }
 
-        // Check for JSON-RPC error object
+        // Check for a JSON-RPC error object
         if let Some(error) = response_body.get("error") {
             let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
             let message = error
@@ -76,7 +76,7 @@ impl RpcClient {
             });
         }
 
-        // Extract the result field
+        // Extract the `result` field
         let result = response_body.get("result").ok_or_else(|| AppError::Rpc {
             status: status.as_u16() as i64,
             message: "response missing 'result' field".to_string(),
