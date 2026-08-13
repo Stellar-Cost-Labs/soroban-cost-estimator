@@ -184,7 +184,7 @@ pub async fn fetch_all_config_settings(
         std::collections::HashMap::new();
     for entry in response.entries {
         let raw = ConfigSettingEntryRaw {
-            id: ConfigSettingId::ContractComputeV0, // placeholder, fixed below
+            id: ConfigSettingId::ContractComputeV0, // placeholder; corrected after key matching below
             config_xdr: entry.xdr,
             last_modified_ledger: entry.last_modified_ledger_seq.unwrap_or(0),
         };

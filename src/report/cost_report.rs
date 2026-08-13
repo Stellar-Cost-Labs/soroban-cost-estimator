@@ -49,7 +49,7 @@ pub fn format_report_table(report: &CostReport) -> String {
     table.add_row(vec![
         "CPU Instructions",
         &report.cpu_instructions.to_string(),
-        "", // fee embedded in non-refundable
+        "", // fee is itemized in the breakdown below
     ]);
     table.add_row(vec!["Memory Bytes", &report.memory_bytes.to_string(), ""]);
     table.add_row(vec!["Read Entries", &report.read_entries.to_string(), ""]);

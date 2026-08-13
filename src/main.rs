@@ -549,7 +549,7 @@ async fn cmd_config_diff(network: &str, against_path: Option<&str>) -> error::Ap
     let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
     println!("{}", config_snapshot::diff::format_diff(&diff));
 
-    // Always check for stale cached estimates, regardless of pricing changes
+    // Check for stale cached estimates even when there are no pricing changes
     match cache::list_cached_estimates(network) {
         Ok(estimates) => {
             if !estimates.is_empty() {
@@ -650,7 +650,7 @@ async fn watch_poll_once(network: &str, first: &mut bool) -> error::AppResult<()
                         println!("{}", config_snapshot::diff::format_diff(&diff));
                     }
 
-                    // Always check for stale cached estimates, regardless of pricing changes
+                    // Check for stale cached estimates even when there are no pricing changes
                     if let Ok(estimates) = cache::list_cached_estimates(network) {
                         if !estimates.is_empty() {
                             let stale = cache::find_stale_estimates(&estimates, snapshot.ledger);
