@@ -50,11 +50,17 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::Snapshot { network, out, json } => {
                 cmd_config_snapshot(&network, out.as_deref(), json).await
             }
-            cli::ConfigAction::Diff { network, against } => {
-                cmd_config_diff(&network, against.as_deref()).await
-            }
+            cli::ConfigAction::Diff {
+                network,
+                against,
+                min_change_pct,
+            } => cmd_config_diff(&network, against.as_deref(), min_change_pct).await,
         },
-        cli::Command::Watch { network, interval } => cmd_watch(&network, &interval).await,
+        cli::Command::Watch {
+            network,
+            interval,
+            min_change_pct,
+        } => cmd_watch(&network, &interval, min_change_pct).await,
     }
 }
 
@@ -527,7 +533,16 @@ async fn cmd_config_snapshot(
 }
 
 /// `config diff` command: compare current config against a snapshot.
-async fn cmd_config_diff(network: &str, against_path: Option<&str>) -> error::AppResult<()> {
+///
+/// `min_change_pct` is the notification threshold: pricing changes whose
+/// relative magnitude is below it are printed as informational and do not
+/// trigger the non-zero exit. `0` keeps the original report-everything
+/// behaviour.
+async fn cmd_config_diff(
+    network: &str,
+    against_path: Option<&str>,
+    min_change_pct: f64,
+) -> error::AppResult<()> {
     let old_snapshot = match against_path {
         Some(path) => config_snapshot::store::load_snapshot_from_path(path)?,
         None => config_snapshot::store::load_latest_snapshot(network)?,
@@ -547,7 +562,10 @@ async fn cmd_config_diff(network: &str, against_path: Option<&str>) -> error::Ap
     }
 
     let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
-    println!("{}", config_snapshot::diff::format_diff(&diff));
+    println!(
+        "{}",
+        config_snapshot::diff::format_diff_with_threshold(&diff, min_change_pct)
+    );
 
     // Check for stale cached estimates even when there are no pricing changes
     match cache::list_cached_estimates(network) {
@@ -578,7 +596,7 @@ async fn cmd_config_diff(network: &str, against_path: Option<&str>) -> error::Ap
         }
     }
 
-    if diff.has_pricing_changes {
+    if diff.has_significant_pricing_changes(min_change_pct) {
         std::process::exit(1);
     }
     Ok(())
@@ -625,9 +643,16 @@ async fn shutdown_signal() -> error::AppResult<()> {
 /// the previous snapshot, print changes and stale-estimate info, then save
 /// the new snapshot.
 ///
+/// `min_change_pct` is the notification threshold applied to printed diffs;
+/// pricing changes below it are annotated as informational.
+///
 /// # Network calls
 /// Makes one batched `getLedgerEntries` RPC call.
-async fn watch_poll_once(network: &str, first: &mut bool) -> error::AppResult<()> {
+async fn watch_poll_once(
+    network: &str,
+    first: &mut bool,
+    min_change_pct: f64,
+) -> error::AppResult<()> {
     let endpoint = rpc::client::resolve_endpoint(network, None)?;
     let client = rpc::client::RpcClient::new(&endpoint);
 
@@ -647,7 +672,13 @@ async fn watch_poll_once(network: &str, first: &mut bool) -> error::AppResult<()
                 if let Ok(old_snapshot) = config_snapshot::store::load_latest_snapshot(network) {
                     let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &snapshot);
                     if !diff.changes.is_empty() {
-                        println!("{}", config_snapshot::diff::format_diff(&diff));
+                        println!(
+                            "{}",
+                            config_snapshot::diff::format_diff_with_threshold(
+                                &diff,
+                                min_change_pct
+                            )
+                        );
                     }
 
                     // Check for stale cached estimates even when there are no pricing changes
@@ -691,12 +722,12 @@ async fn watch_poll_once(network: &str, first: &mut bool) -> error::AppResult<()
 /// Polls immediately, then on `interval`, until SIGINT (Ctrl-C) or SIGTERM
 /// is received — then exits cleanly with code 0. The in-flight poll is
 /// cancelled rather than writing a partial snapshot.
-async fn cmd_watch(network: &str, interval: &str) -> error::AppResult<()> {
+async fn cmd_watch(network: &str, interval: &str, min_change_pct: f64) -> error::AppResult<()> {
     let interval_secs: u64 = parse_interval_secs(interval);
 
     println!(
-        "Watching {} for config changes every {}s... (Ctrl-C to stop)",
-        network, interval_secs
+        "Watching {} for config changes every {}s (notification threshold: {:.1}%)... (Ctrl-C to stop)",
+        network, interval_secs, min_change_pct
     );
 
     let mut first = true;
@@ -708,7 +739,7 @@ async fn cmd_watch(network: &str, interval: &str) -> error::AppResult<()> {
                 return Ok(());
             }
             () = async {
-                let _ = watch_poll_once(network, &mut first).await;
+                let _ = watch_poll_once(network, &mut first, min_change_pct).await;
                 tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
             } => {}
         }
