@@ -109,4 +109,19 @@ pub enum ConfigAction {
         #[arg(long)]
         against: Option<String>,
     },
+
+    /// Show a specific historical snapshot.
+    Show {
+        /// Network to view the snapshot for.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+
+        /// Timestamp of the snapshot to view.
+        #[arg(long)]
+        at: String,
+
+        /// Print the snapshot as JSON instead of the summary lines.
+        #[arg(long)]
+        json: bool,
+    },
 }

@@ -53,6 +53,9 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::Diff { network, against } => {
                 cmd_config_diff(&network, against.as_deref()).await
             }
+            cli::ConfigAction::Show { network, at, json } => {
+                cmd_config_show(&network, &at, json)
+            }
         },
         cli::Command::Watch { network, interval } => cmd_watch(&network, &interval).await,
     }
@@ -581,6 +584,21 @@ async fn cmd_config_diff(network: &str, against_path: Option<&str>) -> error::Ap
     if diff.has_pricing_changes {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+/// `config show` command: show a specific historical snapshot.
+fn cmd_config_show(network: &str, timestamp: &str, json_flag: bool) -> error::AppResult<()> {
+    let snapshot = config_snapshot::store::load_snapshot_by_timestamp(network, timestamp)?;
+
+    if json_flag {
+        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        return Ok(());
+    }
+
+    println!("Network: {}", snapshot.network);
+    println!("Ledger:  {}", snapshot.ledger);
+    println!("Time:    {}", snapshot.timestamp);
     Ok(())
 }
 
