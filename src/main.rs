@@ -526,6 +526,15 @@ async fn cmd_config_snapshot(
     Ok(())
 }
 
+/// True when a config diff signals a network protocol/config upgrade.
+///
+/// Pricing changes are the tool's proxy for "the network changed its
+/// resource-pricing configuration under us" — e.g. what a protocol vote
+/// produces — so they trigger the automatic post-upgrade snapshot.
+fn upgrade_detected(diff: &config_snapshot::diff::ConfigDiff) -> bool {
+    diff.has_pricing_changes
+}
+
 /// `config diff` command: compare current config against a snapshot.
 async fn cmd_config_diff(network: &str, against_path: Option<&str>) -> error::AppResult<()> {
     let old_snapshot = match against_path {
@@ -548,6 +557,22 @@ async fn cmd_config_diff(network: &str, against_path: Option<&str>) -> error::Ap
 
     let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
     println!("{}", config_snapshot::diff::format_diff(&diff));
+
+    // Automatic snapshot on upgrade detection: persist the new config so it
+    // becomes the baseline for future diffs without a separate
+    // `config snapshot` run. A save failure must not mask the exit-code
+    // contract (exit 1 on pricing changes), so warn instead of erroring.
+    if upgrade_detected(&diff) {
+        match config_snapshot::store::save_snapshot(&new_snapshot, None) {
+            Ok(path) => println!(
+                "  Protocol upgrade detected — new config auto-saved to {}",
+                path.display()
+            ),
+            Err(e) => {
+                eprintln!("  Warning: could not auto-save post-upgrade snapshot: {e}");
+            }
+        }
+    }
 
     // Check for stale cached estimates even when there are no pricing changes
     match cache::list_cached_estimates(network) {
@@ -718,6 +743,52 @@ async fn cmd_watch(network: &str, interval: &str) -> error::AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::parse_interval_secs;
+    use super::upgrade_detected;
+    use soroban_cost_estimator::config_snapshot::diff;
+    use soroban_cost_estimator::config_snapshot::model::{
+        ConfigSnapshot, ContractComputeV0, ContractLedgerCostV0,
+    };
+
+    fn snapshot_with_compute_fee(fee: i64) -> ConfigSnapshot {
+        ConfigSnapshot {
+            network: "testnet".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            ledger: 100,
+            contract_compute: Some(ContractComputeV0 {
+                ledger_max_instructions: 1_000_000,
+                tx_max_instructions: 100_000,
+                fee_rate_per_instructions_increment: fee,
+                tx_memory_limit: 41_943_040,
+            }),
+            contract_ledger_cost: None,
+            contract_historical_data: None,
+            contract_events: None,
+            contract_bandwidth: None,
+            state_archival: None,
+        }
+    }
+
+    fn snapshot_with_ledger_cost_fee(fee: i64) -> ConfigSnapshot {
+        let mut snap = snapshot_with_compute_fee(5);
+        snap.contract_ledger_cost = Some(ContractLedgerCostV0 {
+            ledger_max_disk_read_entries: 1_000_000,
+            ledger_max_disk_read_bytes: 1_000_000,
+            ledger_max_write_ledger_entries: 1_000_000,
+            ledger_max_write_bytes: 1_000_000,
+            tx_max_disk_read_entries: 100,
+            tx_max_disk_read_bytes: 1_000_000,
+            tx_max_write_ledger_entries: 100,
+            tx_max_write_bytes: 1_000_000,
+            fee_disk_read_ledger_entry: fee,
+            fee_write_ledger_entry: fee,
+            fee_disk_read1_kb: fee,
+            soroban_state_target_size_bytes: 1_000_000,
+            rent_fee1_kb_soroban_state_size_low: fee,
+            rent_fee1_kb_soroban_state_size_high: fee,
+            soroban_state_rent_fee_growth_factor: 2000,
+        });
+        snap
+    }
 
     #[test]
     fn test_parse_interval_secs() {
@@ -732,5 +803,38 @@ mod tests {
         assert_eq!(parse_interval_secs("s"), 3600);
         assert_eq!(parse_interval_secs("10ss"), 3600);
         assert_eq!(parse_interval_secs("garbage"), 3600);
+    }
+
+    #[test]
+    fn test_upgrade_detected_on_pricing_change() {
+        let old = snapshot_with_compute_fee(100);
+        let new = snapshot_with_compute_fee(200);
+        let diff = diff::diff_snapshots(&old, &new);
+
+        assert!(diff.has_pricing_changes);
+        assert!(upgrade_detected(&diff));
+    }
+
+    #[test]
+    fn test_upgrade_detected_on_any_pricing_field_change() {
+        let old = snapshot_with_ledger_cost_fee(1_000);
+        let mut new = snapshot_with_ledger_cost_fee(1_000);
+        if let Some(cost) = &mut new.contract_ledger_cost {
+            cost.fee_write_ledger_entry = 2_000;
+        }
+        new.ledger = 200;
+        let diff = diff::diff_snapshots(&old, &new);
+
+        assert!(diff.has_pricing_changes);
+        assert!(upgrade_detected(&diff));
+    }
+
+    #[test]
+    fn test_no_upgrade_detected_without_changes() {
+        let snap = snapshot_with_compute_fee(100);
+        let diff = diff::diff_snapshots(&snap, &snap);
+
+        assert!(!diff.has_pricing_changes);
+        assert!(!upgrade_detected(&diff));
     }
 }
