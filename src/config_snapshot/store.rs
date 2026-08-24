@@ -17,12 +17,7 @@ fn snapshots_dir() -> AppResult<PathBuf> {
     Ok(dir)
 }
 
-/// Returns the cache directory, creating it if needed.
-pub fn cache_dir() -> AppResult<PathBuf> {
-    let dir = data_dir()?.join("cache");
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
+
 
 /// Saves a config snapshot to disk as a JSON file.
 ///
@@ -93,23 +88,4 @@ pub fn load_snapshot_from_path(path: &str) -> AppResult<ConfigSnapshot> {
     Ok(snapshot)
 }
 
-/// Lists all available snapshots for a given network.
-///
-/// # Network calls
-/// None — pure file I/O.
-pub fn list_snapshots(network: &str) -> AppResult<Vec<PathBuf>> {
-    let dir = snapshots_dir()?;
-    let mut snapshots = Vec::new();
 
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if name_str.starts_with(&format!("{}-", network)) && name_str.ends_with(".json") {
-            snapshots.push(entry.path());
-        }
-    }
-
-    snapshots.sort();
-    Ok(snapshots)
-}

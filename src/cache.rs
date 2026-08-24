@@ -104,26 +104,6 @@ fn hash_args(args: &[String]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Load a cached estimate, if one exists.
-pub fn load_estimate(
-    wasm_hash: &str,
-    function: &str,
-    args: &[String],
-) -> AppResult<Option<CachedEstimate>> {
-    let args_hash = hash_args(args);
-    let dir = cache_dir()?;
-    let filename = cache_filename(wasm_hash, function, &args_hash);
-    let path = dir.join(&filename);
-
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let content = std::fs::read_to_string(&path)?;
-    let cached: CachedEstimate =
-        serde_json::from_str(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))?;
-    Ok(Some(cached))
-}
 
 /// Find all cached estimates for a given network.
 ///

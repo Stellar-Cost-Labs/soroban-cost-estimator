@@ -145,34 +145,7 @@ pub fn stroops_to_xlm(stroops: i64) -> String {
     }
 }
 
-/// Parse an XLM string to stroops (i64).
-pub fn xlm_to_stroops(xlm: &str) -> AppResult<i64> {
-    let parts: Vec<&str> = xlm.split('.').collect();
-    match parts.len() {
-        1 => {
-            let whole: i64 = parts[0]
-                .parse()
-                .map_err(|_| AppError::FeeCalc(format!("invalid XLM value: {xlm}")))?;
-            whole
-                .checked_mul(10_000_000)
-                .ok_or_else(|| AppError::FeeCalc("XLM value overflow".to_string()))
-        }
-        2 => {
-            let whole: i64 = parts[0]
-                .parse()
-                .map_err(|_| AppError::FeeCalc(format!("invalid XLM value: {xlm}")))?;
-            let fraction_str = format!("{:0<7}", parts[1]);
-            let fraction: i64 = fraction_str[..7.min(fraction_str.len())]
-                .parse()
-                .map_err(|_| AppError::FeeCalc(format!("invalid XLM value: {xlm}")))?;
-            whole
-                .checked_mul(10_000_000)
-                .and_then(|w| w.checked_add(fraction))
-                .ok_or_else(|| AppError::FeeCalc("XLM value overflow".to_string()))
-        }
-        _ => Err(AppError::FeeCalc(format!("invalid XLM value: {xlm}"))),
-    }
-}
+
 
 #[cfg(test)]
 mod tests {
@@ -245,13 +218,7 @@ mod tests {
         assert_eq!(stroops_to_xlm(-10_000_000), "-1.0000000");
     }
 
-    #[test]
-    fn test_xlm_to_stroops() {
-        assert_eq!(xlm_to_stroops("0.0000000").unwrap(), 0);
-        assert_eq!(xlm_to_stroops("1.0000000").unwrap(), 10_000_000);
-        assert_eq!(xlm_to_stroops("0.1234567").unwrap(), 1_234_567);
-        assert!(xlm_to_stroops("invalid").is_err());
-    }
+
 
     #[test]
     fn test_compute_fee_breakdown() {
