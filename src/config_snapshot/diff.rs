@@ -447,6 +447,23 @@ fn check<T: PartialEq + std::fmt::Display>(
     }
 }
 
+/// Returns a copy of a diff containing only pricing-related changes.
+pub fn pricing_only(diff: &ConfigDiff) -> ConfigDiff {
+    let changes = diff
+        .changes
+        .iter()
+        .filter(|change| change.is_pricing_change)
+        .cloned()
+        .collect();
+
+    ConfigDiff {
+        old_snapshot: diff.old_snapshot.clone(),
+        new_snapshot: diff.new_snapshot.clone(),
+        has_pricing_changes: !changes.is_empty(),
+        changes,
+    }
+}
+
 /// Formats a `ConfigDiff` as a human-readable string for display.
 pub fn format_diff(diff: &ConfigDiff) -> String {
     let mut output = String::new();

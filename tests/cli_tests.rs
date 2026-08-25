@@ -175,7 +175,7 @@ fn test_config_diff_help() {
         code, 0,
         "config diff --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--network", "--against"] {
+    for flag in ["--network", "--against", "--pricing-only"] {
         assert!(
             stdout.contains(flag),
             "diff help should mention {flag}; got: {stdout}"
