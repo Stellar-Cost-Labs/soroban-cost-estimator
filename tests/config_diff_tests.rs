@@ -76,6 +76,37 @@ fn test_detects_multiple_changes() {
 }
 
 #[test]
+fn test_pricing_only_filters_non_pricing_changes() {
+    let old = make_snapshot(100, 5);
+    let mut new = make_snapshot(200, 5);
+    new.contract_compute.as_mut().unwrap().tx_memory_limit = 200;
+
+    let diff = diff::diff_snapshots(&old, &new);
+    assert_eq!(diff.changes.len(), 2);
+
+    let pricing_diff = diff::pricing_only(&diff);
+    assert_eq!(pricing_diff.changes.len(), 1);
+    assert_eq!(
+        pricing_diff.changes[0].field_path,
+        "contract_compute.fee_rate_per_instructions_increment"
+    );
+    assert!(pricing_diff.has_pricing_changes);
+}
+
+#[test]
+fn test_pricing_only_has_no_changes_when_only_non_pricing_changes_change() {
+    let old = make_snapshot(100, 5);
+    let mut new = make_snapshot(100, 5);
+    new.contract_compute.as_mut().unwrap().tx_memory_limit = 200;
+
+    let diff = diff::diff_snapshots(&old, &new);
+    let pricing_diff = diff::pricing_only(&diff);
+
+    assert!(pricing_diff.changes.is_empty());
+    assert!(!pricing_diff.has_pricing_changes);
+}
+
+#[test]
 fn test_format_diff_no_changes() {
     let snap = make_snapshot(100, 5);
     let diff = diff::diff_snapshots(&snap, &snap);

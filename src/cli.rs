@@ -108,5 +108,9 @@ pub enum ConfigAction {
         /// Explicit snapshot path to compare against (defaults to latest).
         #[arg(long)]
         against: Option<String>,
+
+        /// Show only pricing-related field changes.
+        #[arg(long)]
+        pricing_only: bool,
     },
 }

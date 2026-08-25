@@ -50,9 +50,11 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::Snapshot { network, out, json } => {
                 cmd_config_snapshot(&network, out.as_deref(), json).await
             }
-            cli::ConfigAction::Diff { network, against } => {
-                cmd_config_diff(&network, against.as_deref()).await
-            }
+            cli::ConfigAction::Diff {
+                network,
+                against,
+                pricing_only,
+            } => cmd_config_diff(&network, against.as_deref(), pricing_only).await,
         },
         cli::Command::Watch { network, interval } => cmd_watch(&network, &interval).await,
     }
@@ -527,7 +529,11 @@ async fn cmd_config_snapshot(
 }
 
 /// `config diff` command: compare current config against a snapshot.
-async fn cmd_config_diff(network: &str, against_path: Option<&str>) -> error::AppResult<()> {
+async fn cmd_config_diff(
+    network: &str,
+    against_path: Option<&str>,
+    pricing_only: bool,
+) -> error::AppResult<()> {
     let old_snapshot = match against_path {
         Some(path) => config_snapshot::store::load_snapshot_from_path(path)?,
         None => config_snapshot::store::load_latest_snapshot(network)?,
@@ -547,7 +553,12 @@ async fn cmd_config_diff(network: &str, against_path: Option<&str>) -> error::Ap
     }
 
     let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
-    println!("{}", config_snapshot::diff::format_diff(&diff));
+    let display_diff = if pricing_only {
+        config_snapshot::diff::pricing_only(&diff)
+    } else {
+        diff.clone()
+    };
+    println!("{}", config_snapshot::diff::format_diff(&display_diff));
 
     // Check for stale cached estimates even when there are no pricing changes
     match cache::list_cached_estimates(network) {
