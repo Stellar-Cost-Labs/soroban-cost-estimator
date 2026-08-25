@@ -154,6 +154,20 @@ soroban-cost-estimator config snapshot --network testnet [--out /custom/path.jso
 Saved to `~/.soroban-cost-estimator/snapshots/<network>-<timestamp>.json`.
 `--json` also prints the snapshot as JSON (and still saves it).
 
+### `config export` and `config import`
+
+Export a validated snapshot as a portable JSON file, then import it into the
+snapshot store on another machine:
+
+```bash
+soroban-cost-estimator config export --snapshot ./testnet-snapshot.json --out ./shared.json
+soroban-cost-estimator config import --snapshot ./shared.json
+```
+
+Export does not contact the network. Import validates the JSON and stores it
+under `~/.soroban-cost-estimator/snapshots/` using the snapshot's network and
+timestamp. Selective export and compression are not supported.
+
 ### `config diff`
 
 Compare the current network config against the most recent (or explicit) snapshot.

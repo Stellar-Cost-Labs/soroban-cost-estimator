@@ -1,5 +1,37 @@
 use soroban_cost_estimator::config_snapshot::diff;
 use soroban_cost_estimator::config_snapshot::model::*;
+use soroban_cost_estimator::config_snapshot::store;
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+static HOME_MUTEX: Mutex<()> = Mutex::new(());
+
+fn with_temp_home<F>(test: F)
+where
+    F: FnOnce(&PathBuf),
+{
+    let _guard = HOME_MUTEX.lock().expect("home mutex");
+    let tmp = std::env::temp_dir().join(format!("sce-snapshot-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("create temp home");
+    let old_home = std::env::var_os("HOME");
+    let old_userprofile = std::env::var_os("USERPROFILE");
+    // SAFETY: tests serialize HOME changes with HOME_MUTEX.
+    unsafe {
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("USERPROFILE", &tmp);
+    }
+    test(&tmp);
+    match old_home {
+        Some(home) => unsafe { std::env::set_var("HOME", home) },
+        None => unsafe { std::env::remove_var("HOME") },
+    }
+    match old_userprofile {
+        Some(home) => unsafe { std::env::set_var("USERPROFILE", home) },
+        None => unsafe { std::env::remove_var("USERPROFILE") },
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
 
 fn make_snapshot(compute_fee: i64, bandwidth_fee: i64) -> ConfigSnapshot {
     ConfigSnapshot {
@@ -22,6 +54,53 @@ fn make_snapshot(compute_fee: i64, bandwidth_fee: i64) -> ConfigSnapshot {
         }),
         state_archival: None,
     }
+}
+
+#[test]
+fn test_snapshot_export_import_round_trip() {
+    with_temp_home(|tmp| {
+        let source = tmp.join("source.json");
+        let exported = tmp.join("shared.json");
+        let snapshot = make_snapshot(100, 5);
+        std::fs::write(&source, serde_json::to_string(&snapshot).expect("serialize snapshot"))
+            .expect("write source");
+
+        let export_path = store::export_snapshot(
+            source.to_str().expect("source path"),
+            exported.to_str().expect("export path"),
+        )
+        .expect("export snapshot");
+        assert_eq!(export_path, exported);
+        let exported_snapshot = store::load_snapshot_from_path(
+            exported.to_str().expect("export path"),
+        )
+        .expect("load export");
+        assert_eq!(exported_snapshot.network, "testnet");
+
+        let imported = store::import_snapshot(exported.to_str().expect("export path"))
+            .expect("import snapshot");
+        assert!(imported.exists());
+        let imported_snapshot =
+            store::load_snapshot_from_path(imported.to_str().expect("import path"))
+                .expect("load import");
+        assert_eq!(imported_snapshot.ledger, 100);
+    });
+}
+
+#[test]
+fn test_snapshot_export_rejects_malformed_json() {
+    with_temp_home(|tmp| {
+        let source = tmp.join("malformed.json");
+        std::fs::write(&source, "not json").expect("write malformed snapshot");
+        let result = store::export_snapshot(
+            source.to_str().expect("source path"),
+            tmp.join("out.json").to_str().expect("out path"),
+        );
+        assert!(matches!(
+            result,
+            Err(soroban_cost_estimator::error::AppError::SnapshotParse(_))
+        ));
+    });
 }
 
 #[test]

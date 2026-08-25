@@ -50,6 +50,16 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::Snapshot { network, out, json } => {
                 cmd_config_snapshot(&network, out.as_deref(), json).await
             }
+            cli::ConfigAction::Export { snapshot, out } => {
+                let path = config_snapshot::store::export_snapshot(&snapshot, &out)?;
+                println!("Snapshot exported to: {}", path.display());
+                Ok(())
+            }
+            cli::ConfigAction::Import { snapshot } => {
+                let path = config_snapshot::store::import_snapshot(&snapshot)?;
+                println!("Snapshot imported to: {}", path.display());
+                Ok(())
+            }
             cli::ConfigAction::Diff { network, against } => {
                 cmd_config_diff(&network, against.as_deref()).await
             }

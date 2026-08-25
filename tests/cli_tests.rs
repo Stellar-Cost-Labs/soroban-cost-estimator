@@ -151,6 +151,8 @@ fn test_config_help() {
         "config help should list snapshot"
     );
     assert!(stdout.contains("diff"), "config help should list diff");
+    assert!(stdout.contains("export"), "config help should list export");
+    assert!(stdout.contains("import"), "config help should list import");
 }
 
 #[test]
@@ -166,6 +168,39 @@ fn test_config_snapshot_help() {
             "snapshot help should mention {flag}; got: {stdout}"
         );
     }
+}
+
+#[test]
+fn test_config_export_import_help() {
+    for command in ["export", "import"] {
+        let (stdout, stderr, code) = run_cli(&["config", command, "--help"]);
+        assert_eq!(code, 0, "config {command} --help should exit 0; stderr: {stderr}");
+        assert!(stdout.contains("--snapshot"), "{command} help should mention --snapshot");
+    }
+}
+
+#[test]
+fn test_config_export_missing_snapshot_errors() {
+    let home = temp_home("export-missing");
+    let (_, stderr, code) = run_cli_in_home(
+        &["config", "export", "--snapshot", "missing.json", "--out", "out.json"],
+        Some(&home),
+    );
+    assert_eq!(code, 1);
+    assert!(stderr.contains("I/O error"), "got: {stderr}");
+}
+
+#[test]
+fn test_config_import_malformed_snapshot_errors() {
+    let home = temp_home("import-malformed");
+    let path = home.join("malformed.json");
+    std::fs::write(&path, "not json").expect("write malformed snapshot");
+    let (_, stderr, code) = run_cli_in_home(
+        &["config", "import", "--snapshot", path.to_str().unwrap()],
+        Some(&home),
+    );
+    assert_eq!(code, 1);
+    assert!(stderr.contains("Snapshot parse error"), "got: {stderr}");
 }
 
 #[test]

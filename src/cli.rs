@@ -99,6 +99,24 @@ pub enum ConfigAction {
         json: bool,
     },
 
+    /// Export a snapshot JSON file for sharing with another machine.
+    Export {
+        /// Snapshot file to export.
+        #[arg(long)]
+        snapshot: String,
+
+        /// Destination JSON file.
+        #[arg(long)]
+        out: String,
+    },
+
+    /// Import and validate a snapshot into the local snapshot store.
+    Import {
+        /// Snapshot JSON file to import.
+        #[arg(long)]
+        snapshot: String,
+    },
+
     /// Diff the current network config against the most recent snapshot.
     Diff {
         /// Network to compare against.
