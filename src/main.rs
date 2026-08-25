@@ -54,6 +54,14 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 cmd_config_diff(&network, against.as_deref()).await
             }
         },
+        cli::Command::Cache { action } => match action {
+            cli::CacheAction::Warm {
+                wasm,
+                network,
+                id,
+                json,
+            } => cmd_cache_warm(&wasm, &network, id.as_deref(), json).await,
+        },
         cli::Command::Watch { network, interval } => cmd_watch(&network, &interval).await,
     }
 }
@@ -227,6 +235,10 @@ async fn cmd_estimate(
 
     let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
 
+    // Drop cache entries from a previous build of this WASM file before
+    // saving fresh ones (mtime/hash change detection — see #91).
+    let _ = cache::invalidate_if_wasm_changed(std::path::Path::new(wasm_path), &wasm_hash);
+
     // Guard: a simulation that returns no cost data and no ledger is almost
     // certainly a misconfigured request (bad --id, wrong network, or an RPC
     // schema drift), not a free transaction. Fail loudly instead of silently
@@ -347,6 +359,10 @@ async fn cmd_estimate_all(
 
     use sha2::Digest;
     let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
+
+    // Drop cache entries from a previous build of this WASM file before
+    // saving fresh ones (mtime/hash change detection — see #91).
+    let _ = cache::invalidate_if_wasm_changed(std::path::Path::new(wasm_path), &wasm_hash);
 
     let mut json_results: Vec<serde_json::Value> = Vec::new();
     let total = wasm_info.functions.len();
@@ -491,6 +507,216 @@ async fn estimate_all_function(
                 Ok(None)
             }
         }
+    }
+}
+
+/// Outcome of warming a single function's cache entry.
+enum WarmOutcome {
+    /// A fresh estimate was simulated and cached.
+    Warmed {
+        cpu_instructions: u64,
+        memory_bytes: u64,
+        fee_stroops: i64,
+        ledger: u32,
+    },
+    /// A cache entry already existed for this function — no RPC call made.
+    Cached,
+    /// The function could not be warmed (needs args, or simulation failed).
+    Skipped(String),
+}
+
+/// `cache warm` command: pre-populate the cache by estimating every exported
+/// function, skipping any that already have a cache entry.
+///
+/// Ties into automatic cache invalidation (#91): before warming, any cache
+/// entries left over from a previous build of the WASM file are dropped.
+async fn cmd_cache_warm(
+    wasm_path: &str,
+    network: &str,
+    contract_id: Option<&str>,
+    json_flag: bool,
+) -> error::AppResult<()> {
+    let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
+    let endpoint = rpc::client::resolve_endpoint(network, None)?;
+    let client = rpc::client::RpcClient::new(&endpoint);
+
+    use sha2::Digest;
+    let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
+
+    // Drop cache entries from a previous build of this WASM file before
+    // warming (mtime/hash change detection — see #91).
+    let _ = cache::invalidate_if_wasm_changed(std::path::Path::new(wasm_path), &wasm_hash);
+
+    if !json_flag {
+        println!(
+            "Warming cache for {} exported function(s) in {} (hash {wasm_hash}):",
+            wasm_info.functions.len(),
+            wasm_path
+        );
+        if contract_id.is_none() {
+            println!(
+                "Note: pass --id <contract-id> to simulate each function against a deployed contract."
+            );
+        }
+    }
+
+    let total = wasm_info.functions.len();
+    let mut warmed = 0u32;
+    let mut cached = 0u32;
+    let mut skipped = 0u32;
+    let mut json_results: Vec<serde_json::Value> = Vec::new();
+
+    for (i, fn_info) in wasm_info.functions.iter().enumerate() {
+        let outcome = warm_function(
+            &client,
+            &wasm_info,
+            fn_info,
+            contract_id,
+            &wasm_hash,
+            network,
+        )
+        .await;
+
+        match outcome {
+            WarmOutcome::Warmed {
+                cpu_instructions,
+                memory_bytes,
+                fee_stroops,
+                ledger,
+            } => {
+                warmed += 1;
+                if json_flag {
+                    json_results.push(serde_json::json!({
+                        "function": fn_info.name,
+                        "status": "warmed",
+                        "cpu_instructions": cpu_instructions,
+                        "memory_bytes": memory_bytes,
+                        "fee_stroops": fee_stroops,
+                        "ledger": ledger,
+                    }));
+                } else {
+                    println!(
+                        "[{}/{}] {} — warmed (CPU: {cpu_instructions} insns, fee: {fee_stroops} stroops, ledger: {ledger})",
+                        i + 1,
+                        total,
+                        fn_info.name
+                    );
+                }
+            }
+            WarmOutcome::Cached => {
+                cached += 1;
+                if json_flag {
+                    json_results.push(serde_json::json!({
+                        "function": fn_info.name,
+                        "status": "cached",
+                    }));
+                } else {
+                    println!("[{}/{}] {} — cached", i + 1, total, fn_info.name);
+                }
+            }
+            WarmOutcome::Skipped(reason) => {
+                skipped += 1;
+                if json_flag {
+                    json_results.push(serde_json::json!({
+                        "function": fn_info.name,
+                        "status": "skipped",
+                        "reason": reason,
+                    }));
+                } else {
+                    println!("[{}/{}] {} — skipped: {reason}", i + 1, total, fn_info.name);
+                }
+            }
+        }
+    }
+
+    if json_flag {
+        println!("{}", serde_json::to_string_pretty(&json_results)?);
+    } else {
+        println!("Warm-up complete: {warmed} warmed, {cached} cached, {skipped} skipped.");
+    }
+
+    Ok(())
+}
+
+/// Warms the cache for one exported function: returns a cached result if one
+/// already exists, otherwise simulates and saves it. Never fails the whole
+/// command — per-function problems become `Skipped`.
+async fn warm_function(
+    client: &rpc::client::RpcClient,
+    wasm_info: &wasm::parser::WasmInfo,
+    fn_info: &wasm::parser::FunctionInfo,
+    contract_id: Option<&str>,
+    wasm_hash: &str,
+    network: &str,
+) -> WarmOutcome {
+    // A cache entry keyed to this exact hash is already warm.
+    if cache::load_estimate(wasm_hash, &fn_info.name, &[])
+        .map(|e| e.is_some())
+        .unwrap_or(false)
+    {
+        return WarmOutcome::Cached;
+    }
+
+    if fn_info.param_count > 0 {
+        return WarmOutcome::Skipped(format!(
+            "needs --fn/--arg ({} param(s))",
+            fn_info.param_count
+        ));
+    }
+
+    let tx_xdr = match xdr_helper::build_simulation_tx_envelope(
+        &wasm_info.bytes,
+        contract_id,
+        Some(fn_info.name.as_str()),
+        &[],
+    ) {
+        Ok(tx) => tx,
+        Err(e) => return WarmOutcome::Skipped(e.to_string()),
+    };
+    let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
+
+    match rpc::simulate::simulate_transaction(client, &tx_b64).await {
+        Ok(resp) => {
+            if missing_simulation_data(&resp) {
+                return WarmOutcome::Skipped(
+                    "simulation returned no cost data and no latest ledger".to_string(),
+                );
+            }
+            let (cpu, mem, ..) = match response_resources(&resp) {
+                Ok(r) => r,
+                Err(e) => return WarmOutcome::Skipped(e.to_string()),
+            };
+            let fee = rpc::simulate::parse_resource_fee(&resp.min_resource_fee)
+                .unwrap_or(None)
+                .or(
+                    rpc::simulate::parse_transaction_data_resource_fee(&resp.transaction_data)
+                        .unwrap_or(None),
+                )
+                .unwrap_or(0);
+            let ledger: u32 = resp
+                .latest_ledger
+                .and_then(|l| u32::try_from(l).ok())
+                .unwrap_or(0);
+
+            let _ = cache::save_estimate(
+                wasm_hash,
+                &fn_info.name,
+                &[],
+                network,
+                ledger,
+                fee,
+                cpu,
+                mem,
+            );
+
+            WarmOutcome::Warmed {
+                cpu_instructions: cpu,
+                memory_bytes: mem,
+                fee_stroops: fee,
+                ledger,
+            }
+        }
+        Err(e) => WarmOutcome::Skipped(e.to_string()),
     }
 }
 

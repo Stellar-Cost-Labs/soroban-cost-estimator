@@ -229,3 +229,99 @@ fn test_overwrite_existing_estimate() {
         assert_eq!(loaded.total_stroops, 200);
     });
 }
+
+#[test]
+fn test_invalidate_when_wasm_hash_changes() {
+    with_temp_home(|tmp| {
+        let wasm_path = tmp.join("contract.wasm");
+        std::fs::write(&wasm_path, b"v1").expect("write v1");
+
+        let hash_v1 = "hash-v1";
+        let hash_v2 = "hash-v2";
+
+        // First observation records the file identity — nothing to drop yet.
+        assert!(!cache::invalidate_if_wasm_changed(&wasm_path, hash_v1).expect("first invalidate"));
+
+        // Save an estimate keyed to the v1 build.
+        cache::save_estimate(hash_v1, "increment", &[], "testnet", 1, 100, 10, 5).expect("save v1");
+
+        // Recompile: content changes → hash changes.
+        std::fs::write(&wasm_path, b"v2").expect("write v2");
+        assert!(cache::invalidate_if_wasm_changed(&wasm_path, hash_v2).expect("invalidate v2"));
+
+        // The v1 estimate was dropped.
+        assert!(
+            cache::load_estimate(hash_v1, "increment", &[])
+                .expect("load v1")
+                .is_none(),
+            "v1 estimates should be removed after a hash change"
+        );
+
+        // Re-observing the unchanged file is a no-op.
+        assert!(!cache::invalidate_if_wasm_changed(&wasm_path, hash_v2).expect("re-invalidate"));
+    });
+}
+
+#[test]
+fn test_invalidate_when_wasm_mtime_changes() {
+    with_temp_home(|tmp| {
+        let wasm_path = tmp.join("contract.wasm");
+        std::fs::write(&wasm_path, b"same-bytes").expect("write");
+
+        let hash = "hash-same";
+
+        // First observation records the file identity.
+        assert!(!cache::invalidate_if_wasm_changed(&wasm_path, hash).expect("first invalidate"));
+
+        // Save an estimate.
+        cache::save_estimate(hash, "increment", &[], "testnet", 1, 100, 10, 5).expect("save");
+
+        // Touch the file: content identical, mtime advanced.
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&wasm_path)
+            .expect("open for mtime");
+        let times = std::fs::FileTimes::new()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10));
+        file.set_times(times).expect("set mtime");
+
+        assert!(cache::invalidate_if_wasm_changed(&wasm_path, hash).expect("invalidate on mtime"));
+
+        // The estimate was dropped even though the hash is unchanged.
+        assert!(
+            cache::load_estimate(hash, "increment", &[])
+                .expect("load")
+                .is_none(),
+            "estimates should be removed after an mtime-only change"
+        );
+    });
+}
+
+#[test]
+fn test_remove_cached_estimates_for_wasm() {
+    with_temp_home(|_tmp| {
+        // Three estimates: two for the same hash, one for a different hash.
+        cache::save_estimate("keep-hash", "a", &[], "testnet", 1, 1, 1, 1).expect("save a");
+        cache::save_estimate("drop-hash", "b", &[], "testnet", 2, 2, 2, 2).expect("save b");
+        cache::save_estimate("drop-hash", "c", &[], "testnet", 3, 3, 3, 3).expect("save c");
+
+        let removed = cache::remove_cached_estimates_for_wasm("drop-hash").expect("remove");
+        assert_eq!(removed, 2, "both drop-hash estimates should be removed");
+
+        assert!(
+            cache::load_estimate("keep-hash", "a", &[])
+                .expect("load keep")
+                .is_some()
+        );
+        assert!(
+            cache::load_estimate("drop-hash", "b", &[])
+                .expect("load drop b")
+                .is_none()
+        );
+        assert!(
+            cache::load_estimate("drop-hash", "c", &[])
+                .expect("load drop c")
+                .is_none()
+        );
+    });
+}
