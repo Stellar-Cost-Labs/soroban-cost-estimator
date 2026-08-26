@@ -6,6 +6,11 @@ use soroban_cost_estimator::cache;
 /// Serialize cache tests because `std::env::set_var` is not thread-safe.
 static HOME_MUTEX: Mutex<()> = Mutex::new(());
 
+/// Number of worker threads used by the concurrency tests.
+const CONCURRENT_THREADS: usize = 8;
+/// Number of cache entries each worker thread writes/reads.
+const ENTRIES_PER_THREAD: usize = 25;
+
 /// Run a test with HOME pointing to a temporary directory so cache
 /// operations don't touch the real user's home.
 ///
@@ -286,5 +291,182 @@ fn test_verify_cache_ignores_non_json_files() {
         let statuses = cache::verify_cache().expect("verify");
         assert_eq!(statuses.len(), 1, "only .json files should be checked");
         assert!(statuses[0].valid);
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Concurrency
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Concurrent `save_estimate`/`load_estimate` calls on distinct cache keys
+/// must not corrupt the cache.
+///
+/// Each thread owns a unique `(wasm_hash, function)` pair and writes/reads
+/// `ENTRIES_PER_THREAD` estimates with unique args, so no two threads ever
+/// touch the same cache file. After every thread finishes, every entry must
+/// still be present, loadable, and parseable.
+#[test]
+fn test_concurrent_save_and_load_estimates() {
+    with_temp_home(|_tmp| {
+        let handles: Vec<_> = (0..CONCURRENT_THREADS)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    let wasm_hash = format!("hash-{t}");
+                    let function = format!("func-{t}");
+                    for j in 0..ENTRIES_PER_THREAD {
+                        let args = vec![format!("arg-{t}-{j}")];
+                        cache::save_estimate(
+                            &wasm_hash,
+                            &function,
+                            &args,
+                            "testnet",
+                            j as u32,
+                            1_000 + j as i64,
+                            10_000 + j as u64,
+                            1_000 + j as u64,
+                        )
+                        .expect("concurrent save");
+
+                        // Load back immediately; only this thread wrote this key.
+                        let loaded = cache::load_estimate(&wasm_hash, &function, &args)
+                            .expect("concurrent load")
+                            .expect("estimate saved by this thread should load");
+                        assert_eq!(loaded.ledger, j as u32);
+                        assert_eq!(loaded.total_stroops, 1_000 + j as i64);
+                        assert_eq!(loaded.cpu_instructions, 10_000 + j as u64);
+                        assert_eq!(loaded.memory_bytes, 1_000 + j as u64);
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("concurrent save/load thread panicked");
+        }
+
+        // Every concurrently written entry must still be present and intact.
+        let estimates = cache::list_cached_estimates("testnet").expect("list after concurrent");
+        assert_eq!(
+            estimates.len(),
+            CONCURRENT_THREADS * ENTRIES_PER_THREAD,
+            "all concurrently written estimates should be present"
+        );
+        let statuses = cache::verify_cache().expect("verify after concurrent");
+        assert_eq!(statuses.len(), CONCURRENT_THREADS * ENTRIES_PER_THREAD);
+        assert!(
+            statuses.iter().all(|s| s.valid),
+            "concurrent save/load must not corrupt entries: {statuses:?}"
+        );
+    });
+}
+
+/// Concurrent `load_estimate` calls must not corrupt the cache.
+///
+/// Seed a known set of entries, then hammer the cache with reads from many
+/// threads at once. Every entry must load back with its exact values and the
+/// cache must still verify as fully valid afterwards.
+#[test]
+fn test_concurrent_load_estimates() {
+    with_temp_home(|_tmp| {
+        // Seed the cache sequentially so every entry exists before the reads.
+        for t in 0..CONCURRENT_THREADS {
+            let wasm_hash = format!("hash-{t}");
+            let function = format!("func-{t}");
+            for j in 0..ENTRIES_PER_THREAD {
+                cache::save_estimate(
+                    &wasm_hash,
+                    &function,
+                    &[format!("arg-{t}-{j}")],
+                    "testnet",
+                    j as u32,
+                    1_000 + j as i64,
+                    10_000 + j as u64,
+                    1_000 + j as u64,
+                )
+                .expect("seed save");
+            }
+        }
+
+        let handles: Vec<_> = (0..CONCURRENT_THREADS)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for j in 0..ENTRIES_PER_THREAD {
+                        let loaded = cache::load_estimate(
+                            &format!("hash-{t}"),
+                            &format!("func-{t}"),
+                            &[format!("arg-{t}-{j}")],
+                        )
+                        .expect("concurrent load")
+                        .expect("seeded estimate should load");
+                        assert_eq!(loaded.ledger, j as u32);
+                        assert_eq!(loaded.total_stroops, 1_000 + j as i64);
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("concurrent load thread panicked");
+        }
+
+        let statuses = cache::verify_cache().expect("verify after concurrent loads");
+        assert_eq!(statuses.len(), CONCURRENT_THREADS * ENTRIES_PER_THREAD);
+        assert!(
+            statuses.iter().all(|s| s.valid),
+            "concurrent loads must not corrupt entries: {statuses:?}"
+        );
+    });
+}
+
+/// Concurrent saves to the *same* cache key must leave a valid entry behind.
+///
+/// Two threads race to write the same `(wasm_hash, function, args)` key with
+/// different ledgers. Whichever write lands last wins, but the surviving file
+/// must parse as a valid `CachedEstimate` (no torn writes) and the cache must
+/// verify cleanly.
+#[test]
+fn test_concurrent_same_key_saves_leave_valid_entry() {
+    with_temp_home(|_tmp| {
+        let args = vec!["shared".to_string()];
+        let handles: Vec<_> = (0..CONCURRENT_THREADS)
+            .map(|t| {
+                let args = args.clone();
+                std::thread::spawn(move || {
+                    cache::save_estimate(
+                        "shared-hash",
+                        "shared-func",
+                        &args,
+                        "testnet",
+                        t as u32,
+                        1_000 + t as i64,
+                        10_000,
+                        1_000,
+                    )
+                    .expect("concurrent same-key save");
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("concurrent same-key thread panicked");
+        }
+
+        // The surviving entry must be one of the written variants.
+        let loaded = cache::load_estimate("shared-hash", "shared-func", &args)
+            .expect("load shared key")
+            .expect("shared key should exist after concurrent saves");
+        assert_eq!(loaded.wasm_hash, "shared-hash");
+        assert_eq!(loaded.function, "shared-func");
+        assert!(
+            loaded.ledger < CONCURRENT_THREADS as u32,
+            "ledger must be one of the written variants: {loaded:?}"
+        );
+
+        let statuses = cache::verify_cache().expect("verify after same-key saves");
+        assert_eq!(statuses.len(), 1, "one entry for the shared key");
+        assert!(
+            statuses[0].valid,
+            "shared-key entry must stay valid: {statuses:?}"
+        );
     });
 }
