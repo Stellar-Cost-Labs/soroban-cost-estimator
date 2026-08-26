@@ -29,6 +29,7 @@ pub fn decode_config_entry_xdr(xdr_b64: &str) -> AppResult<stellar_xdr::ConfigSe
 
 /// Initialize a snapshot with the network, timestamp, and ledger set; all
 /// config entries start empty.
+#[must_use]
 pub fn begin_snapshot(network: &str, ledger: u32) -> ConfigSnapshot {
     use chrono::Utc;
     ConfigSnapshot {
@@ -245,6 +246,7 @@ pub fn parse_contract_id(id: &str) -> AppResult<[u8; 32]> {
 /// non-negative integer that overflows `i64` → `U64`, anything else →
 /// `String`. The inferred type drives the simulation's serialization size,
 /// which is what the fee math actually depends on.
+#[must_use]
 pub fn parse_arg_scval(arg: &str) -> stellar_xdr::ScVal {
     let value = arg.split_once('=').map(|(_, v)| v).unwrap_or(arg);
 

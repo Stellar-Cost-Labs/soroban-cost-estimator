@@ -15,7 +15,13 @@ use crate::error::{AppError, AppResult};
 /// # Network calls
 /// None — pure file I/O + parsing.
 pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
-    let bytes = std::fs::read(path).map_err(|e| AppError::Io(e))?;
+    let bytes = std::fs::read(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            AppError::FileNotFound(path.display().to_string())
+        } else {
+            AppError::Io(e)
+        }
+    })?;
 
     validate_wasm(&bytes)?;
     let functions = enumerate_functions(&bytes)?;
@@ -170,6 +176,7 @@ fn parse_contract_spec(bytes: &[u8]) -> AppResult<(SpecFunctions, bool)> {
 }
 
 /// Human-readable name for a `ScSpecTypeDef`.
+#[must_use]
 fn spec_type_name(t: &stellar_xdr::ScSpecTypeDef) -> &'static str {
     match t {
         stellar_xdr::ScSpecTypeDef::Val => "val",
@@ -224,6 +231,7 @@ pub struct FunctionInfo {
 }
 
 /// Formats a function with its spec-derived signature, e.g. `increment(x: I64)`.
+#[must_use]
 pub fn format_function(fn_info: &FunctionInfo) -> String {
     if fn_info.params.is_empty() {
         return fn_info.name.clone();
