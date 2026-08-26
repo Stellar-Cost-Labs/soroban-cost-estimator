@@ -229,3 +229,62 @@ fn test_overwrite_existing_estimate() {
         assert_eq!(loaded.total_stroops, 200);
     });
 }
+
+#[test]
+fn test_verify_cache_empty() {
+    with_temp_home(|_tmp| {
+        let statuses = cache::verify_cache().expect("verify on empty cache");
+        assert!(statuses.is_empty(), "fresh cache should have no entries");
+    });
+}
+
+#[test]
+fn test_verify_cache_all_valid() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5).expect("save f1");
+        cache::save_estimate("h2", "f2", &[], "mainnet", 2, 200, 20, 10).expect("save f2");
+
+        let statuses = cache::verify_cache().expect("verify");
+        assert_eq!(statuses.len(), 2, "should report both entries");
+        assert!(
+            statuses.iter().all(|s| s.valid),
+            "entries written by save_estimate should all be valid: {statuses:?}"
+        );
+    });
+}
+
+#[test]
+fn test_verify_cache_detects_corrupted_entries() {
+    with_temp_home(|tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5).expect("save f1");
+
+        // Corrupt entry 1: not JSON at all.
+        // Corrupt entry 2: valid JSON but missing required fields.
+        let dir = tmp.join(".soroban-cost-estimator").join("cache");
+        std::fs::write(dir.join("garbage.json"), "{not json").expect("write garbage");
+        std::fs::write(dir.join("wrong_shape.json"), r#"{"foo": 1}"#).expect("write wrong shape");
+
+        let statuses = cache::verify_cache().expect("verify");
+        assert_eq!(statuses.len(), 3, "should report every .json entry");
+
+        let corrupt: Vec<&cache::CacheEntryStatus> = statuses.iter().filter(|s| !s.valid).collect();
+        assert_eq!(corrupt.len(), 2, "both corrupted entries should be flagged");
+        let names: Vec<&str> = corrupt.iter().map(|s| s.filename.as_str()).collect();
+        assert!(names.contains(&"garbage.json"));
+        assert!(names.contains(&"wrong_shape.json"));
+    });
+}
+
+#[test]
+fn test_verify_cache_ignores_non_json_files() {
+    with_temp_home(|tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5).expect("save f1");
+
+        let dir = tmp.join(".soroban-cost-estimator").join("cache");
+        std::fs::write(dir.join("notes.txt"), "not a cache entry").expect("write txt");
+
+        let statuses = cache::verify_cache().expect("verify");
+        assert_eq!(statuses.len(), 1, "only .json files should be checked");
+        assert!(statuses[0].valid);
+    });
+}
