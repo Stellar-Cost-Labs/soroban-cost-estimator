@@ -497,12 +497,15 @@ async fn estimate_all_function(
     }
 }
 
-/// `config snapshot` command: fetch config settings and save snapshot.
-async fn cmd_config_snapshot(
+/// Fetches the current network config settings and builds a snapshot.
+///
+/// Shared by `config snapshot`, `config diff`, and `watch`.
+///
+/// # Network calls
+/// Makes one batched `getLedgerEntries` RPC call.
+async fn fetch_config_snapshot(
     network: &str,
-    out_path: Option<&str>,
-    json_flag: bool,
-) -> error::AppResult<()> {
+) -> error::AppResult<config_snapshot::model::ConfigSnapshot> {
     let endpoint = rpc::client::resolve_endpoint(network, None)?;
     let client = rpc::client::RpcClient::new(&endpoint);
     let raw_entries = rpc::config::fetch_all_config_settings(&client).await?;
@@ -515,6 +518,44 @@ async fn cmd_config_snapshot(
     if let Some(latest) = raw_entries.iter().map(|e| e.last_modified_ledger).max() {
         snapshot.ledger = latest;
     }
+    Ok(snapshot)
+}
+
+/// Prints stale cached estimates for `network` relative to `ledger`, if any.
+fn print_stale_estimates(network: &str, ledger: u32) {
+    match cache::list_cached_estimates(network) {
+        Ok(estimates) => {
+            if !estimates.is_empty() {
+                let stale = cache::find_stale_estimates(&estimates, ledger);
+                if stale.is_empty() {
+                    println!("  All cached estimates are current (ledger {ledger}).");
+                } else {
+                    println!(
+                        "  {} cached estimate(s) from earlier ledger(s) — may be stale:",
+                        stale.len()
+                    );
+                    for est in &stale {
+                        println!(
+                            "    - {} @ ledger {} (current: {})",
+                            est.function, est.ledger, ledger
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            println!("  Warning: could not check cache: {e}");
+        }
+    }
+}
+
+/// `config snapshot` command: fetch config settings and save snapshot.
+async fn cmd_config_snapshot(
+    network: &str,
+    out_path: Option<&str>,
+    json_flag: bool,
+) -> error::AppResult<()> {
+    let snapshot = fetch_config_snapshot(network).await?;
 
     let path = config_snapshot::store::save_snapshot(&snapshot, out_path)?;
 
@@ -545,18 +586,7 @@ async fn cmd_config_diff(network: &str, against_path: Option<&str>) -> error::Ap
         None => config_snapshot::store::load_latest_snapshot(network)?,
     };
 
-    let endpoint = rpc::client::resolve_endpoint(network, None)?;
-    let client = rpc::client::RpcClient::new(&endpoint);
-    let raw_entries = rpc::config::fetch_all_config_settings(&client).await?;
-
-    let mut new_snapshot = xdr_helper::begin_snapshot(network, 0);
-    for raw in &raw_entries {
-        let config_entry = xdr_helper::decode_config_entry_xdr(&raw.config_xdr)?;
-        xdr_helper::apply_config_entry(&mut new_snapshot, config_entry);
-    }
-    if let Some(latest) = raw_entries.iter().map(|e| e.last_modified_ledger).max() {
-        new_snapshot.ledger = latest;
-    }
+    let new_snapshot = fetch_config_snapshot(network).await?;
 
     let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
     println!("{}", config_snapshot::diff::format_diff(&diff));
@@ -578,33 +608,7 @@ async fn cmd_config_diff(network: &str, against_path: Option<&str>) -> error::Ap
     }
 
     // Check for stale cached estimates even when there are no pricing changes
-    match cache::list_cached_estimates(network) {
-        Ok(estimates) => {
-            if !estimates.is_empty() {
-                let stale = cache::find_stale_estimates(&estimates, new_snapshot.ledger);
-                if stale.is_empty() {
-                    println!(
-                        "  All cached estimates are current (ledger {}).",
-                        new_snapshot.ledger
-                    );
-                } else {
-                    println!(
-                        "  {} cached estimate(s) from earlier ledger(s) — may be stale:",
-                        stale.len()
-                    );
-                    for est in &stale {
-                        println!(
-                            "    - {} @ ledger {} (current: {})",
-                            est.function, est.ledger, new_snapshot.ledger
-                        );
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            println!("  Warning: could not check cache: {e}");
-        }
-    }
+    print_stale_estimates(network, new_snapshot.ledger);
 
     if diff.has_pricing_changes {
         std::process::exit(1);
@@ -656,21 +660,8 @@ async fn shutdown_signal() -> error::AppResult<()> {
 /// # Network calls
 /// Makes one batched `getLedgerEntries` RPC call.
 async fn watch_poll_once(network: &str, first: &mut bool) -> error::AppResult<()> {
-    let endpoint = rpc::client::resolve_endpoint(network, None)?;
-    let client = rpc::client::RpcClient::new(&endpoint);
-
-    match rpc::config::fetch_all_config_settings(&client).await {
-        Ok(raw_entries) => {
-            let mut snapshot = xdr_helper::begin_snapshot(network, 0);
-            for raw in &raw_entries {
-                if let Ok(config_entry) = xdr_helper::decode_config_entry_xdr(&raw.config_xdr) {
-                    xdr_helper::apply_config_entry(&mut snapshot, config_entry);
-                }
-            }
-            if let Some(latest) = raw_entries.iter().map(|e| e.last_modified_ledger).max() {
-                snapshot.ledger = latest;
-            }
-
+    match fetch_config_snapshot(network).await {
+        Ok(snapshot) => {
             if !*first {
                 if let Ok(old_snapshot) = config_snapshot::store::load_latest_snapshot(network) {
                     let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &snapshot);
@@ -679,28 +670,7 @@ async fn watch_poll_once(network: &str, first: &mut bool) -> error::AppResult<()
                     }
 
                     // Check for stale cached estimates even when there are no pricing changes
-                    if let Ok(estimates) = cache::list_cached_estimates(network) {
-                        if !estimates.is_empty() {
-                            let stale = cache::find_stale_estimates(&estimates, snapshot.ledger);
-                            if stale.is_empty() {
-                                println!(
-                                    "  All cached estimates are current (ledger {}).",
-                                    snapshot.ledger
-                                );
-                            } else {
-                                println!(
-                                    "  {} cached estimate(s) from earlier ledger(s) — may be stale:",
-                                    stale.len()
-                                );
-                                for est in &stale {
-                                    println!(
-                                        "    - {} @ ledger {} (current: {})",
-                                        est.function, est.ledger, snapshot.ledger
-                                    );
-                                }
-                            }
-                        }
-                    }
+                    print_stale_estimates(network, snapshot.ledger);
                 }
             }
 
