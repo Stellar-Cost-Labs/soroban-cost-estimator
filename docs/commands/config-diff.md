@@ -24,6 +24,11 @@ Options:
   recorded at an earlier ledger as potentially stale.
 - **Exit code 0** when nothing changed; **exit code 1** when a pricing change
   was detected — scripts and CI can branch on it.
+- When a pricing change (a network protocol/config upgrade) is detected, the
+  new config is **automatically saved** as a snapshot in
+  `~/.soroban-cost-estimator/snapshots/`, so it becomes the baseline for the
+  next diff. A failed save is reported as a warning and does not change the
+  exit code.
 
 ## Example — nothing changed
 
@@ -69,8 +74,10 @@ Found 1 field change(s):
       New: 7
 
 ⚠️  Pricing changes detected! Your cached estimates may be stale.
+  Protocol upgrade detected — new config auto-saved to ~/.soroban-cost-estimator/snapshots/testnet-<timestamp>.json
 ```
 
-and the command exits **1**. Re-run `estimate` for the affected contracts and
-refresh the snapshots. See [Config Drift](../concepts/config-drift.md) for the
-workflow this enables.
+and the command exits **1**. The post-upgrade config has already been saved,
+so the next diff compares against it. Re-run `estimate` for the affected
+contracts. See [Config Drift](../concepts/config-drift.md) for the workflow
+this enables.

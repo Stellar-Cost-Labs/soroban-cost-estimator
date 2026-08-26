@@ -176,6 +176,7 @@ fn parse_contract_spec(bytes: &[u8]) -> AppResult<(SpecFunctions, bool)> {
 }
 
 /// Human-readable name for a `ScSpecTypeDef`.
+#[must_use]
 fn spec_type_name(t: &stellar_xdr::ScSpecTypeDef) -> &'static str {
     match t {
         stellar_xdr::ScSpecTypeDef::Val => "val",
@@ -230,6 +231,7 @@ pub struct FunctionInfo {
 }
 
 /// Formats a function with its spec-derived signature, e.g. `increment(x: I64)`.
+#[must_use]
 pub fn format_function(fn_info: &FunctionInfo) -> String {
     if fn_info.params.is_empty() {
         return fn_info.name.clone();
