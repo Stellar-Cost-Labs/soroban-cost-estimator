@@ -843,6 +843,27 @@ mod tests {
         assert_eq!(parse_interval_secs("s"), 3600);
         assert_eq!(parse_interval_secs("10ss"), 3600);
         assert_eq!(parse_interval_secs("garbage"), 3600);
+
+        // Fractional values are not supported by `u64` parsing, so they fall
+        // back to the one-hour default before the unit multiplier is applied.
+        assert_eq!(parse_interval_secs("1.5h"), 12_960_000);
+        assert_eq!(parse_interval_secs("0.5m"), 216_000);
+        assert_eq!(parse_interval_secs("2.25d"), 311_040_000);
+
+        // Mixed case suffixes are normalized before parsing.
+        assert_eq!(parse_interval_secs("45S"), 45);
+        assert_eq!(parse_interval_secs("10M"), 600);
+        assert_eq!(parse_interval_secs("2H"), 7_200);
+        assert_eq!(parse_interval_secs("3D"), 259_200);
+
+        // Boundary conditions: zero, u64 saturation, and leading zeros.
+        assert_eq!(parse_interval_secs("0"), 0);
+        assert_eq!(parse_interval_secs("0m"), 0);
+        assert_eq!(parse_interval_secs("18446744073709551615"), u64::MAX);
+        assert_eq!(parse_interval_secs("18446744073709551615s"), u64::MAX);
+        assert_eq!(parse_interval_secs("18446744073709551615m"), u64::MAX);
+        assert_eq!(parse_interval_secs("9999999999999999999999"), 3600);
+        assert_eq!(parse_interval_secs("007"), 7);
     }
 
     #[test]
