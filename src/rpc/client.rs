@@ -1,6 +1,7 @@
 use serde_json::Value;
 
 use crate::error::{AppError, AppResult};
+use crate::rpc::retry::with_retry;
 
 /// Resolves a network name to its well-known Soroban RPC endpoint.
 ///
@@ -51,7 +52,25 @@ impl RpcClient {
             "params": params,
         });
 
-        let response = self.client.post(&self.url).json(&body).send().await?;
+        let client = self.client.clone();
+        let url = self.url.clone();
+        let request_body = body.clone();
+
+        let response = with_retry(|| {
+            let client = client.clone();
+            let url = url.clone();
+            let request_body = request_body.clone();
+
+            async move {
+                client
+                    .post(&url)
+                    .json(&request_body)
+                    .send()
+                    .await
+                    .map_err(AppError::from)
+            }
+        })
+        .await?;
 
         let status = response.status();
         let response_body: Value = response.json().await?;
