@@ -15,7 +15,13 @@ use crate::error::{AppError, AppResult};
 /// # Network calls
 /// None — pure file I/O + parsing.
 pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
-    let bytes = std::fs::read(path).map_err(|e| AppError::Io(e))?;
+    let bytes = std::fs::read(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            AppError::FileNotFound(path.display().to_string())
+        } else {
+            AppError::Io(e)
+        }
+    })?;
 
     validate_wasm(&bytes)?;
     let functions = enumerate_functions(&bytes)?;
