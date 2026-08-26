@@ -200,6 +200,56 @@ fn test_watch_help() {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[test]
+fn test_help_output_lists_cache() {
+    let (stdout, stderr, code) = run_cli(&["--help"]);
+    assert_eq!(code, 0, "help should exit 0; stderr: {stderr}");
+    assert!(stdout.contains("cache"), "help should list cache command");
+}
+
+#[test]
+fn test_cache_help() {
+    let (stdout, stderr, code) = run_cli(&["cache", "--help"]);
+    assert_eq!(code, 0, "cache --help should exit 0; stderr: {stderr}");
+    assert!(stdout.contains("verify"), "cache help should list verify");
+}
+
+#[test]
+fn test_cache_verify_empty_cache_succeeds() {
+    // Run against a temp HOME so we don't touch the real user's cache.
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = std::env::temp_dir().join(format!(
+        "soroban_cli_verify_test_{}_{}",
+        std::process::id(),
+        suffix
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("create temp home");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(["cache", "verify"])
+        .env("HOME", &tmp)
+        .output()
+        .expect("failed to run CLI");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let code = output.status.code().unwrap_or(-1);
+
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    assert_eq!(
+        code, 0,
+        "verify on empty cache should exit 0; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("empty") || stdout.contains("nothing to verify"),
+        "should report an empty cache: {stdout}"
+    );
+}
+
+#[test]
 fn test_estimate_missing_wasm_errors() {
     let (_, stderr, code) = run_cli(&["estimate"]);
     assert_ne!(code, 0, "estimate without --wasm should error");
@@ -284,8 +334,8 @@ fn test_estimate_nonexistent_wasm_file() {
         "runtime failures are reported on stderr as `Error: …`; got: {stderr}"
     );
     assert!(
-        stderr.contains("I/O error"),
-        "a missing file should surface as an I/O error; got: {stderr}"
+        stderr.contains("File not found"),
+        "a missing file should surface as a file not found error; got: {stderr}"
     );
 }
 
@@ -414,8 +464,8 @@ fn test_estimate_all_nonexistent_wasm_file() {
     let (_, stderr, code) = run_cli(&["estimate-all", "--wasm", "no/such/file.wasm"]);
     assert_eq!(code, 1, "a missing WASM file should exit 1");
     assert!(
-        stderr.contains("I/O error"),
-        "a missing file should surface as an I/O error; got: {stderr}"
+        stderr.contains("File not found"),
+        "a missing file should surface as a file not found error; got: {stderr}"
     );
 }
 

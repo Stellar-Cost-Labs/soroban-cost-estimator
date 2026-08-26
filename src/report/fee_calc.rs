@@ -66,6 +66,7 @@ pub struct FeeRates {
 ///
 /// # Network calls
 /// None — pure computation.
+#[must_use]
 pub fn compute_fee_breakdown(
     total_resource_fee: i64,
     cpu_insns: u64,
@@ -133,6 +134,7 @@ pub fn compute_fee_breakdown(
 ///
 /// Returns a string to avoid floating-point precision issues.
 /// Example: 1234567 stroops → "0.1234567"
+#[must_use]
 pub fn stroops_to_xlm(stroops: i64) -> String {
     let abs = stroops.unsigned_abs();
     let whole = abs / 10_000_000;
