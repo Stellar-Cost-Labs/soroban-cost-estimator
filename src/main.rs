@@ -4,6 +4,7 @@ use soroban_cost_estimator::cli;
 use soroban_cost_estimator::config_snapshot;
 use soroban_cost_estimator::error;
 use soroban_cost_estimator::report;
+use soroban_cost_estimator::report::formatter::{JsonFormatter, ReportFormatter, TableFormatter};
 use soroban_cost_estimator::rpc;
 use soroban_cost_estimator::wasm;
 use soroban_cost_estimator::xdr_helper;
@@ -322,9 +323,9 @@ async fn cmd_estimate(
         info!(total_stroops = fee.total_stroops, total_xlm = %fee.total_xlm, "estimate complete");
 
         if json_flag {
-            println!("{}", report::cost_report::format_report_json(&report));
+            println!("{}", JsonFormatter.format(&report));
         } else {
-            println!("{}", report::cost_report::format_report_table(&report));
+            println!("{}", TableFormatter.format(&report));
         }
 
         Ok(())
