@@ -55,6 +55,9 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             }
         },
         cli::Command::Watch { network, interval } => cmd_watch(&network, &interval).await,
+        cli::Command::Cache { action } => match action {
+            cli::CacheAction::Verify => cmd_cache_verify(),
+        },
     }
 }
 
@@ -738,6 +741,43 @@ async fn cmd_watch(network: &str, interval: &str) -> error::AppResult<()> {
             } => {}
         }
     }
+}
+
+/// `cache verify` command: check every cache entry parses as valid JSON.
+///
+/// Prints a summary line per corrupted entry and exits with code 1 when any
+/// entry fails verification, so scripts can treat a corrupt cache as an
+/// error. A healthy (or empty) cache exits 0.
+///
+/// # Network calls
+/// None — pure file I/O.
+fn cmd_cache_verify() -> error::AppResult<()> {
+    let statuses = cache::verify_cache()?;
+
+    if statuses.is_empty() {
+        println!("Cache is empty — nothing to verify.");
+        return Ok(());
+    }
+
+    let total = statuses.len();
+    let corrupt: Vec<&cache::CacheEntryStatus> = statuses.iter().filter(|s| !s.valid).collect();
+
+    println!("Checked {total} cache entries.");
+
+    if corrupt.is_empty() {
+        println!("All cache entries are valid.");
+    } else {
+        println!(
+            "{} of {total} cache entries failed verification:",
+            corrupt.len()
+        );
+        for status in &corrupt {
+            println!("  - {}", status.filename);
+        }
+        std::process::exit(1);
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

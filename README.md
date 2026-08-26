@@ -184,6 +184,19 @@ Useful in CI or cron jobs to monitor for unexpected pricing changes.
 Press `Ctrl-C` (SIGINT) or send `SIGTERM` to stop **cleanly** (exit code 0):
 the in-flight poll is cancelled rather than writing a partial snapshot.
 
+### `cache verify`
+
+Check that every cached estimate in `~/.soroban-cost-estimator/cache/` is
+still valid JSON and parses as a cache entry — i.e. nothing was corrupted by
+a crash or disk issue.
+
+```bash
+soroban-cost-estimator cache verify
+```
+
+- Exits **0** if the cache is empty or every entry is valid
+- Exits **1** and lists the corrupted filenames if any entry fails
+
 ## Installation
 
 ### Prerequisites
@@ -261,7 +274,8 @@ All data is stored locally — no database required:
 | `~/.soroban-cost-estimator/cache/` | Past `estimate` results, keyed by wasm hash + function + args hash |
 
 The cache enables `config diff` to tell you *which* of your past estimates are
-now stale after a network pricing change.
+now stale after a network pricing change. Run `cache verify` to check the
+cache has not been corrupted.
 
 ## ✅ Verified against live testnet
 
