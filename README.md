@@ -164,6 +164,9 @@ soroban-cost-estimator config diff --network testnet [--against /path/to/snapsho
 
 - Exits **0** if no changes detected
 - Exits **1** with a detailed field-by-field diff if pricing changed
+- **Auto-saves a snapshot of the new config** when a protocol upgrade is
+  detected (pricing changed), so it becomes the baseline for future diffs —
+  no separate `config snapshot` run needed
 - Cross-references the **cache** of past `estimate` results and reports which
   cached estimates are now stale due to the pricing change
 
