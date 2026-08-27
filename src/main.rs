@@ -384,6 +384,8 @@ async fn cmd_estimate_all(
         let client = rpc::client::RpcClient::new(&endpoint);
 
         if !json_flag {
+            println!("{}", wasm::parser::format_module_metadata(&wasm_info));
+            println!();
             println!(
                 "Enumerated {} function(s) in WASM:",
                 wasm_info.functions.len()
