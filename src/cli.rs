@@ -40,6 +40,11 @@ pub enum Command {
         #[arg(long = "arg", value_name = "KEY=VAL")]
         args: Vec<String>,
 
+        /// Skip re-simulation when a cached estimate is still fresh
+        /// (e.g. "30m", "1h", "7d"; bare value = seconds).
+        #[arg(long, value_name = "DURATION")]
+        cache_ttl: Option<String>,
+
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
         json: bool,
@@ -122,18 +127,17 @@ pub enum ConfigAction {
         against: Option<String>,
     },
 
-    /// Show a specific historical snapshot.
-    Show {
-        /// Network to view the snapshot for.
+    /// Show the full chronological change log across all stored snapshots.
+    History {
+        /// Network whose snapshot history to inspect.
         #[arg(long, default_value = "testnet")]
         network: String,
+    },
 
-        /// Timestamp of the snapshot to view.
-        #[arg(long)]
-        at: String,
-
-        /// Print the snapshot as JSON instead of the summary lines.
-        #[arg(long)]
-        json: bool,
+    /// Show when each config setting last changed.
+    LastChanged {
+        /// Network whose snapshot history to inspect.
+        #[arg(long, default_value = "testnet")]
+        network: String,
     },
 }

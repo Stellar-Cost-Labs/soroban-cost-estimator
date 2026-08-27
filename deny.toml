@@ -1,0 +1,37 @@
+# cargo-deny configuration: https://embarkstudios.github.io/cargo-deny/
+# Enforced in CI by the EmbarkStudios/cargo-deny-action workflow
+# (see .github/workflows/ci.yml).
+
+[advisories]
+version = 2
+# All vulnerability advisories fail the check (enforced by cargo-deny by default).
+# Fail the check only when the workspace directly depends on an unmaintained crate.
+unmaintained = "workspace"
+# Report yanked crate versions, but do not fail the check on them.
+yanked = "warn"
+
+[bans]
+# Surface duplicate crate versions in CI output, but do not fail on them.
+multiple-versions = "warn"
+# Reject wildcard (`*`) version requirements.
+wildcards = "deny"
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+]
+
+[sources]
+# Only allow dependencies published to crates.io.
+unknown-registry = "deny"
+unknown-git = "deny"

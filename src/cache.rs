@@ -8,12 +8,42 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use tracing::{debug, trace, warn};
 
 use crate::error::{AppError, AppResult};
+
+/// Current cache-entry schema version.
+///
+/// Bump this whenever the on-disk `CachedEstimate` JSON shape changes.
+/// Entries written by a version of the tool with an older schema are
+/// migrated forward through [`migrate_to_latest`]; entries written by a
+/// *newer* tool (version greater than this) are rejected rather than
+/// silently misread.
+pub const CACHE_SCHEMA_VERSION: u32 = 1;
+
+/// Implicit schema version of cache entries written before the `version`
+/// field existed.
+///
+/// Those legacy entries have no `version` key in their JSON, so serde's
+/// `default` fills in this value via [`default_schema_version`]. They are
+/// the first schema version and require no transformation to reach the
+/// current schema.
+pub const INITIAL_SCHEMA_VERSION: u32 = 1;
+
+/// serde default for the `version` field, applied when an older (or hand
+/// written) entry omits it. Legacy entries predating the version field are
+/// treated as [`INITIAL_SCHEMA_VERSION`].
+fn default_schema_version() -> u32 {
+    INITIAL_SCHEMA_VERSION
+}
 
 /// A cached estimate result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedEstimate {
+    /// Schema version of this entry. Legacy entries default to
+    /// [`INITIAL_SCHEMA_VERSION`] when the field is absent.
+    #[serde(default = "default_schema_version")]
+    pub version: u32,
     /// SHA-256 hash of the WASM bytes (hex).
     pub wasm_hash: String,
     /// Contract function name (e.g. `"(wasm upload)"`).
@@ -78,6 +108,7 @@ pub fn save_estimate(
     let path = dir.join(&filename);
 
     let cached = CachedEstimate {
+        version: CACHE_SCHEMA_VERSION,
         wasm_hash: wasm_hash.to_string(),
         function: function.to_string(),
         args_hash,
@@ -91,7 +122,39 @@ pub fn save_estimate(
 
     let json = serde_json::to_string_pretty(&cached)?;
     std::fs::write(&path, json)?;
+    debug!(path = %path.display(), function, network, ledger, "estimate cached");
     Ok(())
+}
+
+/// Carry a cached estimate forward to the current schema version.
+///
+/// * `version < CACHE_SCHEMA_VERSION`: entries from older schemas are
+///   migrated one step at a time toward the current schema. Currently the
+///   initial and current schemas are identical, so this is the identity
+///   transform; adding a schema change later means appending a migration
+///   step here.
+/// * `version == CACHE_SCHEMA_VERSION`: returned unchanged.
+/// * `version > CACHE_SCHEMA_VERSION`: an entry written by a *newer* tool.
+///   It cannot be safely read (or silently downgraded), so this returns an
+///   error instead of misinterpreting fields.
+///
+/// # Network calls
+/// None — pure transformation.
+pub fn migrate_to_latest(cached: CachedEstimate) -> AppResult<CachedEstimate> {
+    let mut migrated = cached;
+
+    match migrated.version {
+        v if v > CACHE_SCHEMA_VERSION => Err(AppError::General(format!(
+            "cache entry schema v{v} is newer than supported v{CACHE_SCHEMA_VERSION}"
+        ))),
+        // Nothing below the current schema exists yet; future schema changes
+        // add per-step migrations here, e.g. v1 -> v2.
+        v if v < CACHE_SCHEMA_VERSION => {
+            migrated.version = CACHE_SCHEMA_VERSION;
+            Ok(migrated)
+        }
+        _ => Ok(migrated),
+    }
 }
 
 /// Compute a hash of the args for use as a cache key.
@@ -122,7 +185,58 @@ pub fn load_estimate(
     let content = std::fs::read_to_string(&path)?;
     let cached: CachedEstimate =
         serde_json::from_str(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))?;
+    let cached = migrate_to_latest(cached)?;
     Ok(Some(cached))
+}
+
+/// Whether a cached estimate is still fresh, i.e. its timestamp is within
+/// `ttl` of now.
+///
+/// Entries whose timestamp cannot be parsed as RFC 3339 are treated as **not**
+/// fresh: an unverifiable age must not be trusted, so the caller re-simulates
+/// and overwrites the entry.
+///
+/// # Network calls
+/// None — pure time comparison.
+pub fn is_cache_entry_fresh(entry: &CachedEstimate, ttl: std::time::Duration) -> bool {
+    let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&entry.timestamp) else {
+        return false;
+    };
+    let ts = ts.with_timezone(&chrono::Utc);
+    let Ok(ttl) = chrono::TimeDelta::from_std(ttl) else {
+        return false;
+    };
+    chrono::Utc::now().signed_duration_since(ts) <= ttl
+}
+
+/// Load a cached estimate only if it is still fresh (within `ttl`).
+///
+/// Returns `Ok(None)` when no entry exists **or** when the entry has
+/// expired — both mean "re-simulate".
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn load_fresh_estimate(
+    wasm_hash: &str,
+    function: &str,
+    args: &[String],
+    ttl: std::time::Duration,
+) -> AppResult<Option<CachedEstimate>> {
+    let Some(cached) = load_estimate(wasm_hash, function, args)? else {
+        return Ok(None);
+    };
+    if is_cache_entry_fresh(&cached, ttl) {
+        trace!(function, ttl_secs = ttl.as_secs(), "fresh cached estimate");
+        Ok(Some(cached))
+    } else {
+        trace!(
+            function,
+            ttl_secs = ttl.as_secs(),
+            timestamp = %cached.timestamp,
+            "cached estimate expired"
+        );
+        Ok(None)
+    }
 }
 
 /// Find all cached estimates for a given network.
@@ -151,6 +265,7 @@ pub fn list_cached_estimates(network: &str) -> AppResult<Vec<CachedEstimate>> {
         }
     }
 
+    trace!(network, count = estimates.len(), "listed cached estimates");
     Ok(estimates)
 }
 
@@ -159,7 +274,10 @@ pub fn list_cached_estimates(network: &str) -> AppResult<Vec<CachedEstimate>> {
 pub struct CacheEntryStatus {
     /// File name of the cache entry (e.g. `"abc123-my_func-def456.json"`).
     pub filename: String,
-    /// Whether the file parsed as a valid `CachedEstimate`.
+    /// Schema version parsed from the entry, if it deserialized at all.
+    pub version: Option<u32>,
+    /// Whether the file parsed as a valid, readable `CachedEstimate`.
+    /// Entries carrying a schema newer than the current one are not valid.
     pub valid: bool,
 }
 
@@ -188,15 +306,36 @@ pub fn verify_cache() -> AppResult<Vec<CacheEntryStatus>> {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let valid = std::fs::read_to_string(&path)
-                .ok()
-                .map(|content| serde_json::from_str::<CachedEstimate>(&content).is_ok())
-                .unwrap_or(false);
-            statuses.push(CacheEntryStatus { filename, valid });
+
+            // A file counts as valid when it both parses as a
+            // `CachedEstimate` and carries a schema this tool can read.
+            // Entries from the future (version > current) parse fine but are
+            // not migratable to the current schema, so they are flagged.
+            let (valid, version) = match std::fs::read_to_string(&path) {
+                Ok(content) => match serde_json::from_str::<CachedEstimate>(&content) {
+                    Ok(parsed) => {
+                        let version = Some(parsed.version);
+                        let valid = migrate_to_latest(parsed).is_ok();
+                        (valid, version)
+                    }
+                    Err(_) => (false, None),
+                },
+                Err(_) => (false, None),
+            };
+
+            if !valid {
+                warn!(filename, "corrupt or unsupported cache entry");
+            }
+            statuses.push(CacheEntryStatus {
+                filename,
+                version,
+                valid,
+            });
         }
     }
 
     statuses.sort_by(|a, b| a.filename.cmp(&b.filename));
+    debug!(total = statuses.len(), "cache verification complete");
     Ok(statuses)
 }
 
