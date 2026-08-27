@@ -217,6 +217,19 @@ async fn fetch_fee_rates(client: &rpc::client::RpcClient) -> report::fee_calc::F
     rates
 }
 
+/// Fetches the current network ledger and returns how many ledgers old
+/// `simulation_ledger` is relative to it.
+///
+/// Returns `None` when the simulation ledger is unknown or the current ledger
+/// cannot be determined.
+async fn fetch_ledger_age(client: &rpc::client::RpcClient, simulation_ledger: u32) -> Option<u32> {
+    if simulation_ledger == 0 {
+        return None;
+    }
+    let current = client.get_latest_ledger().await.ok().flatten()?;
+    Some(current.saturating_sub(simulation_ledger))
+}
+
 /// `estimate` command: simulate a single invocation and print cost report.
 async fn cmd_estimate(
     wasm_path: &str,
@@ -274,6 +287,8 @@ async fn cmd_estimate(
             .and_then(|l| u32::try_from(l).ok())
             .unwrap_or(0);
 
+        let ledger_age = fetch_ledger_age(&client, latest_ledger).await;
+
         let total_fee_stroops = rpc::simulate::parse_resource_fee(&response.min_resource_fee)
             .unwrap_or(None)
             .or(rpc::simulate::parse_transaction_data_resource_fee(
@@ -310,6 +325,7 @@ async fn cmd_estimate(
             fee: fee.clone(),
             ledger: latest_ledger,
             network: network.to_string(),
+            ledger_age,
         };
 
         let _ = cache::save_estimate(

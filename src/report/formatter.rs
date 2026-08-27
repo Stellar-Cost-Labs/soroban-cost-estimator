@@ -40,6 +40,11 @@ impl ReportFormatter for TableFormatter {
             "Network: {} (ledger {})\n",
             report.network, report.ledger
         ));
+        match report.ledger_age {
+            Some(0) => output.push_str("Ledger age: current\n"),
+            Some(age) => output.push_str(&format!("Ledger age: {} ledger(s) old\n", age)),
+            None => output.push_str("Ledger age: unknown\n"),
+        }
         output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
 
         let mut table = comfy_table::Table::new();
@@ -117,7 +122,7 @@ pub struct CsvFormatter;
 impl ReportFormatter for CsvFormatter {
     fn format(&self, report: &CostReport) -> String {
         let mut output = String::from(
-            "function,network,ledger,wasm_hash,cpu_instructions,memory_bytes,\
+            "function,network,ledger,ledger_age,wasm_hash,cpu_instructions,memory_bytes,\
              read_entries,write_entries,read_bytes,write_bytes,tx_size,\
              non_refundable_stroops,refundable_stroops,total_stroops,total_xlm\n",
         );
@@ -126,6 +131,7 @@ impl ReportFormatter for CsvFormatter {
             &report.function,
             &report.network,
             &report.ledger.to_string(),
+            &report.ledger_age.map(|a| a.to_string()).unwrap_or_default(),
             &report.wasm_hash,
             &report.cpu_instructions.to_string(),
             &report.memory_bytes.to_string(),
@@ -171,6 +177,12 @@ impl ReportFormatter for MarkdownFormatter {
             "- **Network:** {} (ledger {})\n",
             report.network, report.ledger
         ));
+        let ledger_age = match report.ledger_age {
+            Some(0) => "current".to_string(),
+            Some(age) => format!("{age} ledger(s) old"),
+            None => "unknown".to_string(),
+        };
+        output.push_str(&format!("- **Ledger age:** {ledger_age}\n"));
         output.push_str(&format!("- **WASM hash:** `{}`\n\n", report.wasm_hash));
 
         // Resource table
@@ -279,6 +291,7 @@ mod tests {
             },
             ledger: 3_894_195,
             network: "testnet".to_string(),
+            ledger_age: Some(0),
         }
     }
 
@@ -301,6 +314,7 @@ mod tests {
             },
             ledger: 0,
             network: "mainnet".to_string(),
+            ledger_age: None,
         }
     }
 
@@ -403,7 +417,7 @@ mod tests {
         let first_line = output.lines().next().unwrap();
         assert!(first_line.starts_with("function,"));
         let field_count = first_line.split(',').count();
-        assert_eq!(field_count, 15);
+        assert_eq!(field_count, 16);
     }
 
     #[test]

@@ -29,6 +29,9 @@ pub struct CostReport {
     pub ledger: u32,
     /// Network the simulation ran on.
     pub network: String,
+    /// How many ledgers old the simulation ledger is relative to the current
+    /// network ledger. `None` when the current ledger could not be determined.
+    pub ledger_age: Option<u32>,
 }
 
 /// Formats a cost report as a human-readable table.
@@ -40,6 +43,11 @@ pub fn format_report_table(report: &CostReport) -> String {
         "Network: {} (ledger {})\n",
         report.network, report.ledger
     ));
+    match report.ledger_age {
+        Some(0) => output.push_str("Ledger age: current\n"),
+        Some(age) => output.push_str(&format!("Ledger age: {} ledger(s) old\n", age)),
+        None => output.push_str("Ledger age: unknown\n"),
+    }
     output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
 
     let mut table = Table::new();

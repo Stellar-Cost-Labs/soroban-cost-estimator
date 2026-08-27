@@ -5,6 +5,7 @@ expression: MarkdownFormatter.format(&report)
 ## Cost Report: `increment`
 
 - **Network:** testnet (ledger 3894195)
+- **Ledger age:** current
 - **WASM hash:** `abc123def456`
 
 ### Resources

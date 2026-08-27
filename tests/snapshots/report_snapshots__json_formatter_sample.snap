@@ -19,5 +19,6 @@ expression: JsonFormatter.format(&report)
     "total_xlm": "0.0015427"
   },
   "ledger": 3894195,
-  "network": "testnet"
+  "network": "testnet",
+  "ledger_age": 0
 }

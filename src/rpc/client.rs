@@ -95,4 +95,21 @@ impl RpcClient {
         serde_json::from_value(result.clone())
             .map_err(|e| AppError::General(format!("failed to deserialize RPC response: {e}")))
     }
+
+    /// Fetches the current network head ledger sequence via `getLatestLedger`.
+    ///
+    /// Returns `None` if the RPC does not report a sequence number.
+    ///
+    /// # Network calls
+    /// Makes an HTTP POST to the configured RPC endpoint.
+    pub async fn get_latest_ledger(&self) -> AppResult<Option<u32>> {
+        let result: serde_json::Value = self
+            .call("getLatestLedger", serde_json::Value::Null)
+            .await?;
+        let sequence = result
+            .get("sequence")
+            .and_then(|v| v.as_u64())
+            .or_else(|| result.get("latestLedger").and_then(|v| v.as_u64()));
+        Ok(sequence.and_then(|s| u32::try_from(s).ok()))
+    }
 }

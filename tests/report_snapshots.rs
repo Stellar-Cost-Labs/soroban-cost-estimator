@@ -23,6 +23,7 @@ fn sample_report() -> CostReport {
         },
         ledger: 3_894_195,
         network: "testnet".to_string(),
+        ledger_age: Some(0),
     }
 }
 
@@ -45,6 +46,7 @@ fn empty_report() -> CostReport {
         },
         ledger: 0,
         network: "mainnet".to_string(),
+        ledger_age: None,
     }
 }
 
