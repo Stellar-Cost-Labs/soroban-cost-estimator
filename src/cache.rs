@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use tracing::{debug, trace, warn};
 
 use crate::error::{AppError, AppResult};
 
@@ -91,6 +92,7 @@ pub fn save_estimate(
 
     let json = serde_json::to_string_pretty(&cached)?;
     std::fs::write(&path, json)?;
+    debug!(path = %path.display(), function, network, ledger, "estimate cached");
     Ok(())
 }
 
@@ -151,6 +153,7 @@ pub fn list_cached_estimates(network: &str) -> AppResult<Vec<CachedEstimate>> {
         }
     }
 
+    trace!(network, count = estimates.len(), "listed cached estimates");
     Ok(estimates)
 }
 
@@ -192,11 +195,15 @@ pub fn verify_cache() -> AppResult<Vec<CacheEntryStatus>> {
                 .ok()
                 .map(|content| serde_json::from_str::<CachedEstimate>(&content).is_ok())
                 .unwrap_or(false);
+            if !valid {
+                warn!(filename, "corrupt cache entry");
+            }
             statuses.push(CacheEntryStatus { filename, valid });
         }
     }
 
     statuses.sort_by(|a, b| a.filename.cmp(&b.filename));
+    debug!(total = statuses.len(), "cache verification complete");
     Ok(statuses)
 }
 
