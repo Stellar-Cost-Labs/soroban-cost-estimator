@@ -138,7 +138,7 @@ fn test_estimate_all_help() {
         code, 0,
         "estimate-all --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--wasm", "--network", "--id", "--json"] {
+    for flag in ["--wasm", "--network", "--id", "--json", "--format"] {
         assert!(
             stdout.contains(flag),
             "estimate-all help should mention {flag}; got: {stdout}"
@@ -331,6 +331,36 @@ fn test_estimate_cache_ttl_flag_accepted() {
     assert!(
         !stderr.contains("unexpected argument"),
         "--cache-ttl should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_all_format_flag_accepted() {
+    // Verify --format is a recognized argument for estimate-all.
+    let (_, stderr, code) = run_cli(&["estimate-all", "--wasm", "test.wasm", "--format", "csv"]);
+    // Should fail because the file doesn't exist, NOT because --format is unknown.
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--format should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_all_format_csv_conflicts_with_json() {
+    // --format and --json should be mutually exclusive.
+    let (_, stderr, code) = run_cli(&[
+        "estimate-all",
+        "--wasm",
+        "test.wasm",
+        "--format",
+        "csv",
+        "--json",
+    ]);
+    assert_ne!(code, 0, "--format and --json should conflict; stderr: {stderr}");
+    assert!(
+        stderr.contains("cannot") || stderr.contains("conflicts"),
+        "the error should mention the conflict; stderr: {stderr}"
     );
 }
 

@@ -64,8 +64,12 @@ pub enum Command {
         #[arg(long)]
         id: Option<String>,
 
-        /// Output as JSON instead of a human-readable list.
-        #[arg(long)]
+        /// Output format: table, json, csv, markdown.
+        #[arg(long, default_value = "table")]
+        format: String,
+
+        /// Output as JSON (deprecated: use --format json instead).
+        #[arg(long, conflicts_with = "format")]
         json: bool,
     },
 

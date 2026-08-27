@@ -4,7 +4,7 @@ use soroban_cost_estimator::cli;
 use soroban_cost_estimator::config_snapshot;
 use soroban_cost_estimator::error;
 use soroban_cost_estimator::report;
-use soroban_cost_estimator::report::formatter::{JsonFormatter, ReportFormatter, TableFormatter};
+use soroban_cost_estimator::report::formatter::{JsonFormatter, MarkdownFormatter, ReportFormatter, TableFormatter};
 use soroban_cost_estimator::rpc;
 use soroban_cost_estimator::wasm;
 use soroban_cost_estimator::xdr_helper;
@@ -57,8 +57,12 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             wasm,
             network,
             id,
+            format,
             json,
-        } => cmd_estimate_all(&wasm, &network, id.as_deref(), json).await,
+        } => {
+            let fmt = if json { "json".to_string() } else { format };
+            cmd_estimate_all(&wasm, &network, id.as_deref(), &fmt).await
+        },
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot { network, out, json } => {
                 cmd_config_snapshot(&network, out.as_deref(), json).await
@@ -355,7 +359,7 @@ async fn cmd_estimate_all(
     wasm_path: &str,
     network: &str,
     contract_id: Option<&str>,
-    json_flag: bool,
+    format: &str,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -366,7 +370,8 @@ async fn cmd_estimate_all(
         let endpoint = rpc::client::resolve_endpoint(network, None)?;
         let client = rpc::client::RpcClient::new(&endpoint);
 
-        if !json_flag {
+        let text_mode = format == "table" || format == "markdown";
+        if text_mode {
             println!(
                 "Enumerated {} function(s) in WASM:",
                 wasm_info.functions.len()
@@ -393,12 +398,13 @@ async fn cmd_estimate_all(
         use sha2::Digest;
         let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
 
+        let mut reports: Vec<report::cost_report::CostReport> = Vec::new();
         let mut json_results: Vec<serde_json::Value> = Vec::new();
         let total = wasm_info.functions.len();
         debug!(total, "enumerated functions");
 
         for (i, fn_info) in wasm_info.functions.iter().enumerate() {
-            if !json_flag {
+            if text_mode {
                 println!("[{}/{}] {}", i + 1, total, fn_info.name);
             }
             let result = estimate_all_function(
@@ -408,16 +414,58 @@ async fn cmd_estimate_all(
                 contract_id,
                 &wasm_hash,
                 network,
-                json_flag,
             )
             .await?;
-            if let Some(value) = result {
-                json_results.push(value);
+
+            match result {
+                EstimateResult::Report(r) => {
+                    if format == "json" {
+                        json_results.push(serde_json::json!({
+                            "function": r.function,
+                            "status": "ok",
+                            "cpu_instructions": r.cpu_instructions,
+                            "memory_bytes": r.memory_bytes,
+                            "fee_stroops": r.fee.total_stroops,
+                            "fee_xlm": r.fee.total_xlm,
+                            "ledger": r.ledger,
+                        }));
+                    } else if format == "csv" {
+                        reports.push(r);
+                    } else if format == "markdown" {
+                        println!("{}", MarkdownFormatter.format(&r));
+                    } else {
+                        println!(
+                            "CPU: {} insns | Mem: {} bytes | Fee: {} stroops ({}) | Ledger: {}",
+                            r.cpu_instructions, r.memory_bytes,
+                            r.fee.total_stroops, r.fee.total_xlm, r.ledger
+                        );
+                    }
+                }
+                EstimateResult::Skipped { reason } => {
+                    if format == "json" {
+                        json_results.push(serde_json::json!({
+                            "function": fn_info.name,
+                            "status": "skipped",
+                            "reason": &reason,
+                        }));
+                    } else if format != "csv" {
+                        println!("── Estimating '{}' ── Skipped: {reason}", fn_info.name);
+                    }
+                }
             }
         }
 
-        if json_flag {
-            println!("{}", serde_json::to_string_pretty(&json_results)?);
+        match format {
+            "json" => {
+                println!("{}", serde_json::to_string_pretty(&json_results)?);
+            }
+            "csv" => {
+                println!("function,network,ledger,wasm_hash,cpu_instructions,memory_bytes,read_entries,write_entries,read_bytes,write_bytes,tx_size,non_refundable_stroops,refundable_stroops,total_stroops,total_xlm");
+                for r in &reports {
+                    println!("{}", CsvRow(r).to_string());
+                }
+            }
+            _ => {}
         }
 
         Ok(())
@@ -426,8 +474,38 @@ async fn cmd_estimate_all(
     .await
 }
 
-/// Estimates one exported function against the network, printing its result
-/// (non-JSON mode) or returning its JSON record (JSON mode).
+/// A helper struct to format a `CostReport` as a CSV row.
+struct CsvRow<'a>(&'a report::cost_report::CostReport);
+
+impl std::fmt::Display for CsvRow<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let r = self.0;
+        write!(
+            f,
+            "\"{}\",\"{}\",{},\"{}\",{},{},{},{},{},{},{},{},{},{},\"{}\"",
+            r.function, r.network, r.ledger, r.wasm_hash,
+            r.cpu_instructions, r.memory_bytes,
+            r.read_entries, r.write_entries,
+            r.read_bytes, r.write_bytes, r.tx_size,
+            r.fee.non_refundable_stroops, r.fee.refundable_stroops,
+            r.fee.total_stroops, r.fee.total_xlm,
+        )
+    }
+}
+
+/// Represents the outcome of estimating one function: either a successful
+/// `CostReport`, a skip/error status with a reason.
+enum EstimateResult {
+    /// Successful simulation — a full `CostReport` is available.
+    Report(report::cost_report::CostReport),
+    /// Skipped or errored — carries a human-readable reason.
+    Skipped { reason: String },
+}
+
+/// Estimates one exported function against the network.
+///
+/// Returns `EstimateResult::Report` for successful simulations, or
+/// `EstimateResult::Skipped` for functions that need arguments / errored.
 #[allow(clippy::too_many_lines)]
 async fn estimate_all_function(
     client: &rpc::client::RpcClient,
@@ -436,8 +514,7 @@ async fn estimate_all_function(
     contract_id: Option<&str>,
     wasm_hash: &str,
     network: &str,
-    json_flag: bool,
-) -> error::AppResult<Option<serde_json::Value>> {
+) -> error::AppResult<EstimateResult> {
     use tracing::{Instrument, debug, info_span};
 
     let span =
@@ -446,15 +523,7 @@ async fn estimate_all_function(
         if fn_info.param_count > 0 {
             let reason = format!("needs --fn/--arg ({} param(s))", fn_info.param_count);
             debug!(reason, "skipping function");
-            if json_flag {
-                return Ok(Some(serde_json::json!({
-                    "function": fn_info.name,
-                    "status": "skipped",
-                    "reason": reason,
-                })));
-            }
-            println!("── Estimating '{}' ── Skipped: {reason}", fn_info.name);
-            return Ok(None);
+            return Ok(EstimateResult::Skipped { reason });
         }
 
         let tx_xdr = match xdr_helper::build_simulation_tx_envelope(
@@ -466,15 +535,9 @@ async fn estimate_all_function(
             Ok(tx) => tx,
             Err(e) => {
                 debug!(error = %e, "tx construction failed");
-                if json_flag {
-                    return Ok(Some(serde_json::json!({
-                        "function": fn_info.name,
-                        "status": "skipped",
-                        "reason": e.to_string(),
-                    })));
-                }
-                eprintln!("── Estimating '{}' ── Skipped: {e}", fn_info.name);
-                return Ok(None);
+                return Ok(EstimateResult::Skipped {
+                    reason: e.to_string(),
+                });
             }
         };
         let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
@@ -485,31 +548,25 @@ async fn estimate_all_function(
                 if missing_simulation_data(&resp) {
                     let msg = "simulation returned no cost data and no latest ledger — check --id and the RPC endpoint";
                     debug!(msg, "simulation missing data");
-                    if json_flag {
-                        return Ok(Some(serde_json::json!({
-                            "function": fn_info.name,
-                            "status": "error",
-                            "error": msg,
-                        })));
-                    }
-                    eprintln!("── Estimating '{}' ── Error: {msg}", fn_info.name);
-                    return Ok(None);
+                    return Ok(EstimateResult::Skipped {
+                        reason: msg.to_string(),
+                    });
                 }
 
-                let (cpu, mem, ..) = response_resources(&resp)?;
-                let fee = rpc::simulate::parse_resource_fee(&resp.min_resource_fee)
+                let (cpu, mem, read_entries, write_entries, read_bytes, write_bytes) =
+                    response_resources(&resp)?;
+                let fee_stroops = rpc::simulate::parse_resource_fee(&resp.min_resource_fee)
                     .unwrap_or(None)
                     .or(rpc::simulate::parse_transaction_data_resource_fee(
                         &resp.transaction_data,
                     )?)
                     .unwrap_or(0);
-                let xlm = report::fee_calc::stroops_to_xlm(fee);
                 let ledger: u32 = resp
                     .latest_ledger
                     .and_then(|l| u32::try_from(l).ok())
                     .unwrap_or(0);
 
-                debug!(cpu, mem, fee, ledger, "simulation complete");
+                debug!(cpu, mem = mem, fee = fee_stroops, ledger, "simulation complete");
 
                 let _ = cache::save_estimate(
                     wasm_hash,
@@ -517,40 +574,47 @@ async fn estimate_all_function(
                     &[],
                     network,
                     ledger,
-                    fee,
+                    fee_stroops,
                     cpu,
                     mem,
                 );
 
-                if json_flag {
-                    Ok(Some(serde_json::json!({
-                        "function": fn_info.name,
-                        "status": "ok",
-                        "cpu_instructions": cpu,
-                        "memory_bytes": mem,
-                        "fee_stroops": fee,
-                        "fee_xlm": xlm,
-                        "ledger": ledger,
-                    })))
-                } else {
-                    println!(
-                        "CPU: {cpu} insns | Mem: {mem} bytes | Fee: {fee} stroops ({xlm} XLM) | Ledger: {ledger}"
-                    );
-                    Ok(None)
-                }
+                let fee = report::fee_calc::compute_fee_breakdown(
+                    fee_stroops,
+                    cpu,
+                    read_entries,
+                    write_entries,
+                    read_bytes,
+                    tx_xdr.len() as u32,
+                    report::fee_calc::FeeRates {
+                        fee_per_10k_insns: 0,
+                        fee_per_read_entry: 0,
+                        fee_per_write_entry: 0,
+                        fee_per_read_1kb: 0,
+                        fee_per_1kb: 0,
+                    },
+                );
+
+                Ok(EstimateResult::Report(report::cost_report::CostReport {
+                    function: fn_info.name.clone(),
+                    wasm_hash: wasm_hash.to_string(),
+                    cpu_instructions: cpu,
+                    memory_bytes: mem,
+                    tx_size: tx_xdr.len() as u32,
+                    read_entries,
+                    write_entries,
+                    read_bytes,
+                    write_bytes,
+                    fee,
+                    ledger,
+                    network: network.to_string(),
+                }))
             }
             Err(e) => {
                 debug!(error = %e, "simulation failed");
-                if json_flag {
-                    Ok(Some(serde_json::json!({
-                        "function": fn_info.name,
-                        "status": "error",
-                        "error": e.to_string(),
-                    })))
-                } else {
-                    eprintln!("Skipped — simulation failed: {e}");
-                    Ok(None)
-                }
+                Ok(EstimateResult::Skipped {
+                    reason: e.to_string(),
+                })
             }
         }
     }
