@@ -227,6 +227,11 @@ async fn fetch_fee_rates(client: &rpc::client::RpcClient) -> report::fee_calc::F
 }
 
 /// `estimate` command: simulate a single invocation and print cost report.
+///
+/// All RPC traffic (simulation and fee-rate fetches) goes through one
+/// `RpcClient`, which deduplicates identical requests — the same method with
+/// the same params — so a repeated WASM-upload envelope (when `--fn` is
+/// omitted) or identical fee-rate fetches transmit at most once.
 async fn cmd_estimate(
     wasm_path: &str,
     network: &str,
@@ -358,6 +363,11 @@ async fn cmd_estimate(
 }
 
 /// `estimate-all` command: enumerate all functions and estimate each.
+///
+/// Every function shares a single deduplicating `RpcClient`. Batch runs that
+/// hit the same request twice — the shared WASM-upload path when a function
+/// envelope is built against an undeployed contract, or identical fee-rate
+/// lookups — transmit each distinct `(method, params)` pair only once.
 async fn cmd_estimate_all(
     wasm_path: &str,
     network: &str,
