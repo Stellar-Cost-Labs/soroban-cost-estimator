@@ -189,6 +189,56 @@ pub fn load_estimate(
     Ok(Some(cached))
 }
 
+/// Whether a cached estimate is still fresh, i.e. its timestamp is within
+/// `ttl` of now.
+///
+/// Entries whose timestamp cannot be parsed as RFC 3339 are treated as **not**
+/// fresh: an unverifiable age must not be trusted, so the caller re-simulates
+/// and overwrites the entry.
+///
+/// # Network calls
+/// None — pure time comparison.
+pub fn is_cache_entry_fresh(entry: &CachedEstimate, ttl: std::time::Duration) -> bool {
+    let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&entry.timestamp) else {
+        return false;
+    };
+    let ts = ts.with_timezone(&chrono::Utc);
+    let Ok(ttl) = chrono::TimeDelta::from_std(ttl) else {
+        return false;
+    };
+    chrono::Utc::now().signed_duration_since(ts) <= ttl
+}
+
+/// Load a cached estimate only if it is still fresh (within `ttl`).
+///
+/// Returns `Ok(None)` when no entry exists **or** when the entry has
+/// expired — both mean "re-simulate".
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn load_fresh_estimate(
+    wasm_hash: &str,
+    function: &str,
+    args: &[String],
+    ttl: std::time::Duration,
+) -> AppResult<Option<CachedEstimate>> {
+    let Some(cached) = load_estimate(wasm_hash, function, args)? else {
+        return Ok(None);
+    };
+    if is_cache_entry_fresh(&cached, ttl) {
+        trace!(function, ttl_secs = ttl.as_secs(), "fresh cached estimate");
+        Ok(Some(cached))
+    } else {
+        trace!(
+            function,
+            ttl_secs = ttl.as_secs(),
+            timestamp = %cached.timestamp,
+            "cached estimate expired"
+        );
+        Ok(None)
+    }
+}
+
 /// Find all cached estimates for a given network.
 ///
 /// Used by `config diff` to check which cached estimates are now stale
