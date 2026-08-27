@@ -51,13 +51,13 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
 }
 
 /// Basic structural validation of a WASM binary.
-fn validate_wasm(bytes: &[u8]) -> AppResult<()> {
+pub fn validate_wasm(bytes: &[u8]) -> AppResult<()> {
     wasmparser::validate(bytes).map_err(|e| AppError::WasmValidation(e.to_string()))?;
     Ok(())
 }
 
 /// Enumerates exported function names from a validated WASM binary.
-fn enumerate_functions(bytes: &[u8]) -> AppResult<Vec<FunctionInfo>> {
+pub fn enumerate_functions(bytes: &[u8]) -> AppResult<Vec<FunctionInfo>> {
     let mut functions = Vec::new();
     // Map from function index -> type index
     let mut func_to_type: Vec<u32> = Vec::new();
@@ -117,7 +117,7 @@ fn enumerate_functions(bytes: &[u8]) -> AppResult<Vec<FunctionInfo>> {
 }
 
 /// Decoded spec function entries: (function name, typed parameter list).
-type SpecFunctions = Vec<(String, Vec<ParamInfo>)>;
+pub type SpecFunctions = Vec<(String, Vec<ParamInfo>)>;
 
 /// Decodes the Soroban contract spec (`contractspecv0` custom section).
 ///
@@ -130,7 +130,7 @@ type SpecFunctions = Vec<(String, Vec<ParamInfo>)>;
 /// 4-byte union discriminant (e.g. `00 00 00 00` = FunctionV0). We therefore
 /// decode entries one at a time from a cursor, stopping when the stream is
 /// exhausted.
-fn parse_contract_spec(bytes: &[u8]) -> AppResult<(SpecFunctions, bool)> {
+pub fn parse_contract_spec(bytes: &[u8]) -> AppResult<(SpecFunctions, bool)> {
     let mut spec_functions = Vec::new();
     let mut has_spec = false;
 
