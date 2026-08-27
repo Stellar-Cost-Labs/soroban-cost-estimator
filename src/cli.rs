@@ -85,6 +85,18 @@ pub enum Command {
         #[arg(long, value_name = "PCT", default_value_t = 0.0)]
         min_change_pct: f64,
     },
+
+    /// Inspect and manage the local estimate cache.
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CacheAction {
+    /// Check that every cached estimate is valid JSON and not corrupted.
+    Verify,
 }
 
 #[derive(Subcommand, Debug)]

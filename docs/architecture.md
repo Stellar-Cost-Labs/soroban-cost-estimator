@@ -77,3 +77,7 @@ the report names which past estimates are now stale. See
 - **Negative refundable**: the refundable portion floors at 0 — a simulation
   that omits the fee entirely must not produce an impossible negative
   refundable in the report.
+
+## Design Decisions
+- **No Floating Point**: Fee math uses integer stroops math strictly to avoid rounding inconsistencies.
+- **Stateless Analysis**: The WASM parsing and fee breakdown are pure computation; only the RPC simulation stage communicates with the network.
