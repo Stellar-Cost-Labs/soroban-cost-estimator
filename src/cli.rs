@@ -80,6 +80,18 @@ pub enum Command {
         #[arg(long, default_value = "1h")]
         interval: String,
     },
+
+    /// Inspect and manage the local estimate cache.
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CacheAction {
+    /// Check that every cached estimate is valid JSON and not corrupted.
+    Verify,
 }
 
 #[derive(Subcommand, Debug)]
@@ -108,5 +120,19 @@ pub enum ConfigAction {
         /// Explicit snapshot path to compare against (defaults to latest).
         #[arg(long)]
         against: Option<String>,
+    },
+
+    /// Show the full chronological change log across all stored snapshots.
+    History {
+        /// Network whose snapshot history to inspect.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+    },
+
+    /// Show when each config setting last changed.
+    LastChanged {
+        /// Network whose snapshot history to inspect.
+        #[arg(long, default_value = "testnet")]
+        network: String,
     },
 }

@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use tracing::{debug, trace};
+
 use crate::config_snapshot::model::ConfigSnapshot;
 use crate::error::{AppError, AppResult};
 
@@ -47,6 +49,7 @@ pub fn save_snapshot(snapshot: &ConfigSnapshot, out_path: Option<&str>) -> AppRe
 
     let json = serde_json::to_string_pretty(snapshot)?;
     std::fs::write(&path, json)?;
+    debug!(path = %path.display(), network = snapshot.network, ledger = snapshot.ledger, "snapshot saved");
     Ok(path)
 }
 
@@ -58,6 +61,7 @@ pub fn save_snapshot(snapshot: &ConfigSnapshot, out_path: Option<&str>) -> AppRe
 /// # Network calls
 /// None — pure file I/O.
 pub fn load_latest_snapshot(network: &str) -> AppResult<ConfigSnapshot> {
+    debug!(network, "loading latest snapshot");
     let dir = snapshots_dir()?;
     let mut entries: Vec<_> = std::fs::read_dir(&dir)?
         .filter_map(|e| e.ok())
@@ -79,6 +83,7 @@ pub fn load_latest_snapshot(network: &str) -> AppResult<ConfigSnapshot> {
     let content = std::fs::read_to_string(latest.path())?;
     let snapshot: ConfigSnapshot =
         serde_json::from_str(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))?;
+    trace!(network, ledger = snapshot.ledger, "latest snapshot loaded");
     Ok(snapshot)
 }
 
@@ -87,9 +92,15 @@ pub fn load_latest_snapshot(network: &str) -> AppResult<ConfigSnapshot> {
 /// # Network calls
 /// None — pure file I/O.
 pub fn load_snapshot_from_path(path: &str) -> AppResult<ConfigSnapshot> {
+    debug!(path, "loading snapshot from path");
     let content = std::fs::read_to_string(path)?;
     let snapshot: ConfigSnapshot =
         serde_json::from_str(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))?;
+    trace!(
+        network = snapshot.network,
+        ledger = snapshot.ledger,
+        "snapshot loaded from path"
+    );
     Ok(snapshot)
 }
 
