@@ -53,6 +53,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::Diff { network, against } => {
                 cmd_config_diff(&network, against.as_deref()).await
             }
+            cli::ConfigAction::History { network } => cmd_config_history(&network),
+            cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network),
         },
         cli::Command::Cache { action } => match action {
             cli::CacheAction::Warm {
@@ -63,6 +65,9 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             } => cmd_cache_warm(&wasm, &network, id.as_deref(), json).await,
         },
         cli::Command::Watch { network, interval } => cmd_watch(&network, &interval).await,
+        cli::Command::Cache { action } => match action {
+            cli::CacheAction::Verify => cmd_cache_verify(),
+        },
     }
 }
 
@@ -510,222 +515,15 @@ async fn estimate_all_function(
     }
 }
 
-/// Outcome of warming a single function's cache entry.
-enum WarmOutcome {
-    /// A fresh estimate was simulated and cached.
-    Warmed {
-        cpu_instructions: u64,
-        memory_bytes: u64,
-        fee_stroops: i64,
-        ledger: u32,
-    },
-    /// A cache entry already existed for this function — no RPC call made.
-    Cached,
-    /// The function could not be warmed (needs args, or simulation failed).
-    Skipped(String),
-}
-
-/// `cache warm` command: pre-populate the cache by estimating every exported
-/// function, skipping any that already have a cache entry.
+/// Fetches the current network config settings and builds a snapshot.
 ///
-/// Ties into automatic cache invalidation (#91): before warming, any cache
-/// entries left over from a previous build of the WASM file are dropped.
-async fn cmd_cache_warm(
-    wasm_path: &str,
+/// Shared by `config snapshot`, `config diff`, and `watch`.
+///
+/// # Network calls
+/// Makes one batched `getLedgerEntries` RPC call.
+async fn fetch_config_snapshot(
     network: &str,
-    contract_id: Option<&str>,
-    json_flag: bool,
-) -> error::AppResult<()> {
-    let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
-    let endpoint = rpc::client::resolve_endpoint(network, None)?;
-    let client = rpc::client::RpcClient::new(&endpoint);
-
-    use sha2::Digest;
-    let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
-
-    // Drop cache entries from a previous build of this WASM file before
-    // warming (mtime/hash change detection — see #91).
-    let _ = cache::invalidate_if_wasm_changed(std::path::Path::new(wasm_path), &wasm_hash);
-
-    if !json_flag {
-        println!(
-            "Warming cache for {} exported function(s) in {} (hash {wasm_hash}):",
-            wasm_info.functions.len(),
-            wasm_path
-        );
-        if contract_id.is_none() {
-            println!(
-                "Note: pass --id <contract-id> to simulate each function against a deployed contract."
-            );
-        }
-    }
-
-    let total = wasm_info.functions.len();
-    let mut warmed = 0u32;
-    let mut cached = 0u32;
-    let mut skipped = 0u32;
-    let mut json_results: Vec<serde_json::Value> = Vec::new();
-
-    for (i, fn_info) in wasm_info.functions.iter().enumerate() {
-        let outcome = warm_function(
-            &client,
-            &wasm_info,
-            fn_info,
-            contract_id,
-            &wasm_hash,
-            network,
-        )
-        .await;
-
-        match outcome {
-            WarmOutcome::Warmed {
-                cpu_instructions,
-                memory_bytes,
-                fee_stroops,
-                ledger,
-            } => {
-                warmed += 1;
-                if json_flag {
-                    json_results.push(serde_json::json!({
-                        "function": fn_info.name,
-                        "status": "warmed",
-                        "cpu_instructions": cpu_instructions,
-                        "memory_bytes": memory_bytes,
-                        "fee_stroops": fee_stroops,
-                        "ledger": ledger,
-                    }));
-                } else {
-                    println!(
-                        "[{}/{}] {} — warmed (CPU: {cpu_instructions} insns, fee: {fee_stroops} stroops, ledger: {ledger})",
-                        i + 1,
-                        total,
-                        fn_info.name
-                    );
-                }
-            }
-            WarmOutcome::Cached => {
-                cached += 1;
-                if json_flag {
-                    json_results.push(serde_json::json!({
-                        "function": fn_info.name,
-                        "status": "cached",
-                    }));
-                } else {
-                    println!("[{}/{}] {} — cached", i + 1, total, fn_info.name);
-                }
-            }
-            WarmOutcome::Skipped(reason) => {
-                skipped += 1;
-                if json_flag {
-                    json_results.push(serde_json::json!({
-                        "function": fn_info.name,
-                        "status": "skipped",
-                        "reason": reason,
-                    }));
-                } else {
-                    println!("[{}/{}] {} — skipped: {reason}", i + 1, total, fn_info.name);
-                }
-            }
-        }
-    }
-
-    if json_flag {
-        println!("{}", serde_json::to_string_pretty(&json_results)?);
-    } else {
-        println!("Warm-up complete: {warmed} warmed, {cached} cached, {skipped} skipped.");
-    }
-
-    Ok(())
-}
-
-/// Warms the cache for one exported function: returns a cached result if one
-/// already exists, otherwise simulates and saves it. Never fails the whole
-/// command — per-function problems become `Skipped`.
-async fn warm_function(
-    client: &rpc::client::RpcClient,
-    wasm_info: &wasm::parser::WasmInfo,
-    fn_info: &wasm::parser::FunctionInfo,
-    contract_id: Option<&str>,
-    wasm_hash: &str,
-    network: &str,
-) -> WarmOutcome {
-    // A cache entry keyed to this exact hash is already warm.
-    if cache::load_estimate(wasm_hash, &fn_info.name, &[])
-        .map(|e| e.is_some())
-        .unwrap_or(false)
-    {
-        return WarmOutcome::Cached;
-    }
-
-    if fn_info.param_count > 0 {
-        return WarmOutcome::Skipped(format!(
-            "needs --fn/--arg ({} param(s))",
-            fn_info.param_count
-        ));
-    }
-
-    let tx_xdr = match xdr_helper::build_simulation_tx_envelope(
-        &wasm_info.bytes,
-        contract_id,
-        Some(fn_info.name.as_str()),
-        &[],
-    ) {
-        Ok(tx) => tx,
-        Err(e) => return WarmOutcome::Skipped(e.to_string()),
-    };
-    let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
-
-    match rpc::simulate::simulate_transaction(client, &tx_b64).await {
-        Ok(resp) => {
-            if missing_simulation_data(&resp) {
-                return WarmOutcome::Skipped(
-                    "simulation returned no cost data and no latest ledger".to_string(),
-                );
-            }
-            let (cpu, mem, ..) = match response_resources(&resp) {
-                Ok(r) => r,
-                Err(e) => return WarmOutcome::Skipped(e.to_string()),
-            };
-            let fee = rpc::simulate::parse_resource_fee(&resp.min_resource_fee)
-                .unwrap_or(None)
-                .or(
-                    rpc::simulate::parse_transaction_data_resource_fee(&resp.transaction_data)
-                        .unwrap_or(None),
-                )
-                .unwrap_or(0);
-            let ledger: u32 = resp
-                .latest_ledger
-                .and_then(|l| u32::try_from(l).ok())
-                .unwrap_or(0);
-
-            let _ = cache::save_estimate(
-                wasm_hash,
-                &fn_info.name,
-                &[],
-                network,
-                ledger,
-                fee,
-                cpu,
-                mem,
-            );
-
-            WarmOutcome::Warmed {
-                cpu_instructions: cpu,
-                memory_bytes: mem,
-                fee_stroops: fee,
-                ledger,
-            }
-        }
-        Err(e) => WarmOutcome::Skipped(e.to_string()),
-    }
-}
-
-/// `config snapshot` command: fetch config settings and save snapshot.
-async fn cmd_config_snapshot(
-    network: &str,
-    out_path: Option<&str>,
-    json_flag: bool,
-) -> error::AppResult<()> {
+) -> error::AppResult<config_snapshot::model::ConfigSnapshot> {
     let endpoint = rpc::client::resolve_endpoint(network, None)?;
     let client = rpc::client::RpcClient::new(&endpoint);
     let raw_entries = rpc::config::fetch_all_config_settings(&client).await?;
@@ -738,6 +536,44 @@ async fn cmd_config_snapshot(
     if let Some(latest) = raw_entries.iter().map(|e| e.last_modified_ledger).max() {
         snapshot.ledger = latest;
     }
+    Ok(snapshot)
+}
+
+/// Prints stale cached estimates for `network` relative to `ledger`, if any.
+fn print_stale_estimates(network: &str, ledger: u32) {
+    match cache::list_cached_estimates(network) {
+        Ok(estimates) => {
+            if !estimates.is_empty() {
+                let stale = cache::find_stale_estimates(&estimates, ledger);
+                if stale.is_empty() {
+                    println!("  All cached estimates are current (ledger {ledger}).");
+                } else {
+                    println!(
+                        "  {} cached estimate(s) from earlier ledger(s) — may be stale:",
+                        stale.len()
+                    );
+                    for est in &stale {
+                        println!(
+                            "    - {} @ ledger {} (current: {})",
+                            est.function, est.ledger, ledger
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            println!("  Warning: could not check cache: {e}");
+        }
+    }
+}
+
+/// `config snapshot` command: fetch config settings and save snapshot.
+async fn cmd_config_snapshot(
+    network: &str,
+    out_path: Option<&str>,
+    json_flag: bool,
+) -> error::AppResult<()> {
+    let snapshot = fetch_config_snapshot(network).await?;
 
     let path = config_snapshot::store::save_snapshot(&snapshot, out_path)?;
 
@@ -752,6 +588,15 @@ async fn cmd_config_snapshot(
     Ok(())
 }
 
+/// True when a config diff signals a network protocol/config upgrade.
+///
+/// Pricing changes are the tool's proxy for "the network changed its
+/// resource-pricing configuration under us" — e.g. what a protocol vote
+/// produces — so they trigger the automatic post-upgrade snapshot.
+fn upgrade_detected(diff: &config_snapshot::diff::ConfigDiff) -> bool {
+    diff.has_pricing_changes
+}
+
 /// `config diff` command: compare current config against a snapshot.
 async fn cmd_config_diff(network: &str, against_path: Option<&str>) -> error::AppResult<()> {
     let old_snapshot = match against_path {
@@ -759,54 +604,54 @@ async fn cmd_config_diff(network: &str, against_path: Option<&str>) -> error::Ap
         None => config_snapshot::store::load_latest_snapshot(network)?,
     };
 
-    let endpoint = rpc::client::resolve_endpoint(network, None)?;
-    let client = rpc::client::RpcClient::new(&endpoint);
-    let raw_entries = rpc::config::fetch_all_config_settings(&client).await?;
-
-    let mut new_snapshot = xdr_helper::begin_snapshot(network, 0);
-    for raw in &raw_entries {
-        let config_entry = xdr_helper::decode_config_entry_xdr(&raw.config_xdr)?;
-        xdr_helper::apply_config_entry(&mut new_snapshot, config_entry);
-    }
-    if let Some(latest) = raw_entries.iter().map(|e| e.last_modified_ledger).max() {
-        new_snapshot.ledger = latest;
-    }
+    let new_snapshot = fetch_config_snapshot(network).await?;
 
     let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
     println!("{}", config_snapshot::diff::format_diff(&diff));
 
-    // Check for stale cached estimates even when there are no pricing changes
-    match cache::list_cached_estimates(network) {
-        Ok(estimates) => {
-            if !estimates.is_empty() {
-                let stale = cache::find_stale_estimates(&estimates, new_snapshot.ledger);
-                if stale.is_empty() {
-                    println!(
-                        "  All cached estimates are current (ledger {}).",
-                        new_snapshot.ledger
-                    );
-                } else {
-                    println!(
-                        "  {} cached estimate(s) from earlier ledger(s) — may be stale:",
-                        stale.len()
-                    );
-                    for est in &stale {
-                        println!(
-                            "    - {} @ ledger {} (current: {})",
-                            est.function, est.ledger, new_snapshot.ledger
-                        );
-                    }
-                }
+    // Automatic snapshot on upgrade detection: persist the new config so it
+    // becomes the baseline for future diffs without a separate
+    // `config snapshot` run. A save failure must not mask the exit-code
+    // contract (exit 1 on pricing changes), so warn instead of erroring.
+    if upgrade_detected(&diff) {
+        match config_snapshot::store::save_snapshot(&new_snapshot, None) {
+            Ok(path) => println!(
+                "  Protocol upgrade detected — new config auto-saved to {}",
+                path.display()
+            ),
+            Err(e) => {
+                eprintln!("  Warning: could not auto-save post-upgrade snapshot: {e}");
             }
         }
-        Err(e) => {
-            println!("  Warning: could not check cache: {e}");
-        }
     }
+
+    // Check for stale cached estimates even when there are no pricing changes
+    print_stale_estimates(network, new_snapshot.ledger);
 
     if diff.has_pricing_changes {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+/// `config history` command: print the full chronological change log.
+fn cmd_config_history(network: &str) -> error::AppResult<()> {
+    let log = config_snapshot::history::load_change_log(network)?;
+    println!(
+        "{}",
+        config_snapshot::history::format_change_log(network, &log)
+    );
+    Ok(())
+}
+
+/// `config last-changed` command: print when each setting last changed.
+fn cmd_config_last_changed(network: &str) -> error::AppResult<()> {
+    let log = config_snapshot::history::load_change_log(network)?;
+    let last_changed = config_snapshot::history::last_changed_from_log(&log);
+    println!(
+        "{}",
+        config_snapshot::history::format_last_changed(network, &last_changed)
+    );
     Ok(())
 }
 
@@ -854,21 +699,8 @@ async fn shutdown_signal() -> error::AppResult<()> {
 /// # Network calls
 /// Makes one batched `getLedgerEntries` RPC call.
 async fn watch_poll_once(network: &str, first: &mut bool) -> error::AppResult<()> {
-    let endpoint = rpc::client::resolve_endpoint(network, None)?;
-    let client = rpc::client::RpcClient::new(&endpoint);
-
-    match rpc::config::fetch_all_config_settings(&client).await {
-        Ok(raw_entries) => {
-            let mut snapshot = xdr_helper::begin_snapshot(network, 0);
-            for raw in &raw_entries {
-                if let Ok(config_entry) = xdr_helper::decode_config_entry_xdr(&raw.config_xdr) {
-                    xdr_helper::apply_config_entry(&mut snapshot, config_entry);
-                }
-            }
-            if let Some(latest) = raw_entries.iter().map(|e| e.last_modified_ledger).max() {
-                snapshot.ledger = latest;
-            }
-
+    match fetch_config_snapshot(network).await {
+        Ok(snapshot) => {
             if !*first {
                 if let Ok(old_snapshot) = config_snapshot::store::load_latest_snapshot(network) {
                     let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &snapshot);
@@ -877,28 +709,7 @@ async fn watch_poll_once(network: &str, first: &mut bool) -> error::AppResult<()
                     }
 
                     // Check for stale cached estimates even when there are no pricing changes
-                    if let Ok(estimates) = cache::list_cached_estimates(network) {
-                        if !estimates.is_empty() {
-                            let stale = cache::find_stale_estimates(&estimates, snapshot.ledger);
-                            if stale.is_empty() {
-                                println!(
-                                    "  All cached estimates are current (ledger {}).",
-                                    snapshot.ledger
-                                );
-                            } else {
-                                println!(
-                                    "  {} cached estimate(s) from earlier ledger(s) — may be stale:",
-                                    stale.len()
-                                );
-                                for est in &stale {
-                                    println!(
-                                        "    - {} @ ledger {} (current: {})",
-                                        est.function, est.ledger, snapshot.ledger
-                                    );
-                                }
-                            }
-                        }
-                    }
+                    print_stale_estimates(network, snapshot.ledger);
                 }
             }
 
@@ -941,9 +752,92 @@ async fn cmd_watch(network: &str, interval: &str) -> error::AppResult<()> {
     }
 }
 
+/// `cache verify` command: check every cache entry parses as valid JSON.
+///
+/// Prints a summary line per corrupted entry and exits with code 1 when any
+/// entry fails verification, so scripts can treat a corrupt cache as an
+/// error. A healthy (or empty) cache exits 0.
+///
+/// # Network calls
+/// None — pure file I/O.
+fn cmd_cache_verify() -> error::AppResult<()> {
+    let statuses = cache::verify_cache()?;
+
+    if statuses.is_empty() {
+        println!("Cache is empty — nothing to verify.");
+        return Ok(());
+    }
+
+    let total = statuses.len();
+    let corrupt: Vec<&cache::CacheEntryStatus> = statuses.iter().filter(|s| !s.valid).collect();
+
+    println!("Checked {total} cache entries.");
+
+    if corrupt.is_empty() {
+        println!("All cache entries are valid.");
+    } else {
+        println!(
+            "{} of {total} cache entries failed verification:",
+            corrupt.len()
+        );
+        for status in &corrupt {
+            println!("  - {}", status.filename);
+        }
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_interval_secs;
+    use super::upgrade_detected;
+    use soroban_cost_estimator::config_snapshot::diff;
+    use soroban_cost_estimator::config_snapshot::model::{
+        ConfigSnapshot, ContractComputeV0, ContractLedgerCostV0,
+    };
+
+    fn snapshot_with_compute_fee(fee: i64) -> ConfigSnapshot {
+        ConfigSnapshot {
+            network: "testnet".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            ledger: 100,
+            contract_compute: Some(ContractComputeV0 {
+                ledger_max_instructions: 1_000_000,
+                tx_max_instructions: 100_000,
+                fee_rate_per_instructions_increment: fee,
+                tx_memory_limit: 41_943_040,
+            }),
+            contract_ledger_cost: None,
+            contract_historical_data: None,
+            contract_events: None,
+            contract_bandwidth: None,
+            state_archival: None,
+        }
+    }
+
+    fn snapshot_with_ledger_cost_fee(fee: i64) -> ConfigSnapshot {
+        let mut snap = snapshot_with_compute_fee(5);
+        snap.contract_ledger_cost = Some(ContractLedgerCostV0 {
+            ledger_max_disk_read_entries: 1_000_000,
+            ledger_max_disk_read_bytes: 1_000_000,
+            ledger_max_write_ledger_entries: 1_000_000,
+            ledger_max_write_bytes: 1_000_000,
+            tx_max_disk_read_entries: 100,
+            tx_max_disk_read_bytes: 1_000_000,
+            tx_max_write_ledger_entries: 100,
+            tx_max_write_bytes: 1_000_000,
+            fee_disk_read_ledger_entry: fee,
+            fee_write_ledger_entry: fee,
+            fee_disk_read1_kb: fee,
+            soroban_state_target_size_bytes: 1_000_000,
+            rent_fee1_kb_soroban_state_size_low: fee,
+            rent_fee1_kb_soroban_state_size_high: fee,
+            soroban_state_rent_fee_growth_factor: 2000,
+        });
+        snap
+    }
 
     #[test]
     fn test_parse_interval_secs() {
@@ -958,5 +852,59 @@ mod tests {
         assert_eq!(parse_interval_secs("s"), 3600);
         assert_eq!(parse_interval_secs("10ss"), 3600);
         assert_eq!(parse_interval_secs("garbage"), 3600);
+
+        // Fractional values are not supported by `u64` parsing, so they fall
+        // back to the one-hour default before the unit multiplier is applied.
+        assert_eq!(parse_interval_secs("1.5h"), 12_960_000);
+        assert_eq!(parse_interval_secs("0.5m"), 216_000);
+        assert_eq!(parse_interval_secs("2.25d"), 311_040_000);
+
+        // Mixed case suffixes are normalized before parsing.
+        assert_eq!(parse_interval_secs("45S"), 45);
+        assert_eq!(parse_interval_secs("10M"), 600);
+        assert_eq!(parse_interval_secs("2H"), 7_200);
+        assert_eq!(parse_interval_secs("3D"), 259_200);
+
+        // Boundary conditions: zero, u64 saturation, and leading zeros.
+        assert_eq!(parse_interval_secs("0"), 0);
+        assert_eq!(parse_interval_secs("0m"), 0);
+        assert_eq!(parse_interval_secs("18446744073709551615"), u64::MAX);
+        assert_eq!(parse_interval_secs("18446744073709551615s"), u64::MAX);
+        assert_eq!(parse_interval_secs("18446744073709551615m"), u64::MAX);
+        assert_eq!(parse_interval_secs("9999999999999999999999"), 3600);
+        assert_eq!(parse_interval_secs("007"), 7);
+    }
+
+    #[test]
+    fn test_upgrade_detected_on_pricing_change() {
+        let old = snapshot_with_compute_fee(100);
+        let new = snapshot_with_compute_fee(200);
+        let diff = diff::diff_snapshots(&old, &new);
+
+        assert!(diff.has_pricing_changes);
+        assert!(upgrade_detected(&diff));
+    }
+
+    #[test]
+    fn test_upgrade_detected_on_any_pricing_field_change() {
+        let old = snapshot_with_ledger_cost_fee(1_000);
+        let mut new = snapshot_with_ledger_cost_fee(1_000);
+        if let Some(cost) = &mut new.contract_ledger_cost {
+            cost.fee_write_ledger_entry = 2_000;
+        }
+        new.ledger = 200;
+        let diff = diff::diff_snapshots(&old, &new);
+
+        assert!(diff.has_pricing_changes);
+        assert!(upgrade_detected(&diff));
+    }
+
+    #[test]
+    fn test_no_upgrade_detected_without_changes() {
+        let snap = snapshot_with_compute_fee(100);
+        let diff = diff::diff_snapshots(&snap, &snap);
+
+        assert!(!diff.has_pricing_changes);
+        assert!(!upgrade_detected(&diff));
     }
 }
