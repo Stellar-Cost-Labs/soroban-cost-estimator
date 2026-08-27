@@ -160,8 +160,12 @@ pub async fn cmd_estimate(args: EstimateArgs) -> error::AppResult<()> {
 
     // Raw XDR bytes: the transaction size for the bandwidth fee must be the
     // XDR byte count, not the base64 length (base64 inflates it by ~33%).
-    let tx_xdr =
-        xdr_helper::build_simulation_tx_envelope(&wasm_info.bytes, args.id.as_deref(), args.r#fn.as_deref(), &sc_vals)?;
+    let tx_xdr = xdr_helper::build_simulation_tx_envelope(
+        &wasm_info.bytes,
+        args.id.as_deref(),
+        args.r#fn.as_deref(),
+        &sc_vals,
+    )?;
     let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
 
     let response = rpc::simulate::simulate_transaction(&client, &tx_b64).await?;
@@ -227,7 +231,7 @@ pub async fn cmd_estimate(args: EstimateArgs) -> error::AppResult<()> {
         write_bytes,
         fee: fee.clone(),
         ledger: latest_ledger,
-        network: args.network.to_string(),
+        network: args.network.clone(),
     };
 
     // Save to cache

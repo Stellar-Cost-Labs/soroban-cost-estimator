@@ -14,6 +14,12 @@ pub enum ConfigAction {
 
     /// Diff the current network config against the most recent snapshot.
     Diff(DiffArgs),
+
+    /// Show the full chronological change log across all stored snapshots.
+    History(HistoryArgs),
+
+    /// Show when each config setting last changed.
+    LastChanged(LastChangedArgs),
 }
 
 #[derive(Args, Debug)]
@@ -40,4 +46,18 @@ pub struct DiffArgs {
     /// Explicit snapshot path to compare against (defaults to latest).
     #[arg(long)]
     pub against: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct HistoryArgs {
+    /// Network whose snapshot history to inspect.
+    #[arg(long, default_value = "testnet")]
+    pub network: String,
+}
+
+#[derive(Args, Debug)]
+pub struct LastChangedArgs {
+    /// Network whose snapshot history to inspect.
+    #[arg(long, default_value = "testnet")]
+    pub network: String,
 }

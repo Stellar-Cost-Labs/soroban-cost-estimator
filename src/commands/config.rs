@@ -1,4 +1,15 @@
-use crate::args::config::{DiffArgs, SnapshotArgs};
+use crate::args::config::{
+    ConfigAction, ConfigArgs, DiffArgs, HistoryArgs, LastChangedArgs, SnapshotArgs,
+};
+
+pub async fn cmd_config(args: ConfigArgs) -> error::AppResult<()> {
+    match args.action {
+        ConfigAction::Snapshot(args) => cmd_config_snapshot(args).await,
+        ConfigAction::Diff(args) => cmd_config_diff(args).await,
+        ConfigAction::History(args) => cmd_config_history(&args),
+        ConfigAction::LastChanged(args) => cmd_config_last_changed(&args),
+    }
+}
 use crate::cache;
 use crate::config_snapshot;
 use crate::error;
@@ -56,6 +67,20 @@ pub async fn cmd_config_diff(args: DiffArgs) -> error::AppResult<()> {
     let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
     println!("{}", config_snapshot::diff::format_diff(&diff));
 
+    if diff.has_pricing_changes {
+        match config_snapshot::store::save_snapshot(&new_snapshot, None) {
+            Ok(path) => {
+                println!(
+                    "  Protocol upgrade detected — new config auto-saved to {}",
+                    path.display()
+                );
+            }
+            Err(e) => {
+                eprintln!("  Warning: could not auto-save post-upgrade snapshot: {e}");
+            }
+        }
+    }
+
     // Check for stale cached estimates even when there are no pricing changes
     match cache::list_cached_estimates(&args.network) {
         Ok(estimates) => {
@@ -88,5 +113,26 @@ pub async fn cmd_config_diff(args: DiffArgs) -> error::AppResult<()> {
     if diff.has_pricing_changes {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+/// `config history` command: print the full chronological change log.
+pub fn cmd_config_history(args: &HistoryArgs) -> error::AppResult<()> {
+    let log = config_snapshot::history::load_change_log(&args.network)?;
+    println!(
+        "{}",
+        config_snapshot::history::format_change_log(&args.network, &log)
+    );
+    Ok(())
+}
+
+/// `config last-changed` command: print when each setting last changed.
+pub fn cmd_config_last_changed(args: &LastChangedArgs) -> error::AppResult<()> {
+    let log = config_snapshot::history::load_change_log(&args.network)?;
+    let last_changed = config_snapshot::history::last_changed_from_log(&log);
+    println!(
+        "{}",
+        config_snapshot::history::format_last_changed(&args.network, &last_changed)
+    );
     Ok(())
 }
