@@ -946,6 +946,17 @@ fn cmd_cache_verify() -> error::AppResult<()> {
     Ok(())
 }
 
+/// `cache warm` command: pre-populate cache by estimating every exported function.
+async fn cmd_cache_warm(
+    wasm_path: &str,
+    network: &str,
+    contract_id: Option<&str>,
+    json_flag: bool,
+) -> error::AppResult<()> {
+    cmd_estimate_all(wasm_path, network, contract_id, json_flag).await
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::parse_interval_secs;

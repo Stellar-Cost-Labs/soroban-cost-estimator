@@ -159,4 +159,3 @@ pub enum ConfigAction {
         network: String,
     },
 }
-
