@@ -1,0 +1,23 @@
+---
+source: tests/report_snapshots.rs
+expression: JsonFormatter.format(&empty)
+---
+{
+  "function": "(wasm upload)",
+  "wasm_hash": "0000000000000000",
+  "cpu_instructions": 0,
+  "memory_bytes": 0,
+  "tx_size": 0,
+  "read_entries": 0,
+  "write_entries": 0,
+  "read_bytes": 0,
+  "write_bytes": 0,
+  "fee": {
+    "non_refundable_stroops": 0,
+    "refundable_stroops": 0,
+    "total_stroops": 0,
+    "total_xlm": "0.0000000"
+  },
+  "ledger": 0,
+  "network": "mainnet"
+}
