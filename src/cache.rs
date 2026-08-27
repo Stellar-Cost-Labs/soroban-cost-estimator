@@ -154,6 +154,52 @@ pub fn list_cached_estimates(network: &str) -> AppResult<Vec<CachedEstimate>> {
     Ok(estimates)
 }
 
+/// Integrity status of a single cache entry file.
+#[derive(Debug, Clone)]
+pub struct CacheEntryStatus {
+    /// File name of the cache entry (e.g. `"abc123-my_func-def456.json"`).
+    pub filename: String,
+    /// Whether the file parsed as a valid `CachedEstimate`.
+    pub valid: bool,
+}
+
+/// Verify the integrity of every entry in the estimate cache.
+///
+/// Reads each `.json` file in the cache directory and checks that it parses
+/// as a valid [`CachedEstimate`]. Returns one status per entry, sorted by
+/// filename. Files that are unreadable, invalid JSON, or missing required
+/// fields are reported as not valid.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn verify_cache() -> AppResult<Vec<CacheEntryStatus>> {
+    let dir = cache_dir()?;
+    let mut statuses = Vec::new();
+
+    if !dir.exists() {
+        return Ok(statuses);
+    }
+
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().map(|e| e == "json").unwrap_or(false) {
+            let filename = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let valid = std::fs::read_to_string(&path)
+                .ok()
+                .map(|content| serde_json::from_str::<CachedEstimate>(&content).is_ok())
+                .unwrap_or(false);
+            statuses.push(CacheEntryStatus { filename, valid });
+        }
+    }
+
+    statuses.sort_by(|a, b| a.filename.cmp(&b.filename));
+    Ok(statuses)
+}
+
 /// Check which cached estimates are now stale (simulated at an earlier ledger).
 ///
 /// Returns a list of cached estimates that were made before `current_ledger`.
