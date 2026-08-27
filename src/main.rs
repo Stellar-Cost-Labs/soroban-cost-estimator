@@ -76,11 +76,9 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 id,
                 json,
             } => cmd_cache_warm(&wasm, &network, id.as_deref(), json).await,
-        },
-        cli::Command::Watch { network, interval } => cmd_watch(&network, &interval).await,
-        cli::Command::Cache { action } => match action {
             cli::CacheAction::Verify => cmd_cache_verify(),
         },
+        cli::Command::Watch { network, interval } => cmd_watch(&network, &interval).await,
     }
 }
 
