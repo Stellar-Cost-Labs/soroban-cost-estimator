@@ -1,0 +1,23 @@
+---
+source: tests/report_snapshots.rs
+expression: JsonFormatter.format(&report)
+---
+{
+  "function": "increment",
+  "wasm_hash": "abc123def456",
+  "cpu_instructions": 532502,
+  "memory_bytes": 0,
+  "tx_size": 156,
+  "read_entries": 1,
+  "write_entries": 1,
+  "read_bytes": 0,
+  "write_bytes": 136,
+  "fee": {
+    "non_refundable_stroops": 4496,
+    "refundable_stroops": 10931,
+    "total_stroops": 15427,
+    "total_xlm": "0.0015427"
+  },
+  "ledger": 3894195,
+  "network": "testnet"
+}

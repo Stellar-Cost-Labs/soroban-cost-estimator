@@ -1,0 +1,30 @@
+---
+source: tests/report_snapshots.rs
+expression: TableFormatter.format(&report)
+---
+Function: increment
+Network: testnet (ledger 3894195)
+WASM hash: abc123def456
+
++------------------+----------+---------------+
+| Resource         | Consumed | Fee (stroops) |
++=============================================+
+| CPU Instructions | 532502   |               |
+|------------------+----------+---------------|
+| Memory Bytes     | 0        |               |
+|------------------+----------+---------------|
+| Read Entries     | 1        |               |
+|------------------+----------+---------------|
+| Write Entries    | 1        |               |
+|------------------+----------+---------------|
+| Read Bytes       | 0        |               |
+|------------------+----------+---------------|
+| Write Bytes      | 136      |               |
+|------------------+----------+---------------|
+| Transaction Size | 156      |               |
++------------------+----------+---------------+
+
+Fee Breakdown:
+  Non-refundable: 4496 stroops
+  Refundable:     10931 stroops
+  Total:          15427 stroops (0.0015427)

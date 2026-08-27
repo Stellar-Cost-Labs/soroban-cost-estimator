@@ -1,0 +1,6 @@
+---
+source: tests/report_snapshots.rs
+expression: CsvFormatter.format(&empty)
+---
+function,network,ledger,wasm_hash,cpu_instructions,memory_bytes,read_entries,write_entries,read_bytes,write_bytes,tx_size,non_refundable_stroops,refundable_stroops,total_stroops,total_xlm
+(wasm upload),mainnet,0,0000000000000000,0,0,0,0,0,0,0,0,0,0,0.0000000

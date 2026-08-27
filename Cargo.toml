@@ -90,7 +90,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [dev-dependencies]
+insta = "1.40.0"
 proptest = "1.11.0"
+criterion = "0.5"
 
 [profile.release]
 lto = true
@@ -104,3 +106,8 @@ path = "src/main.rs"
 [[bin]]
 name = "gen_test_wasm"
 path = "src/bin/gen_test_wasm.rs"
+
+[[bench]]
+name = "wasm_parse"
+harness = false
+
