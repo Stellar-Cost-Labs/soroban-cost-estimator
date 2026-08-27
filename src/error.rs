@@ -20,6 +20,16 @@ pub enum AppError {
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
 
+    // ── WebSocket ────────────────────────────────────────────────
+    #[error("WebSocket connection failed: {0}")]
+    WsConnect(String),
+
+    #[error("WebSocket protocol error: {0}")]
+    WsProtocol(String),
+
+    #[error("WebSocket connection closed unexpectedly")]
+    WsClosed,
+
     #[error("RPC endpoint not configured for network: {0}")]
     UnknownNetwork(String),
 

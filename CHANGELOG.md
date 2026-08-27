@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `rpc::ws` — a WebSocket JSON-RPC 2.0 client (`WsRpcClient`) with an
+  `events` subscription for real-time event streaming, plus
+  `resolve_ws_endpoint` for deriving `wss://…/ws` endpoints from well-known
+  network URLs. Future-proofing for live monitoring of config changes.
 - `CHANGELOG.md` following the Keep a Changelog format.
 - `docs/migration.md` — migration guide for users coming from
   `stellar contract invoke --cost`.
