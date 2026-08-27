@@ -86,6 +86,7 @@ dirs = "6.0.0"
 thiserror = "2.0.19"
 
 [dev-dependencies]
+proptest = "1.11.0"
 
 [profile.release]
 lto = true
