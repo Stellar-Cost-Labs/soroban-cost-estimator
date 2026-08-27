@@ -121,4 +121,18 @@ pub enum ConfigAction {
         #[arg(long)]
         against: Option<String>,
     },
+
+    /// Show the full chronological change log across all stored snapshots.
+    History {
+        /// Network whose snapshot history to inspect.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+    },
+
+    /// Show when each config setting last changed.
+    LastChanged {
+        /// Network whose snapshot history to inspect.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+    },
 }
