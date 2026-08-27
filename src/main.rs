@@ -275,6 +275,9 @@ async fn cmd_estimate(
         let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
         let client = rpc::client::RpcClient::new(&endpoint);
 
+        xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
+        debug!(arg_count = args.len(), "validated arguments against contract spec");
+
         let sc_vals: Vec<stellar_xdr::ScVal> = args
             .iter()
             .map(|a| xdr_helper::parse_arg_scval(a))
