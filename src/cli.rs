@@ -80,6 +80,18 @@ pub enum Command {
         #[arg(long, default_value = "1h")]
         interval: String,
     },
+
+    /// Inspect and manage the local estimate cache.
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CacheAction {
+    /// Check that every cached estimate is valid JSON and not corrupted.
+    Verify,
 }
 
 #[derive(Subcommand, Debug)]
