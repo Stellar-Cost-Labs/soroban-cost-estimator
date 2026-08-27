@@ -53,6 +53,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::Diff { network, against } => {
                 cmd_config_diff(&network, against.as_deref()).await
             }
+            cli::ConfigAction::History { network } => cmd_config_history(&network),
+            cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network),
         },
         cli::Command::Watch { network, interval } => cmd_watch(&network, &interval).await,
         cli::Command::Cache { action } => match action {
@@ -613,6 +615,27 @@ async fn cmd_config_diff(network: &str, against_path: Option<&str>) -> error::Ap
     if diff.has_pricing_changes {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+/// `config history` command: print the full chronological change log.
+fn cmd_config_history(network: &str) -> error::AppResult<()> {
+    let log = config_snapshot::history::load_change_log(network)?;
+    println!(
+        "{}",
+        config_snapshot::history::format_change_log(network, &log)
+    );
+    Ok(())
+}
+
+/// `config last-changed` command: print when each setting last changed.
+fn cmd_config_last_changed(network: &str) -> error::AppResult<()> {
+    let log = config_snapshot::history::load_change_log(network)?;
+    let last_changed = config_snapshot::history::last_changed_from_log(&log);
+    println!(
+        "{}",
+        config_snapshot::history::format_last_changed(network, &last_changed)
+    );
     Ok(())
 }
 
