@@ -956,7 +956,6 @@ async fn cmd_cache_warm(
     cmd_estimate_all(wasm_path, network, contract_id, json_flag).await
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::parse_interval_secs;

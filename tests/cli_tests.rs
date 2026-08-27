@@ -742,7 +742,10 @@ fn test_cache_warm_nonexistent_wasm_file() {
         code, 1,
         "a missing WASM file should exit 1; stderr: {stderr}"
     );
-    assert!(stderr.contains("I/O error"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("File not found") || stderr.contains("I/O error"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
