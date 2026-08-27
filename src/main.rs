@@ -38,6 +38,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             r#fn,
             id,
             args,
+            cache_ttl,
             json,
         } => {
             cmd_estimate(
@@ -47,6 +48,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 id.as_deref(),
                 r#fn.as_deref(),
                 &args,
+                cache_ttl.as_deref(),
                 json,
             )
             .await
@@ -225,6 +227,7 @@ async fn cmd_estimate(
     contract_id: Option<&str>,
     fn_name: Option<&str>,
     args: &[String],
+    cache_ttl: Option<&str>,
     json_flag: bool,
 ) -> error::AppResult<()> {
     use sha2::Digest;
@@ -242,6 +245,21 @@ async fn cmd_estimate(
         let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
         debug!(functions = wasm_info.functions.len(), has_spec = wasm_info.has_spec, "WASM loaded");
 
+        let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
+        let function_name = fn_name.unwrap_or("(wasm upload)");
+
+        // With --cache-ttl, reuse a still-fresh cached estimate and skip the
+        // (expensive) simulation entirely.
+        let ttl_secs = cache_ttl.map(parse_interval_secs);
+        if let Some(fresh) =
+            fresh_cached_estimate(&wasm_hash, &function_name, args, ttl_secs)?
+        {
+            let ttl_secs = ttl_secs.unwrap_or_default();
+            info!(ttl_secs, function = %function_name, "cache hit — reusing fresh estimate");
+            print_cached_estimate(&fresh, ttl_secs, json_flag);
+            return Ok(());
+        }
+
         let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
         let client = rpc::client::RpcClient::new(&endpoint);
 
@@ -257,8 +275,6 @@ async fn cmd_estimate(
         debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
 
         let response = rpc::simulate::simulate_transaction(&client, &tx_b64).await?;
-
-        let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
 
         if missing_simulation_data(&response) {
             return Err(error::AppError::SimulationFailed(
@@ -294,8 +310,6 @@ async fn cmd_estimate(
             tx_xdr.len() as u32,
             fee_rates,
         );
-
-        let function_name = fn_name.unwrap_or("(wasm upload)");
 
         let report = report::cost_report::CostReport {
             function: function_name.to_string(),
@@ -723,19 +737,63 @@ fn cmd_config_last_changed(network: &str) -> error::AppResult<()> {
     Ok(())
 }
 
-/// `config show` command: show a specific historical snapshot.
-fn cmd_config_show(network: &str, timestamp: &str, json_flag: bool) -> error::AppResult<()> {
-    let snapshot = config_snapshot::store::load_snapshot_by_timestamp(network, timestamp)?;
+/// Look up a cached estimate that is still fresh under `--cache-ttl`.
+///
+/// Returns `Ok(None)` when the flag is absent (nothing to do), no entry
+/// exists, or the entry has expired — all of which mean "re-simulate".
+///
+/// # Network calls
+/// None — pure file I/O.
+fn fresh_cached_estimate(
+    wasm_hash: &str,
+    function: &str,
+    args: &[String],
+    ttl_secs: Option<u64>,
+) -> error::AppResult<Option<cache::CachedEstimate>> {
+    let Some(ttl_secs) = ttl_secs else {
+        return Ok(None);
+    };
+    cache::load_fresh_estimate(
+        wasm_hash,
+        function,
+        args,
+        std::time::Duration::from_secs(ttl_secs),
+    )
+}
 
+/// Print a fresh cached estimate that `estimate` is reusing instead of
+/// re-simulating.
+///
+/// # Network calls
+/// None — pure output.
+fn print_cached_estimate(fresh: &cache::CachedEstimate, ttl_secs: u64, json_flag: bool) {
     if json_flag {
-        println!("{}", serde_json::to_string_pretty(&snapshot)?);
-        return Ok(());
+        println!(
+            "{}",
+            serde_json::json!({
+                "cache": "hit",
+                "function": fresh.function,
+                "ledger": fresh.ledger,
+                "total_stroops": fresh.total_stroops,
+                "cpu_instructions": fresh.cpu_instructions,
+                "memory_bytes": fresh.memory_bytes,
+                "timestamp": fresh.timestamp,
+            })
+        );
+    } else {
+        println!(
+            "Cache hit — estimate from {} is still fresh (TTL {ttl_secs}s); skipping simulation.",
+            fresh.timestamp
+        );
+        println!(
+            "  Total fee: {} stroops ({} XLM) | CPU: {} insns | Mem: {} bytes | Ledger: {}",
+            fresh.total_stroops,
+            report::fee_calc::stroops_to_xlm(fresh.total_stroops),
+            fresh.cpu_instructions,
+            fresh.memory_bytes,
+            fresh.ledger,
+        );
     }
-
-    println!("Network: {}", snapshot.network);
-    println!("Ledger:  {}", snapshot.ledger);
-    println!("Time:    {}", snapshot.timestamp);
-    Ok(())
 }
 
 /// Parse an interval like `3600`, `3600s`, `30m`, `1h`, or `1d` into seconds.

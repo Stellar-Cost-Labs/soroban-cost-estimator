@@ -40,6 +40,11 @@ pub enum Command {
         #[arg(long = "arg", value_name = "KEY=VAL")]
         args: Vec<String>,
 
+        /// Skip re-simulation when a cached estimate is still fresh
+        /// (e.g. "30m", "1h", "7d"; bare value = seconds).
+        #[arg(long, value_name = "DURATION")]
+        cache_ttl: Option<String>,
+
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
         json: bool,
