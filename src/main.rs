@@ -39,6 +39,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             id,
             args,
             json,
+            precision,
         } => {
             cmd_estimate(
                 &wasm,
@@ -48,6 +49,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 r#fn.as_deref(),
                 &args,
                 json,
+                precision,
             )
             .await
         }
@@ -56,7 +58,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             network,
             id,
             json,
-        } => cmd_estimate_all(&wasm, &network, id.as_deref(), json).await,
+            precision,
+        } => cmd_estimate_all(&wasm, &network, id.as_deref(), json, precision).await,
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot { network, out, json } => {
                 cmd_config_snapshot(&network, out.as_deref(), json).await
@@ -226,6 +229,7 @@ async fn cmd_estimate(
     fn_name: Option<&str>,
     args: &[String],
     json_flag: bool,
+    precision: u32,
 ) -> error::AppResult<()> {
     use sha2::Digest;
     use tracing::{Instrument, info_span};
@@ -293,6 +297,7 @@ async fn cmd_estimate(
             read_bytes,
             tx_xdr.len() as u32,
             fee_rates,
+            precision,
         );
 
         let function_name = fn_name.unwrap_or("(wasm upload)");
@@ -342,6 +347,7 @@ async fn cmd_estimate_all(
     network: &str,
     contract_id: Option<&str>,
     json_flag: bool,
+    precision: u32,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -395,6 +401,7 @@ async fn cmd_estimate_all(
                 &wasm_hash,
                 network,
                 json_flag,
+                precision,
             )
             .await?;
             if let Some(value) = result {
@@ -423,6 +430,7 @@ async fn estimate_all_function(
     wasm_hash: &str,
     network: &str,
     json_flag: bool,
+    precision: u32,
 ) -> error::AppResult<Option<serde_json::Value>> {
     use tracing::{Instrument, debug, info_span};
 
@@ -489,7 +497,7 @@ async fn estimate_all_function(
                         &resp.transaction_data,
                     )?)
                     .unwrap_or(0);
-                let xlm = report::fee_calc::stroops_to_xlm(fee);
+                let xlm = report::fee_calc::stroops_to_xlm(fee, precision);
                 let ledger: u32 = resp
                     .latest_ledger
                     .and_then(|l| u32::try_from(l).ok())

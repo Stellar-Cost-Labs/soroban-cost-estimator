@@ -43,6 +43,10 @@ pub enum Command {
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
         json: bool,
+
+        /// Number of decimal places to show for XLM fee values (default: 7).
+        #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u32).range(0..=18))]
+        precision: u32,
     },
 
     /// Enumerate all public contract functions and estimate each one.
@@ -62,6 +66,10 @@ pub enum Command {
         /// Output as JSON instead of a human-readable list.
         #[arg(long)]
         json: bool,
+
+        /// Number of decimal places to show for XLM fee values (default: 7).
+        #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u32).range(0..=18))]
+        precision: u32,
     },
 
     /// Fetch and store a snapshot of the network's resource-pricing configuration.
