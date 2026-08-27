@@ -2,6 +2,7 @@ use std::io::Cursor;
 use std::path::Path;
 
 use stellar_xdr::ReadXdr;
+use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
 
@@ -15,30 +16,33 @@ use crate::error::{AppError, AppResult};
 /// # Network calls
 /// None — pure file I/O + parsing.
 pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
-    let bytes = std::fs::read(path).map_err(|e| AppError::Io(e))?;
+    debug!(path = %path.display(), "loading WASM file");
+    let bytes = std::fs::read(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            AppError::FileNotFound(path.display().to_string())
+        } else {
+            AppError::Io(e)
+        }
+    })?;
+    debug!(bytes = bytes.len(), "WASM bytes read");
 
     validate_wasm(&bytes)?;
+    debug!("WASM validated");
+
     let functions = enumerate_functions(&bytes)?;
-    // The spec is advisory: if it cannot be decoded (e.g. an oversized or
-    // malformed `contractspecv0` section), degrade to bare WASM exports
-    // rather than failing the whole load.
     let (spec_functions, has_spec) = parse_contract_spec(&bytes).unwrap_or_default();
 
-    // Enrich the export-derived function list with spec-derived typed params.
     let mut functions = functions;
     if !spec_functions.is_empty() {
         for fn_info in &mut functions {
             if let Some((_, params)) = spec_functions.iter().find(|(n, _)| n == &fn_info.name) {
                 fn_info.params = params.clone();
-                // The WASM type section counts the injected `env` pointer as
-                // a parameter (`increment(env, step)` reports 2), but the
-                // spec knows the real user-facing arity. Prefer the spec so
-                // `param_count` drives --arg/--fn decisions correctly.
                 fn_info.param_count = params.len() as u32;
             }
         }
     }
 
+    trace!(functions = functions.len(), has_spec, "WASM parsed");
     Ok(WasmInfo {
         bytes,
         functions,
@@ -170,6 +174,7 @@ fn parse_contract_spec(bytes: &[u8]) -> AppResult<(SpecFunctions, bool)> {
 }
 
 /// Human-readable name for a `ScSpecTypeDef`.
+#[must_use]
 fn spec_type_name(t: &stellar_xdr::ScSpecTypeDef) -> &'static str {
     match t {
         stellar_xdr::ScSpecTypeDef::Val => "val",
@@ -224,6 +229,7 @@ pub struct FunctionInfo {
 }
 
 /// Formats a function with its spec-derived signature, e.g. `increment(x: I64)`.
+#[must_use]
 pub fn format_function(fn_info: &FunctionInfo) -> String {
     if fn_info.params.is_empty() {
         return fn_info.name.clone();
