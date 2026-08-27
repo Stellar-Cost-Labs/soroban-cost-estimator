@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod config;
 pub mod estimate;
 pub mod watch;
@@ -29,4 +30,7 @@ pub enum Command {
 
     /// Poll network config on an interval and print diffs when they appear.
     Watch(watch::WatchArgs),
+
+    /// Inspect and manage the local estimate cache.
+    Cache(cache::CacheArgs),
 }
