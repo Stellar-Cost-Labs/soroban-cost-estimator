@@ -93,3 +93,23 @@ fn test_format_diff_with_changes() {
     assert!(output.contains("100"));
     assert!(output.contains("200"));
 }
+
+#[test]
+fn test_format_diff_shows_explanations() {
+    let old = make_snapshot(100, 5);
+    let new = make_snapshot(200, 5);
+    let diff = diff::diff_snapshots(&old, &new);
+    let output = diff::format_diff(&diff);
+    // fee_rate_per_instructions_increment has an explanation
+    assert!(output.contains("Stroops charged per 10,000 CPU instructions"));
+}
+
+#[test]
+fn test_diff_change_has_explanation() {
+    let old = make_snapshot(100, 5);
+    let new = make_snapshot(200, 5);
+    let diff = diff::diff_snapshots(&old, &new);
+    let change = &diff.changes[0];
+    assert!(change.explanation.is_some());
+    assert!(change.explanation.unwrap().contains("CPU instructions"));
+}
