@@ -433,11 +433,11 @@ pub fn format_module_metadata(info: &WasmInfo) -> String {
             let addr = if memory.memory64 { "64-bit" } else { "32-bit" };
             match memory.maximum_pages {
                 Some(max) => lines.push(format!(
-                    "- memory: {addr}, initial {} pages, max {max} pages",
+                    "- memories: {addr}, initial {} pages, max {max} pages",
                     memory.initial_pages
                 )),
                 None => lines.push(format!(
-                    "- memory: {addr}, initial {} pages, unbounded",
+                    "- memories: {addr}, initial {} pages, unbounded",
                     memory.initial_pages
                 )),
             }
