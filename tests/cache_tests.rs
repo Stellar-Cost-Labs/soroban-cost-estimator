@@ -672,3 +672,156 @@ fn test_concurrent_same_key_saves_leave_valid_entry() {
         );
     });
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// TTL (time-to-live) freshness
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Write a raw JSON cache entry with an explicit `timestamp`, bypassing
+/// `save_estimate` so tests can control how old an entry is for TTL checks.
+///
+/// The filename follows the `{wasm_hash}-{function}-{args_hash}.json`
+/// convention that `load_estimate` looks up, with `args_hash` computed the
+/// same way the library does (SHA-256 over the concatenated arg strings).
+fn write_raw_entry_with_timestamp(
+    tmp: &Path,
+    wasm_hash: &str,
+    function: &str,
+    args: &[&str],
+    timestamp: &str,
+) {
+    let mut hasher = sha2::Sha256::new();
+    for arg in args {
+        hasher.update(arg.as_bytes());
+    }
+    let args_hash = hex::encode(hasher.finalize());
+
+    let dir = tmp.join(".soroban-cost-estimator").join("cache");
+    std::fs::create_dir_all(&dir).expect("create cache dir");
+    let path = dir.join(format!("{wasm_hash}-{function}-{args_hash}.json"));
+
+    let value = json!({
+        "wasm_hash": wasm_hash,
+        "function": function,
+        "args_hash": args_hash,
+        "network": "testnet",
+        "ledger": 7,
+        "total_stroops": 100,
+        "cpu_instructions": 10,
+        "memory_bytes": 5,
+        "timestamp": timestamp,
+    });
+    std::fs::write(path, value.to_string()).expect("write raw entry");
+}
+
+/// An entry timestamped "now" is fresh under a TTL of one hour.
+#[test]
+fn test_is_cache_entry_fresh_within_ttl() {
+    with_temp_home(|tmp| {
+        let now = chrono::Utc::now().to_rfc3339();
+        write_raw_entry_with_timestamp(tmp, "h1", "f1", &["a"], &now);
+
+        let entry = cache::load_estimate("h1", "f1", &["a".to_string()])
+            .expect("load")
+            .expect("entry should exist");
+        assert!(
+            cache::is_cache_entry_fresh(&entry, std::time::Duration::from_secs(3600)),
+            "an entry written now should be fresh under a 1h TTL"
+        );
+    });
+}
+
+/// An entry older than the TTL is not fresh.
+#[test]
+fn test_is_cache_entry_fresh_expired() {
+    with_temp_home(|tmp| {
+        let two_hours_ago = (chrono::Utc::now() - chrono::TimeDelta::hours(2)).to_rfc3339();
+        write_raw_entry_with_timestamp(tmp, "h1", "f1", &["a"], &two_hours_ago);
+
+        let entry = cache::load_estimate("h1", "f1", &["a".to_string()])
+            .expect("load")
+            .expect("entry should exist");
+        assert!(
+            !cache::is_cache_entry_fresh(&entry, std::time::Duration::from_secs(3600)),
+            "an entry written 2h ago should be stale under a 1h TTL"
+        );
+    });
+}
+
+/// An entry whose timestamp cannot be parsed is never considered fresh:
+/// an unverifiable age must not be trusted.
+#[test]
+fn test_is_cache_entry_fresh_unparseable_timestamp() {
+    with_temp_home(|tmp| {
+        write_raw_entry_with_timestamp(tmp, "h1", "f1", &["a"], "not-a-date");
+
+        let entry = cache::load_estimate("h1", "f1", &["a".to_string()])
+            .expect("load")
+            .expect("entry should exist");
+        assert!(
+            !cache::is_cache_entry_fresh(&entry, std::time::Duration::from_secs(3600)),
+            "an entry with an unparseable timestamp must not count as fresh"
+        );
+    });
+}
+
+/// No entry at all means "re-simulate": `load_fresh_estimate` returns None.
+#[test]
+fn test_load_fresh_estimate_missing_entry() {
+    with_temp_home(|_tmp| {
+        let fresh = cache::load_fresh_estimate(
+            "nope",
+            "no_func",
+            &[],
+            std::time::Duration::from_secs(3600),
+        )
+        .expect("load fresh on empty cache");
+        assert!(fresh.is_none(), "a missing entry must yield None");
+    });
+}
+
+/// A fresh entry is returned intact by `load_fresh_estimate`.
+#[test]
+fn test_load_fresh_estimate_returns_fresh_entry() {
+    with_temp_home(|tmp| {
+        let now = chrono::Utc::now().to_rfc3339();
+        write_raw_entry_with_timestamp(tmp, "h1", "f1", &["a"], &now);
+
+        let fresh = cache::load_fresh_estimate(
+            "h1",
+            "f1",
+            &["a".to_string()],
+            std::time::Duration::from_secs(3600),
+        )
+        .expect("load fresh")
+        .expect("fresh entry should be returned");
+        assert_eq!(fresh.wasm_hash, "h1");
+        assert_eq!(fresh.ledger, 7);
+    });
+}
+
+/// An expired entry is treated as a miss even though the file exists: the
+/// caller must re-simulate.
+#[test]
+fn test_load_fresh_estimate_expired_returns_none() {
+    with_temp_home(|tmp| {
+        let two_hours_ago = (chrono::Utc::now() - chrono::TimeDelta::hours(2)).to_rfc3339();
+        write_raw_entry_with_timestamp(tmp, "h1", "f1", &["a"], &two_hours_ago);
+
+        // The entry exists and loads fine...
+        let loaded = cache::load_estimate("h1", "f1", &["a".to_string()])
+            .expect("load")
+            .expect("entry should exist");
+        assert_eq!(loaded.ledger, 7);
+
+        // ...but it is not fresh under a 1h TTL.
+        let fresh = cache::load_fresh_estimate(
+            "h1",
+            "f1",
+            &["a".to_string()],
+            std::time::Duration::from_secs(3600),
+        )
+        .expect("load fresh");
+        assert!(fresh.is_none(), "an expired entry must yield None");
+    });
+}
