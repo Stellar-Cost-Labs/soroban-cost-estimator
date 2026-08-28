@@ -924,6 +924,9 @@ async fn shutdown_signal() -> error::AppResult<()> {
 /// the previous snapshot, print changes and stale-estimate info, then save
 /// the new snapshot.
 ///
+/// `min_change_pct` is the notification threshold applied to printed diffs;
+/// pricing changes below it are annotated as informational.
+///
 /// # Network calls
 /// Makes one batched `getLedgerEntries` RPC call.
 async fn watch_poll_once(network: &str, first: &mut bool) -> error::AppResult<()> {
@@ -966,8 +969,8 @@ async fn cmd_watch(network: &str, interval: &str) -> error::AppResult<()> {
 
     info!(interval_secs, "starting watch");
     println!(
-        "Watching {} for config changes every {}s... (Ctrl-C to stop)",
-        network, interval_secs
+        "Watching {} for config changes every {}s (notification threshold: {:.1}%)... (Ctrl-C to stop)",
+        network, interval_secs, min_change_pct
     );
 
     let mut first = true;
@@ -980,7 +983,7 @@ async fn cmd_watch(network: &str, interval: &str) -> error::AppResult<()> {
                 return Ok(());
             }
             () = async {
-                let _ = watch_poll_once(network, &mut first).await;
+                let _ = watch_poll_once(network, &mut first, min_change_pct).await;
                 tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
             } => {}
         }

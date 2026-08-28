@@ -10,6 +10,23 @@ pub struct FieldDiff {
     pub old_value: String,
     pub new_value: String,
     pub is_pricing_change: bool,
+    /// Relative change as a percentage (`((new - old) / |old|) * 100`) when
+    /// both values are numeric and the old value is non-zero. `None` for
+    /// non-numeric fields (e.g. `(missing) → (present)`) or zero baselines.
+    pub percent_change: Option<f64>,
+}
+
+/// Computes the relative change between two values as a percentage.
+///
+/// Returns `None` when either value is not numeric or the baseline is zero
+/// (a 0 → N jump has no meaningful finite percentage).
+pub fn percent_change(old: &str, new: &str) -> Option<f64> {
+    let old_num = old.parse::<f64>().ok()?;
+    let new_num = new.parse::<f64>().ok()?;
+    if old_num == 0.0 {
+        return None;
+    }
+    Some(((new_num - old_num) / old_num.abs()) * 100.0)
 }
 
 /// The result of comparing two config snapshots.
@@ -19,6 +36,19 @@ pub struct ConfigDiff {
     pub new_snapshot: SnapshotInfo,
     pub changes: Vec<FieldDiff>,
     pub has_pricing_changes: bool,
+}
+
+impl ConfigDiff {
+    /// True when at least one pricing change meets or exceeds
+    /// `threshold_pct` (a percentage of the old value, e.g. `10.0` = 10%).
+    ///
+    /// With a threshold of 0 this equals `has_pricing_changes`, preserving
+    /// the default behaviour.
+    pub fn has_significant_pricing_changes(&self, threshold_pct: f64) -> bool {
+        self.changes
+            .iter()
+            .any(|c| c.is_pricing_change && is_significant(c, threshold_pct))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +99,19 @@ pub fn diff_snapshots(old: &ConfigSnapshot, new: &ConfigSnapshot) -> ConfigDiff 
     }
 }
 
+/// True when a change meets or exceeds the notification threshold.
+///
+/// Non-pricing changes are informational and always considered significant.
+/// Pricing changes whose percentage cannot be computed (non-numeric values or
+/// a zero baseline) also count as significant — an unquantifiable pricing
+/// change must never be silently suppressed.
+pub fn is_significant(change: &FieldDiff, threshold_pct: f64) -> bool {
+    match change.percent_change {
+        Some(pct) => pct.abs() >= threshold_pct,
+        None => true,
+    }
+}
+
 fn compare_contract_compute(
     diffs: &mut Vec<FieldDiff>,
     old: &Option<ContractComputeV0>,
@@ -110,12 +153,14 @@ fn compare_contract_compute(
             old_value: "(missing)".to_string(),
             new_value: "(present)".to_string(),
             is_pricing_change: true,
+            percent_change: None,
         }),
         (Some(_), None) => diffs.push(FieldDiff {
             field_path: "contract_compute".to_string(),
             old_value: "(present)".to_string(),
             new_value: "(missing)".to_string(),
             is_pricing_change: true,
+            percent_change: None,
         }),
         _ => {}
     }
@@ -211,12 +256,14 @@ fn compare_ledger_cost(
             old_value: "(missing)".to_string(),
             new_value: "(present)".to_string(),
             is_pricing_change: true,
+            percent_change: None,
         }),
         (Some(_), None) => diffs.push(FieldDiff {
             field_path: "contract_ledger_cost".to_string(),
             old_value: "(present)".to_string(),
             new_value: "(missing)".to_string(),
             is_pricing_change: true,
+            percent_change: None,
         }),
         _ => {}
     }
@@ -242,12 +289,14 @@ fn compare_historical_data(
             old_value: "(missing)".to_string(),
             new_value: "(present)".to_string(),
             is_pricing_change: true,
+            percent_change: None,
         }),
         (Some(_), None) => diffs.push(FieldDiff {
             field_path: "contract_historical_data".to_string(),
             old_value: "(present)".to_string(),
             new_value: "(missing)".to_string(),
             is_pricing_change: true,
+            percent_change: None,
         }),
         _ => {}
     }
@@ -280,12 +329,14 @@ fn compare_events(
             old_value: "(missing)".to_string(),
             new_value: "(present)".to_string(),
             is_pricing_change: true,
+            percent_change: None,
         }),
         (Some(_), None) => diffs.push(FieldDiff {
             field_path: "contract_events".to_string(),
             old_value: "(present)".to_string(),
             new_value: "(missing)".to_string(),
             is_pricing_change: true,
+            percent_change: None,
         }),
         _ => {}
     }
@@ -325,12 +376,14 @@ fn compare_bandwidth(
             old_value: "(missing)".to_string(),
             new_value: "(present)".to_string(),
             is_pricing_change: true,
+            percent_change: None,
         }),
         (Some(_), None) => diffs.push(FieldDiff {
             field_path: "contract_bandwidth".to_string(),
             old_value: "(present)".to_string(),
             new_value: "(missing)".to_string(),
             is_pricing_change: true,
+            percent_change: None,
         }),
         _ => {}
     }
@@ -419,12 +472,14 @@ fn compare_state_archival(
             old_value: "(missing)".to_string(),
             new_value: "(present)".to_string(),
             is_pricing_change: true,
+            percent_change: None,
         }),
         (Some(_), None) => diffs.push(FieldDiff {
             field_path: "state_archival".to_string(),
             old_value: "(present)".to_string(),
             new_value: "(missing)".to_string(),
             is_pricing_change: true,
+            percent_change: None,
         }),
         _ => {}
     }
@@ -438,17 +493,34 @@ fn check<T: PartialEq + std::fmt::Display>(
     is_pricing: bool,
 ) {
     if old != new {
+        let old_value = old.to_string();
+        let new_value = new.to_string();
+        let pct = percent_change(&old_value, &new_value);
         diffs.push(FieldDiff {
             field_path: path.to_string(),
-            old_value: old.to_string(),
-            new_value: new.to_string(),
+            old_value,
+            new_value,
             is_pricing_change: is_pricing,
+            percent_change: pct,
         });
     }
 }
 
 /// Formats a `ConfigDiff` as a human-readable string for display.
+///
+/// Shows every change with no threshold filtering (equivalent to a 0%
+/// threshold). See [`format_diff_with_threshold`] for threshold-aware output.
 pub fn format_diff(diff: &ConfigDiff) -> String {
+    format_diff_with_threshold(diff, 0.0)
+}
+
+/// Formats a `ConfigDiff` as a human-readable string, annotating pricing
+/// changes whose magnitude falls below `threshold_pct`.
+///
+/// Non-pricing changes are always shown unannotated. The trailing
+/// stale-estimates warning is only emitted when at least one pricing change
+/// meets the threshold.
+pub fn format_diff_with_threshold(diff: &ConfigDiff, threshold_pct: f64) -> String {
     let mut output = String::new();
 
     output.push_str(&format!(
@@ -479,11 +551,71 @@ pub fn format_diff(diff: &ConfigDiff) -> String {
         output.push_str(&format!("  {icon} {}\n", change.field_path));
         output.push_str(&format!("      Old: {}\n", change.old_value));
         output.push_str(&format!("      New: {}\n", change.new_value));
+        if let Some(pct) = change.percent_change {
+            output.push_str(&format!("      Change: {pct:+.1}%\n"));
+        }
+        if change.is_pricing_change && !is_significant(change, threshold_pct) {
+            output.push_str(&format!(
+                "      (below {:.1}% notification threshold — informational)\n",
+                threshold_pct
+            ));
+        }
     }
 
-    if diff.has_pricing_changes {
+    if diff.has_significant_pricing_changes(threshold_pct) {
         output.push_str("\n⚠️  Pricing changes detected! Your cached estimates may be stale.\n");
     }
 
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FieldDiff, is_significant, percent_change};
+
+    fn field_diff(old: &str, new: &str) -> FieldDiff {
+        FieldDiff {
+            field_path: "test.field".to_string(),
+            old_value: old.to_string(),
+            new_value: new.to_string(),
+            is_pricing_change: true,
+            percent_change: percent_change(old, new),
+        }
+    }
+
+    #[test]
+    fn test_percent_change_basic() {
+        assert!((percent_change("100", "110").unwrap() - 10.0).abs() < f64::EPSILON);
+        assert!((percent_change("100", "50").unwrap() - (-50.0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_percent_change_non_numeric_is_none() {
+        assert_eq!(percent_change("(missing)", "(present)"), None);
+        assert_eq!(percent_change("abc", "200"), None);
+    }
+
+    #[test]
+    fn test_percent_change_zero_baseline_is_none() {
+        assert_eq!(percent_change("0", "500"), None);
+    }
+
+    #[test]
+    fn test_is_significant_zero_threshold_always_true() {
+        assert!(is_significant(&field_diff("100", "101"), 0.0));
+    }
+
+    #[test]
+    fn test_is_significant_respects_threshold() {
+        assert!(is_significant(&field_diff("100", "120"), 10.0));
+        assert!(is_significant(&field_diff("100", "80"), 10.0));
+        assert!(!is_significant(&field_diff("100", "105"), 10.0));
+    }
+
+    #[test]
+    fn test_is_significant_unquantifiable_counts_as_significant() {
+        let mut change = field_diff("100", "120");
+        change.percent_change = None;
+        assert!(is_significant(&change, 10.0));
+    }
 }
