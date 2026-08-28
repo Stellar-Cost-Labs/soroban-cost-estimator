@@ -14,6 +14,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use serde_json::json;
+use sha2::Digest;
+
 /// An RPC URL that is guaranteed not to answer: port 1 on loopback.
 /// Used to drive the network error path without leaving the machine.
 const DEAD_RPC: &str = "http://127.0.0.1:1";
@@ -87,6 +90,7 @@ fn test_help_output() {
         "help should list estimate-all"
     );
     assert!(stdout.contains("config"), "help should list config command");
+    assert!(stdout.contains("cache"), "help should list cache command");
     assert!(stdout.contains("watch"), "help should list watch command");
 }
 
@@ -118,6 +122,7 @@ fn test_estimate_help() {
         "--fn",
         "--id",
         "--arg",
+        "--cache-ttl",
         "--json",
     ] {
         assert!(
@@ -200,6 +205,56 @@ fn test_watch_help() {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[test]
+fn test_help_output_lists_cache() {
+    let (stdout, stderr, code) = run_cli(&["--help"]);
+    assert_eq!(code, 0, "help should exit 0; stderr: {stderr}");
+    assert!(stdout.contains("cache"), "help should list cache command");
+}
+
+#[test]
+fn test_cache_help() {
+    let (stdout, stderr, code) = run_cli(&["cache", "--help"]);
+    assert_eq!(code, 0, "cache --help should exit 0; stderr: {stderr}");
+    assert!(stdout.contains("verify"), "cache help should list verify");
+}
+
+#[test]
+fn test_cache_verify_empty_cache_succeeds() {
+    // Run against a temp HOME so we don't touch the real user's cache.
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = std::env::temp_dir().join(format!(
+        "soroban_cli_verify_test_{}_{}",
+        std::process::id(),
+        suffix
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("create temp home");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(["cache", "verify"])
+        .env("HOME", &tmp)
+        .output()
+        .expect("failed to run CLI");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let code = output.status.code().unwrap_or(-1);
+
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    assert_eq!(
+        code, 0,
+        "verify on empty cache should exit 0; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("empty") || stdout.contains("nothing to verify"),
+        "should report an empty cache: {stdout}"
+    );
+}
+
+#[test]
 fn test_estimate_missing_wasm_errors() {
     let (_, stderr, code) = run_cli(&["estimate"]);
     assert_ne!(code, 0, "estimate without --wasm should error");
@@ -268,6 +323,18 @@ fn test_short_wasm_flag_accepted() {
     );
 }
 
+#[test]
+fn test_estimate_cache_ttl_flag_accepted() {
+    // Verify --cache-ttl is a recognized argument for estimate.
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--cache-ttl", "1h"]);
+    // Should fail because the file doesn't exist, NOT because --cache-ttl is unknown.
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--cache-ttl should be a recognized argument; stderr: {stderr}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // `estimate` — runtime error paths (all offline)
 // ─────────────────────────────────────────────────────────────────────────
@@ -284,8 +351,8 @@ fn test_estimate_nonexistent_wasm_file() {
         "runtime failures are reported on stderr as `Error: …`; got: {stderr}"
     );
     assert!(
-        stderr.contains("I/O error"),
-        "a missing file should surface as an I/O error; got: {stderr}"
+        stderr.contains("File not found"),
+        "a missing file should surface as a file not found error; got: {stderr}"
     );
 }
 
@@ -405,6 +472,136 @@ fn test_estimate_rpc_url_overrides_unknown_network() {
     );
 }
 
+/// Seed a cache entry for `tests/fixtures/minimal.wasm` (default `(wasm
+/// upload)` function, no args) with the given timestamp, in `home`.
+///
+/// Mirrors the library's cache-key computation: `wasm_hash` is the SHA-256 of
+/// the WASM bytes and `args_hash` is the SHA-256 of the concatenated args
+/// (empty for no args).
+fn seed_cache_entry(home: &Path, timestamp: &str) {
+    let wasm_bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
+    let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_bytes));
+    let args_hash = hex::encode(sha2::Sha256::digest(b""));
+
+    let cache_dir = home.join(".soroban-cost-estimator").join("cache");
+    std::fs::create_dir_all(&cache_dir).expect("create cache dir");
+    let path = cache_dir.join(format!("{wasm_hash}-(wasm upload)-{args_hash}.json"));
+
+    let entry = json!({
+        "wasm_hash": wasm_hash,
+        "function": "(wasm upload)",
+        "args_hash": args_hash,
+        "network": "testnet",
+        "ledger": 42,
+        "total_stroops": 1_000,
+        "cpu_instructions": 500,
+        "memory_bytes": 250,
+        "timestamp": timestamp,
+    });
+    std::fs::write(path, entry.to_string()).expect("write cache entry");
+}
+
+#[test]
+fn test_estimate_cache_hit_skips_simulation() {
+    // A fresh cached estimate plus --cache-ttl must short-circuit before any
+    // RPC call: even a dead endpoint succeeds, because it is never contacted.
+    let home = temp_home("cache-ttl-hit");
+    seed_cache_entry(&home, &chrono::Utc::now().to_rfc3339());
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--cache-ttl",
+            "1h",
+            "--rpc-url",
+            DEAD_RPC,
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "a fresh cache hit should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("Cache hit"),
+        "stdout should announce the cache hit; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("1,000 stroops") || stdout.contains("1000 stroops"),
+        "stdout should include the cached fee; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_estimate_cache_hit_json_output() {
+    let home = temp_home("cache-ttl-json");
+    seed_cache_entry(&home, &chrono::Utc::now().to_rfc3339());
+
+    // tracing's `info!` lines go to stdout in this binary, so silence them
+    // with RUST_LOG=error to get pure JSON on stdout.
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--cache-ttl",
+            "1h",
+            "--json",
+            "--rpc-url",
+            DEAD_RPC,
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run CLI");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a fresh cache hit should exit 0; stderr: {stderr}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    assert_eq!(parsed["cache"], "hit");
+    assert_eq!(parsed["total_stroops"], 1_000);
+    assert_eq!(parsed["ledger"], 42);
+}
+
+#[test]
+fn test_estimate_cache_expired_resimulates() {
+    // An expired entry must NOT short-circuit: the command proceeds to
+    // simulate, so the dead endpoint is contacted and the run fails.
+    let home = temp_home("cache-ttl-expired");
+    seed_cache_entry(
+        &home,
+        &(chrono::Utc::now() - chrono::TimeDelta::hours(2)).to_rfc3339(),
+    );
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--cache-ttl",
+            "1h",
+            "--rpc-url",
+            DEAD_RPC,
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "an expired entry must fall through to simulation");
+    assert!(
+        !stdout.contains("Cache hit"),
+        "an expired entry must not be reported as a hit; got: {stdout}"
+    );
+    assert!(
+        stderr.contains("HTTP request failed") || stderr.contains("error sending request"),
+        "re-simulation should hit the dead endpoint; got: {stderr}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // `estimate-all`
 // ─────────────────────────────────────────────────────────────────────────
@@ -414,8 +611,8 @@ fn test_estimate_all_nonexistent_wasm_file() {
     let (_, stderr, code) = run_cli(&["estimate-all", "--wasm", "no/such/file.wasm"]);
     assert_eq!(code, 1, "a missing WASM file should exit 1");
     assert!(
-        stderr.contains("I/O error"),
-        "a missing file should surface as an I/O error; got: {stderr}"
+        stderr.contains("File not found"),
+        "a missing file should surface as a file not found error; got: {stderr}"
     );
 }
 
@@ -511,6 +708,77 @@ fn test_config_diff_against_malformed_snapshot_errors() {
         "a malformed snapshot should surface as a parse error; got: {stderr}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// `cache warm`
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_cache_warm_help() {
+    let (stdout, stderr, code) = run_cli(&["cache", "warm", "--help"]);
+    assert_eq!(code, 0, "cache warm --help should exit 0; stderr: {stderr}");
+    for flag in ["--wasm", "--network", "--id", "--json"] {
+        assert!(
+            stdout.contains(flag),
+            "cache warm help should mention {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_cache_warm_missing_wasm_errors() {
+    let (_, stderr, code) = run_cli(&["cache", "warm"]);
+    assert_ne!(code, 0, "cache warm without --wasm should error");
+    assert!(
+        stderr.contains("error") || stderr.contains("required"),
+        "stderr should indicate error: {stderr}"
+    );
+}
+
+#[test]
+fn test_cache_warm_nonexistent_wasm_file() {
+    let (_, stderr, code) = run_cli(&["cache", "warm", "--wasm", "no/such/file.wasm"]);
+    assert_eq!(
+        code, 1,
+        "a missing WASM file should exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("File not found") || stderr.contains("I/O error"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_cache_warm_invalid_wasm_file() {
+    let home = temp_home("warm-invalid-wasm");
+    let bogus = home.join("bogus.wasm");
+    std::fs::write(&bogus, b"not a real wasm").expect("write fixture");
+
+    let (_, stderr, code) = run_cli(&["cache", "warm", "--wasm", bogus.to_str().unwrap()]);
+    assert_eq!(code, 1, "invalid WASM should exit 1");
+    assert!(stderr.contains("WASM validation error"), "stderr: {stderr}");
+}
+
+#[test]
+fn test_cache_warm_unknown_network() {
+    let (_, stderr, code) = run_cli(&[
+        "cache",
+        "warm",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--network",
+        "not-a-network",
+    ]);
+    assert_eq!(code, 1, "an unknown network should exit 1");
+    assert!(
+        stderr.contains("RPC endpoint not configured for network: not-a-network"),
+        "stderr: {stderr}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `config diff`
+// ─────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn test_config_diff_loads_valid_snapshot_before_network() {

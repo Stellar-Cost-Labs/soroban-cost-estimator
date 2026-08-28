@@ -1,10 +1,17 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use serde_json::json;
+use sha2::Digest;
 use soroban_cost_estimator::cache;
 
 /// Serialize cache tests because `std::env::set_var` is not thread-safe.
 static HOME_MUTEX: Mutex<()> = Mutex::new(());
+
+/// Number of worker threads used by the concurrency tests.
+const CONCURRENT_THREADS: usize = 8;
+/// Number of cache entries each worker thread writes/reads.
+const ENTRIES_PER_THREAD: usize = 25;
 
 /// Run a test with HOME pointing to a temporary directory so cache
 /// operations don't touch the real user's home.
@@ -227,5 +234,594 @@ fn test_overwrite_existing_estimate() {
             .expect("should exist");
         assert_eq!(loaded.ledger, 20);
         assert_eq!(loaded.total_stroops, 200);
+    });
+}
+
+#[test]
+fn test_verify_cache_empty() {
+    with_temp_home(|_tmp| {
+        let statuses = cache::verify_cache().expect("verify on empty cache");
+        assert!(statuses.is_empty(), "fresh cache should have no entries");
+    });
+}
+
+#[test]
+fn test_verify_cache_all_valid() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5).expect("save f1");
+        cache::save_estimate("h2", "f2", &[], "mainnet", 2, 200, 20, 10).expect("save f2");
+
+        let statuses = cache::verify_cache().expect("verify");
+        assert_eq!(statuses.len(), 2, "should report both entries");
+        assert!(
+            statuses.iter().all(|s| s.valid),
+            "entries written by save_estimate should all be valid: {statuses:?}"
+        );
+    });
+}
+
+#[test]
+fn test_verify_cache_detects_corrupted_entries() {
+    with_temp_home(|tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5).expect("save f1");
+
+        // Corrupt entry 1: not JSON at all.
+        // Corrupt entry 2: valid JSON but missing required fields.
+        let dir = tmp.join(".soroban-cost-estimator").join("cache");
+        std::fs::write(dir.join("garbage.json"), "{not json").expect("write garbage");
+        std::fs::write(dir.join("wrong_shape.json"), r#"{"foo": 1}"#).expect("write wrong shape");
+
+        let statuses = cache::verify_cache().expect("verify");
+        assert_eq!(statuses.len(), 3, "should report every .json entry");
+
+        let corrupt: Vec<&cache::CacheEntryStatus> = statuses.iter().filter(|s| !s.valid).collect();
+        assert_eq!(corrupt.len(), 2, "both corrupted entries should be flagged");
+        let names: Vec<&str> = corrupt.iter().map(|s| s.filename.as_str()).collect();
+        assert!(names.contains(&"garbage.json"));
+        assert!(names.contains(&"wrong_shape.json"));
+    });
+}
+
+#[test]
+fn test_verify_cache_ignores_non_json_files() {
+    with_temp_home(|tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5).expect("save f1");
+
+        let dir = tmp.join(".soroban-cost-estimator").join("cache");
+        std::fs::write(dir.join("notes.txt"), "not a cache entry").expect("write txt");
+
+        let statuses = cache::verify_cache().expect("verify");
+        assert_eq!(statuses.len(), 1, "only .json files should be checked");
+        assert!(statuses[0].valid);
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Concurrency
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Concurrent `save_estimate`/`load_estimate` calls on distinct cache keys
+/// must not corrupt the cache.
+///
+/// Each thread owns a unique `(wasm_hash, function)` pair and writes/reads
+/// `ENTRIES_PER_THREAD` estimates with unique args, so no two threads ever
+/// touch the same cache file. After every thread finishes, every entry must
+/// still be present, loadable, and parseable.
+#[test]
+fn test_concurrent_save_and_load_estimates() {
+    with_temp_home(|_tmp| {
+        let handles: Vec<_> = (0..CONCURRENT_THREADS)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    let wasm_hash = format!("hash-{t}");
+                    let function = format!("func-{t}");
+                    for j in 0..ENTRIES_PER_THREAD {
+                        let args = vec![format!("arg-{t}-{j}")];
+                        cache::save_estimate(
+                            &wasm_hash,
+                            &function,
+                            &args,
+                            "testnet",
+                            j as u32,
+                            1_000 + j as i64,
+                            10_000 + j as u64,
+                            1_000 + j as u64,
+                        )
+                        .expect("concurrent save");
+
+                        // Load back immediately; only this thread wrote this key.
+                        let loaded = cache::load_estimate(&wasm_hash, &function, &args)
+                            .expect("concurrent load")
+                            .expect("estimate saved by this thread should load");
+                        assert_eq!(loaded.ledger, j as u32);
+                        assert_eq!(loaded.total_stroops, 1_000 + j as i64);
+                        assert_eq!(loaded.cpu_instructions, 10_000 + j as u64);
+                        assert_eq!(loaded.memory_bytes, 1_000 + j as u64);
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("concurrent save/load thread panicked");
+        }
+
+        // Every concurrently written entry must still be present and intact.
+        let estimates = cache::list_cached_estimates("testnet").expect("list after concurrent");
+        assert_eq!(
+            estimates.len(),
+            CONCURRENT_THREADS * ENTRIES_PER_THREAD,
+            "all concurrently written estimates should be present"
+        );
+        let statuses = cache::verify_cache().expect("verify after concurrent");
+        assert_eq!(statuses.len(), CONCURRENT_THREADS * ENTRIES_PER_THREAD);
+        assert!(
+            statuses.iter().all(|s| s.valid),
+            "concurrent save/load must not corrupt entries: {statuses:?}"
+        );
+    });
+}
+
+/// Concurrent `load_estimate` calls must not corrupt the cache.
+///
+/// Seed a known set of entries, then hammer the cache with reads from many
+/// threads at once. Every entry must load back with its exact values and the
+/// cache must still verify as fully valid afterwards.
+#[test]
+fn test_concurrent_load_estimates() {
+    with_temp_home(|_tmp| {
+        // Seed the cache sequentially so every entry exists before the reads.
+        for t in 0..CONCURRENT_THREADS {
+            let wasm_hash = format!("hash-{t}");
+            let function = format!("func-{t}");
+            for j in 0..ENTRIES_PER_THREAD {
+                cache::save_estimate(
+                    &wasm_hash,
+                    &function,
+                    &[format!("arg-{t}-{j}")],
+                    "testnet",
+                    j as u32,
+                    1_000 + j as i64,
+                    10_000 + j as u64,
+                    1_000 + j as u64,
+                )
+                .expect("seed save");
+            }
+        }
+
+        let handles: Vec<_> = (0..CONCURRENT_THREADS)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for j in 0..ENTRIES_PER_THREAD {
+                        let loaded = cache::load_estimate(
+                            &format!("hash-{t}"),
+                            &format!("func-{t}"),
+                            &[format!("arg-{t}-{j}")],
+                        )
+                        .expect("concurrent load")
+                        .expect("seeded estimate should load");
+                        assert_eq!(loaded.ledger, j as u32);
+                        assert_eq!(loaded.total_stroops, 1_000 + j as i64);
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("concurrent load thread panicked");
+        }
+
+        let statuses = cache::verify_cache().expect("verify after concurrent loads");
+        assert_eq!(statuses.len(), CONCURRENT_THREADS * ENTRIES_PER_THREAD);
+        assert!(
+            statuses.iter().all(|s| s.valid),
+            "concurrent loads must not corrupt entries: {statuses:?}"
+        );
+    });
+}
+
+/// Write a raw JSON cache entry with an explicit schema `version` (or no
+/// `version` key when `version: None`), bypassing `save_estimate` so tests
+/// can exercise the migration path directly.
+///
+/// The filename follows the `{wasm_hash}-{function}-{args_hash}.json`
+/// convention that `load_estimate` looks up, with `args_hash` computed the
+/// same way the library does (SHA-256 over the concatenated arg strings).
+fn write_raw_entry(
+    tmp: &Path,
+    wasm_hash: &str,
+    function: &str,
+    args: &[&str],
+    version: Option<u32>,
+    ledger: u32,
+) {
+    let mut hasher = sha2::Sha256::new();
+    for arg in args {
+        hasher.update(arg.as_bytes());
+    }
+    let args_hash = hex::encode(hasher.finalize());
+
+    let dir = tmp.join(".soroban-cost-estimator").join("cache");
+    std::fs::create_dir_all(&dir).expect("create cache dir");
+    let path = dir.join(format!("{wasm_hash}-{function}-{args_hash}.json"));
+
+    let mut value = json!({
+        "wasm_hash": wasm_hash,
+        "function": function,
+        "args_hash": args_hash,
+        "network": "testnet",
+        "ledger": ledger,
+        "total_stroops": 100,
+        "cpu_instructions": 10,
+        "memory_bytes": 5,
+        "timestamp": "2026-01-01T00:00:00Z",
+    });
+    if let Some(v) = version {
+        value["version"] = json!(v);
+    }
+
+    std::fs::write(path, value.to_string()).expect("write raw entry");
+}
+
+/// The current schema version constant exposed by the library.
+///
+/// Kept in sync with `cache::CACHE_SCHEMA_VERSION`. If the library bumps
+/// the schema, these tests must be revisited.
+fn current_schema_version() -> u32 {
+    cache::CACHE_SCHEMA_VERSION
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Schema versioning & migration
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Entries saved by `save_estimate` carry the current schema version, and
+/// loading them returns the same version.
+#[test]
+fn test_saved_entries_are_current_schema_version() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 3, 100, 10, 5).expect("save");
+        let loaded = cache::load_estimate("h1", "f1", &[])
+            .expect("load")
+            .expect("entry should exist");
+        assert_eq!(loaded.version, current_schema_version());
+    });
+}
+
+/// A legacy entry (no `version` key) loads successfully and is treated as
+/// the initial schema version, which then equals the current schema.
+#[test]
+fn test_load_legacy_entry_without_version_field() {
+    with_temp_home(|tmp| {
+        // No `version` key, like entries written before versioning
+        // was introduced.
+        write_raw_entry(tmp, "legacy", "old_func", &["a"], None, 7);
+        let loaded = cache::load_estimate("legacy", "old_func", &["a".to_string()])
+            .expect("legacy entry should load")
+            .expect("entry should exist");
+        assert_eq!(loaded.version, current_schema_version());
+        assert_eq!(loaded.wasm_hash, "legacy");
+        assert_eq!(loaded.ledger, 7);
+    });
+}
+
+/// An entry that already carries the current version passes through
+/// `migrate_to_latest` unchanged (fields and version intact).
+#[test]
+fn test_migrate_to_latest_current_version_is_identity() {
+    with_temp_home(|_tmp| {
+        let entry = cache::CachedEstimate {
+            version: current_schema_version(),
+            wasm_hash: "abc".to_string(),
+            function: "f".to_string(),
+            args_hash: "def".to_string(),
+            network: "testnet".to_string(),
+            ledger: 1,
+            total_stroops: 100,
+            cpu_instructions: 10,
+            memory_bytes: 5,
+            timestamp: "t".to_string(),
+        };
+        let migrated = cache::migrate_to_latest(entry.clone()).expect("migrate");
+        assert_eq!(migrated.version, current_schema_version());
+        assert_eq!(migrated.ledger, 1);
+    });
+}
+
+/// An entry with a version *newer* than the current schema is rejected by
+/// `migrate_to_latest` rather than silently misread.
+#[test]
+fn test_migrate_to_latest_rejects_future_version() {
+    with_temp_home(|_tmp| {
+        let entry = cache::CachedEstimate {
+            version: current_schema_version() + 1,
+            wasm_hash: "abc".to_string(),
+            function: "f".to_string(),
+            args_hash: "def".to_string(),
+            network: "testnet".to_string(),
+            ledger: 1,
+            total_stroops: 100,
+            cpu_instructions: 10,
+            memory_bytes: 5,
+            timestamp: "t".to_string(),
+        };
+        let err = cache::migrate_to_latest(entry).expect_err("future version must be rejected");
+        assert!(err.to_string().contains("newer"), "unhelpful error: {err}");
+    });
+}
+
+/// `load_estimate` surfaces the error for an entry written by a newer tool,
+/// instead of returning a misleading success.
+#[test]
+fn test_load_rejects_future_version_entry() {
+    with_temp_home(|tmp| {
+        write_raw_entry(
+            tmp,
+            "future",
+            "new_func",
+            &["b"],
+            Some(current_schema_version() + 1),
+            1,
+        );
+        let result = cache::load_estimate("future", "new_func", &["b".to_string()]);
+        assert!(
+            result.is_err(),
+            "future-version entries must fail to load, got {result:?}"
+        );
+    });
+}
+
+/// `verify_cache` flags future-version entries as not valid and records the
+/// detected version, even though their JSON parses cleanly.
+#[test]
+fn test_verify_cache_flags_future_version_entries() {
+    with_temp_home(|tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5).expect("save valid");
+        write_raw_entry(
+            tmp,
+            "future",
+            "new_func",
+            &["b"],
+            Some(current_schema_version() + 1),
+            1,
+        );
+
+        let statuses = cache::verify_cache().expect("verify");
+        assert_eq!(statuses.len(), 2, "both .json files should be reported");
+
+        let future = statuses
+            .iter()
+            .find(|s| s.filename.starts_with("future"))
+            .expect("future entry should be reported");
+        assert!(!future.valid, "future-version entry must be flagged");
+
+        let good = statuses
+            .iter()
+            .find(|s| s.filename.starts_with("h1"))
+            .expect("valid entry should be reported");
+        assert!(good.valid, "current-version entry must stay valid");
+        assert_eq!(good.version, Some(current_schema_version()));
+    });
+}
+
+/// Legacy entries (no version key) are reported as valid by `verify_cache`,
+/// with their detected version defaulting to the initial schema.
+#[test]
+fn test_verify_cache_accepts_legacy_entries() {
+    with_temp_home(|tmp| {
+        write_raw_entry(tmp, "legacy", "old_func", &["a"], None, 7);
+        let statuses = cache::verify_cache().expect("verify");
+        assert_eq!(statuses.len(), 1);
+        assert!(
+            statuses[0].valid,
+            "legacy entry should verify as valid: {statuses:?}"
+        );
+        assert_eq!(statuses[0].version, Some(cache::INITIAL_SCHEMA_VERSION));
+    });
+}
+
+/// Concurrent saves to the *same* cache key must leave a valid entry behind.
+///
+/// Two threads race to write the same `(wasm_hash, function, args)` key with
+/// different ledgers. Whichever write lands last wins, but the surviving file
+/// must parse as a valid `CachedEstimate` (no torn writes) and the cache must
+/// verify cleanly.
+#[test]
+fn test_concurrent_same_key_saves_leave_valid_entry() {
+    with_temp_home(|_tmp| {
+        let args = vec!["shared".to_string()];
+        let handles: Vec<_> = (0..CONCURRENT_THREADS)
+            .map(|t| {
+                let args = args.clone();
+                std::thread::spawn(move || {
+                    cache::save_estimate(
+                        "shared-hash",
+                        "shared-func",
+                        &args,
+                        "testnet",
+                        t as u32,
+                        1_000 + t as i64,
+                        10_000,
+                        1_000,
+                    )
+                    .expect("concurrent same-key save");
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("concurrent same-key thread panicked");
+        }
+
+        // The surviving entry must be one of the written variants.
+        let loaded = cache::load_estimate("shared-hash", "shared-func", &args)
+            .expect("load shared key")
+            .expect("shared key should exist after concurrent saves");
+        assert_eq!(loaded.wasm_hash, "shared-hash");
+        assert_eq!(loaded.function, "shared-func");
+        assert!(
+            loaded.ledger < CONCURRENT_THREADS as u32,
+            "ledger must be one of the written variants: {loaded:?}"
+        );
+
+        let statuses = cache::verify_cache().expect("verify after same-key saves");
+        assert_eq!(statuses.len(), 1, "one entry for the shared key");
+        assert!(
+            statuses[0].valid,
+            "shared-key entry must stay valid: {statuses:?}"
+        );
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// TTL (time-to-live) freshness
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Write a raw JSON cache entry with an explicit `timestamp`, bypassing
+/// `save_estimate` so tests can control how old an entry is for TTL checks.
+///
+/// The filename follows the `{wasm_hash}-{function}-{args_hash}.json`
+/// convention that `load_estimate` looks up, with `args_hash` computed the
+/// same way the library does (SHA-256 over the concatenated arg strings).
+fn write_raw_entry_with_timestamp(
+    tmp: &Path,
+    wasm_hash: &str,
+    function: &str,
+    args: &[&str],
+    timestamp: &str,
+) {
+    let mut hasher = sha2::Sha256::new();
+    for arg in args {
+        hasher.update(arg.as_bytes());
+    }
+    let args_hash = hex::encode(hasher.finalize());
+
+    let dir = tmp.join(".soroban-cost-estimator").join("cache");
+    std::fs::create_dir_all(&dir).expect("create cache dir");
+    let path = dir.join(format!("{wasm_hash}-{function}-{args_hash}.json"));
+
+    let value = json!({
+        "wasm_hash": wasm_hash,
+        "function": function,
+        "args_hash": args_hash,
+        "network": "testnet",
+        "ledger": 7,
+        "total_stroops": 100,
+        "cpu_instructions": 10,
+        "memory_bytes": 5,
+        "timestamp": timestamp,
+    });
+    std::fs::write(path, value.to_string()).expect("write raw entry");
+}
+
+/// An entry timestamped "now" is fresh under a TTL of one hour.
+#[test]
+fn test_is_cache_entry_fresh_within_ttl() {
+    with_temp_home(|tmp| {
+        let now = chrono::Utc::now().to_rfc3339();
+        write_raw_entry_with_timestamp(tmp, "h1", "f1", &["a"], &now);
+
+        let entry = cache::load_estimate("h1", "f1", &["a".to_string()])
+            .expect("load")
+            .expect("entry should exist");
+        assert!(
+            cache::is_cache_entry_fresh(&entry, std::time::Duration::from_secs(3600)),
+            "an entry written now should be fresh under a 1h TTL"
+        );
+    });
+}
+
+/// An entry older than the TTL is not fresh.
+#[test]
+fn test_is_cache_entry_fresh_expired() {
+    with_temp_home(|tmp| {
+        let two_hours_ago = (chrono::Utc::now() - chrono::TimeDelta::hours(2)).to_rfc3339();
+        write_raw_entry_with_timestamp(tmp, "h1", "f1", &["a"], &two_hours_ago);
+
+        let entry = cache::load_estimate("h1", "f1", &["a".to_string()])
+            .expect("load")
+            .expect("entry should exist");
+        assert!(
+            !cache::is_cache_entry_fresh(&entry, std::time::Duration::from_secs(3600)),
+            "an entry written 2h ago should be stale under a 1h TTL"
+        );
+    });
+}
+
+/// An entry whose timestamp cannot be parsed is never considered fresh:
+/// an unverifiable age must not be trusted.
+#[test]
+fn test_is_cache_entry_fresh_unparseable_timestamp() {
+    with_temp_home(|tmp| {
+        write_raw_entry_with_timestamp(tmp, "h1", "f1", &["a"], "not-a-date");
+
+        let entry = cache::load_estimate("h1", "f1", &["a".to_string()])
+            .expect("load")
+            .expect("entry should exist");
+        assert!(
+            !cache::is_cache_entry_fresh(&entry, std::time::Duration::from_secs(3600)),
+            "an entry with an unparseable timestamp must not count as fresh"
+        );
+    });
+}
+
+/// No entry at all means "re-simulate": `load_fresh_estimate` returns None.
+#[test]
+fn test_load_fresh_estimate_missing_entry() {
+    with_temp_home(|_tmp| {
+        let fresh = cache::load_fresh_estimate(
+            "nope",
+            "no_func",
+            &[],
+            std::time::Duration::from_secs(3600),
+        )
+        .expect("load fresh on empty cache");
+        assert!(fresh.is_none(), "a missing entry must yield None");
+    });
+}
+
+/// A fresh entry is returned intact by `load_fresh_estimate`.
+#[test]
+fn test_load_fresh_estimate_returns_fresh_entry() {
+    with_temp_home(|tmp| {
+        let now = chrono::Utc::now().to_rfc3339();
+        write_raw_entry_with_timestamp(tmp, "h1", "f1", &["a"], &now);
+
+        let fresh = cache::load_fresh_estimate(
+            "h1",
+            "f1",
+            &["a".to_string()],
+            std::time::Duration::from_secs(3600),
+        )
+        .expect("load fresh")
+        .expect("fresh entry should be returned");
+        assert_eq!(fresh.wasm_hash, "h1");
+        assert_eq!(fresh.ledger, 7);
+    });
+}
+
+/// An expired entry is treated as a miss even though the file exists: the
+/// caller must re-simulate.
+#[test]
+fn test_load_fresh_estimate_expired_returns_none() {
+    with_temp_home(|tmp| {
+        let two_hours_ago = (chrono::Utc::now() - chrono::TimeDelta::hours(2)).to_rfc3339();
+        write_raw_entry_with_timestamp(tmp, "h1", "f1", &["a"], &two_hours_ago);
+
+        // The entry exists and loads fine...
+        let loaded = cache::load_estimate("h1", "f1", &["a".to_string()])
+            .expect("load")
+            .expect("entry should exist");
+        assert_eq!(loaded.ledger, 7);
+
+        // ...but it is not fresh under a 1h TTL.
+        let fresh = cache::load_fresh_estimate(
+            "h1",
+            "f1",
+            &["a".to_string()],
+            std::time::Duration::from_secs(3600),
+        )
+        .expect("load fresh");
+        assert!(fresh.is_none(), "an expired entry must yield None");
     });
 }
