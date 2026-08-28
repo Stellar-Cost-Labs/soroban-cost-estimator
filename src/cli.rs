@@ -8,6 +8,10 @@ use clap::{Parser, Subcommand};
 #[command(name = "soroban-cost-estimator")]
 #[command(about = "Estimate Soroban contract costs & track network pricing changes", long_about = None)]
 pub struct Cli {
+    /// Fallback RPC URL used when the primary endpoint is unreachable.
+    #[arg(long, global = true)]
+    pub rpc_fallback_url: Option<String>,
+
     #[command(subcommand)]
     pub command: Command,
 }

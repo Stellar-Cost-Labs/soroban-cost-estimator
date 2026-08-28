@@ -30,6 +30,7 @@ async fn main() {
 }
 
 async fn run(args: cli::Cli) -> error::AppResult<()> {
+    let fallback = args.rpc_fallback_url.as_deref();
     match args.command {
         cli::Command::Estimate {
             wasm,
@@ -45,6 +46,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 &wasm,
                 &network,
                 rpc_url.as_deref(),
+                fallback,
                 id.as_deref(),
                 r#fn.as_deref(),
                 &args,
@@ -58,18 +60,18 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             network,
             id,
             json,
-        } => cmd_estimate_all(&wasm, &network, id.as_deref(), json).await,
+        } => cmd_estimate_all(&wasm, &network, fallback, id.as_deref(), json).await,
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot { network, out, json } => {
-                cmd_config_snapshot(&network, out.as_deref(), json).await
+                cmd_config_snapshot(&network, fallback, out.as_deref(), json).await
             }
             cli::ConfigAction::Diff { network, against } => {
-                cmd_config_diff(&network, against.as_deref()).await
+                cmd_config_diff(&network, fallback, against.as_deref()).await
             }
             cli::ConfigAction::History { network } => cmd_config_history(&network),
             cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network),
         },
-        cli::Command::Watch { network, interval } => cmd_watch(&network, &interval).await,
+        cli::Command::Watch { network, interval } => cmd_watch(&network, fallback, &interval).await,
         cli::Command::Cache { action } => match action {
             cli::CacheAction::Verify => cmd_cache_verify(),
         },
@@ -224,6 +226,7 @@ async fn cmd_estimate(
     wasm_path: &str,
     network: &str,
     rpc_url: Option<&str>,
+    rpc_fallback_url: Option<&str>,
     contract_id: Option<&str>,
     fn_name: Option<&str>,
     args: &[String],
@@ -261,7 +264,7 @@ async fn cmd_estimate(
         }
 
         let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
-        let client = rpc::client::RpcClient::new(&endpoint);
+        let client = rpc::client::RpcClient::with_fallback(&endpoint, rpc_fallback_url);
 
         let sc_vals: Vec<stellar_xdr::ScVal> = args
             .iter()
@@ -354,6 +357,7 @@ async fn cmd_estimate(
 async fn cmd_estimate_all(
     wasm_path: &str,
     network: &str,
+    rpc_fallback_url: Option<&str>,
     contract_id: Option<&str>,
     json_flag: bool,
 ) -> error::AppResult<()> {
@@ -364,7 +368,7 @@ async fn cmd_estimate_all(
     async {
         let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
         let endpoint = rpc::client::resolve_endpoint(network, None)?;
-        let client = rpc::client::RpcClient::new(&endpoint);
+        let client = rpc::client::RpcClient::with_fallback(&endpoint, rpc_fallback_url);
 
         if !json_flag {
             println!(
@@ -566,6 +570,7 @@ async fn estimate_all_function(
 /// Makes one batched `getLedgerEntries` RPC call.
 async fn fetch_config_snapshot(
     network: &str,
+    rpc_fallback_url: Option<&str>,
 ) -> error::AppResult<config_snapshot::model::ConfigSnapshot> {
     use tracing::Instrument;
     use tracing::{debug, info_span};
@@ -573,7 +578,7 @@ async fn fetch_config_snapshot(
     let span = info_span!("fetch_config_snapshot", network);
     async {
         let endpoint = rpc::client::resolve_endpoint(network, None)?;
-        let client = rpc::client::RpcClient::new(&endpoint);
+        let client = rpc::client::RpcClient::with_fallback(&endpoint, rpc_fallback_url);
         debug!("fetching all config settings");
         let raw_entries = rpc::config::fetch_all_config_settings(&client).await?;
         debug!(entries = raw_entries.len(), "received config entries");
@@ -624,6 +629,7 @@ fn print_stale_estimates(network: &str, ledger: u32) {
 /// `config snapshot` command: fetch config settings and save snapshot.
 async fn cmd_config_snapshot(
     network: &str,
+    rpc_fallback_url: Option<&str>,
     out_path: Option<&str>,
     json_flag: bool,
 ) -> error::AppResult<()> {
@@ -633,7 +639,7 @@ async fn cmd_config_snapshot(
     let span = info_span!("cmd_config_snapshot", network);
     async {
         info!("taking config snapshot");
-        let snapshot = fetch_config_snapshot(network).await?;
+        let snapshot = fetch_config_snapshot(network, rpc_fallback_url).await?;
 
         let path = config_snapshot::store::save_snapshot(&snapshot, out_path)?;
         info!(path = %path.display(), ledger = snapshot.ledger, "snapshot saved");
@@ -662,7 +668,11 @@ fn upgrade_detected(diff: &config_snapshot::diff::ConfigDiff) -> bool {
 }
 
 /// `config diff` command: compare current config against a snapshot.
-async fn cmd_config_diff(network: &str, against_path: Option<&str>) -> error::AppResult<()> {
+async fn cmd_config_diff(
+    network: &str,
+    rpc_fallback_url: Option<&str>,
+    against_path: Option<&str>,
+) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::{debug, info_span};
 
@@ -679,7 +689,7 @@ async fn cmd_config_diff(network: &str, against_path: Option<&str>) -> error::Ap
             }
         };
 
-        let new_snapshot = fetch_config_snapshot(network).await?;
+        let new_snapshot = fetch_config_snapshot(network, rpc_fallback_url).await?;
 
         let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
         debug!(
@@ -839,10 +849,14 @@ async fn shutdown_signal() -> error::AppResult<()> {
 ///
 /// # Network calls
 /// Makes one batched `getLedgerEntries` RPC call.
-async fn watch_poll_once(network: &str, first: &mut bool) -> error::AppResult<()> {
+async fn watch_poll_once(
+    network: &str,
+    rpc_fallback_url: Option<&str>,
+    first: &mut bool,
+) -> error::AppResult<()> {
     use tracing::{debug, warn};
 
-    match fetch_config_snapshot(network).await {
+    match fetch_config_snapshot(network, rpc_fallback_url).await {
         Ok(snapshot) => {
             if !*first {
                 if let Ok(old_snapshot) = config_snapshot::store::load_latest_snapshot(network) {
@@ -872,7 +886,11 @@ async fn watch_poll_once(network: &str, first: &mut bool) -> error::AppResult<()
 /// Polls immediately, then on `interval`, until SIGINT (Ctrl-C) or SIGTERM
 /// is received — then exits cleanly with code 0. The in-flight poll is
 /// cancelled rather than writing a partial snapshot.
-async fn cmd_watch(network: &str, interval: &str) -> error::AppResult<()> {
+async fn cmd_watch(
+    network: &str,
+    rpc_fallback_url: Option<&str>,
+    interval: &str,
+) -> error::AppResult<()> {
     use tracing::info;
 
     let interval_secs: u64 = parse_interval_secs(interval);
@@ -893,7 +911,7 @@ async fn cmd_watch(network: &str, interval: &str) -> error::AppResult<()> {
                 return Ok(());
             }
             () = async {
-                let _ = watch_poll_once(network, &mut first).await;
+                let _ = watch_poll_once(network, rpc_fallback_url, &mut first).await;
                 tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
             } => {}
         }

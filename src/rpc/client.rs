@@ -1,5 +1,5 @@
 use serde_json::Value;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::error::{AppError, AppResult};
 
@@ -30,6 +30,7 @@ pub fn resolve_endpoint(network: &str, custom_url: Option<&str>) -> AppResult<St
 #[derive(Debug, Clone)]
 pub struct RpcClient {
     url: String,
+    fallback_url: Option<String>,
     client: reqwest::Client,
 }
 
@@ -39,14 +40,32 @@ impl RpcClient {
         debug!(url, "creating RPC client");
         Self {
             url: url.to_string(),
+            fallback_url: None,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    /// Create a new RPC client with a fallback URL for failover.
+    pub fn with_fallback(url: &str, fallback_url: Option<&str>) -> Self {
+        debug!(url, ?fallback_url, "creating RPC client with fallback");
+        Self {
+            url: url.to_string(),
+            fallback_url: fallback_url.map(String::from),
             client: reqwest::Client::new(),
         }
     }
 
     /// Send a JSON-RPC request and deserialize the response.
     ///
+    /// Tries the primary endpoint first. If the primary fails with a
+    /// network-level error (connection refused, timeout, DNS failure, etc.)
+    /// and a fallback URL is configured, retries against the fallback.
+    ///
+    /// RPC-level errors (e.g. bad method, invalid params) are **not** retried
+    /// against the fallback — they would fail there too.
+    ///
     /// # Network calls
-    /// Makes an HTTP POST to the configured RPC endpoint.
+    /// Makes an HTTP POST to the configured RPC endpoint (and optionally the fallback).
     pub async fn call<T: serde::de::DeserializeOwned>(
         &self,
         method: &str,
@@ -60,7 +79,48 @@ impl RpcClient {
         });
 
         trace!(method, "sending RPC request");
-        let response = self.client.post(&self.url).json(&body).send().await?;
+        match self.post_and_deserialize(method, &body, &self.url).await {
+            Ok(result) => Ok(result),
+            Err(e) if self.is_network_error(&e) => {
+                if let Some(ref fallback) = self.fallback_url {
+                    warn!(
+                        method,
+                        primary = %self.url,
+                        fallback = %fallback,
+                        error = %e,
+                        "primary RPC endpoint failed — trying fallback"
+                    );
+                    self.post_and_deserialize(method, &body, fallback).await
+                } else {
+                    Err(e)
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Check whether an error is a network-level failure (as opposed to an
+    /// RPC-level error returned inside a successful HTTP response).
+    fn is_network_error(&self, error: &AppError) -> bool {
+        match error {
+            AppError::Http(e) => {
+                // reqwest errors that indicate connectivity problems — these
+                // are the cases where a fallback endpoint might succeed.
+                e.is_connect() || e.is_timeout() || e.is_request()
+            }
+            _ => false,
+        }
+    }
+
+    /// POST to the given URL, parse the JSON-RPC response, and deserialize
+    /// the `result` field into `T`.
+    async fn post_and_deserialize<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        body: &Value,
+        url: &str,
+    ) -> AppResult<T> {
+        let response = self.client.post(url).json(body).send().await?;
 
         let status = response.status();
         let response_body: Value = response.json().await?;
