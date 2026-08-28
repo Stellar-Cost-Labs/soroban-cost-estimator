@@ -1,0 +1,30 @@
+---
+source: tests/report_snapshots.rs
+expression: TableFormatter.format(&empty)
+---
+Function: (wasm upload)
+Network: mainnet (ledger 0)
+WASM hash: 0000000000000000
+
++------------------+----------+---------------+
+| Resource         | Consumed | Fee (stroops) |
++=============================================+
+| CPU Instructions | 0        |               |
+|------------------+----------+---------------|
+| Memory Bytes     | 0        |               |
+|------------------+----------+---------------|
+| Read Entries     | 0        |               |
+|------------------+----------+---------------|
+| Write Entries    | 0        |               |
+|------------------+----------+---------------|
+| Read Bytes       | 0        |               |
+|------------------+----------+---------------|
+| Write Bytes      | 0        |               |
+|------------------+----------+---------------|
+| Transaction Size | 0        |               |
++------------------+----------+---------------+
+
+Fee Breakdown:
+  Non-refundable: 0 stroops
+  Refundable:     0 stroops
+  Total:          0 stroops (0.0000000)
