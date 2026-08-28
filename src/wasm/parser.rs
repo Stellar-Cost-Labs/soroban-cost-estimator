@@ -364,8 +364,11 @@ pub fn validate_arg_value(type_def: &stellar_xdr::ScSpecTypeDef, arg: &str) -> A
         stellar_xdr::ScSpecTypeDef::Symbol => is_valid_symbol(value),
         stellar_xdr::ScSpecTypeDef::Bytes => is_valid_hex(value),
         stellar_xdr::ScSpecTypeDef::BytesN(spec) => {
-            let byte_len = value.len() / 2;
-            is_valid_hex(value) && Some(byte_len) == usize::try_from(spec.n).ok()
+            let hex = value
+                .strip_prefix("0x")
+                .or_else(|| value.strip_prefix("0X"))
+                .unwrap_or(value);
+            is_valid_hex(value) && Some(hex.len() / 2) == usize::try_from(spec.n).ok()
         }
         stellar_xdr::ScSpecTypeDef::Address => is_valid_address(value),
         // Bare strings, and types that carry no validator: bespoke parsers
