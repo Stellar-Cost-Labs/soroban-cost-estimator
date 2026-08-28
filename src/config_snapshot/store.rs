@@ -147,38 +147,3 @@ pub fn load_snapshot_by_timestamp(network: &str, timestamp: &str) -> AppResult<C
         serde_json::from_str(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))?;
     Ok(snapshot)
 }
-
-/// Deletes snapshots older than `days` for the specified network.
-///
-/// # Network calls
-/// None — pure file I/O.
-pub fn clean_old_snapshots(network: &str, days: u64) -> AppResult<usize> {
-    let dir = snapshots_dir()?;
-    let mut deleted = 0;
-
-    // Calculate the cutoff date
-    let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
-
-    if !dir.exists() {
-        return Ok(0);
-    }
-
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        if name_str.starts_with(&format!("{}-", network)) && name_str.ends_with(".json") {
-            let metadata = entry.metadata()?;
-            if let Ok(modified) = metadata.modified() {
-                let modified_dt = chrono::DateTime::<chrono::Utc>::from(modified);
-
-                if modified_dt < cutoff && std::fs::remove_file(entry.path()).is_ok() {
-                    deleted += 1;
-                }
-            }
-        }
-    }
-
-    Ok(deleted)
-}

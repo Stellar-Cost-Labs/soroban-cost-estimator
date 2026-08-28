@@ -72,10 +72,16 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::History { network } => cmd_config_history(&network),
             cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network),
         },
-        cli::Command::Watch { network, interval } => cmd_watch(&network, &interval).await,
         cli::Command::Cache { action } => match action {
+            cli::CacheAction::Warm {
+                wasm,
+                network,
+                id,
+                json,
+            } => cmd_cache_warm(&wasm, &network, id.as_deref(), json).await,
             cli::CacheAction::Verify => cmd_cache_verify(),
         },
+        cli::Command::Watch { network, interval } => cmd_watch(&network, &interval).await,
     }
 }
 
@@ -941,6 +947,16 @@ fn cmd_cache_verify() -> error::AppResult<()> {
     }
 
     Ok(())
+}
+
+/// `cache warm` command: pre-populate cache by estimating every exported function.
+async fn cmd_cache_warm(
+    wasm_path: &str,
+    network: &str,
+    contract_id: Option<&str>,
+    json_flag: bool,
+) -> error::AppResult<()> {
+    cmd_estimate_all(wasm_path, network, contract_id, json_flag).await
 }
 
 #[cfg(test)]
