@@ -366,12 +366,12 @@ mod tests {
         let task_a = {
             let client = Arc::clone(&client);
             let params = params.clone();
-            tokio::spawn(async move { client.call("test.method", params).await })
+            tokio::spawn(async move { client.call::<Value>("test.method", params).await })
         };
         let task_b = {
             let client = Arc::clone(&client);
             let params = params.clone();
-            tokio::spawn(async move { client.call("test.method", params).await })
+            tokio::spawn(async move { client.call::<Value>("test.method", params).await })
         };
 
         let (ra, rb) = (task_a.await.expect("task"), task_b.await.expect("task"));
