@@ -69,6 +69,17 @@ pub enum Command {
         json: bool,
     },
 
+    /// Print WASM metadata (functions, contract spec, size, hash) without any RPC calls.
+    WasmInfo {
+        /// Path to the compiled Soroban contract `.wasm` file.
+        #[arg(long, short)]
+        wasm: String,
+
+        /// Output as JSON instead of a human-readable listing.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Fetch and store a snapshot of the network's resource-pricing configuration.
     Config {
         #[command(subcommand)]
