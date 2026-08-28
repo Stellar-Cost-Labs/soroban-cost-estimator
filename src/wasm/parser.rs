@@ -87,6 +87,7 @@ pub struct ModuleMetadata {
 /// needs to describe a module, not just the typed function list. Function
 /// signatures are reconstructed by following the type/function/export index
 /// spaces, the same as `enumerate_functions`.
+#[allow(clippy::too_many_lines)]
 pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
     let mut functions = Vec::new();
     // Map from function index -> type index
