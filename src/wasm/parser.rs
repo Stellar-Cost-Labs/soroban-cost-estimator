@@ -154,13 +154,37 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
             }
             wasmparser::Payload::StartSection { func, .. } => start_function = Some(func),
             wasmparser::Payload::ImportSection(section) => {
-                for imported in section {
-                    let imported = imported.map_err(|e| AppError::WasmParse(e.to_string()))?;
-                    imports.push(ImportInfo {
-                        module: imported.module.to_string(),
-                        name: imported.name.to_string(),
-                        kind: type_ref_kind_name(&imported.ty).to_string(),
-                    });
+                for group in section {
+                    let group = group.map_err(|e| AppError::WasmParse(e.to_string()))?;
+                    match group {
+                        wasmparser::Imports::Single(_, imported) => {
+                            imports.push(ImportInfo {
+                                module: imported.module.to_string(),
+                                name: imported.name.to_string(),
+                                kind: type_ref_kind_name(&imported.ty).to_string(),
+                            });
+                        }
+                        wasmparser::Imports::Compact1 { module, items } => {
+                            for item in items {
+                                let item = item.map_err(|e| AppError::WasmParse(e.to_string()))?;
+                                imports.push(ImportInfo {
+                                    module: module.to_string(),
+                                    name: item.name.to_string(),
+                                    kind: type_ref_kind_name(&item.ty).to_string(),
+                                });
+                            }
+                        }
+                        wasmparser::Imports::Compact2 { module, ty, names } => {
+                            for name in names {
+                                let name = name.map_err(|e| AppError::WasmParse(e.to_string()))?;
+                                imports.push(ImportInfo {
+                                    module: module.to_string(),
+                                    name: name.to_string(),
+                                    kind: type_ref_kind_name(&ty).to_string(),
+                                });
+                            }
+                        }
+                    }
                 }
             }
             _ => {}
