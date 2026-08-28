@@ -1168,6 +1168,7 @@ mod tests {
                 params: vec![ParamInfo {
                     name: "step".to_string(),
                     type_name: "I64".to_string(),
+                    type_def: stellar_xdr::ScSpecTypeDef::I64,
                 }],
             }],
             start_function: None,

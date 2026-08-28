@@ -362,15 +362,16 @@ pub fn validate_arg_value(type_def: &stellar_xdr::ScSpecTypeDef, arg: &str) -> A
             is_wide_integer(value)
         }
         stellar_xdr::ScSpecTypeDef::Symbol => is_valid_symbol(value),
-        stellar_xdr::ScSpecTypeDef::String => true,
         stellar_xdr::ScSpecTypeDef::Bytes => is_valid_hex(value),
         stellar_xdr::ScSpecTypeDef::BytesN(spec) => {
             let byte_len = value.len() / 2;
             is_valid_hex(value) && Some(byte_len) == usize::try_from(spec.n).ok()
         }
         stellar_xdr::ScSpecTypeDef::Address => is_valid_address(value),
-        // Types that carry no validator: bespoke parsers are out of scope.
-        stellar_xdr::ScSpecTypeDef::Val
+        // Bare strings, and types that carry no validator: bespoke parsers
+        // are out of scope.
+        stellar_xdr::ScSpecTypeDef::String
+        | stellar_xdr::ScSpecTypeDef::Val
         | stellar_xdr::ScSpecTypeDef::Void
         | stellar_xdr::ScSpecTypeDef::Error
         | stellar_xdr::ScSpecTypeDef::MuxedAddress
@@ -431,7 +432,7 @@ pub fn is_valid_hex(value: &str) -> bool {
 /// `G…` account; both are 56 chars) or a 64-hex-char contract id.
 #[must_use]
 pub fn is_valid_address(value: &str) -> bool {
-    let c_g = matches!(value.as_bytes().first(), Some(b'C') | Some(b'G')) && value.len() == 56;
+    let c_g = matches!(value.as_bytes().first(), Some(b'C' | b'G')) && value.len() == 56;
     let hex_id = value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit());
     c_g || hex_id
 }
