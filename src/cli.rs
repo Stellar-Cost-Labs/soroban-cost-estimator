@@ -12,6 +12,12 @@ pub struct Cli {
     #[arg(long, short, global = true)]
     pub verbose: bool,
 
+    /// Custom HTTP header to send with RPC requests.
+    /// Repeatable: pass multiple `--header "Key: Value"` flags for several headers.
+    /// Useful for API keys and auth tokens on private nodes.
+    #[arg(long = "header", value_name = "KEY: VALUE", global = true)]
+    pub headers: Vec<String>,
+
     #[command(subcommand)]
     pub command: Command,
 }

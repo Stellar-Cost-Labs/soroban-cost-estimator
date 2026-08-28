@@ -335,6 +335,71 @@ fn test_estimate_cache_ttl_flag_accepted() {
     );
 }
 
+#[test]
+fn test_header_flag_accepted() {
+    // Verify --header is a recognized global argument.
+    let (_, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "test.wasm",
+        "--header",
+        "X-API-Key: secret",
+    ]);
+    // Should fail because the file doesn't exist, NOT because --header is unknown.
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--header should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_multiple_header_flags_accepted() {
+    // Verify multiple --header flags are accepted.
+    let (_, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "test.wasm",
+        "--header",
+        "X-API-Key: secret",
+        "--header",
+        "Authorization: Bearer tok",
+    ]);
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "multiple --header flags should be accepted; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_header_flag_in_help() {
+    // Verify --header appears in the global help output.
+    let (stdout, stderr, code) = run_cli(&["--help"]);
+    assert_eq!(code, 0, "help should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("--header"),
+        "global help should list --header; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_header_flag_on_estimate_all() {
+    // Verify --header works on estimate-all as a global flag.
+    let (_, stderr, code) = run_cli(&[
+        "estimate-all",
+        "--wasm",
+        "test.wasm",
+        "--header",
+        "X-Custom: val",
+    ]);
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--header should work on estimate-all; stderr: {stderr}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // `estimate` — runtime error paths (all offline)
 // ─────────────────────────────────────────────────────────────────────────
