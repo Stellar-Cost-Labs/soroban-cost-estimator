@@ -1167,6 +1167,10 @@ mod tests {
                     type_name: "I64".to_string(),
                 }],
             }],
+            start_function: None,
+            memories: Vec::new(),
+            imports: Vec::new(),
+            exports: Vec::new(),
         };
         let value = wasm_info_json("/tmp/contract.wasm", &info, "deadbeef");
 
