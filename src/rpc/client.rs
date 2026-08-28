@@ -1,4 +1,8 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use serde_json::Value;
+use tokio::sync::Mutex;
 use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
@@ -26,11 +30,38 @@ pub fn resolve_endpoint(network: &str, custom_url: Option<&str>) -> AppResult<St
     endpoint
 }
 
+/// Key identifying a deduplicable JSON-RPC request: `(method, serialized params)`.
+type RequestKey = (String, String);
+
+/// Private, shared deduplication state for a `RpcClient`.
+///
+/// Deduplication collapses identical JSON-RPC requests — the same method with
+/// the same params — into a single network call. This matters for batch
+/// operations such as `estimate-all`, where several functions share the same
+/// WASM upload path and would otherwise transmit the identical upload request
+/// over and over.
+#[derive(Debug, Default)]
+struct DedupState {
+    /// Results of identical requests that already completed successfully,
+    /// keyed by request. A cache hit skips the network entirely.
+    completed: HashMap<RequestKey, Value>,
+    /// Per-request serialization gates. The first caller for a key (the
+    /// "leader") performs the request; concurrent identical callers wait on
+    /// the gate, then read the cached result. Followers of a *failed* leader
+    /// observe no cached result and simply become the next leader, so a
+    /// retry only costs the request itself.
+    in_flight: HashMap<RequestKey, Arc<Mutex<()>>>,
+}
+
 /// A minimal JSON-RPC 2.0 client for Soroban RPC endpoints.
-#[derive(Debug, Clone)]
+///
+/// Identical in-flight or completed requests (same method + params) are
+/// deduplicated so a batch operation sends each distinct request only once.
+#[derive(Debug)]
 pub struct RpcClient {
     url: String,
     client: reqwest::Client,
+    dedup: Arc<Mutex<DedupState>>,
 }
 
 impl RpcClient {
@@ -40,18 +71,77 @@ impl RpcClient {
         Self {
             url: url.to_string(),
             client: reqwest::Client::new(),
+            dedup: Arc::new(Mutex::new(DedupState::default())),
         }
     }
 
     /// Send a JSON-RPC request and deserialize the response.
     ///
+    /// Requests are deduplicated by `(method, params)`: a request identical to
+    /// one already completed returns the cached result without sending
+    /// anything, and concurrent identical requests are collapsed into a single
+    /// network call (single-flight). A failed leader does not poison its
+    /// followers — the next waiter retries the request itself.
+    ///
     /// # Network calls
-    /// Makes an HTTP POST to the configured RPC endpoint.
+    /// At most one HTTP POST for any distinct `(method, params)` pair; zero
+    /// for a cache hit.
     pub async fn call<T: serde::de::DeserializeOwned>(
         &self,
         method: &str,
         params: Value,
     ) -> AppResult<T> {
+        let key = (method.to_string(), params.to_string());
+
+        loop {
+            // Fast path: an identical request already completed successfully.
+            if let Some(cached) = self.cached_result(&key).await {
+                trace!(method, "deduplicated against completed request");
+                return deserialize_result::<T>(cached);
+            }
+
+            // Claim (or reuse) the serialization gate for this key.
+            let gate = {
+                let mut state = self.dedup.lock().await;
+                Arc::clone(
+                    state
+                        .in_flight
+                        .entry(key.clone())
+                        .or_insert_with(|| Arc::new(Mutex::new(()))),
+                )
+            };
+
+            if let Ok(_guard) = gate.try_lock() {
+                // Leader: perform the network request and publish the result
+                // for any waiters before releasing the gate.
+                let result = self.perform_call(method, params).await;
+                let mut state = self.dedup.lock().await;
+                if let Ok(value) = &result {
+                    state.completed.insert(key.clone(), value.clone());
+                }
+                state.in_flight.remove(&key);
+                return result.and_then(deserialize_result::<T>);
+            }
+
+            // Follower: wait for the leader to finish, then loop back to the
+            // fast path. If the leader failed, nothing was cached and this
+            // iteration becomes the new leader (a retry).
+            let _follower_guard = gate.lock().await;
+        }
+    }
+
+    /// Returns the cached result for `key`, if a prior identical request
+    /// completed successfully.
+    async fn cached_result(&self, key: &RequestKey) -> Option<Value> {
+        let state = self.dedup.lock().await;
+        state.completed.get(key).cloned()
+    }
+
+    /// Performs the actual HTTP POST and extracts the raw `result` value.
+    ///
+    /// # Network calls
+    /// Makes an HTTP POST to the configured RPC endpoint.
+    async fn perform_call(&self, method: &str, params: Value) -> AppResult<Value> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -92,7 +182,208 @@ impl RpcClient {
         })?;
 
         trace!(method, "RPC call succeeded");
-        serde_json::from_value(result.clone())
-            .map_err(|e| AppError::General(format!("failed to deserialize RPC response: {e}")))
+        Ok(result.clone())
+    }
+}
+
+/// Deserializes a raw JSON-RPC `result` value into the caller's type.
+fn deserialize_result<T: serde::de::DeserializeOwned>(value: Value) -> AppResult<T> {
+    serde_json::from_value(value)
+        .map_err(|e| AppError::General(format!("failed to deserialize RPC response: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use serde_json::Value;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    use super::RpcClient;
+
+    /// Spawns a tiny HTTP server that answers JSON-RPC `simulateTransaction`
+    /// calls, counting how many were received. The first `fail_times` calls
+    /// return a JSON-RPC error body instead of a result.
+    async fn spawn_json_rpc_stub(fail_times: u32) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind stub server");
+        let addr = listener.local_addr().expect("no local address");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let server_counter = Arc::clone(&counter);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let counter = Arc::clone(&server_counter);
+                tokio::spawn(async move {
+                    let _ = handle_conn(stream, counter, fail_times).await;
+                });
+            }
+        });
+
+        (format!("http://{addr}"), counter)
+    }
+
+    async fn handle_conn(
+        mut stream: TcpStream,
+        counter: Arc<AtomicUsize>,
+        fail_times: u32,
+    ) -> std::io::Result<()> {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut tmp).await?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let header_end = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("request headers must end")
+            + 4;
+        let content_length: usize = String::from_utf8_lossy(&buf[..header_end])
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .and_then(|v| v.trim().parse().ok())
+            })
+            .unwrap_or(0);
+        while buf.len() < header_end + content_length {
+            let n = stream.read(&mut tmp).await?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+
+        let call_no = counter.fetch_add(1, Ordering::SeqCst);
+        let body = if (call_no as u32) < fail_times {
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure"}}"#
+        } else {
+            r#"{"jsonrpc":"2.0","id":1,"result":{"pong":true}}"#
+        };
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await?;
+        stream.flush().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_dedup_sequential_identical_requests() {
+        let (url, counter) = spawn_json_rpc_stub(0).await;
+        let client = RpcClient::new(&url);
+        let params = serde_json::json!({"k": "v"});
+
+        let _: Value = client
+            .call("test.method", params.clone())
+            .await
+            .expect("first call");
+        let _: Value = client
+            .call("test.method", params)
+            .await
+            .expect("deduped call");
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "identical requests must hit the network once"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dedup_distinct_params_not_deduplicated() {
+        let (url, counter) = spawn_json_rpc_stub(0).await;
+        let client = RpcClient::new(&url);
+
+        let _: Value = client
+            .call("test.method", serde_json::json!({"k": 1}))
+            .await
+            .expect("first distinct call");
+        let _: Value = client
+            .call("test.method", serde_json::json!({"k": 2}))
+            .await
+            .expect("second distinct call");
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "distinct requests must both hit the network"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dedup_concurrent_identical_requests() {
+        let (url, counter) = spawn_json_rpc_stub(0).await;
+        let client = Arc::new(RpcClient::new(&url));
+
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let client = Arc::clone(&client);
+            handles.push(tokio::spawn(async move {
+                let _: Value = client
+                    .call("test.method", serde_json::json!({"k": "v"}))
+                    .await
+                    .expect("deduped concurrent call");
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("task should not panic");
+        }
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "concurrent identical requests must hit the network once"
+        );
+    }
+
+    /// A failed leader reports the error to its own caller but must not poison
+    /// waiters: a follower observes no cached result and retries the request
+    /// itself, so the follower succeeds at the cost of one extra network
+    /// attempt. Exactly one of the two identical callers ends up successful.
+    #[tokio::test]
+    async fn test_dedup_failed_leader_followers_retry() {
+        let (url, counter) = spawn_json_rpc_stub(1).await;
+        let client = Arc::new(RpcClient::new(&url));
+
+        let params = serde_json::json!({"k": "v"});
+        let task_a = {
+            let client = Arc::clone(&client);
+            let params = params.clone();
+            tokio::spawn(async move { client.call::<Value>("test.method", params).await })
+        };
+        let task_b = {
+            let client = Arc::clone(&client);
+            let params = params.clone();
+            tokio::spawn(async move { client.call::<Value>("test.method", params).await })
+        };
+
+        let (ra, rb) = (task_a.await.expect("task"), task_b.await.expect("task"));
+        assert_eq!(
+            usize::from(ra.is_ok()) + usize::from(rb.is_ok()),
+            1,
+            "exactly one caller succeeds; the other sees the leader's error"
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "follower retried once after the leader's failure"
+        );
     }
 }
