@@ -75,21 +75,20 @@ pub enum Command {
         action: ConfigAction,
     },
 
+    /// Manage the local estimate cache.
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+
     /// Poll network config on an interval and print diffs when they appear.
     Watch {
         /// Network to watch.
         #[arg(long, default_value = "testnet")]
         network: String,
-
         /// Polling interval (e.g. "30m", "1h").
         #[arg(long, default_value = "1h")]
         interval: String,
-    },
-
-    /// Inspect and manage the local estimate cache.
-    Cache {
-        #[command(subcommand)]
-        action: CacheAction,
     },
 }
 
@@ -97,6 +96,25 @@ pub enum Command {
 pub enum CacheAction {
     /// Check that every cached estimate is valid JSON and not corrupted.
     Verify,
+
+    /// Pre-populate the cache by estimating every exported function.
+    Warm {
+        /// Path to the compiled Soroban contract `.wasm` file.
+        #[arg(long, short)]
+        wasm: String,
+
+        /// Network to simulate against.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+
+        /// Deployed contract ID (64 hex chars) to invoke each function against.
+        #[arg(long)]
+        id: Option<String>,
+
+        /// Output as JSON instead of a human-readable list.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

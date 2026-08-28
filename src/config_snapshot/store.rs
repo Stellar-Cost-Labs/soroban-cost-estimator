@@ -124,3 +124,26 @@ pub fn list_snapshots(network: &str) -> AppResult<Vec<PathBuf>> {
     snapshots.sort();
     Ok(snapshots)
 }
+
+/// Loads a specific snapshot by network and timestamp.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn load_snapshot_by_timestamp(network: &str, timestamp: &str) -> AppResult<ConfigSnapshot> {
+    let dir = snapshots_dir()?;
+    let ts_safe = timestamp.replace(':', "-");
+    let filename = format!("{}-{}.json", network, ts_safe);
+    let path = dir.join(&filename);
+
+    if !path.exists() {
+        return Err(AppError::General(format!(
+            "No snapshot found for network '{}' at timestamp '{}'",
+            network, timestamp
+        )));
+    }
+
+    let content = std::fs::read_to_string(&path)?;
+    let snapshot: ConfigSnapshot =
+        serde_json::from_str(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))?;
+    Ok(snapshot)
+}
