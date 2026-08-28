@@ -384,6 +384,8 @@ async fn cmd_estimate_all(
         let client = rpc::client::RpcClient::new(&endpoint);
 
         if !json_flag {
+            println!("{}", wasm::parser::format_module_metadata(&wasm_info));
+            println!();
             println!(
                 "Enumerated {} function(s) in WASM:",
                 wasm_info.functions.len()
@@ -1165,6 +1167,10 @@ mod tests {
                     type_name: "I64".to_string(),
                 }],
             }],
+            start_function: None,
+            memories: Vec::new(),
+            imports: Vec::new(),
+            exports: Vec::new(),
         };
         let value = wasm_info_json("/tmp/contract.wasm", &info, "deadbeef");
 

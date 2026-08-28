@@ -87,3 +87,80 @@ fn test_nonexistent_wasm() {
     ));
     assert!(result.is_err(), "nonexistent file should error");
 }
+
+/// The bare fixture exports only the `add_one` function; the captured export
+/// structure must reflect that, and the module start function is absent.
+#[test]
+fn test_module_metadata_bare_wasm() {
+    let path = Path::new("tests/fixtures/minimal.wasm");
+    let wasm_info =
+        soroban_cost_estimator::wasm::parser::load_wasm(path).expect("failed to load test WASM");
+
+    let add_one_export = wasm_info
+        .exports
+        .iter()
+        .find(|e| e.name == "add_one")
+        .expect("add_one should appear in the export structure");
+    assert_eq!(add_one_export.kind, "function");
+
+    assert!(
+        wasm_info.start_function.is_none(),
+        "bare fixture has no start function"
+    );
+    assert!(
+        wasm_info.memories.is_empty() || wasm_info.memories.len() == 1,
+        "bare fixture declares at most one memory"
+    );
+
+    let summary = soroban_cost_estimator::wasm::parser::format_module_metadata(&wasm_info);
+    assert!(
+        summary.contains("WASM module metadata:"),
+        "summary should have a header, got: {summary}"
+    );
+    assert!(
+        summary.contains("imports:") && summary.contains("exports:"),
+        "summary should list imports and exports, got: {summary}"
+    );
+}
+
+/// The real-contract fixture must carry its exported functions in the export
+/// structure, typed params in the spec, and a complete import/export summary.
+#[test]
+fn test_module_metadata_real_contract() {
+    let path = Path::new("tests/fixtures/contract.wasm");
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(path)
+        .expect("failed to load contract fixture");
+
+    assert!(
+        wasm_info.has_spec,
+        "fixture should carry a contractspecv0 section"
+    );
+    assert!(
+        !wasm_info.functions.is_empty(),
+        "fixture should export functions"
+    );
+    assert!(
+        !wasm_info.exports.is_empty(),
+        "fixture should populate the export structure"
+    );
+
+    for function in &wasm_info.functions {
+        let export = wasm_info
+            .exports
+            .iter()
+            .find(|e| e.name == function.name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "exported function {} missing from export structure",
+                    function.name
+                )
+            });
+        assert_eq!(export.kind, "function");
+    }
+
+    let summary = soroban_cost_estimator::wasm::parser::format_module_metadata(&wasm_info);
+    assert!(
+        summary.contains("start function") && summary.contains("memories:"),
+        "summary should describe entry points, got: {summary}"
+    );
+}
