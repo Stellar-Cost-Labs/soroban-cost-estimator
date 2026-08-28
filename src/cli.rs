@@ -8,6 +8,10 @@ use clap::{Parser, Subcommand};
 #[command(name = "soroban-cost-estimator")]
 #[command(about = "Estimate Soroban contract costs & track network pricing changes", long_about = None)]
 pub struct Cli {
+    /// Enable verbose output (debug-level logging for RPC requests/responses).
+    #[arg(long, short, global = true)]
+    pub verbose: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }

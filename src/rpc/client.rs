@@ -59,18 +59,11 @@ impl RpcClient {
             "params": params,
         });
 
-        trace!(method, "sending RPC request");
+        debug!(method, params = %params, "sending RPC request");
         let response = self.client.post(&self.url).json(&body).send().await?;
 
         let status = response.status();
         let response_body: Value = response.json().await?;
-        if std::env::var("SCE_DEBUG_RPC").is_ok() {
-            debug!(
-                method,
-                response = %serde_json::to_string(&response_body).unwrap_or_default(),
-                "RPC response"
-            );
-        }
 
         if let Some(error) = response_body.get("error") {
             let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
@@ -79,7 +72,7 @@ impl RpcClient {
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown error")
                 .to_string();
-            debug!(method, code, message, "RPC error");
+            debug!(method, code, message, "RPC error response");
             return Err(AppError::Rpc {
                 status: code,
                 message,
@@ -91,6 +84,12 @@ impl RpcClient {
             message: "response missing 'result' field".to_string(),
         })?;
 
+        debug!(
+            method,
+            status = %status,
+            result = %serde_json::to_string(result).unwrap_or_default(),
+            "RPC response received"
+        );
         trace!(method, "RPC call succeeded");
         serde_json::from_value(result.clone())
             .map_err(|e| AppError::General(format!("failed to deserialize RPC response: {e}")))
