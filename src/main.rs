@@ -276,9 +276,6 @@ async fn cmd_estimate(
         let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
         let client = rpc::client::RpcClient::new(&endpoint);
 
-        xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
-        debug!(arg_count = args.len(), "validated arguments against contract spec");
-
         let sc_vals: Vec<stellar_xdr::ScVal> = args
             .iter()
             .map(|a| xdr_helper::parse_arg_scval(a))
@@ -287,6 +284,10 @@ async fn cmd_estimate(
 
         let tx_xdr =
             xdr_helper::build_simulation_tx_envelope(&wasm_info.bytes, contract_id, fn_name, &sc_vals)?;
+
+        xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
+        debug!(arg_count = args.len(), "validated arguments against contract spec");
+
         let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
         debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
 
