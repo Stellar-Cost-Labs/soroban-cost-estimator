@@ -2,6 +2,7 @@ use std::io::Cursor;
 use std::path::Path;
 
 use stellar_xdr::ReadXdr;
+use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
 
@@ -15,6 +16,7 @@ use crate::error::{AppError, AppResult};
 /// # Network calls
 /// None — pure file I/O + parsing.
 pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
+    debug!(path = %path.display(), "loading WASM file");
     let bytes = std::fs::read(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             AppError::FileNotFound(path.display().to_string())
@@ -22,29 +24,25 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
             AppError::Io(e)
         }
     })?;
+    debug!(bytes = bytes.len(), "WASM bytes read");
 
     validate_wasm(&bytes)?;
+    debug!("WASM validated");
+
     let functions = enumerate_functions(&bytes)?;
-    // The spec is advisory: if it cannot be decoded (e.g. an oversized or
-    // malformed `contractspecv0` section), degrade to bare WASM exports
-    // rather than failing the whole load.
     let (spec_functions, has_spec) = parse_contract_spec(&bytes).unwrap_or_default();
 
-    // Enrich the export-derived function list with spec-derived typed params.
     let mut functions = functions;
     if !spec_functions.is_empty() {
         for fn_info in &mut functions {
             if let Some((_, params)) = spec_functions.iter().find(|(n, _)| n == &fn_info.name) {
                 fn_info.params = params.clone();
-                // The WASM type section counts the injected `env` pointer as
-                // a parameter (`increment(env, step)` reports 2), but the
-                // spec knows the real user-facing arity. Prefer the spec so
-                // `param_count` drives --arg/--fn decisions correctly.
                 fn_info.param_count = params.len() as u32;
             }
         }
     }
 
+    trace!(functions = functions.len(), has_spec, "WASM parsed");
     Ok(WasmInfo {
         bytes,
         functions,
@@ -53,13 +51,13 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
 }
 
 /// Basic structural validation of a WASM binary.
-fn validate_wasm(bytes: &[u8]) -> AppResult<()> {
+pub fn validate_wasm(bytes: &[u8]) -> AppResult<()> {
     wasmparser::validate(bytes).map_err(|e| AppError::WasmValidation(e.to_string()))?;
     Ok(())
 }
 
 /// Enumerates exported function names from a validated WASM binary.
-fn enumerate_functions(bytes: &[u8]) -> AppResult<Vec<FunctionInfo>> {
+pub fn enumerate_functions(bytes: &[u8]) -> AppResult<Vec<FunctionInfo>> {
     let mut functions = Vec::new();
     // Map from function index -> type index
     let mut func_to_type: Vec<u32> = Vec::new();
@@ -119,7 +117,7 @@ fn enumerate_functions(bytes: &[u8]) -> AppResult<Vec<FunctionInfo>> {
 }
 
 /// Decoded spec function entries: (function name, typed parameter list).
-type SpecFunctions = Vec<(String, Vec<ParamInfo>)>;
+pub type SpecFunctions = Vec<(String, Vec<ParamInfo>)>;
 
 /// Decodes the Soroban contract spec (`contractspecv0` custom section).
 ///
@@ -132,7 +130,7 @@ type SpecFunctions = Vec<(String, Vec<ParamInfo>)>;
 /// 4-byte union discriminant (e.g. `00 00 00 00` = FunctionV0). We therefore
 /// decode entries one at a time from a cursor, stopping when the stream is
 /// exhausted.
-fn parse_contract_spec(bytes: &[u8]) -> AppResult<(SpecFunctions, bool)> {
+pub fn parse_contract_spec(bytes: &[u8]) -> AppResult<(SpecFunctions, bool)> {
     let mut spec_functions = Vec::new();
     let mut has_spec = false;
 
@@ -176,6 +174,7 @@ fn parse_contract_spec(bytes: &[u8]) -> AppResult<(SpecFunctions, bool)> {
 }
 
 /// Human-readable name for a `ScSpecTypeDef`.
+#[must_use]
 fn spec_type_name(t: &stellar_xdr::ScSpecTypeDef) -> &'static str {
     match t {
         stellar_xdr::ScSpecTypeDef::Val => "val",
@@ -230,6 +229,7 @@ pub struct FunctionInfo {
 }
 
 /// Formats a function with its spec-derived signature, e.g. `increment(x: I64)`.
+#[must_use]
 pub fn format_function(fn_info: &FunctionInfo) -> String {
     if fn_info.params.is_empty() {
         return fn_info.name.clone();

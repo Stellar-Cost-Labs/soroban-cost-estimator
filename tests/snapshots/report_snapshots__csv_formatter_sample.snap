@@ -1,0 +1,6 @@
+---
+source: tests/report_snapshots.rs
+expression: CsvFormatter.format(&report)
+---
+function,network,ledger,wasm_hash,cpu_instructions,memory_bytes,read_entries,write_entries,read_bytes,write_bytes,tx_size,non_refundable_stroops,refundable_stroops,total_stroops,total_xlm
+increment,testnet,3894195,abc123def456,532502,0,1,1,0,136,156,4496,10931,15427,0.0015427

@@ -5,15 +5,46 @@
 //! command cross-references cached estimates to tell the user which ones
 //! are now stale due to network pricing changes.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use tracing::{debug, trace, warn};
 
 use crate::error::{AppError, AppResult};
+
+/// Current cache-entry schema version.
+///
+/// Bump this whenever the on-disk `CachedEstimate` JSON shape changes.
+/// Entries written by a version of the tool with an older schema are
+/// migrated forward through [`migrate_to_latest`]; entries written by a
+/// *newer* tool (version greater than this) are rejected rather than
+/// silently misread.
+pub const CACHE_SCHEMA_VERSION: u32 = 1;
+
+/// Implicit schema version of cache entries written before the `version`
+/// field existed.
+///
+/// Those legacy entries have no `version` key in their JSON, so serde's
+/// `default` fills in this value via [`default_schema_version`]. They are
+/// the first schema version and require no transformation to reach the
+/// current schema.
+pub const INITIAL_SCHEMA_VERSION: u32 = 1;
+
+/// serde default for the `version` field, applied when an older (or hand
+/// written) entry omits it. Legacy entries predating the version field are
+/// treated as [`INITIAL_SCHEMA_VERSION`].
+fn default_schema_version() -> u32 {
+    INITIAL_SCHEMA_VERSION
+}
 
 /// A cached estimate result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedEstimate {
+    /// Schema version of this entry. Legacy entries default to
+    /// [`INITIAL_SCHEMA_VERSION`] when the field is absent.
+    #[serde(default = "default_schema_version")]
+    pub version: u32,
     /// SHA-256 hash of the WASM bytes (hex).
     pub wasm_hash: String,
     /// Contract function name (e.g. `"(wasm upload)"`).
@@ -34,11 +65,19 @@ pub struct CachedEstimate {
     pub timestamp: String,
 }
 
-/// Returns the cache directory path, creating it if needed.
-fn cache_dir() -> AppResult<PathBuf> {
+/// Returns the base data directory path: `~/.soroban-cost-estimator`,
+/// creating it if needed.
+fn data_dir() -> AppResult<PathBuf> {
     let home = dirs::home_dir()
         .ok_or_else(|| AppError::General("could not determine home directory".to_string()))?;
-    let dir = home.join(".soroban-cost-estimator").join("cache");
+    let dir = home.join(".soroban-cost-estimator");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Returns the cache directory path, creating it if needed.
+fn cache_dir() -> AppResult<PathBuf> {
+    let dir = data_dir()?.join("cache");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -78,6 +117,7 @@ pub fn save_estimate(
     let path = dir.join(&filename);
 
     let cached = CachedEstimate {
+        version: CACHE_SCHEMA_VERSION,
         wasm_hash: wasm_hash.to_string(),
         function: function.to_string(),
         args_hash,
@@ -91,7 +131,39 @@ pub fn save_estimate(
 
     let json = serde_json::to_string_pretty(&cached)?;
     std::fs::write(&path, json)?;
+    debug!(path = %path.display(), function, network, ledger, "estimate cached");
     Ok(())
+}
+
+/// Carry a cached estimate forward to the current schema version.
+///
+/// * `version < CACHE_SCHEMA_VERSION`: entries from older schemas are
+///   migrated one step at a time toward the current schema. Currently the
+///   initial and current schemas are identical, so this is the identity
+///   transform; adding a schema change later means appending a migration
+///   step here.
+/// * `version == CACHE_SCHEMA_VERSION`: returned unchanged.
+/// * `version > CACHE_SCHEMA_VERSION`: an entry written by a *newer* tool.
+///   It cannot be safely read (or silently downgraded), so this returns an
+///   error instead of misinterpreting fields.
+///
+/// # Network calls
+/// None — pure transformation.
+pub fn migrate_to_latest(cached: CachedEstimate) -> AppResult<CachedEstimate> {
+    let mut migrated = cached;
+
+    match migrated.version {
+        v if v > CACHE_SCHEMA_VERSION => Err(AppError::General(format!(
+            "cache entry schema v{v} is newer than supported v{CACHE_SCHEMA_VERSION}"
+        ))),
+        // Nothing below the current schema exists yet; future schema changes
+        // add per-step migrations here, e.g. v1 -> v2.
+        v if v < CACHE_SCHEMA_VERSION => {
+            migrated.version = CACHE_SCHEMA_VERSION;
+            Ok(migrated)
+        }
+        _ => Ok(migrated),
+    }
 }
 
 /// Compute a hash of the args for use as a cache key.
@@ -122,7 +194,58 @@ pub fn load_estimate(
     let content = std::fs::read_to_string(&path)?;
     let cached: CachedEstimate =
         serde_json::from_str(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))?;
+    let cached = migrate_to_latest(cached)?;
     Ok(Some(cached))
+}
+
+/// Whether a cached estimate is still fresh, i.e. its timestamp is within
+/// `ttl` of now.
+///
+/// Entries whose timestamp cannot be parsed as RFC 3339 are treated as **not**
+/// fresh: an unverifiable age must not be trusted, so the caller re-simulates
+/// and overwrites the entry.
+///
+/// # Network calls
+/// None — pure time comparison.
+pub fn is_cache_entry_fresh(entry: &CachedEstimate, ttl: std::time::Duration) -> bool {
+    let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&entry.timestamp) else {
+        return false;
+    };
+    let ts = ts.with_timezone(&chrono::Utc);
+    let Ok(ttl) = chrono::TimeDelta::from_std(ttl) else {
+        return false;
+    };
+    chrono::Utc::now().signed_duration_since(ts) <= ttl
+}
+
+/// Load a cached estimate only if it is still fresh (within `ttl`).
+///
+/// Returns `Ok(None)` when no entry exists **or** when the entry has
+/// expired — both mean "re-simulate".
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn load_fresh_estimate(
+    wasm_hash: &str,
+    function: &str,
+    args: &[String],
+    ttl: std::time::Duration,
+) -> AppResult<Option<CachedEstimate>> {
+    let Some(cached) = load_estimate(wasm_hash, function, args)? else {
+        return Ok(None);
+    };
+    if is_cache_entry_fresh(&cached, ttl) {
+        trace!(function, ttl_secs = ttl.as_secs(), "fresh cached estimate");
+        Ok(Some(cached))
+    } else {
+        trace!(
+            function,
+            ttl_secs = ttl.as_secs(),
+            timestamp = %cached.timestamp,
+            "cached estimate expired"
+        );
+        Ok(None)
+    }
 }
 
 /// Find all cached estimates for a given network.
@@ -151,7 +274,78 @@ pub fn list_cached_estimates(network: &str) -> AppResult<Vec<CachedEstimate>> {
         }
     }
 
+    trace!(network, count = estimates.len(), "listed cached estimates");
     Ok(estimates)
+}
+
+/// Integrity status of a single cache entry file.
+#[derive(Debug, Clone)]
+pub struct CacheEntryStatus {
+    /// File name of the cache entry (e.g. `"abc123-my_func-def456.json"`).
+    pub filename: String,
+    /// Schema version parsed from the entry, if it deserialized at all.
+    pub version: Option<u32>,
+    /// Whether the file parsed as a valid, readable `CachedEstimate`.
+    /// Entries carrying a schema newer than the current one are not valid.
+    pub valid: bool,
+}
+
+/// Verify the integrity of every entry in the estimate cache.
+///
+/// Reads each `.json` file in the cache directory and checks that it parses
+/// as a valid [`CachedEstimate`]. Returns one status per entry, sorted by
+/// filename. Files that are unreadable, invalid JSON, or missing required
+/// fields are reported as not valid.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn verify_cache() -> AppResult<Vec<CacheEntryStatus>> {
+    let dir = cache_dir()?;
+    let mut statuses = Vec::new();
+
+    if !dir.exists() {
+        return Ok(statuses);
+    }
+
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().map(|e| e == "json").unwrap_or(false) {
+            let filename = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            // A file counts as valid when it both parses as a
+            // `CachedEstimate` and carries a schema this tool can read.
+            // Entries from the future (version > current) parse fine but are
+            // not migratable to the current schema, so they are flagged.
+            let (valid, version) = match std::fs::read_to_string(&path) {
+                Ok(content) => match serde_json::from_str::<CachedEstimate>(&content) {
+                    Ok(parsed) => {
+                        let version = Some(parsed.version);
+                        let valid = migrate_to_latest(parsed).is_ok();
+                        (valid, version)
+                    }
+                    Err(_) => (false, None),
+                },
+                Err(_) => (false, None),
+            };
+
+            if !valid {
+                warn!(filename, "corrupt or unsupported cache entry");
+            }
+            statuses.push(CacheEntryStatus {
+                filename,
+                version,
+                valid,
+            });
+        }
+    }
+
+    statuses.sort_by(|a, b| a.filename.cmp(&b.filename));
+    debug!(total = statuses.len(), "cache verification complete");
+    Ok(statuses)
 }
 
 /// Check which cached estimates are now stale (simulated at an earlier ledger).
@@ -165,4 +359,131 @@ pub fn find_stale_estimates(
         .iter()
         .filter(|e| e.ledger < current_ledger)
         .collect()
+}
+
+/// Last-observed identity of a WASM file: its SHA-256 hash and modification
+/// time. Used to detect when a contract was recompiled or replaced so the
+/// stale cache entries from the previous build can be dropped automatically.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WasmFileRecord {
+    /// SHA-256 hash of the WASM bytes (hex), as last observed.
+    wasm_hash: String,
+    /// File mtime, in nanoseconds since the Unix epoch.
+    mtime_nanos: u64,
+}
+
+/// Registry mapping a canonical WASM file path to its last-observed identity.
+type WasmRegistry = HashMap<String, WasmFileRecord>;
+
+/// Path to the on-disk registry of WASM file identities.
+///
+/// Lives in the data directory (not the cache directory) so that the cache
+/// directory stays a flat list of `CachedEstimate` JSON files.
+fn registry_path() -> AppResult<PathBuf> {
+    Ok(data_dir()?.join("wasm-files.json"))
+}
+
+/// Load the WASM file registry, or an empty one if it does not exist yet.
+fn load_registry() -> AppResult<WasmRegistry> {
+    let path = registry_path()?;
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let content = std::fs::read_to_string(&path)?;
+    // A malformed registry (e.g. hand-edited) degrades to empty rather than
+    // failing the command; the next invalidation pass will rebuild it.
+    let registry: WasmRegistry = serde_json::from_str(&content).unwrap_or_default();
+    Ok(registry)
+}
+
+/// Persist the WASM file registry to disk.
+fn save_registry(registry: &WasmRegistry) -> AppResult<()> {
+    let path = registry_path()?;
+    let json = serde_json::to_string_pretty(registry)?;
+    std::fs::write(&path, json)?;
+    Ok(())
+}
+
+/// Remove every cached estimate produced from the given WASM hash.
+///
+/// Returns the number of cache files removed. Used by
+/// [`invalidate_if_wasm_changed`] to drop entries from a previous build once
+/// the WASM file has changed.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn remove_cached_estimates_for_wasm(wasm_hash: &str) -> AppResult<usize> {
+    let dir = cache_dir()?;
+    let mut removed = 0;
+
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().map(|e| e == "json").unwrap_or(false) {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(cached) = serde_json::from_str::<CachedEstimate>(&content) {
+                    if cached.wasm_hash == wasm_hash {
+                        std::fs::remove_file(&path)?;
+                        removed += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(removed)
+}
+
+/// Invalidate cache entries when a WASM file's mtime or hash has changed.
+///
+/// Called before estimates are saved for a freshly loaded WASM file. It
+/// compares the file's current hash and modification time against the last
+/// observed values in the registry; if either differs (the contract was
+/// recompiled or replaced), every cache entry keyed to the previous hash is
+/// removed so the new build's estimates start clean.
+///
+/// Returns `true` when stale entries were removed, `false` otherwise.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn invalidate_if_wasm_changed(wasm_path: &Path, current_hash: &str) -> AppResult<bool> {
+    let mtime_nanos = wasm_file_mtime_nanos(wasm_path)?;
+    let key = std::fs::canonicalize(wasm_path)
+        .unwrap_or_else(|_| wasm_path.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+
+    let mut registry = load_registry()?;
+    let changed = match registry.get(&key) {
+        Some(prev) if prev.wasm_hash != current_hash || prev.mtime_nanos != mtime_nanos => {
+            remove_cached_estimates_for_wasm(&prev.wasm_hash)?;
+            true
+        }
+        _ => false,
+    };
+
+    registry.insert(
+        key,
+        WasmFileRecord {
+            wasm_hash: current_hash.to_string(),
+            mtime_nanos,
+        },
+    );
+    save_registry(&registry)?;
+
+    Ok(changed)
+}
+
+/// Read a file's modification time as nanoseconds since the Unix epoch.
+///
+/// Falls back to `0` when the platform cannot report a modification time,
+/// rather than failing the whole command.
+fn wasm_file_mtime_nanos(wasm_path: &Path) -> AppResult<u64> {
+    let metadata = std::fs::metadata(wasm_path)?;
+    let modified = metadata.modified()?;
+    let nanos = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    Ok(nanos)
 }
