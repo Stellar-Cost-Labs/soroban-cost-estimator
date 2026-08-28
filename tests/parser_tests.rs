@@ -164,3 +164,71 @@ fn test_module_metadata_real_contract() {
         "summary should describe entry points, got: {summary}"
     );
 }
+
+#[test]
+fn test_validate_arg_value_i64() {
+    let ty = stellar_xdr::ScSpecTypeDef::I64;
+
+    assert!(soroban_cost_estimator::wasm::parser::validate_arg_value(&ty, "42").is_ok());
+    assert!(soroban_cost_estimator::wasm::parser::validate_arg_value(&ty, "step=42").is_ok());
+    assert!(soroban_cost_estimator::wasm::parser::validate_arg_value(&ty, "-7").is_ok());
+    assert!(
+        soroban_cost_estimator::wasm::parser::validate_arg_value(&ty, "abc").is_err(),
+        "abc is not an i64"
+    );
+    assert!(
+        soroban_cost_estimator::wasm::parser::validate_arg_value(&ty, "99999999999999999999999999")
+            .is_err(),
+        "overflow is not an i64"
+    );
+}
+
+#[test]
+fn test_validate_arg_value_bool() {
+    let ty = stellar_xdr::ScSpecTypeDef::Bool;
+    assert!(soroban_cost_estimator::wasm::parser::validate_arg_value(&ty, "true").is_ok());
+    assert!(soroban_cost_estimator::wasm::parser::validate_arg_value(&ty, "false").is_ok());
+    assert!(soroban_cost_estimator::wasm::parser::validate_arg_value(&ty, "yes").is_err());
+}
+
+#[test]
+fn test_validate_arg_value_symbol() {
+    let ty = stellar_xdr::ScSpecTypeDef::Symbol;
+    assert!(soroban_cost_estimator::wasm::parser::validate_arg_value(&ty, "player_1").is_ok());
+    assert!(
+        soroban_cost_estimator::wasm::parser::validate_arg_value(&ty, "a b").is_err(),
+        "spaces are not symbols"
+    );
+    assert!(
+        soroban_cost_estimator::wasm::parser::validate_arg_value(&ty, "").is_err(),
+        "empty symbol is invalid"
+    );
+    let too_long = "a".repeat(33);
+    assert!(soroban_cost_estimator::wasm::parser::validate_arg_value(&ty, &too_long).is_err());
+}
+
+#[test]
+fn test_validate_arg_value_wide_integers() {
+    let ty = stellar_xdr::ScSpecTypeDef::U256;
+    assert!(
+        soroban_cost_estimator::wasm::parser::validate_arg_value(
+            &ty,
+            "340282366920938463463374607431768211455"
+        )
+        .is_ok()
+    );
+    assert!(soroban_cost_estimator::wasm::parser::validate_arg_value(&ty, "0x1ff").is_ok());
+    assert!(soroban_cost_estimator::wasm::parser::validate_arg_value(&ty, "abc").is_err());
+    assert!(soroban_cost_estimator::wasm::parser::validate_arg_value(&ty, "").is_err());
+}
+
+#[test]
+fn test_validate_arg_value_bytes_n() {
+    let two = stellar_xdr::ScSpecTypeDef::BytesN(stellar_xdr::ScSpecTypeBytesN { n: 2 });
+    assert!(soroban_cost_estimator::wasm::parser::validate_arg_value(&two, "0x00ff").is_ok());
+    assert!(soroban_cost_estimator::wasm::parser::validate_arg_value(&two, "00ff").is_ok());
+    assert!(
+        soroban_cost_estimator::wasm::parser::validate_arg_value(&two, "0x00").is_err(),
+        "2-byte type needs 2 bytes"
+    );
+}

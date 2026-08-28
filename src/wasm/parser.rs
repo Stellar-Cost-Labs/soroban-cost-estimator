@@ -278,6 +278,7 @@ pub fn parse_contract_spec(bytes: &[u8]) -> AppResult<(SpecFunctions, bool)> {
                         .map(|input| ParamInfo {
                             name: String::from_utf8_lossy(input.name.as_slice()).to_string(),
                             type_name: spec_type_name(&input.type_).to_string(),
+                            type_def: input.type_.clone(),
                         })
                         .collect();
                     spec_functions.push((name, params));
@@ -329,6 +330,114 @@ pub struct ParamInfo {
     pub name: String,
     /// Human-readable Soroban type, e.g. `I64`, `Symbol`, `String`.
     pub type_name: String,
+    /// The raw spec type definition, used for `--arg` value validation.
+    pub type_def: stellar_xdr::ScSpecTypeDef,
+}
+
+/// Validates a single `--arg` `key=value` pair against a contract-spec type.
+///
+/// When a contract spec is present the declared type is authoritative, so a
+/// value that cannot represent that type (e.g. `abc` for `i64`) is rejected
+/// before any RPC simulation is attempted. Bare values and `key=value` forms
+/// are both accepted; the key is informational and ignored.
+///
+/// "Out of scope" types (custom user-defined types, val/void/vec/map/tuple,
+/// options, results) cannot be validated without a bespoke parser and are
+/// accepted as-is.
+pub fn validate_arg_value(type_def: &stellar_xdr::ScSpecTypeDef, arg: &str) -> AppResult<()> {
+    let value = arg.split_once('=').map(|(_, v)| v).unwrap_or(arg);
+    let expected = spec_type_name(type_def);
+
+    let ok = match type_def {
+        stellar_xdr::ScSpecTypeDef::Bool => value == "true" || value == "false",
+        stellar_xdr::ScSpecTypeDef::U32 => value.parse::<u32>().is_ok(),
+        stellar_xdr::ScSpecTypeDef::I32 => value.parse::<i32>().is_ok(),
+        stellar_xdr::ScSpecTypeDef::U64
+        | stellar_xdr::ScSpecTypeDef::Timepoint
+        | stellar_xdr::ScSpecTypeDef::Duration => value.parse::<u64>().is_ok(),
+        stellar_xdr::ScSpecTypeDef::I64 => value.parse::<i64>().is_ok(),
+        stellar_xdr::ScSpecTypeDef::U128 => value.parse::<u128>().is_ok(),
+        stellar_xdr::ScSpecTypeDef::I128 => value.parse::<i128>().is_ok(),
+        stellar_xdr::ScSpecTypeDef::U256 | stellar_xdr::ScSpecTypeDef::I256 => {
+            is_wide_integer(value)
+        }
+        stellar_xdr::ScSpecTypeDef::Symbol => is_valid_symbol(value),
+        stellar_xdr::ScSpecTypeDef::Bytes => is_valid_hex(value),
+        stellar_xdr::ScSpecTypeDef::BytesN(spec) => {
+            let hex = value
+                .strip_prefix("0x")
+                .or_else(|| value.strip_prefix("0X"))
+                .unwrap_or(value);
+            is_valid_hex(value) && Some(hex.len() / 2) == usize::try_from(spec.n).ok()
+        }
+        stellar_xdr::ScSpecTypeDef::Address => is_valid_address(value),
+        // Bare strings, and types that carry no validator: bespoke parsers
+        // are out of scope.
+        stellar_xdr::ScSpecTypeDef::String
+        | stellar_xdr::ScSpecTypeDef::Val
+        | stellar_xdr::ScSpecTypeDef::Void
+        | stellar_xdr::ScSpecTypeDef::Error
+        | stellar_xdr::ScSpecTypeDef::MuxedAddress
+        | stellar_xdr::ScSpecTypeDef::Option(_)
+        | stellar_xdr::ScSpecTypeDef::Result(_)
+        | stellar_xdr::ScSpecTypeDef::Vec(_)
+        | stellar_xdr::ScSpecTypeDef::Map(_)
+        | stellar_xdr::ScSpecTypeDef::Tuple(_)
+        | stellar_xdr::ScSpecTypeDef::Udt(_) => true,
+    };
+
+    if !ok {
+        return Err(AppError::TypeValidation(format!(
+            "arg '{arg}' cannot be used as '{expected}'"
+        )));
+    }
+    Ok(())
+}
+
+/// True when `value` is a plausible u256/i256 integer: optional `0x` hex or a
+/// plain decimal without sign-ambiguity issues. A full 256-bit parse is out of
+/// scope, so this is a conservative syntax check.
+#[must_use]
+pub fn is_wide_integer(value: &str) -> bool {
+    let digits = value.strip_prefix("-").unwrap_or(value);
+    if let Some(hex) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit())
+    } else {
+        !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+    }
+}
+
+/// True when `value` is a valid Soroban symbol: 1..=32 chars of `[A-Za-z0-9_]`.
+#[must_use]
+pub fn is_valid_symbol(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// True when `value` is an even-length, non-empty lowercase hex string (either
+/// bare or `0x`-prefixed).
+#[must_use]
+pub fn is_valid_hex(value: &str) -> bool {
+    let stripped = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    !stripped.is_empty()
+        && stripped.len() % 2 == 0
+        && stripped.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// True when `value` looks like a Stellar strkey address (`C…` contract or
+/// `G…` account; both are 56 chars) or a 64-hex-char contract id.
+#[must_use]
+pub fn is_valid_address(value: &str) -> bool {
+    let c_g = matches!(value.as_bytes().first(), Some(b'C' | b'G')) && value.len() == 56;
+    let hex_id = value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit());
+    c_g || hex_id
 }
 
 /// Information about a linear memory declared by a WASM module.

@@ -232,6 +232,7 @@ async fn fetch_fee_rates(client: &rpc::client::RpcClient) -> report::fee_calc::F
 /// `RpcClient`, which deduplicates identical requests — the same method with
 /// the same params — so a repeated WASM-upload envelope (when `--fn` is
 /// omitted) or identical fee-rate fetches transmit at most once.
+#[allow(clippy::too_many_lines)]
 async fn cmd_estimate(
     wasm_path: &str,
     network: &str,
@@ -283,6 +284,10 @@ async fn cmd_estimate(
 
         let tx_xdr =
             xdr_helper::build_simulation_tx_envelope(&wasm_info.bytes, contract_id, fn_name, &sc_vals)?;
+
+        xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
+        debug!(arg_count = args.len(), "validated arguments against contract spec");
+
         let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
         debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
 
@@ -1165,6 +1170,7 @@ mod tests {
                 params: vec![ParamInfo {
                     name: "step".to_string(),
                     type_name: "I64".to_string(),
+                    type_def: stellar_xdr::ScSpecTypeDef::I64,
                 }],
             }],
             start_function: None,
