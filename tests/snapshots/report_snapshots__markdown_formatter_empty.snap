@@ -6,6 +6,7 @@ expression: MarkdownFormatter.format(&empty)
 
 - **Network:** mainnet (ledger 0)
 - **WASM hash:** `0000000000000000`
+- **RPC round-trip:** 0 ms
 
 ### Resources
 
