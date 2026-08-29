@@ -457,6 +457,7 @@ async fn cmd_estimate(
             ledger: latest_ledger,
             network: network.to_string(),
             rpc_latency_ms,
+            rates: Some(fee_rates),
         };
 
         let _ = cache::save_estimate(
