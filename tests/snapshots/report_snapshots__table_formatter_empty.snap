@@ -4,6 +4,7 @@ expression: TableFormatter.format(&empty)
 ---
 Function: (wasm upload)
 Network: mainnet (ledger 0)
+RPC round-trip: 0 ms
 WASM hash: 0000000000000000
 
 +------------------+----------+---------------+
