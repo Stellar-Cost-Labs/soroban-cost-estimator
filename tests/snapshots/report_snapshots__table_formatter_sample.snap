@@ -4,6 +4,7 @@ expression: TableFormatter.format(&report)
 ---
 Function: increment
 Network: testnet (ledger 3894195)
+RPC round-trip: 87 ms
 WASM hash: abc123def456
 
 +------------------+----------+---------------+
