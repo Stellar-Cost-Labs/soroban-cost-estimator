@@ -28,6 +28,7 @@ fn sample_report() -> CostReport {
         network: "testnet".to_string(),
         rpc_latency_ms: 87,
         delta: None,
+        rates: None,
     }
 }
 
@@ -55,6 +56,7 @@ fn empty_report() -> CostReport {
         network: "mainnet".to_string(),
         rpc_latency_ms: 0,
         delta: None,
+        rates: None,
     }
 }
 
