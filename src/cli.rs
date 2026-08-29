@@ -113,6 +113,11 @@ pub enum ConfigAction {
         network: String,
         #[arg(long)]
         against: Option<String>,
+
+        /// Print a single-line summary (counts of pricing/non-pricing changes)
+        /// instead of the full diff. Useful for CI status lines.
+        #[arg(long)]
+        summary: bool,
     },
     History {
         #[arg(long, default_value = "testnet")]

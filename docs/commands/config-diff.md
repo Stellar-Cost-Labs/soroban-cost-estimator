@@ -11,6 +11,7 @@ Usage: soroban-cost-estimator config diff [OPTIONS]
 Options:
       --network <NETWORK>  Network to compare against [default: testnet]
       --against <AGAINST>  Explicit snapshot path to compare against (defaults to latest)
+      --summary            Print a single-line count summary instead of the full diff
   -h, --help               Print help
 ```
 
@@ -24,6 +25,15 @@ Options:
   recorded at an earlier ledger as potentially stale.
 - **Exit code 0** when nothing changed; **exit code 1** when a pricing change
   was detected — scripts and CI can branch on it.
+- `--summary` prints a single line, `X pricing changes, Y non-pricing changes`
+  (and suppresses the stale-cache and auto-save chatter), so you can read it
+  directly into a CI status line. The exit code and auto-save side effects are
+  unchanged. Example:
+
+  ```bash
+  soroban-cost-estimator config diff --network testnet --summary
+  # 2 pricing changes, 1 non-pricing changes
+  ```
 - When a pricing change (a network protocol/config upgrade) is detected, the
   new config is **automatically saved** as a snapshot in
   `~/.soroban-cost-estimator/snapshots/`, so it becomes the baseline for the
