@@ -262,6 +262,12 @@ async fn cmd_estimate(
         let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
         let function_name = fn_name.unwrap_or("(wasm upload)");
 
+        // Show the hash before anything else — the user can verify they are
+        // simulating the intended file before any RPC traffic is sent.
+        if !json_flag {
+            println!("WASM SHA-256: {wasm_hash}");
+        }
+
         // With --cache-ttl, reuse a still-fresh cached estimate and skip the
         // (expensive) simulation entirely.
         let ttl_secs = cache_ttl.map(parse_interval_secs);
@@ -391,10 +397,16 @@ async fn cmd_estimate_all(
     let span = info_span!("cmd_estimate_all", wasm_path, network);
     async {
         let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
-        let endpoint = rpc::client::resolve_endpoint(network, None)?;
-        let client = rpc::client::RpcClient::new(&endpoint);
+
+        // Confirm the exact file being estimated up front — printed before any
+        // endpoint resolution or simulation, so the hash is visible even when
+        // the network cannot be reached.
+        use sha2::Digest;
+        let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
 
         if !json_flag {
+            println!("WASM SHA-256: {wasm_hash}");
+            println!();
             println!("{}", wasm::parser::format_module_metadata(&wasm_info));
             println!();
             println!(
@@ -421,8 +433,8 @@ async fn cmd_estimate_all(
             }
         }
 
-        use sha2::Digest;
-        let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
+        let endpoint = rpc::client::resolve_endpoint(network, None)?;
+        let client = rpc::client::RpcClient::new(&endpoint);
 
         let mut json_results: Vec<serde_json::Value> = Vec::new();
         let total = wasm_info.functions.len();
