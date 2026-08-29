@@ -30,6 +30,7 @@ async fn main() {
 }
 
 async fn run(args: cli::Cli) -> error::AppResult<()> {
+    let rps = args.rps;
     match args.command {
         cli::Command::Estimate {
             wasm,
@@ -50,6 +51,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 &args,
                 cache_ttl.as_deref(),
                 json,
+                rps,
             )
             .await
         }
@@ -58,14 +60,14 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             network,
             id,
             json,
-        } => cmd_estimate_all(&wasm, &network, id.as_deref(), json).await,
+        } => cmd_estimate_all(&wasm, &network, id.as_deref(), json, rps).await,
         cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(&wasm, json),
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot { network, out, json } => {
-                cmd_config_snapshot(&network, out.as_deref(), json).await
+                cmd_config_snapshot(&network, out.as_deref(), json, rps).await
             }
             cli::ConfigAction::Diff { network, against } => {
-                cmd_config_diff(&network, against.as_deref()).await
+                cmd_config_diff(&network, against.as_deref(), rps).await
             }
             cli::ConfigAction::History { network } => cmd_config_history(&network),
             cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network),
@@ -77,10 +79,10 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 network,
                 id,
                 json,
-            } => cmd_cache_warm(&wasm, &network, id.as_deref(), json).await,
+            } => cmd_cache_warm(&wasm, &network, id.as_deref(), json, rps).await,
             cli::CacheAction::Verify => cmd_cache_verify(),
         },
-        cli::Command::Watch { network, interval } => cmd_watch(&network, &interval).await,
+        cli::Command::Watch { network, interval } => cmd_watch(&network, &interval, rps).await,
     }
 }
 
@@ -243,6 +245,7 @@ async fn cmd_estimate(
     args: &[String],
     cache_ttl: Option<&str>,
     json_flag: bool,
+    rps: Option<u64>,
 ) -> error::AppResult<()> {
     use sha2::Digest;
     use tracing::{Instrument, info_span};
@@ -262,6 +265,12 @@ async fn cmd_estimate(
         let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
         let function_name = fn_name.unwrap_or("(wasm upload)");
 
+        // Show the hash before anything else — the user can verify they are
+        // simulating the intended file before any RPC traffic is sent.
+        if !json_flag {
+            println!("WASM SHA-256: {wasm_hash}");
+        }
+
         // With --cache-ttl, reuse a still-fresh cached estimate and skip the
         // (expensive) simulation entirely.
         let ttl_secs = cache_ttl.map(parse_interval_secs);
@@ -275,7 +284,7 @@ async fn cmd_estimate(
         }
 
         let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
-        let client = rpc::client::RpcClient::new(&endpoint);
+        let client = rpc::client::RpcClient::with_rate_limit(&endpoint, rps);
 
         let sc_vals: Vec<stellar_xdr::ScVal> = args
             .iter()
@@ -379,6 +388,7 @@ async fn cmd_estimate_all(
     network: &str,
     contract_id: Option<&str>,
     json_flag: bool,
+    rps: Option<u64>,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -386,10 +396,16 @@ async fn cmd_estimate_all(
     let span = info_span!("cmd_estimate_all", wasm_path, network);
     async {
         let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
-        let endpoint = rpc::client::resolve_endpoint(network, None)?;
-        let client = rpc::client::RpcClient::new(&endpoint);
+
+        // Confirm the exact file being estimated up front — printed before any
+        // endpoint resolution or simulation, so the hash is visible even when
+        // the network cannot be reached.
+        use sha2::Digest;
+        let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
 
         if !json_flag {
+            println!("WASM SHA-256: {wasm_hash}");
+            println!();
             println!("{}", wasm::parser::format_module_metadata(&wasm_info));
             println!();
             println!(
@@ -408,6 +424,7 @@ async fn cmd_estimate_all(
                     "absent (bare WASM exports only)"
                 }
             );
+            println!("{}", wasm::parser::format_contract_meta(&wasm_info.contract_meta));
             if contract_id.is_none() {
                 println!(
                     "Note: pass --id <contract-id> to simulate each function against a deployed contract."
@@ -415,8 +432,8 @@ async fn cmd_estimate_all(
             }
         }
 
-        use sha2::Digest;
-        let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
+        let endpoint = rpc::client::resolve_endpoint(network, None)?;
+        let client = rpc::client::RpcClient::new(&endpoint);
 
         let mut json_results: Vec<serde_json::Value> = Vec::new();
         let total = wasm_info.functions.len();
@@ -619,6 +636,10 @@ fn cmd_wasm_info(wasm_path: &str, json_flag: bool) -> error::AppResult<()> {
             "absent (bare WASM exports only)"
         }
     );
+    println!(
+        "{}",
+        wasm::parser::format_contract_meta(&wasm_info.contract_meta)
+    );
     Ok(())
 }
 
@@ -633,6 +654,14 @@ fn wasm_info_json(
         "size": wasm_info.bytes.len(),
         "sha256": hash,
         "has_spec": wasm_info.has_spec,
+        "contract_meta": {
+            "name": wasm_info.contract_meta.name,
+            "version": wasm_info.contract_meta.version,
+            "description": wasm_info.contract_meta.description,
+            "entries": wasm_info.contract_meta.entries.iter().map(|(key, value)| {
+                serde_json::json!({ "key": key, "value": value })
+            }).collect::<Vec<_>>(),
+        },
         "functions": wasm_info.functions.iter().map(|f| {
             serde_json::json!({
                 "name": f.name,
@@ -654,6 +683,7 @@ fn wasm_info_json(
 /// Makes one batched `getLedgerEntries` RPC call.
 async fn fetch_config_snapshot(
     network: &str,
+    rps: Option<u64>,
 ) -> error::AppResult<config_snapshot::model::ConfigSnapshot> {
     use tracing::Instrument;
     use tracing::{debug, info_span};
@@ -661,7 +691,7 @@ async fn fetch_config_snapshot(
     let span = info_span!("fetch_config_snapshot", network);
     async {
         let endpoint = rpc::client::resolve_endpoint(network, None)?;
-        let client = rpc::client::RpcClient::new(&endpoint);
+        let client = rpc::client::RpcClient::with_rate_limit(&endpoint, rps);
         debug!("fetching all config settings");
         let raw_entries = rpc::config::fetch_all_config_settings(&client).await?;
         debug!(entries = raw_entries.len(), "received config entries");
@@ -714,6 +744,7 @@ async fn cmd_config_snapshot(
     network: &str,
     out_path: Option<&str>,
     json_flag: bool,
+    rps: Option<u64>,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -721,7 +752,7 @@ async fn cmd_config_snapshot(
     let span = info_span!("cmd_config_snapshot", network);
     async {
         info!("taking config snapshot");
-        let snapshot = fetch_config_snapshot(network).await?;
+        let snapshot = fetch_config_snapshot(network, rps).await?;
 
         let path = config_snapshot::store::save_snapshot(&snapshot, out_path)?;
         info!(path = %path.display(), ledger = snapshot.ledger, "snapshot saved");
@@ -750,7 +781,11 @@ fn upgrade_detected(diff: &config_snapshot::diff::ConfigDiff) -> bool {
 }
 
 /// `config diff` command: compare current config against a snapshot.
-async fn cmd_config_diff(network: &str, against_path: Option<&str>) -> error::AppResult<()> {
+async fn cmd_config_diff(
+    network: &str,
+    against_path: Option<&str>,
+    rps: Option<u64>,
+) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::{debug, info_span};
 
@@ -767,7 +802,7 @@ async fn cmd_config_diff(network: &str, against_path: Option<&str>) -> error::Ap
             }
         };
 
-        let new_snapshot = fetch_config_snapshot(network).await?;
+        let new_snapshot = fetch_config_snapshot(network, rps).await?;
 
         let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
         debug!(
@@ -958,10 +993,14 @@ async fn shutdown_signal() -> error::AppResult<()> {
 ///
 /// # Network calls
 /// Makes one batched `getLedgerEntries` RPC call.
-async fn watch_poll_once(network: &str, first: &mut bool) -> error::AppResult<()> {
+async fn watch_poll_once(
+    network: &str,
+    first: &mut bool,
+    rps: Option<u64>,
+) -> error::AppResult<()> {
     use tracing::{debug, warn};
 
-    match fetch_config_snapshot(network).await {
+    match fetch_config_snapshot(network, rps).await {
         Ok(snapshot) => {
             if !*first {
                 if let Ok(old_snapshot) = config_snapshot::store::load_latest_snapshot(network) {
@@ -991,7 +1030,7 @@ async fn watch_poll_once(network: &str, first: &mut bool) -> error::AppResult<()
 /// Polls immediately, then on `interval`, until SIGINT (Ctrl-C) or SIGTERM
 /// is received — then exits cleanly with code 0. The in-flight poll is
 /// cancelled rather than writing a partial snapshot.
-async fn cmd_watch(network: &str, interval: &str) -> error::AppResult<()> {
+async fn cmd_watch(network: &str, interval: &str, rps: Option<u64>) -> error::AppResult<()> {
     use tracing::info;
 
     let interval_secs: u64 = parse_interval_secs(interval);
@@ -1012,7 +1051,7 @@ async fn cmd_watch(network: &str, interval: &str) -> error::AppResult<()> {
                 return Ok(());
             }
             () = async {
-                let _ = watch_poll_once(network, &mut first).await;
+                let _ = watch_poll_once(network, &mut first, rps).await;
                 tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
             } => {}
         }
@@ -1065,8 +1104,9 @@ async fn cmd_cache_warm(
     network: &str,
     contract_id: Option<&str>,
     json_flag: bool,
+    rps: Option<u64>,
 ) -> error::AppResult<()> {
-    cmd_estimate_all(wasm_path, network, contract_id, json_flag).await
+    cmd_estimate_all(wasm_path, network, contract_id, json_flag, rps).await
 }
 
 #[cfg(test)]
@@ -1078,7 +1118,7 @@ mod tests {
     use soroban_cost_estimator::config_snapshot::model::{
         ConfigSnapshot, ContractComputeV0, ContractLedgerCostV0,
     };
-    use soroban_cost_estimator::wasm::parser::{FunctionInfo, ParamInfo, WasmInfo};
+    use soroban_cost_estimator::wasm::parser::{ContractMeta, FunctionInfo, ParamInfo, WasmInfo};
 
     fn snapshot_with_compute_fee(fee: i64) -> ConfigSnapshot {
         ConfigSnapshot {
@@ -1195,6 +1235,7 @@ mod tests {
         let info = WasmInfo {
             bytes: vec![0u8; 44],
             has_spec: true,
+            contract_meta: ContractMeta::default(),
             functions: vec![FunctionInfo {
                 name: "increment".to_string(),
                 param_count: 1,
@@ -1216,6 +1257,8 @@ mod tests {
         assert_eq!(value["size"], 44);
         assert_eq!(value["sha256"], "deadbeef");
         assert_eq!(value["has_spec"], true);
+        assert_eq!(value["contract_meta"]["name"], serde_json::Value::Null);
+        assert_eq!(value["contract_meta"]["entries"], serde_json::json!([]));
         assert_eq!(value["functions"][0]["name"], "increment");
         assert_eq!(value["functions"][0]["params"][0]["name"], "step");
         assert_eq!(value["functions"][0]["params"][0]["type"], "I64");
