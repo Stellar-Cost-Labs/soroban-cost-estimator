@@ -8,10 +8,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, trace, warn};
 
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 
 /// Current cache-entry schema version.
 ///

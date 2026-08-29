@@ -1,5 +1,6 @@
 //! Helpers for encoding/decoding Soroban XDR types using `stellar_xdr`.
 
+use anyhow::{anyhow, Context};
 use stellar_xdr::ReadXdr;
 use stellar_xdr::WriteXdr;
 
@@ -14,17 +15,17 @@ use crate::wasm::parser::FunctionInfo;
 /// fields that are returned as separate JSON fields).
 pub fn decode_config_entry_xdr(xdr_b64: &str) -> AppResult<stellar_xdr::ConfigSettingEntry> {
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, xdr_b64)
-        .map_err(|e| AppError::XdrDecode(format!("base64 decode: {e}")))?;
+        .context("XDR decode error: base64 decode")?;
 
     let entry_data = stellar_xdr::LedgerEntryData::from_xdr(&bytes, stellar_xdr::Limits::none())
-        .map_err(|e| AppError::XdrDecode(format!("LedgerEntryData from_xdr: {e}")))?;
+        .context("XDR decode error: LedgerEntryData from_xdr")?;
 
     match entry_data {
         stellar_xdr::LedgerEntryData::ConfigSetting(config_entry) => Ok(config_entry),
-        other => Err(AppError::XdrDecode(format!(
-            "expected ConfigSetting entry, got {}",
+        other => Err(anyhow!(
+            "XDR decode error: expected ConfigSetting entry, got {}",
             other.name()
-        ))),
+        )),
     }
 }
 
@@ -143,15 +144,13 @@ pub fn build_simulation_tx_envelope(
     let host_function = match function_name {
         Some(fn_name) => {
             let id_hex = contract_id.ok_or_else(|| {
-                AppError::TxConstruction(
-                    "contract id required for function invocation (pass --id <64-hex>)".to_string(),
-                )
+                anyhow!("Transaction construction error: contract id required for function invocation (pass --id <64-hex>)")
             })?;
             let id_bytes = parse_contract_id(id_hex)?;
 
             let fn_name_bytes: Vec<u8> = fn_name.as_bytes().to_vec();
             let sc_symbol = stellar_xdr::ScSymbol::try_from(fn_name_bytes).map_err(
-                |e: stellar_xdr::Error| AppError::TxConstruction(format!("ScSymbol: {e}")),
+                |e: stellar_xdr::Error| anyhow!("Transaction construction error: ScSymbol: {e}"),
             )?;
 
             let contract_id = stellar_xdr::ContractId(stellar_xdr::Hash(id_bytes));
@@ -160,7 +159,7 @@ pub fn build_simulation_tx_envelope(
             let args_m: VecM<stellar_xdr::ScVal> = args
                 .to_vec()
                 .try_into()
-                .map_err(|e| AppError::TxConstruction(format!("ScVal args: {e}")))?;
+                .map_err(|e| anyhow!("Transaction construction error: ScVal args: {e}"))?;
 
             stellar_xdr::HostFunction::InvokeContract(stellar_xdr::InvokeContractArgs {
                 contract_address: sc_address,
@@ -172,7 +171,7 @@ pub fn build_simulation_tx_envelope(
             let wasm_vec: Vec<u8> = wasm_bytes.to_vec();
             let bytes_m: stellar_xdr::BytesM =
                 wasm_vec.try_into().map_err(|e: stellar_xdr::Error| {
-                    AppError::TxConstruction(format!("BytesM: {e}"))
+                    anyhow!("Transaction construction error: BytesM: {e}")
                 })?;
             stellar_xdr::HostFunction::UploadContractWasm(bytes_m)
         }
@@ -192,7 +191,7 @@ pub fn build_simulation_tx_envelope(
         vec![operation]
             .try_into()
             .map_err(|e: stellar_xdr::Error| {
-                AppError::TxConstruction(format!("VecM operations: {e}"))
+                anyhow!("Transaction construction error: VecM operations: {e}")
             })?;
 
     let tx = stellar_xdr::Transaction {
@@ -212,7 +211,7 @@ pub fn build_simulation_tx_envelope(
 
     let xdr_bytes = tx_env
         .to_xdr(stellar_xdr::Limits::none())
-        .map_err(|e| AppError::TxConstruction(format!("XDR encode: {e}")))?;
+        .context("Transaction construction error: XDR encode")?;
 
     Ok(xdr_bytes)
 }
@@ -281,9 +280,7 @@ pub fn parse_contract_id(id: &str) -> AppResult<[u8; 32]> {
     // Fall back to a strkey contract ID (`C…`, SEP-23) — the format the
     // Stellar CLI prints after `contract deploy`.
     let contract_id = id.parse::<stellar_xdr::ContractId>().map_err(|e| {
-        AppError::TxConstruction(format!(
-            "invalid contract id (expected 64 hex chars or a C… strkey): {e}"
-        ))
+        anyhow!("invalid contract id (expected 64 hex chars or a C… strkey): {e}")
     })?;
     Ok(contract_id.0.0)
 }

@@ -1,4 +1,5 @@
 use clap::Parser;
+use anyhow::anyhow;
 use soroban_cost_estimator::cache;
 use soroban_cost_estimator::cli;
 use soroban_cost_estimator::config_snapshot;

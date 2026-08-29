@@ -1,10 +1,11 @@
 use std::io::Cursor;
 use std::path::Path;
 
+use anyhow::{anyhow, Context};
 use stellar_xdr::ReadXdr;
 use tracing::{debug, trace};
 
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 
 /// Loads a compiled Soroban contract `.wasm` file from disk.
 ///
@@ -100,11 +101,11 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
     let mut exports = Vec::new();
 
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
-        let payload = payload.map_err(|e| AppError::WasmParse(e.to_string()))?;
+        let payload = payload.map_err(|e| anyhow!("WASM parse error: {e}"))?;
         match payload {
             wasmparser::Payload::TypeSection(section) => {
                 for rec_group in section {
-                    let rec_group = rec_group.map_err(|e| AppError::WasmParse(e.to_string()))?;
+                    let rec_group = rec_group.map_err(|e| anyhow!("WASM parse error: {e}"))?;
                     for ty in rec_group.types() {
                         let func_type = ty.unwrap_func();
                         type_infos.push((
@@ -116,7 +117,7 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
             }
             wasmparser::Payload::FunctionSection(section) => {
                 for func in section {
-                    let func = func.map_err(|e| AppError::WasmParse(e.to_string()))?;
+                    let func = func.map_err(|e| anyhow!("WASM parse error: {e}"))?;
                     func_to_type.push(func);
                 }
             }
@@ -193,9 +194,7 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
     }
 
     if functions.is_empty() {
-        return Err(AppError::WasmParse(
-            "no exported functions found in WASM binary".to_string(),
-        ));
+        return Err(anyhow!("WASM parse error: no exported functions found in WASM binary"));
     }
 
     Ok(ModuleMetadata {
@@ -251,7 +250,7 @@ pub fn parse_contract_spec(bytes: &[u8]) -> AppResult<(SpecFunctions, bool)> {
     let mut has_spec = false;
 
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
-        let payload = payload.map_err(|e| AppError::WasmParse(e.to_string()))?;
+        let payload = payload.map_err(|e| anyhow!("WASM parse error: {e}"))?;
         if let wasmparser::Payload::CustomSection(section) = payload {
             if section.name() != "contractspecv0" {
                 continue;

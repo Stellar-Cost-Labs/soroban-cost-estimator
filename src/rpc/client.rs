@@ -172,7 +172,10 @@ impl RpcClient {
         })
         .await?;
         let status = response.status();
-        let response_body: Value = response.json().await?;
+        let response_body: Value = response
+            .json()
+            .await
+            .context("failed to decode RPC response as JSON")?;
         if std::env::var("SCE_DEBUG_RPC").is_ok() {
             debug!(
                 method,
@@ -188,7 +191,7 @@ impl RpcClient {
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown error")
                 .to_string();
-            debug!(method, code, message, "RPC error");
+th            debug!(method, code, message, "RPC error");
             return Err(AppError::Rpc {
                 status: code,
                 message,

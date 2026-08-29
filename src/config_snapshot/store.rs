@@ -3,12 +3,11 @@ use std::path::PathBuf;
 use tracing::{debug, trace};
 
 use crate::config_snapshot::model::ConfigSnapshot;
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 
 /// Returns the base data directory: `~/.soroban-cost-estimator`.
 fn data_dir() -> AppResult<PathBuf> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| AppError::General("could not determine home directory".to_string()))?;
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("could not determine home directory"))?;
     Ok(home.join(".soroban-cost-estimator"))
 }
 
@@ -78,7 +77,7 @@ pub fn load_latest_snapshot(network: &str) -> AppResult<ConfigSnapshot> {
     let latest = entries
         .into_iter()
         .last()
-        .ok_or_else(|| AppError::NoSnapshots(network.to_string()))?;
+        .ok_or_else(|| anyhow!("No snapshots available for network: {network}"))?;
 
     let content = std::fs::read_to_string(latest.path())?;
     let snapshot: ConfigSnapshot =
