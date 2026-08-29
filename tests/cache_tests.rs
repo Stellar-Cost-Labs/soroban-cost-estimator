@@ -297,8 +297,320 @@ fn test_verify_cache_ignores_non_json_files() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Concurrency
+// Cross-network cache isolation
 // ─────────────────────────────────────────────────────────────────────────
+
+/// Saving the same key (wasm_hash + function + args) on two different
+/// networks overwrites the previous entry.  This documents the current
+/// behaviour so any future fix can be detected by these tests.
+#[test]
+fn test_same_key_different_networks_overwrites_previous() {
+    with_temp_home(|_tmp| {
+        // First write: testnet, ledger 10
+        cache::save_estimate(
+            "hash1",
+            "func1",
+            &["arg".to_string()],
+            "testnet",
+            10,
+            100,
+            10,
+            5,
+        )
+        .expect("save testnet");
+
+        let loaded = cache::load_estimate("hash1", "func1", &["arg".to_string()])
+            .expect("load")
+            .expect("should exist");
+        assert_eq!(loaded.network, "testnet");
+        assert_eq!(loaded.ledger, 10);
+
+        // Second write: mainnet, same key, ledger 20
+        cache::save_estimate(
+            "hash1",
+            "func1",
+            &["arg".to_string()],
+            "mainnet",
+            20,
+            200,
+            20,
+            10,
+        )
+        .expect("save mainnet");
+
+        // The testnet entry is gone — the file was overwritten.
+        let loaded = cache::load_estimate("hash1", "func1", &["arg".to_string()])
+            .expect("load")
+            .expect("should still exist");
+        assert_eq!(
+            loaded.network, "mainnet",
+            "mainnet should have overwritten testnet"
+        );
+        assert_eq!(loaded.ledger, 20);
+
+        // list_cached_estimates confirms the leak.
+        let testnet = cache::list_cached_estimates("testnet").expect("list");
+        assert!(
+            testnet.is_empty(),
+            "testnet should have no entries after overwrite"
+        );
+        let mainnet = cache::list_cached_estimates("mainnet").expect("list");
+        assert_eq!(mainnet.len(), 1);
+    });
+}
+
+/// When different networks use distinct wasm_hash + function + args keys,
+/// each network's estimates are fully isolated.
+#[test]
+fn test_different_keys_different_networks_are_isolated() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate(
+            "hashA",
+            "funcA",
+            &["a1".to_string()],
+            "testnet",
+            1,
+            100,
+            10,
+            5,
+        )
+        .expect("testnet A");
+        cache::save_estimate(
+            "hashB",
+            "funcB",
+            &["b1".to_string()],
+            "mainnet",
+            2,
+            200,
+            20,
+            10,
+        )
+        .expect("mainnet B");
+        cache::save_estimate(
+            "hashC",
+            "funcC",
+            &["c1".to_string()],
+            "futurenet",
+            3,
+            300,
+            30,
+            15,
+        )
+        .expect("futurenet C");
+
+        let tn = cache::list_cached_estimates("testnet").expect("list testnet");
+        assert_eq!(tn.len(), 1);
+        assert_eq!(tn[0].function, "funcA");
+        assert_eq!(tn[0].network, "testnet");
+
+        let mn = cache::list_cached_estimates("mainnet").expect("list mainnet");
+        assert_eq!(mn.len(), 1);
+        assert_eq!(mn[0].function, "funcB");
+        assert_eq!(mn[0].network, "mainnet");
+
+        let fn_ = cache::list_cached_estimates("futurenet").expect("list futurenet");
+        assert_eq!(fn_.len(), 1);
+        assert_eq!(fn_[0].function, "funcC");
+        assert_eq!(fn_[0].network, "futurenet");
+    });
+}
+
+/// load_estimate does not filter by network — it returns whatever the file
+/// contains.  This test documents that cross-network calls return the
+/// *stored* network, even if the caller intended a different one.
+#[test]
+fn test_load_estimate_returns_stored_network_not_caller_network() {
+    with_temp_home(|_tmp| {
+        // Save on testnet
+        cache::save_estimate("hash", "fn", &["x".to_string()], "testnet", 10, 100, 10, 5)
+            .expect("save");
+
+        // load_estimate has no network parameter — it returns whatever was saved.
+        let loaded = cache::load_estimate("hash", "fn", &["x".to_string()])
+            .expect("load")
+            .expect("should exist");
+        assert_eq!(loaded.network, "testnet");
+    });
+}
+
+/// Multiple networks with the same wasm_hash and function but different args
+/// should not leak — the args hash isolates them.
+#[test]
+fn test_same_wasm_function_different_args_different_networks_isolated() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate(
+            "hash",
+            "func",
+            &["arg-tn".to_string()],
+            "testnet",
+            1,
+            100,
+            10,
+            5,
+        )
+        .expect("testnet save");
+        cache::save_estimate(
+            "hash",
+            "func",
+            &["arg-mn".to_string()],
+            "mainnet",
+            2,
+            200,
+            20,
+            10,
+        )
+        .expect("mainnet save");
+
+        let tn = cache::load_estimate("hash", "func", &["arg-tn".to_string()])
+            .expect("load tn")
+            .expect("should exist");
+        assert_eq!(tn.network, "testnet");
+        assert_eq!(tn.ledger, 1);
+
+        let mn = cache::load_estimate("hash", "func", &["arg-mn".to_string()])
+            .expect("load mn")
+            .expect("should exist");
+        assert_eq!(mn.network, "mainnet");
+        assert_eq!(mn.ledger, 2);
+
+        // Both still appear under their respective network lists.
+        assert_eq!(cache::list_cached_estimates("testnet").unwrap().len(), 1);
+        assert_eq!(cache::list_cached_estimates("mainnet").unwrap().len(), 1);
+    });
+}
+
+/// find_stale_estimates must not mix networks — stale entries from one
+/// network must not appear when querying another.
+#[test]
+fn test_find_stale_estimates_does_not_mix_networks() {
+    with_temp_home(|_tmp| {
+        // testnet: ledger 5 (stale at ledger 10)
+        cache::save_estimate("h", "f-tn", &[], "testnet", 5, 100, 10, 5).expect("tn");
+        // mainnet: ledger 12 (NOT stale at ledger 10)
+        cache::save_estimate("h", "f-mn", &[], "mainnet", 12, 200, 20, 10).expect("mn");
+
+        let tn_all = cache::list_cached_estimates("testnet").expect("list tn");
+        let tn_stale = cache::find_stale_estimates(&tn_all, 10);
+        assert_eq!(tn_stale.len(), 1, "testnet ledger 5 should be stale at 10");
+        assert_eq!(tn_stale[0].network, "testnet");
+
+        let mn_all = cache::list_cached_estimates("mainnet").expect("list mn");
+        let mn_stale = cache::find_stale_estimates(&mn_all, 10);
+        assert!(
+            mn_stale.is_empty(),
+            "mainnet ledger 12 should not be stale at 10"
+        );
+    });
+}
+
+/// verify_cache must report entries from every network as valid, and not
+/// leak network information across files.
+#[test]
+fn test_verify_cache_across_networks_all_valid() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5).expect("tn");
+        cache::save_estimate("h2", "f2", &[], "mainnet", 2, 200, 20, 10).expect("mn");
+        cache::save_estimate("h3", "f3", &[], "futurenet", 3, 300, 30, 15).expect("fn");
+
+        let statuses = cache::verify_cache().expect("verify");
+        assert_eq!(statuses.len(), 3, "all three entries should be verified");
+        assert!(
+            statuses.iter().all(|s| s.valid),
+            "all entries should be valid"
+        );
+    });
+}
+
+/// Concurrent saves from two different networks to the same key must leave
+/// a valid entry behind — no torn writes, no corruption.
+#[test]
+fn test_concurrent_cross_network_same_key_no_corruption() {
+    with_temp_home(|_tmp| {
+        let args = vec!["shared".to_string()];
+        let tn_args = args.clone();
+        let mn_args = args.clone();
+
+        let tn = std::thread::spawn(move || {
+            cache::save_estimate(
+                "shared-hash",
+                "shared-func",
+                &tn_args,
+                "testnet",
+                1,
+                100,
+                10,
+                5,
+            )
+            .expect("concurrent testnet save");
+        });
+        let mn = std::thread::spawn(move || {
+            cache::save_estimate(
+                "shared-hash",
+                "shared-func",
+                &mn_args,
+                "mainnet",
+                2,
+                200,
+                20,
+                10,
+            )
+            .expect("concurrent mainnet save");
+        });
+
+        tn.join().expect("testnet thread panicked");
+        mn.join().expect("mainnet thread panicked");
+
+        // The surviving entry must be valid JSON.
+        let loaded = cache::load_estimate("shared-hash", "shared-func", &args)
+            .expect("load")
+            .expect("shared key should exist");
+        assert!(
+            loaded.network == "testnet" || loaded.network == "mainnet",
+            "surviving entry must be from one of the two networks: {loaded:?}"
+        );
+
+        let statuses = cache::verify_cache().expect("verify");
+        assert_eq!(statuses.len(), 1, "one entry for the shared key");
+        assert!(statuses[0].valid, "entry must be valid: {statuses:?}");
+    });
+}
+
+/// Load after cross-network overwrite must return the latest writer's data,
+/// not the first writer's. This is the "leak" scenario: a testnet cache
+/// entry is silently replaced by a mainnet write.
+#[test]
+fn test_load_after_cross_network_overwrite_returns_latest_writer() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h", "f", &["x".to_string()], "testnet", 100, 1000, 100, 50)
+            .expect("save testnet");
+
+        let before = cache::load_estimate("h", "f", &["x".to_string()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.network, "testnet");
+        assert_eq!(before.ledger, 100);
+
+        // Overwrite with mainnet
+        cache::save_estimate("h", "f", &["x".to_string()], "mainnet", 200, 2000, 200, 100)
+            .expect("save mainnet");
+
+        let after = cache::load_estimate("h", "f", &["x".to_string()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.network, "mainnet",
+            "should return mainnet after overwrite"
+        );
+        assert_eq!(after.ledger, 200);
+
+        // Verify the testnet list is now empty for this key.
+        let tn = cache::list_cached_estimates("testnet").unwrap();
+        assert!(
+            tn.is_empty(),
+            "testnet list should be empty after mainnet overwrite"
+        );
+    });
+}
 
 /// Concurrent `save_estimate`/`load_estimate` calls on distinct cache keys
 /// must not corrupt the cache.

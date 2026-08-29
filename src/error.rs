@@ -37,6 +37,9 @@ pub enum AppError {
     #[error("WASM validation error: {0}")]
     WasmValidation(String),
 
+    #[error("argument type validation error: {0}")]
+    TypeValidation(String),
+
     // ── Config Snapshot ─────────────────────────────────────────────
     #[error("Snapshot not found: {0}")]
     SnapshotNotFound(String),
