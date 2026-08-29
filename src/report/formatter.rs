@@ -74,6 +74,13 @@ impl ReportFormatter for TableFormatter {
             report.fee.total_stroops, report.fee.total_xlm,
         ));
 
+        // ASCII bar chart for visual cost breakdown
+        output.push_str(&cost_report::format_cost_breakdown_chart(
+            report.fee.total_stroops,
+            report.fee.non_refundable_stroops,
+            report.fee.refundable_stroops,
+        ));
+
         output
     }
 
@@ -347,6 +354,34 @@ mod tests {
     #[test]
     fn test_table_formatter_display() {
         assert_eq!(TableFormatter.to_string(), "table");
+    }
+
+    #[test]
+    fn test_table_formatter_contains_chart() {
+        let formatter = TableFormatter;
+        let output = formatter.format(&sample_report());
+        assert!(output.contains("Fee Breakdown Chart:"));
+        assert!(output.contains("Non-refundable"));
+        assert!(output.contains("Refundable"));
+        // Bars should contain # characters
+        let lines: Vec<&str> = output.lines().collect();
+        let chart_lines: Vec<&str> = lines
+            .iter()
+            .filter(|l| l.contains("Non-refundable") || l.contains("Refundable"))
+            .copied()
+            .collect();
+        assert_eq!(chart_lines.len(), 2);
+        for line in &chart_lines {
+            assert!(line.contains('#'), "chart line should contain '#': {line}");
+        }
+    }
+
+    #[test]
+    fn test_table_formatter_empty_report_no_chart() {
+        let formatter = TableFormatter;
+        let output = formatter.format(&empty_report());
+        // Chart section should not be present when all fees are zero
+        assert!(!output.contains("Fee Breakdown Chart:"));
     }
 
     // ── JSON formatter ───────────────────────────────────────────────
