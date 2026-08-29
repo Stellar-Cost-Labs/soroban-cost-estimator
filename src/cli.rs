@@ -159,6 +159,11 @@ pub enum ConfigAction {
         /// Explicit snapshot path to compare against (defaults to latest).
         #[arg(long)]
         against: Option<String>,
+
+        /// Print a single-line summary (counts of pricing/non-pricing changes)
+        /// instead of the full diff. Useful for CI status lines.
+        #[arg(long)]
+        summary: bool,
     },
 
     /// Show the full chronological change log across all stored snapshots.
