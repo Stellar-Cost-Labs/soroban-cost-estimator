@@ -859,6 +859,90 @@ fn test_watch_unknown_network_is_non_fatal() {
     );
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// `estimate` / `estimate-all` — WASM hash shown before simulation
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_estimate_displays_wasm_hash_before_simulation() {
+    // The hash must be printed before any RPC traffic: with a dead endpoint,
+    // the run still fails — but stdout already carries the hash line.
+    let wasm_bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
+    let expected_hash = hex::encode(sha2::Sha256::digest(&wasm_bytes));
+    let home = temp_home("estimate-hash");
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--rpc-url",
+            DEAD_RPC,
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "dead RPC should still fail; stderr: {stderr}");
+    assert!(
+        stdout.contains(&format!("WASM SHA-256: {expected_hash}")),
+        "hash should be printed before simulation; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_estimate_all_displays_wasm_hash_before_simulation() {
+    // `estimate-all` has no `--rpc-url` flag, so drive the failure with an
+    // unknown network name: the hash is printed before endpoint resolution,
+    // so it must be visible even though resolution then fails.
+    let wasm_bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
+    let expected_hash = hex::encode(sha2::Sha256::digest(&wasm_bytes));
+    let home = temp_home("estimate-all-hash");
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "estimate-all",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--network",
+            "not-a-network",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "unknown network should fail; stderr: {stderr}");
+    assert!(
+        stdout.contains(&format!("WASM SHA-256: {expected_hash}")),
+        "hash should be printed before endpoint resolution; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_estimate_json_output_stays_pure_json() {
+    // The hash line must not leak into --json output: stdout must stay a
+    // single JSON document even though the simulation fails afterwards.
+    let home = temp_home("estimate-json-pure");
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--json",
+            "--rpc-url",
+            DEAD_RPC,
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run CLI");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Simulation fails against the dead endpoint, but what little is printed
+    // must be valid JSON — never a bare "WASM SHA-256:" line.
+    assert!(
+        !stdout.contains("WASM SHA-256"),
+        "JSON mode must not print the hash line; got: {stdout}"
+    );
+}
+
 #[test]
 fn test_watch_interval_suffixes_are_parsed() {
     // `30m` must resolve to 1800s in the banner — the interval parser is unit
