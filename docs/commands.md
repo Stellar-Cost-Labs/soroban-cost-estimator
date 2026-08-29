@@ -661,7 +661,11 @@ All commands accept:
 
 | Flag | Description |
 |------|-------------|
+| `--format <FORMAT>` | Select `table`, `json`, `csv`, or `markdown` output; defaults to `table` |
+| `--rps <N>` | Cap RPC requests per second |
 | `--help` / `-h` | Print command-specific help |
+
+`--format` applies to report-producing commands. The legacy `--json` flag remains supported as an alias for `--format json` where it was previously available.
 
 ## Network Resolution
 
