@@ -365,7 +365,7 @@ fn test_estimate_invalid_wasm_file() {
     let (_, stderr, code) = run_cli(&["estimate", "--wasm", bogus.to_str().unwrap()]);
     assert_eq!(code, 1, "invalid WASM should exit 1");
     assert!(
-        stderr.contains("WASM validation error"),
+        stderr.contains("failed to validate WASM"),
         "invalid bytes should fail validation; got: {stderr}"
     );
 }
@@ -381,7 +381,9 @@ fn test_estimate_unknown_network() {
     ]);
     assert_eq!(code, 1, "an unknown network should exit 1");
     assert!(
-        stderr.contains("RPC endpoint not configured for network: not-a-network"),
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
         "the error should name the unknown network; got: {stderr}"
     );
 }
@@ -625,7 +627,7 @@ fn test_estimate_all_invalid_wasm_file() {
     let (_, stderr, code) = run_cli(&["estimate-all", "--wasm", bogus.to_str().unwrap()]);
     assert_eq!(code, 1, "invalid WASM should exit 1");
     assert!(
-        stderr.contains("WASM validation error"),
+        stderr.contains("failed to validate WASM"),
         "invalid bytes should fail validation; got: {stderr}"
     );
 }
@@ -641,7 +643,9 @@ fn test_estimate_all_unknown_network() {
     ]);
     assert_eq!(code, 1, "an unknown network should exit 1");
     assert!(
-        stderr.contains("RPC endpoint not configured for network: not-a-network"),
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
         "the error should name the unknown network; got: {stderr}"
     );
 }
@@ -655,7 +659,9 @@ fn test_config_snapshot_unknown_network() {
     let (_, stderr, code) = run_cli(&["config", "snapshot", "--network", "not-a-network"]);
     assert_eq!(code, 1, "an unknown network should exit 1");
     assert!(
-        stderr.contains("RPC endpoint not configured for network: not-a-network"),
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
         "the error should name the unknown network; got: {stderr}"
     );
 }
@@ -673,7 +679,7 @@ fn test_config_diff_without_snapshots_errors() {
         run_cli_in_home(&["config", "diff", "--network", "testnet"], Some(&home));
     assert_eq!(code, 1, "diffing with no snapshots should exit 1");
     assert!(
-        stderr.contains("No snapshots available for network: testnet"),
+        stderr.contains("none available for network testnet"),
         "the error should name the network with no snapshots; got: {stderr}"
     );
 }
@@ -687,7 +693,7 @@ fn test_config_diff_against_missing_file_errors() {
     );
     assert_eq!(code, 1, "a missing --against file should exit 1");
     assert!(
-        stderr.contains("I/O error"),
+        stderr.contains("Error: failed to perform I/O"),
         "a missing snapshot file should surface as an I/O error; got: {stderr}"
     );
 }
@@ -704,7 +710,7 @@ fn test_config_diff_against_malformed_snapshot_errors() {
     );
     assert_eq!(code, 1, "a malformed snapshot should exit 1");
     assert!(
-        stderr.contains("Snapshot parse error"),
+        stderr.contains("Error: failed to parse snapshot"),
         "a malformed snapshot should surface as a parse error; got: {stderr}"
     );
 }
@@ -743,7 +749,7 @@ fn test_cache_warm_nonexistent_wasm_file() {
         "a missing WASM file should exit 1; stderr: {stderr}"
     );
     assert!(
-        stderr.contains("File not found") || stderr.contains("I/O error"),
+        stderr.contains("File not found") || stderr.contains("Error: failed to perform I/O"),
         "stderr: {stderr}"
     );
 }
@@ -756,7 +762,10 @@ fn test_cache_warm_invalid_wasm_file() {
 
     let (_, stderr, code) = run_cli(&["cache", "warm", "--wasm", bogus.to_str().unwrap()]);
     assert_eq!(code, 1, "invalid WASM should exit 1");
-    assert!(stderr.contains("WASM validation error"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("failed to validate WASM"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
@@ -771,7 +780,9 @@ fn test_cache_warm_unknown_network() {
     ]);
     assert_eq!(code, 1, "an unknown network should exit 1");
     assert!(
-        stderr.contains("RPC endpoint not configured for network: not-a-network"),
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
         "stderr: {stderr}"
     );
 }
@@ -802,11 +813,13 @@ fn test_config_diff_loads_valid_snapshot_before_network() {
     );
     assert_eq!(code, 1, "the unknown network should exit 1");
     assert!(
-        stderr.contains("RPC endpoint not configured for network: not-a-network"),
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
         "the snapshot should load cleanly and the network should be the failure; got: {stderr}"
     );
     assert!(
-        !stderr.contains("Snapshot parse error"),
+        !stderr.contains("Error: failed to parse snapshot"),
         "a valid snapshot must not be reported as malformed; got: {stderr}"
     );
 }
@@ -843,6 +856,102 @@ fn test_watch_unknown_network_is_non_fatal() {
     assert!(
         stdout.contains("Watching not-a-network for config changes every 3600s"),
         "watch should announce its network and resolved interval; got: {stdout}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `wasm-info` — contractmeta display
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Encodes one `ScMetaEntry::ScMetaV0` union value (XDR): 4-byte
+/// discriminant 0, then `{ key, val }` as length-prefixed strings, each
+/// padded to a 4-byte boundary (XDR string padding).
+fn xdr_meta_entry(key: &str, val: &str) -> Vec<u8> {
+    let mut out = 0u32.to_be_bytes().to_vec();
+    for s in [key, val] {
+        out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+        out.extend_from_slice(s.as_bytes());
+        let padding = (4 - s.len() % 4) % 4;
+        out.extend_from_slice(&[0u8; 4][..padding]);
+    }
+    out
+}
+
+/// Wraps `payload` in a WASM custom section (id 0) named `name`.
+fn custom_section(name: &str, payload: &[u8]) -> Vec<u8> {
+    let mut content = Vec::new();
+    content.push(name.len() as u8);
+    content.extend_from_slice(name.as_bytes());
+    content.extend_from_slice(payload);
+
+    let mut section = vec![0u8];
+    let mut size = content.len() as u32;
+    loop {
+        let mut byte = (size & 0x7f) as u8;
+        size >>= 7;
+        if size != 0 {
+            byte |= 0x80;
+        }
+        section.push(byte);
+        if size == 0 {
+            break;
+        }
+    }
+    section.extend_from_slice(&content);
+    section
+}
+
+#[test]
+fn test_wasm_info_displays_contract_meta() {
+    // Extend the bare fixture with a contractmeta section and point wasm-info
+    // at it: name/version/description must be shown (table and JSON modes).
+    let mut bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&xdr_meta_entry("name", "MetaContract"));
+    payload.extend_from_slice(&xdr_meta_entry("version", "9.9.9"));
+    payload.extend_from_slice(&xdr_meta_entry("description", "A meta description"));
+    bytes.extend_from_slice(&custom_section("contractmetav0", &payload));
+
+    let home = temp_home("wasm-info-meta");
+    let path = home.join("meta.wasm");
+    std::fs::write(&path, &bytes).expect("write fixture");
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &["wasm-info", "--wasm", path.to_str().unwrap()],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "wasm-info should succeed; stderr: {stderr}");
+    assert!(stdout.contains("Contract meta: present"));
+    assert!(stdout.contains("name: MetaContract"));
+    assert!(stdout.contains("version: 9.9.9"));
+    assert!(stdout.contains("description: A meta description"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(["wasm-info", "--wasm", path.to_str().unwrap(), "--json"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run CLI");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    assert_eq!(parsed["contract_meta"]["name"], "MetaContract");
+    assert_eq!(parsed["contract_meta"]["version"], "9.9.9");
+    assert_eq!(parsed["contract_meta"]["description"], "A meta description");
+}
+
+#[test]
+fn test_wasm_info_reports_absent_contract_meta() {
+    let home = temp_home("wasm-info-no-meta");
+    let (stdout, stderr, code) = run_cli_in_home(
+        &["wasm-info", "--wasm", "tests/fixtures/minimal.wasm"],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "wasm-info should succeed; stderr: {stderr}");
+    assert!(
+        stdout.contains("Contract meta: absent"),
+        "bare WASM should report absent meta; got: {stdout}"
     );
 }
 
