@@ -413,6 +413,7 @@ async fn cmd_estimate_all(
                     "absent (bare WASM exports only)"
                 }
             );
+            println!("{}", wasm::parser::format_contract_meta(&wasm_info.contract_meta));
             if contract_id.is_none() {
                 println!(
                     "Note: pass --id <contract-id> to simulate each function against a deployed contract."
@@ -624,6 +625,10 @@ fn cmd_wasm_info(wasm_path: &str, json_flag: bool) -> error::AppResult<()> {
             "absent (bare WASM exports only)"
         }
     );
+    println!(
+        "{}",
+        wasm::parser::format_contract_meta(&wasm_info.contract_meta)
+    );
     Ok(())
 }
 
@@ -638,6 +643,14 @@ fn wasm_info_json(
         "size": wasm_info.bytes.len(),
         "sha256": hash,
         "has_spec": wasm_info.has_spec,
+        "contract_meta": {
+            "name": wasm_info.contract_meta.name,
+            "version": wasm_info.contract_meta.version,
+            "description": wasm_info.contract_meta.description,
+            "entries": wasm_info.contract_meta.entries.iter().map(|(key, value)| {
+                serde_json::json!({ "key": key, "value": value })
+            }).collect::<Vec<_>>(),
+        },
         "functions": wasm_info.functions.iter().map(|f| {
             serde_json::json!({
                 "name": f.name,
@@ -1083,7 +1096,7 @@ mod tests {
     use soroban_cost_estimator::config_snapshot::model::{
         ConfigSnapshot, ContractComputeV0, ContractLedgerCostV0,
     };
-    use soroban_cost_estimator::wasm::parser::{FunctionInfo, ParamInfo, WasmInfo};
+    use soroban_cost_estimator::wasm::parser::{ContractMeta, FunctionInfo, ParamInfo, WasmInfo};
 
     fn snapshot_with_compute_fee(fee: i64) -> ConfigSnapshot {
         ConfigSnapshot {
@@ -1200,6 +1213,7 @@ mod tests {
         let info = WasmInfo {
             bytes: vec![0u8; 44],
             has_spec: true,
+            contract_meta: ContractMeta::default(),
             functions: vec![FunctionInfo {
                 name: "increment".to_string(),
                 param_count: 1,
@@ -1221,6 +1235,8 @@ mod tests {
         assert_eq!(value["size"], 44);
         assert_eq!(value["sha256"], "deadbeef");
         assert_eq!(value["has_spec"], true);
+        assert_eq!(value["contract_meta"]["name"], serde_json::Value::Null);
+        assert_eq!(value["contract_meta"]["entries"], serde_json::json!([]));
         assert_eq!(value["functions"][0]["name"], "increment");
         assert_eq!(value["functions"][0]["params"][0]["name"], "step");
         assert_eq!(value["functions"][0]["params"][0]["type"], "I64");
