@@ -88,6 +88,7 @@ thiserror = "2.0.19"
 # Structured tracing / logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+governor = "0.10.4"
 
 [dev-dependencies]
 insta = "1.40.0"

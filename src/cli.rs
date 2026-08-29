@@ -8,6 +8,11 @@ use clap::{Parser, Subcommand};
 #[command(name = "soroban-cost-estimator")]
 #[command(about = "Estimate Soroban contract costs & track network pricing changes", long_about = None)]
 pub struct Cli {
+    /// Cap RPC requests at N per second (fixed-rate spacing; applies to
+    /// every network call, e.g. batch runs like estimate-all). 0 disables.
+    #[arg(long, global = true, value_name = "N")]
+    pub rps: Option<u64>,
+
     #[command(subcommand)]
     pub command: Command,
 }
