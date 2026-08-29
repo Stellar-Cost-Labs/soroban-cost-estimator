@@ -1137,3 +1137,207 @@ fn test_load_fresh_estimate_expired_returns_none() {
         assert!(fresh.is_none(), "an expired entry must yield None");
     });
 }
+
+/// Set a cache entry file's modification time, used to control LRU ordering
+/// in eviction tests.
+fn set_cache_file_mtime(tmp: &Path, wasm_hash: &str, function: &str, args: &[&str], age: u64) {
+    let mut hasher = sha2::Sha256::new();
+    for arg in args {
+        hasher.update(arg.as_bytes());
+    }
+    let args_hash = hex::encode(hasher.finalize());
+    let dir = tmp.join(".soroban-cost-estimator").join("cache");
+    let path = dir.join(format!("{wasm_hash}-{function}-{args_hash}.json"));
+    let file = std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .expect("open cache file");
+    let mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
+    file.set_modified(mtime).expect("set mtime");
+}
+
+/// `cache_size_bytes` reports 0 for an empty cache and grows as entries are
+/// added.
+#[test]
+fn test_cache_size_bytes_tracks_entries() {
+    with_temp_home(|tmp| {
+        assert_eq!(
+            cache::cache_size_bytes().expect("empty cache size"),
+            0,
+            "empty cache must measure 0 bytes"
+        );
+
+        cache::save_estimate("h1", "f1", &["a".to_string()], "testnet", 1, 100, 10, 5)
+            .expect("save first");
+        let after_one = cache::cache_size_bytes().expect("size after one");
+        assert!(after_one > 0, "one entry must be measurable");
+
+        cache::save_estimate("h2", "f2", &["b".to_string()], "testnet", 1, 100, 10, 5)
+            .expect("save second");
+        let after_two = cache::cache_size_bytes().expect("size after two");
+        assert!(
+            after_two > after_one,
+            "second entry must grow the measured size"
+        );
+        let _ = tmp;
+    });
+}
+
+/// `evict_lru_entries` removes the least-recently-used entries first when
+/// the cache exceeds the limit, and stops once it fits.
+#[test]
+fn test_evict_lru_entries_evicts_oldest_first() {
+    with_temp_home(|tmp| {
+        // Three distinct entries; `write_raw_entry` writes them in quick
+        // succession so their mtimes are nearly identical. Force distinct
+        // ages to make LRU order deterministic.
+        write_raw_entry(tmp, "h_old", "f_old", &["old"], None, 1);
+        write_raw_entry(tmp, "h_mid", "f_mid", &["mid"], None, 1);
+        write_raw_entry(tmp, "h_new", "f_new", &["new"], None, 1);
+        set_cache_file_mtime(tmp, "h_old", "f_old", &["old"], 300);
+        set_cache_file_mtime(tmp, "h_mid", "f_mid", &["mid"], 200);
+        set_cache_file_mtime(tmp, "h_new", "f_new", &["new"], 100);
+
+        let total = cache::cache_size_bytes().expect("total size");
+
+        // Entries are uniform in size, so a limit of total/3 fits exactly
+        // one entry: the two older entries must be evicted.
+        let evicted = cache::evict_lru_entries(total / 3, None).expect("evict");
+        assert_eq!(evicted, 2, "exactly the two oldest entries evicted");
+
+        assert!(
+            cache::load_estimate("h_old", "f_old", &["old".to_string()])
+                .expect("load old")
+                .is_none(),
+            "oldest entry must be evicted"
+        );
+        assert!(
+            cache::load_estimate("h_mid", "f_mid", &["mid".to_string()])
+                .expect("load mid")
+                .is_none(),
+            "second-oldest entry must be evicted"
+        );
+        assert!(
+            cache::load_estimate("h_new", "f_new", &["new".to_string()])
+                .expect("load new")
+                .is_some(),
+            "newest entry must survive"
+        );
+        let _ = tmp;
+    });
+}
+
+/// `evict_lru_entries` never evicts the protected entry, even when it is the
+/// least-recently-used file on disk.
+#[test]
+fn test_evict_lru_entries_respects_protected() {
+    with_temp_home(|tmp| {
+        write_raw_entry(tmp, "h_old", "f_old", &["old"], None, 1);
+        write_raw_entry(tmp, "h_new", "f_new", &["new"], None, 1);
+        set_cache_file_mtime(tmp, "h_old", "f_old", &["old"], 300);
+        set_cache_file_mtime(tmp, "h_new", "f_new", &["new"], 100);
+
+        let dir = tmp.join(".soroban-cost-estimator").join("cache");
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"old");
+        let args_hash = hex::encode(hasher.finalize());
+        let protected_path = dir.join(format!("h_old-f_old-{args_hash}.json"));
+
+        // Limit fits only one entry; the protected (oldest) one must be
+        // spared, so the newer entry is evicted instead.
+        let total = cache::cache_size_bytes().expect("total size");
+        let evicted = cache::evict_lru_entries(total - 1, Some(&protected_path))
+            .expect("evict with protection");
+        assert_eq!(evicted, 1);
+
+        assert!(
+            cache::load_estimate("h_old", "f_old", &["old".to_string()])
+                .expect("load protected")
+                .is_some(),
+            "protected entry must survive eviction"
+        );
+        assert!(
+            cache::load_estimate("h_new", "f_new", &["new".to_string()])
+                .expect("load new")
+                .is_none(),
+            "non-protected entry must be evicted"
+        );
+        let _ = tmp;
+    });
+}
+
+/// Loading an entry refreshes its recency: a read bumps the file mtime, so
+/// a just-read (older) entry survives eviction over an unread newer one.
+#[test]
+fn test_load_refreshes_recency_for_lru() {
+    with_temp_home(|tmp| {
+        write_raw_entry(tmp, "h_old", "f_old", &["old"], None, 1);
+        write_raw_entry(tmp, "h_new", "f_new", &["new"], None, 1);
+        set_cache_file_mtime(tmp, "h_old", "f_old", &["old"], 300);
+        set_cache_file_mtime(tmp, "h_new", "f_new", &["new"], 100);
+
+        // Reading the older entry must make it the most-recently-used one.
+        assert!(
+            cache::load_estimate("h_old", "f_old", &["old".to_string()])
+                .expect("load old")
+                .is_some(),
+            "old entry should load"
+        );
+
+        // Only one entry fits: the one that was just read survives.
+        let total = cache::cache_size_bytes().expect("total size");
+        let evicted = cache::evict_lru_entries(total / 2, None).expect("evict");
+        assert_eq!(evicted, 1, "one entry evicted");
+
+        assert!(
+            cache::load_estimate("h_old", "f_old", &["old".to_string()])
+                .expect("load old again")
+                .is_some(),
+            "just-read entry must survive eviction"
+        );
+        assert!(
+            cache::load_estimate("h_new", "f_new", &["new".to_string()])
+                .expect("load new")
+                .is_none(),
+            "unread entry must be evicted"
+        );
+        let _ = tmp;
+    });
+}
+
+/// The eviction path stays healthy with many entries in the cache: saving
+/// several estimates then enforcing a tight limit evicts the oldest and
+/// keeps the newest readable through the public API.
+#[test]
+fn test_save_estimate_then_evict_keeps_newest() {
+    with_temp_home(|tmp| {
+        for i in 0..5 {
+            let key = format!("h{i}");
+            let fkey = format!("f{i}");
+            cache::save_estimate(&key, &fkey, &["x".to_string()], "testnet", 1, 100, 10, 5)
+                .expect("save estimate");
+            set_cache_file_mtime(tmp, &key, &fkey, &["x"], 300 - i * 50);
+        }
+
+        // Entries are uniform in size, so a limit of total/5 fits exactly
+        // one entry: the four older entries must be evicted.
+        let total = cache::cache_size_bytes().expect("total size");
+        let evicted = cache::evict_lru_entries(total / 5, None).expect("evict");
+        assert_eq!(evicted, 4, "four oldest entries evicted");
+
+        // The newest estimate is still loadable after eviction.
+        assert!(
+            cache::load_estimate("h4", "f4", &["x".to_string()])
+                .expect("load newest")
+                .is_some(),
+            "newest entry must survive eviction"
+        );
+        assert!(
+            cache::load_estimate("h0", "f0", &["x".to_string()])
+                .expect("load oldest")
+                .is_none(),
+            "oldest entry must be evicted"
+        );
+        let _ = tmp;
+    });
+}
