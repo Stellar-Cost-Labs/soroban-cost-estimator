@@ -6,6 +6,7 @@ expression: MarkdownFormatter.format(&report)
 
 - **Network:** testnet (ledger 3894195)
 - **WASM hash:** `abc123def456`
+- **RPC round-trip:** 87 ms
 
 ### Resources
 
