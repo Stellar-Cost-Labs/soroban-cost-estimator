@@ -84,6 +84,30 @@ fn test_format_diff_no_changes() {
 }
 
 #[test]
+fn test_format_diff_summary_counts_mixed() {
+    let old = make_snapshot(100, 5);
+    let mut new = make_snapshot(200, 10); // two pricing changes
+    if let Some(compute) = &mut new.contract_compute {
+        compute.ledger_max_instructions = 2_000_000; // non-pricing change
+    }
+    let diff = diff::diff_snapshots(&old, &new);
+    assert_eq!(
+        diff::format_diff_summary(&diff),
+        "2 pricing changes, 1 non-pricing changes"
+    );
+}
+
+#[test]
+fn test_format_diff_summary_no_changes() {
+    let snap = make_snapshot(100, 5);
+    let diff = diff::diff_snapshots(&snap, &snap);
+    assert_eq!(
+        diff::format_diff_summary(&diff),
+        "0 pricing changes, 0 non-pricing changes"
+    );
+}
+
+#[test]
 fn test_format_diff_with_changes() {
     let old = make_snapshot(100, 5);
     let new = make_snapshot(200, 5);
