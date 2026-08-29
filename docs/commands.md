@@ -344,6 +344,7 @@ soroban-cost-estimator config diff [OPTIONS]
 |------|----------|---------|-------------|
 | `--network <NETWORK>` | | `testnet` | Network to compare against |
 | `--against <AGAINST>` | | latest snapshot | Explicit snapshot path to compare against |
+| `--summary` | | `false` | Print a single-line count summary instead of the full diff (for CI status lines) |
 | `--help` `-h` | | | Print help |
 
 **Behavior**

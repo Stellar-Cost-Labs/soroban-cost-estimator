@@ -510,6 +510,16 @@ fn check<T: PartialEq + std::fmt::Display>(
     }
 }
 
+/// Formats a `ConfigDiff` as a single-line summary for CI status lines.
+///
+/// Example: `2 pricing changes, 1 non-pricing changes` or
+/// `0 pricing changes, 0 non-pricing changes`.
+pub fn format_diff_summary(diff: &ConfigDiff) -> String {
+    let pricing = diff.changes.iter().filter(|c| c.is_pricing_change).count();
+    let non_pricing = diff.changes.len() - pricing;
+    format!("{pricing} pricing changes, {non_pricing} non-pricing changes")
+}
+
 /// Formats a `ConfigDiff` as a human-readable string for display.
 pub fn format_diff(diff: &ConfigDiff) -> String {
     let mut output = String::new();
@@ -650,6 +660,32 @@ mod tests {
         );
         // Should NOT show raw snake_case path
         assert!(!output.contains("contract_compute.fee_rate_per_instructions_increment"));
+    }
+
+    #[test]
+    fn test_format_diff_summary_counts() {
+        let old = make_snapshot(100, 5);
+        // Change the compute fee (pricing) and the bandwidth fee (pricing).
+        let mut new = make_snapshot(200, 10);
+        // Change a non-pricing field too, via the compute struct.
+        if let Some(compute) = &mut new.contract_compute {
+            compute.ledger_max_instructions = 2_000_000;
+        }
+        let diff = diff_snapshots(&old, &new);
+        assert_eq!(
+            format_diff_summary(&diff),
+            "2 pricing changes, 1 non-pricing changes"
+        );
+    }
+
+    #[test]
+    fn test_format_diff_summary_no_changes() {
+        let snap = make_snapshot(100, 5);
+        let diff = diff_snapshots(&snap, &snap);
+        assert_eq!(
+            format_diff_summary(&diff),
+            "0 pricing changes, 0 non-pricing changes"
+        );
     }
 
     #[test]
