@@ -442,6 +442,7 @@ async fn cmd_estimate_all(
 
         let mut json_results: Vec<serde_json::Value> = Vec::new();
         let mut fees: Vec<i64> = Vec::new();
+        let mut cpus: Vec<u64> = Vec::new();
         let total = wasm_info.functions.len();
         debug!(total, "enumerated functions");
 
@@ -463,6 +464,9 @@ async fn cmd_estimate_all(
                 if let Some(fee) = outcome.fee_stroops {
                     fees.push(fee);
                 }
+                if let Some(cpu) = outcome.cpu_insns {
+                    cpus.push(cpu);
+                }
                 if let Some(value) = outcome.json {
                     json_results.push(value);
                 }
@@ -472,6 +476,9 @@ async fn cmd_estimate_all(
         // Aggregate fee range across every successfully estimated function
         // (#83): min/max/average in stroops (and XLM) for the whole batch.
         emit_fee_range_summary(&fees, json_flag, &mut json_results);
+
+        // #75: Total cost summary — total functions, total fee, total CPU.
+        emit_total_summary(&fees, &cpus, json_flag, &mut json_results);
 
         if json_flag {
             println!("{}", serde_json::to_string_pretty(&json_results)?);
@@ -535,6 +542,40 @@ fn emit_fee_range_summary(
     );
 }
 
+/// Emit the total cost summary for an `estimate-all` batch (#75).
+///
+/// Prints total functions, total estimated fee, and total CPU after all
+/// functions have been estimated. JSON mode appends the summary record.
+fn emit_total_summary(
+    fees: &[i64],
+    cpus: &[u64],
+    json_flag: bool,
+    json_results: &mut Vec<serde_json::Value>,
+) {
+    let total_functions = fees.len();
+    let total_fee: i64 = fees.iter().sum();
+    let total_cpu: u64 = cpus.iter().sum();
+    let total_xlm = report::fee_calc::stroops_to_xlm(total_fee);
+
+    if json_flag {
+        json_results.push(serde_json::json!({
+            "function": "(total-summary)",
+            "status": "summary",
+            "functions_estimated": total_functions,
+            "total_fee_stroops": total_fee,
+            "total_fee_xlm": total_xlm,
+            "total_cpu_instructions": total_cpu,
+        }));
+        return;
+    }
+
+    println!();
+    println!(
+        "Total: {} functions, {} stroops ({} XLM), {} CPU instructions",
+        total_functions, total_fee, total_xlm, total_cpu
+    );
+}
+
 /// Outcome of estimating one exported function in `estimate-all`.
 struct EstimateAllOutcome {
     /// JSON record for `--json` output mode, if the caller wants it.
@@ -543,6 +584,8 @@ struct EstimateAllOutcome {
     /// `None` for skipped/errored functions, which must not count toward
     /// the aggregate fee range.
     fee_stroops: Option<i64>,
+    /// CPU instructions when the function was estimated successfully.
+    cpu_insns: Option<u64>,
 }
 
 /// Estimates one exported function against the network, printing its result
@@ -573,6 +616,7 @@ async fn estimate_all_function(
                         "reason": reason,
                     })),
                     fee_stroops: None,
+                    cpu_insns: None,
                 }));
             }
             println!("── Estimating '{}' ── Skipped: {reason}", fn_info.name);
@@ -596,6 +640,7 @@ async fn estimate_all_function(
                             "reason": e.to_string(),
                         })),
                         fee_stroops: None,
+                        cpu_insns: None,
                     }));
                 }
                 eprintln!("── Estimating '{}' ── Skipped: {e}", fn_info.name);
@@ -618,6 +663,7 @@ async fn estimate_all_function(
                                 "error": msg,
                             })),
                             fee_stroops: None,
+                            cpu_insns: None,
                         }));
                     }
                     eprintln!("── Estimating '{}' ── Error: {msg}", fn_info.name);
@@ -662,6 +708,7 @@ async fn estimate_all_function(
                             "ledger": ledger,
                         })),
                         fee_stroops: Some(fee),
+                        cpu_insns: Some(cpu),
                     }))
                 } else {
                     println!(
@@ -670,6 +717,7 @@ async fn estimate_all_function(
                     Ok(Some(EstimateAllOutcome {
                         json: None,
                         fee_stroops: Some(fee),
+                        cpu_insns: Some(cpu),
                     }))
                 }
             }
@@ -683,6 +731,7 @@ async fn estimate_all_function(
                             "error": e.to_string(),
                         })),
                         fee_stroops: None,
+                        cpu_insns: None,
                     }))
                 } else {
                     eprintln!("Skipped — simulation failed: {e}");
