@@ -31,6 +31,15 @@ pub const CACHE_SCHEMA_VERSION: u32 = 1;
 /// current schema.
 pub const INITIAL_SCHEMA_VERSION: u32 = 1;
 
+/// Maximum total size of the estimate cache, in bytes.
+///
+/// When saving a new estimate would push the cache past this limit, the
+/// least-recently-used entries are evicted until the cache fits under the
+/// limit. The limit is a fixed constant rather than a user-configurable
+/// setting; entries are ranked by file modification time, which is refreshed
+/// on read (see [`load_estimate`]) so recently used entries survive eviction.
+pub const MAX_CACHE_SIZE_BYTES: u64 = 100 * 1024 * 1024; // 100 MiB
+
 /// serde default for the `version` field, applied when an older (or hand
 /// written) entry omits it. Legacy entries predating the version field are
 /// treated as [`INITIAL_SCHEMA_VERSION`].
@@ -134,8 +143,96 @@ pub fn save_estimate(
     let tmp = dir.join(format!("{filename}.{tid}.tmp"));
     std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, &path)?;
+
+    // Adding an entry may push the cache past its maximum size; evict
+    // least-recently-used entries to bring it back under the limit. The
+    // entry just written is the most recently used, so it is never the
+    // first eviction candidate.
+    let evicted = evict_lru_entries(MAX_CACHE_SIZE_BYTES, Some(&path))?;
+    if evicted > 0 {
+        warn!(evicted, "cache size limit reached; evicted LRU entries");
+    }
+
     debug!(path = %path.display(), function, network, ledger, "estimate cached");
     Ok(())
+}
+
+/// Total size in bytes of all `.json` entries currently in the cache.
+///
+/// Only `.json` files count toward the cache size; transient `*.tmp`
+/// write-ahead files are ignored.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn cache_size_bytes() -> AppResult<u64> {
+    let dir = cache_dir()?;
+    total_json_bytes(&dir)
+}
+
+/// Sum the size of every `.json` file in `dir`.
+fn total_json_bytes(dir: &Path) -> AppResult<u64> {
+    let mut total: u64 = 0;
+    if !dir.exists() {
+        return Ok(total);
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().map(|e| e == "json").unwrap_or(false) {
+            total = total.saturating_add(entry.metadata()?.len());
+        }
+    }
+    Ok(total)
+}
+
+/// Evict least-recently-used cache entries until the cache holds at most
+/// `limit_bytes` of `.json` data.
+///
+/// Entries are ranked by file modification time (oldest first). The file at
+/// `protected` — if any — is never evicted, so callers can keep the entry
+/// they just wrote. Returns the number of entries evicted.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn evict_lru_entries(limit_bytes: u64, protected: Option<&Path>) -> AppResult<usize> {
+    let dir = cache_dir()?;
+    if !dir.exists() {
+        return Ok(0);
+    }
+
+    let mut entries: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+    let mut total: u64 = 0;
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().map(|e| e == "json").unwrap_or(false) {
+            let metadata = entry.metadata()?;
+            let mtime = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+            total = total.saturating_add(metadata.len());
+            entries.push((mtime, metadata.len(), path));
+        }
+    }
+
+    // Sort oldest-first so eviction removes the least-recently-used entries.
+    entries.sort_by_key(|entry| entry.0);
+
+    let mut evicted = 0;
+    for (_mtime, size, path) in entries {
+        if total <= limit_bytes {
+            break;
+        }
+        if protected.is_some_and(|p| p == path) {
+            // Never evict the protected entry; skip it and continue checking
+            // other (older) candidates.
+            continue;
+        }
+        std::fs::remove_file(&path)?;
+        total = total.saturating_sub(size);
+        evicted += 1;
+        trace!(path = %path.display(), "evicted LRU cache entry");
+    }
+
+    Ok(evicted)
 }
 
 /// Carry a cached estimate forward to the current schema version.
@@ -198,6 +295,15 @@ pub fn load_estimate(
     let cached: CachedEstimate =
         serde_json::from_str(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))?;
     let cached = migrate_to_latest(cached)?;
+
+    // A successful read makes this entry recently used: bump its mtime so
+    // LRU eviction (which ranks by mtime) prefers evicting entries that
+    // have not been read in a while. A failure here is non-fatal — the read
+    // itself succeeded and the mtime is only an eviction hint.
+    if let Ok(file) = std::fs::File::options().write(true).open(&path) {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
+
     Ok(Some(cached))
 }
 
