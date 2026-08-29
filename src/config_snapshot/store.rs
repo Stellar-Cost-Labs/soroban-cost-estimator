@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use tracing::{debug, trace};
+
 use crate::config_snapshot::model::ConfigSnapshot;
 use crate::error::{AppError, AppResult};
 
@@ -47,6 +49,7 @@ pub fn save_snapshot(snapshot: &ConfigSnapshot, out_path: Option<&str>) -> AppRe
 
     let json = serde_json::to_string_pretty(snapshot)?;
     std::fs::write(&path, json)?;
+    debug!(path = %path.display(), network = snapshot.network, ledger = snapshot.ledger, "snapshot saved");
     Ok(path)
 }
 
@@ -58,6 +61,7 @@ pub fn save_snapshot(snapshot: &ConfigSnapshot, out_path: Option<&str>) -> AppRe
 /// # Network calls
 /// None — pure file I/O.
 pub fn load_latest_snapshot(network: &str) -> AppResult<ConfigSnapshot> {
+    debug!(network, "loading latest snapshot");
     let dir = snapshots_dir()?;
     let mut entries: Vec<_> = std::fs::read_dir(&dir)?
         .filter_map(|e| e.ok())
@@ -79,6 +83,7 @@ pub fn load_latest_snapshot(network: &str) -> AppResult<ConfigSnapshot> {
     let content = std::fs::read_to_string(latest.path())?;
     let snapshot: ConfigSnapshot =
         serde_json::from_str(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))?;
+    trace!(network, ledger = snapshot.ledger, "latest snapshot loaded");
     Ok(snapshot)
 }
 
@@ -87,9 +92,15 @@ pub fn load_latest_snapshot(network: &str) -> AppResult<ConfigSnapshot> {
 /// # Network calls
 /// None — pure file I/O.
 pub fn load_snapshot_from_path(path: &str) -> AppResult<ConfigSnapshot> {
+    debug!(path, "loading snapshot from path");
     let content = std::fs::read_to_string(path)?;
     let snapshot: ConfigSnapshot =
         serde_json::from_str(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))?;
+    trace!(
+        network = snapshot.network,
+        ledger = snapshot.ledger,
+        "snapshot loaded from path"
+    );
     Ok(snapshot)
 }
 
@@ -130,4 +141,104 @@ pub fn list_snapshots(network: &str) -> AppResult<Vec<PathBuf>> {
 
     snapshots.sort();
     Ok(snapshots)
+}
+
+/// Loads a specific snapshot by network and timestamp.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn load_snapshot_by_timestamp(network: &str, timestamp: &str) -> AppResult<ConfigSnapshot> {
+    let dir = snapshots_dir()?;
+    let ts_safe = timestamp.replace(':', "-");
+    let filename = format!("{}-{}.json", network, ts_safe);
+    let path = dir.join(&filename);
+
+    if !path.exists() {
+        return Err(AppError::General(format!(
+            "No snapshot found for network '{}' at timestamp '{}'",
+            network, timestamp
+        )));
+    }
+
+    let content = std::fs::read_to_string(&path)?;
+    let snapshot: ConfigSnapshot =
+        serde_json::from_str(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))?;
+    Ok(snapshot)
+}
+
+/// Result of validating a single snapshot file.
+#[derive(Debug, Clone)]
+pub struct SnapshotValidation {
+    pub path: PathBuf,
+    pub filename: String,
+    pub valid: bool,
+    pub error: Option<String>,
+}
+
+/// Validates all stored snapshot files for a given network.
+///
+/// Each file is checked for:
+/// - Readable (file exists and is not empty)
+/// - Valid JSON (deserializes as `ConfigSnapshot`)
+/// - Non-empty network field
+/// - Non-zero ledger
+///
+/// Returns a list of validation results, one per file.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn validate_all_snapshots(network: &str) -> AppResult<Vec<SnapshotValidation>> {
+    let paths = list_snapshots(network)?;
+    let mut results = Vec::with_capacity(paths.len());
+
+    for path in paths {
+        let filename = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        match validate_single_snapshot(&path) {
+            Ok(()) => {
+                results.push(SnapshotValidation {
+                    path,
+                    filename,
+                    valid: true,
+                    error: None,
+                });
+            }
+            Err(e) => {
+                results.push(SnapshotValidation {
+                    path,
+                    filename,
+                    valid: false,
+                    error: Some(e.to_string()),
+                });
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Validates a single snapshot file.
+fn validate_single_snapshot(path: &std::path::Path) -> AppResult<()> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| AppError::General(format!("cannot read file: {e}")))?;
+
+    if content.trim().is_empty() {
+        return Err(AppError::General("file is empty".to_string()));
+    }
+
+    let snapshot: ConfigSnapshot = serde_json::from_str(&content)
+        .map_err(|e| AppError::General(format!("invalid JSON: {e}")))?;
+
+    if snapshot.network.is_empty() {
+        return Err(AppError::General("network field is empty".to_string()));
+    }
+
+    if snapshot.ledger == 0 {
+        return Err(AppError::General("ledger is zero".to_string()));
+    }
+
+    Ok(())
 }
