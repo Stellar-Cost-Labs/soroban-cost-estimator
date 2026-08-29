@@ -69,6 +69,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             }
             cli::ConfigAction::History { network } => cmd_config_history(&network),
             cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network),
+            cli::ConfigAction::Validate { network } => cmd_config_validate(&network),
         },
         cli::Command::Cache { action } => match action {
             cli::CacheAction::Warm {
@@ -881,6 +882,37 @@ fn print_cached_estimate(fresh: &cache::CachedEstimate, ttl_secs: u64, json_flag
             fresh.ledger,
         );
     }
+}
+
+/// `config validate` command: check all stored snapshots for integrity.
+fn cmd_config_validate(network: &str) -> error::AppResult<()> {
+    let statuses = config_snapshot::store::validate_all_snapshots(network)?;
+
+    if statuses.is_empty() {
+        println!("No snapshots found for network '{network}'.");
+        return Ok(());
+    }
+
+    let total = statuses.len();
+    let invalid: Vec<_> = statuses.iter().filter(|s| !s.valid).collect();
+
+    println!("Validated {total} snapshot(s) for network '{network}'.");
+
+    if invalid.is_empty() {
+        println!("All snapshots are valid.");
+    } else {
+        println!("{}/{} snapshot(s) failed validation:", invalid.len(), total);
+        for status in &invalid {
+            println!(
+                "  - {}: {}",
+                status.filename,
+                status.error.as_deref().unwrap_or("unknown error")
+            );
+        }
+        std::process::exit(1);
+    }
+
+    Ok(())
 }
 
 /// Parse an interval like `3600`, `3600s`, `30m`, `1h`, or `1d` into seconds.

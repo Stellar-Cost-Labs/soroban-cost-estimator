@@ -147,3 +147,80 @@ pub fn load_snapshot_by_timestamp(network: &str, timestamp: &str) -> AppResult<C
         serde_json::from_str(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))?;
     Ok(snapshot)
 }
+
+/// Result of validating a single snapshot file.
+#[derive(Debug, Clone)]
+pub struct SnapshotValidation {
+    pub path: PathBuf,
+    pub filename: String,
+    pub valid: bool,
+    pub error: Option<String>,
+}
+
+/// Validates all stored snapshot files for a given network.
+///
+/// Each file is checked for:
+/// - Readable (file exists and is not empty)
+/// - Valid JSON (deserializes as `ConfigSnapshot`)
+/// - Non-empty network field
+/// - Non-zero ledger
+///
+/// Returns a list of validation results, one per file.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn validate_all_snapshots(network: &str) -> AppResult<Vec<SnapshotValidation>> {
+    let paths = list_snapshots(network)?;
+    let mut results = Vec::with_capacity(paths.len());
+
+    for path in paths {
+        let filename = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        match validate_single_snapshot(&path) {
+            Ok(()) => {
+                results.push(SnapshotValidation {
+                    path,
+                    filename,
+                    valid: true,
+                    error: None,
+                });
+            }
+            Err(e) => {
+                results.push(SnapshotValidation {
+                    path,
+                    filename,
+                    valid: false,
+                    error: Some(e.to_string()),
+                });
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Validates a single snapshot file.
+fn validate_single_snapshot(path: &std::path::Path) -> AppResult<()> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| AppError::General(format!("cannot read file: {e}")))?;
+
+    if content.trim().is_empty() {
+        return Err(AppError::General("file is empty".to_string()));
+    }
+
+    let snapshot: ConfigSnapshot = serde_json::from_str(&content)
+        .map_err(|e| AppError::General(format!("invalid JSON: {e}")))?;
+
+    if snapshot.network.is_empty() {
+        return Err(AppError::General("network field is empty".to_string()));
+    }
+
+    if snapshot.ledger == 0 {
+        return Err(AppError::General("ledger is zero".to_string()));
+    }
+
+    Ok(())
+}

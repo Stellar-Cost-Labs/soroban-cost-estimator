@@ -21,8 +21,11 @@ expression: MarkdownFormatter.format(&empty)
 
 ### Fee Breakdown
 
-| Component | Stroops |
-| --- | --- |
-| Non-refundable | 0 |
-| Refundable | 0 |
-| **Total** | **0** (0.0000000) |
+| Component | Stroops | % of Total |
+| --- | --- | --- |
+| Non-refundable | 0 | 0.0% |
+| Refundable | 0 | 0.0% |
+| CPU | 0 | 0.0% |
+| Storage | 0 | 0.0% |
+| Bandwidth | 0 | 0.0% |
+| **Total** | **0** (0.0000000) | **100.0%** |
