@@ -4,7 +4,7 @@ use soroban_cost_estimator::cli;
 use soroban_cost_estimator::config_snapshot;
 use soroban_cost_estimator::error;
 use soroban_cost_estimator::report;
-use soroban_cost_estimator::report::formatter::{JsonFormatter, ReportFormatter, TableFormatter};
+use soroban_cost_estimator::report::formatter::formatter_by_name;
 use soroban_cost_estimator::rpc;
 use soroban_cost_estimator::wasm;
 use soroban_cost_estimator::xdr_helper;
@@ -29,8 +29,10 @@ async fn main() {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run(args: cli::Cli) -> error::AppResult<()> {
     let rps = args.rps;
+    let format = args.format;
     match args.command {
         cli::Command::Estimate {
             wasm,
@@ -50,7 +52,11 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 r#fn.as_deref(),
                 &args,
                 cache_ttl.as_deref(),
-                json,
+                if json {
+                    cli::OutputFormat::Json
+                } else {
+                    format
+                },
                 rps,
             )
             .await
@@ -60,11 +66,41 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             network,
             id,
             json,
-        } => cmd_estimate_all(&wasm, &network, id.as_deref(), json, rps).await,
-        cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(&wasm, json),
+        } => {
+            cmd_estimate_all(
+                &wasm,
+                &network,
+                id.as_deref(),
+                if json {
+                    cli::OutputFormat::Json
+                } else {
+                    format
+                },
+                rps,
+            )
+            .await
+        }
+        cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(
+            &wasm,
+            if json {
+                cli::OutputFormat::Json
+            } else {
+                format
+            },
+        ),
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot { network, out, json } => {
-                cmd_config_snapshot(&network, out.as_deref(), json, rps).await
+                cmd_config_snapshot(
+                    &network,
+                    out.as_deref(),
+                    if json {
+                        cli::OutputFormat::Json
+                    } else {
+                        format
+                    },
+                    rps,
+                )
+                .await
             }
             cli::ConfigAction::Diff { network, against } => {
                 cmd_config_diff(&network, against.as_deref(), rps).await
@@ -79,7 +115,20 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 network,
                 id,
                 json,
-            } => cmd_cache_warm(&wasm, &network, id.as_deref(), json, rps).await,
+            } => {
+                cmd_cache_warm(
+                    &wasm,
+                    &network,
+                    id.as_deref(),
+                    if json {
+                        cli::OutputFormat::Json
+                    } else {
+                        format
+                    },
+                    rps,
+                )
+                .await
+            }
             cli::CacheAction::Verify => cmd_cache_verify(),
         },
         cli::Command::Watch { network, interval } => cmd_watch(&network, &interval, rps).await,
@@ -229,6 +278,15 @@ async fn fetch_fee_rates(client: &rpc::client::RpcClient) -> report::fee_calc::F
     rates
 }
 
+fn output_format_name(format: cli::OutputFormat) -> &'static str {
+    match format {
+        cli::OutputFormat::Table => "table",
+        cli::OutputFormat::Json => "json",
+        cli::OutputFormat::Csv => "csv",
+        cli::OutputFormat::Markdown => "markdown",
+    }
+}
+
 /// `estimate` command: simulate a single invocation and print cost report.
 ///
 /// All RPC traffic (simulation and fee-rate fetches) goes through one
@@ -244,7 +302,7 @@ async fn cmd_estimate(
     fn_name: Option<&str>,
     args: &[String],
     cache_ttl: Option<&str>,
-    json_flag: bool,
+    format: cli::OutputFormat,
     rps: Option<u64>,
 ) -> error::AppResult<()> {
     use sha2::Digest;
@@ -267,7 +325,7 @@ async fn cmd_estimate(
 
         // Show the hash before anything else — the user can verify they are
         // simulating the intended file before any RPC traffic is sent.
-        if !json_flag {
+        if format == cli::OutputFormat::Table {
             println!("WASM SHA-256: {wasm_hash}");
         }
 
@@ -279,7 +337,7 @@ async fn cmd_estimate(
         {
             let ttl_secs = ttl_secs.unwrap_or_default();
             info!(ttl_secs, function = %function_name, "cache hit — reusing fresh estimate");
-            print_cached_estimate(&fresh, ttl_secs, json_flag);
+            print_cached_estimate(&fresh, ttl_secs, format == cli::OutputFormat::Json);
             return Ok(());
         }
 
@@ -370,11 +428,8 @@ async fn cmd_estimate(
         );
         info!(total_stroops = fee.total_stroops, total_xlm = %fee.total_xlm, "estimate complete");
 
-        if json_flag {
-            println!("{}", JsonFormatter.format(&report));
-        } else {
-            println!("{}", TableFormatter.format(&report));
-        }
+        let formatter = formatter_by_name(output_format_name(format)).expect("valid output format");
+        println!("{}", formatter.format(&report));
 
         Ok(())
     }
@@ -392,7 +447,7 @@ async fn cmd_estimate_all(
     wasm_path: &str,
     network: &str,
     contract_id: Option<&str>,
-    json_flag: bool,
+    format: cli::OutputFormat,
     rps: Option<u64>,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
@@ -408,7 +463,7 @@ async fn cmd_estimate_all(
         use sha2::Digest;
         let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
 
-        if !json_flag {
+        if format == cli::OutputFormat::Table {
             println!("WASM SHA-256: {wasm_hash}");
             println!();
             println!("{}", wasm::parser::format_module_metadata(&wasm_info));
@@ -446,7 +501,7 @@ async fn cmd_estimate_all(
         debug!(total, "enumerated functions");
 
         for (i, fn_info) in wasm_info.functions.iter().enumerate() {
-            if !json_flag {
+            if format == cli::OutputFormat::Table {
                 println!("[{}/{}] {}", i + 1, total, fn_info.name);
             }
             let outcome = estimate_all_function(
@@ -456,7 +511,7 @@ async fn cmd_estimate_all(
                 contract_id,
                 &wasm_hash,
                 network,
-                json_flag,
+                format == cli::OutputFormat::Json,
             )
             .await?;
             if let Some(outcome) = outcome {
@@ -471,16 +526,71 @@ async fn cmd_estimate_all(
 
         // Aggregate fee range across every successfully estimated function
         // (#83): min/max/average in stroops (and XLM) for the whole batch.
-        emit_fee_range_summary(&fees, json_flag, &mut json_results);
+        emit_fee_range_summary(&fees, format == cli::OutputFormat::Json, &mut json_results);
 
-        if json_flag {
-            println!("{}", serde_json::to_string_pretty(&json_results)?);
+        match format {
+            cli::OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&json_results)?),
+            cli::OutputFormat::Csv => print_estimate_all_csv(&json_results),
+            cli::OutputFormat::Markdown => print_estimate_all_markdown(&json_results),
+            cli::OutputFormat::Table => {}
         }
 
         Ok(())
     }
     .instrument(span)
     .await
+}
+
+fn print_estimate_all_csv(results: &[serde_json::Value]) {
+    println!("function,status,cpu_instructions,memory_bytes,fee_stroops,fee_xlm,ledger,reason");
+    for result in results {
+        println!(
+            "{},{},{},{},{},{},{},{}",
+            csv_value(result["function"].as_str().unwrap_or("")),
+            csv_value(result["status"].as_str().unwrap_or("")),
+            result["cpu_instructions"].as_u64().unwrap_or(0),
+            result["memory_bytes"].as_u64().unwrap_or(0),
+            result["fee_stroops"].as_i64().unwrap_or(0),
+            csv_value(result["fee_xlm"].as_str().unwrap_or("")),
+            result["ledger"].as_u64().unwrap_or(0),
+            csv_value(
+                result["reason"]
+                    .as_str()
+                    .or(result["error"].as_str())
+                    .unwrap_or("")
+            ),
+        );
+    }
+}
+
+fn print_estimate_all_markdown(results: &[serde_json::Value]) {
+    println!(
+        "## Estimate Results\n\n| Function | Status | CPU | Memory | Fee (stroops) | Ledger | Details |\n| --- | --- | ---: | ---: | ---: | ---: | --- |"
+    );
+    for result in results {
+        let detail = result["reason"]
+            .as_str()
+            .or(result["error"].as_str())
+            .unwrap_or("");
+        println!(
+            "| {} | {} | {} | {} | {} | {} | {} |",
+            result["function"].as_str().unwrap_or(""),
+            result["status"].as_str().unwrap_or(""),
+            result["cpu_instructions"].as_u64().unwrap_or(0),
+            result["memory_bytes"].as_u64().unwrap_or(0),
+            result["fee_stroops"].as_i64().unwrap_or(0),
+            result["ledger"].as_u64().unwrap_or(0),
+            detail.replace('|', "\\|")
+        );
+    }
+}
+
+fn csv_value(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
 }
 
 /// Emit the aggregate fee-range summary for an `estimate-all` batch (#83).
@@ -500,7 +610,6 @@ fn emit_fee_range_summary(
         }
         return;
     };
-
     if json_flag {
         json_results.push(serde_json::json!({
             "function": "(summary)",
@@ -537,7 +646,7 @@ fn emit_fee_range_summary(
 
 /// Outcome of estimating one exported function in `estimate-all`.
 struct EstimateAllOutcome {
-    /// JSON record for `--json` output mode, if the caller wants it.
+    /// Structured record for machine-readable output modes.
     json: Option<serde_json::Value>,
     /// Total fee in stroops when the function was estimated successfully.
     /// `None` for skipped/errored functions, which must not count toward
@@ -702,16 +811,36 @@ async fn estimate_all_function(
 ///
 /// # Network calls
 /// None — pure file I/O + parsing.
-fn cmd_wasm_info(wasm_path: &str, json_flag: bool) -> error::AppResult<()> {
+fn cmd_wasm_info(wasm_path: &str, format: cli::OutputFormat) -> error::AppResult<()> {
     use sha2::Digest;
 
     let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
     let hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
 
-    if json_flag {
+    if format == cli::OutputFormat::Json {
         println!(
             "{}",
             serde_json::to_string_pretty(&wasm_info_json(wasm_path, &wasm_info, &hash))?
+        );
+        return Ok(());
+    }
+    if format == cli::OutputFormat::Csv {
+        println!("path,size,sha256,has_spec,function_count");
+        println!(
+            "{wasm_path},{},{},{},{}",
+            wasm_info.bytes.len(),
+            hash,
+            wasm_info.has_spec,
+            wasm_info.functions.len()
+        );
+        return Ok(());
+    }
+    if format == cli::OutputFormat::Markdown {
+        println!(
+            "# WASM Info\n\n| Field | Value |\n| --- | --- |\n| Path | `{wasm_path}` |\n| Size | {} bytes |\n| SHA-256 | `{hash}` |\n| Contract spec | {} |\n| Functions | {} |",
+            wasm_info.bytes.len(),
+            wasm_info.has_spec,
+            wasm_info.functions.len()
         );
         return Ok(());
     }
@@ -838,7 +967,7 @@ fn print_stale_estimates(network: &str, ledger: u32) {
 async fn cmd_config_snapshot(
     network: &str,
     out_path: Option<&str>,
-    json_flag: bool,
+    format: cli::OutputFormat,
     rps: Option<u64>,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
@@ -852,8 +981,17 @@ async fn cmd_config_snapshot(
         let path = config_snapshot::store::save_snapshot(&snapshot, out_path)?;
         info!(path = %path.display(), ledger = snapshot.ledger, "snapshot saved");
 
-        if json_flag {
+        if format == cli::OutputFormat::Json {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            return Ok(());
+        }
+        if format == cli::OutputFormat::Csv {
+            println!("network,ledger,timestamp,path");
+            println!("{},{},{},{}", snapshot.network, snapshot.ledger, snapshot.timestamp, path.display());
+            return Ok(());
+        }
+        if format == cli::OutputFormat::Markdown {
+            println!("# Config Snapshot\n\n| Field | Value |\n| --- | --- |\n| Network | {} |\n| Ledger | {} |\n| Timestamp | {} |\n| Path | `{}` |", snapshot.network, snapshot.ledger, snapshot.timestamp, path.display());
             return Ok(());
         }
         println!("Config snapshot saved to: {}", path.display());
@@ -1198,10 +1336,10 @@ async fn cmd_cache_warm(
     wasm_path: &str,
     network: &str,
     contract_id: Option<&str>,
-    json_flag: bool,
+    format: cli::OutputFormat,
     rps: Option<u64>,
 ) -> error::AppResult<()> {
-    cmd_estimate_all(wasm_path, network, contract_id, json_flag, rps).await
+    cmd_estimate_all(wasm_path, network, contract_id, format, rps).await
 }
 
 #[cfg(test)]
