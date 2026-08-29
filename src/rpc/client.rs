@@ -3,6 +3,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use governor::{Quota, RateLimiter};
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{debug, trace};
@@ -31,6 +32,16 @@ pub fn resolve_endpoint(network: &str, custom_url: Option<&str>) -> AppResult<St
         debug!(network, url, "resolved RPC endpoint");
     }
     endpoint
+}
+
+/// Response from the Soroban RPC `getHealth` call.
+///
+/// A reachable, healthy Soroban node answers with `{"status": "healthy"}`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthResponse {
+    /// The node's health status ("healthy" when ready to serve requests).
+    pub status: String,
 }
 
 /// Key identifying a deduplicable JSON-RPC request: `(method, serialized params)`.
@@ -95,6 +106,46 @@ impl RpcClient {
             client: reqwest::Client::new(),
             dedup: Arc::new(Mutex::new(DedupState::default())),
             limiter: rps.and_then(build_rate_limiter),
+        }
+    }
+
+    /// Validate that the RPC endpoint is reachable and healthy before any
+    /// simulation is run.
+    ///
+    /// Issues a lightweight `getHealth` JSON-RPC call and fails fast with a
+    /// clear, actionable error when the endpoint cannot be reached or reports
+    /// a status other than `healthy` — so a misconfigured `--rpc-url` (or a
+    /// down RPC node) is surfaced up front instead of surfacing midway through
+    /// an expensive batch of simulations.
+    ///
+    /// # Network calls
+    /// Makes at most one `getHealth` RPC call to the configured endpoint.
+    pub async fn health_check(&self) -> AppResult<()> {
+        let health: HealthResponse = self
+            .call("getHealth", serde_json::json!({}))
+            .await
+            .map_err(|e| {
+                AppError::Rpc {
+                    status: -1,
+                    message: format!(
+                        "unable to reach RPC endpoint {url}: {e}. Check --rpc-url / --network and that the node is reachable.",
+                        url = self.url
+                    ),
+                }
+            })?;
+
+        if health.status == "healthy" {
+            debug!(url = self.url, "RPC endpoint health check passed");
+            Ok(())
+        } else {
+            Err(AppError::Rpc {
+                status: -1,
+                message: format!(
+                    "RPC endpoint {url} reported unhealthy status: {status}. Check --rpc-url / --network.",
+                    url = self.url,
+                    status = health.status,
+                ),
+            })
         }
     }
 
@@ -533,6 +584,85 @@ mod tests {
         assert!(
             start.elapsed().as_millis() < 45,
             "disabled rate limiting must not delay requests"
+        );
+    }
+
+    /// Spawns a tiny HTTP server that answers a single JSON-RPC `getHealth`
+    /// call with the given result `status` value.
+    async fn spawn_health_stub(status: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind health stub server");
+        let addr = listener.local_addr().expect("no local address");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut tmp).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"status":"{status}"}}}}"#);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.flush().await;
+        });
+
+        format!("http://{addr}")
+    }
+
+    /// A healthy endpoint passes `health_check`.
+    #[tokio::test]
+    async fn test_health_check_healthy() {
+        let url = spawn_health_stub("healthy").await;
+        let client = RpcClient::new(&url);
+        client.health_check().await.expect("healthy endpoint");
+    }
+
+    /// A reachable but non-healthy node fails the check with a clear error
+    /// rather than silently proceeding into a simulation.
+    #[tokio::test]
+    async fn test_health_check_unhealthy_status() {
+        let url = spawn_health_stub("degraded").await;
+        let client = RpcClient::new(&url);
+        let err = client.health_check().await.expect_err("degraded endpoint");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("degraded") && msg.contains(&url),
+            "unhealthy status must surface the status and URL: {msg}"
+        );
+    }
+
+    /// An unreachable endpoint fails fail-fast with a clear, actionable error.
+    #[tokio::test]
+    async fn test_health_check_unreachable_endpoint() {
+        // Bind a listener so the port is guaranteed free, then close it so the
+        // RPC client cannot connect — an unreachable endpoint.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("no address");
+        drop(listener);
+
+        let url = format!("http://{addr}");
+        let client = RpcClient::new(&url);
+        let err = client
+            .health_check()
+            .await
+            .expect_err("unreachable endpoint");
+        assert!(
+            err.to_string().contains("unable to reach RPC endpoint"),
+            "unreachable endpoint must yield a clear error: {err}"
         );
     }
 }

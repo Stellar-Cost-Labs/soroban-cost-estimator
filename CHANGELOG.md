@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `estimate` / `estimate-all` validate that the RPC endpoint is reachable and
+  healthy before running any simulation (#55). A lightweight `getHealth` call
+  fails fast with a clear, actionable error on a misconfigured `--rpc-url` or
+  a down node, instead of surfacing the problem midway through the run.
 - `config diff --summary` — print a single-line summary
   (`X pricing changes, Y non-pricing changes`) instead of the full diff, for CI
   status lines. Exit code and auto-save side effects are unchanged.
