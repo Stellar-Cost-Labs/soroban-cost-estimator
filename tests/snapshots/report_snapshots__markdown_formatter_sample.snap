@@ -1,0 +1,28 @@
+---
+source: tests/report_snapshots.rs
+expression: MarkdownFormatter.format(&report)
+---
+## Cost Report: `increment`
+
+- **Network:** testnet (ledger 3894195)
+- **WASM hash:** `abc123def456`
+
+### Resources
+
+| Resource | Consumed |
+| --- | --- |
+| CPU Instructions | 532502 |
+| Memory Bytes | 0 |
+| Read Entries | 1 |
+| Write Entries | 1 |
+| Read Bytes | 0 |
+| Write Bytes | 136 |
+| Transaction Size | 156 |
+
+### Fee Breakdown
+
+| Component | Stroops |
+| --- | --- |
+| Non-refundable | 4496 |
+| Refundable | 10931 |
+| **Total** | **15427** (0.0015427) |
