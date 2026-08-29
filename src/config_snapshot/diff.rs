@@ -3,104 +3,66 @@ use crate::config_snapshot::model::{
     ContractHistoricalDataV0, ContractLedgerCostV0, StateArchivalV0,
 };
 
-/// Returns a human-readable explanation for a given config setting field path.
+/// Maps a config setting prefix to its human-readable name.
 ///
-/// Each explanation describes what the setting controls and the unit of
-/// its value (stroops, bytes, instructions, etc.).
-pub fn setting_explanation(field_path: &str) -> Option<&'static str> {
-    match field_path {
-        "contract_compute.ledger_max_instructions" => {
-            Some("Maximum CPU instructions a single ledger can execute across all transactions")
+/// Matches the XDR enum variant names from `ConfigSettingId`.
+pub fn setting_display_name(field_path: &str) -> &str {
+    match field_path.split('.').next() {
+        Some("contract_compute") => "Contract Compute V0",
+        Some("contract_ledger_cost") => "Contract Ledger Cost V0",
+        Some("contract_historical_data") => "Contract Historical Data V0",
+        Some("contract_events") => "Contract Events V0",
+        Some("contract_bandwidth") => "Contract Bandwidth V0",
+        Some("state_archival") => "State Archival",
+        _ => field_path,
+    }
+}
+
+/// Converts a raw field name (snake_case) into a Title Case label.
+///
+/// Example: `fee_rate_per_instructions_increment` → `Fee Rate Per Instructions Increment`
+pub fn humanize_field_name(field_path: &str) -> String {
+    match field_path.find('.') {
+        Some(pos) => {
+            let suffix = &field_path[pos + 1..];
+            suffix
+                .split('_')
+                .map(|word| {
+                    let mut chars = word.chars();
+                    match chars.next() {
+                        Some(c) => c.to_uppercase().to_string() + &chars.as_str().to_lowercase(),
+                        None => String::new(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
         }
-        "contract_compute.tx_max_instructions" => {
-            Some("Maximum CPU instructions a single transaction can execute")
-        }
-        "contract_compute.fee_rate_per_instructions_increment" => {
-            Some("Stroops charged per 10,000 CPU instructions (non-refundable fee)")
-        }
-        "contract_compute.tx_memory_limit" => {
-            Some("Maximum memory (in bytes) a single transaction can allocate")
-        }
-        "contract_ledger_cost.ledger_max_disk_read_entries" => {
-            Some("Maximum ledger entries readable per ledger")
-        }
-        "contract_ledger_cost.ledger_max_disk_read_bytes" => {
-            Some("Maximum bytes readable from disk per ledger")
-        }
-        "contract_ledger_cost.ledger_max_write_ledger_entries" => {
-            Some("Maximum ledger entries writable per ledger")
-        }
-        "contract_ledger_cost.ledger_max_write_bytes" => {
-            Some("Maximum bytes writable to disk per ledger")
-        }
-        "contract_ledger_cost.fee_disk_read_ledger_entry" => {
-            Some("Stroops charged per ledger entry read (non-refundable fee)")
-        }
-        "contract_ledger_cost.fee_write_ledger_entry" => {
-            Some("Stroops charged per ledger entry written (non-refundable fee)")
-        }
-        "contract_ledger_cost.fee_disk_read1_kb" => {
-            Some("Stroops charged per 1 KB read from disk (non-refundable fee)")
-        }
-        "contract_ledger_cost.soroban_state_target_size_bytes" => {
-            Some("Target total Soroban state size in bytes for rent fee calculation")
-        }
-        "contract_ledger_cost.rent_fee1_kb_soroban_state_size_low" => {
-            Some("Rent fee per 1 KB when Soroban state is below the target size")
-        }
-        "contract_ledger_cost.rent_fee1_kb_soroban_state_size_high" => {
-            Some("Rent fee per 1 KB when Soroban state is above the target size")
-        }
-        "contract_ledger_cost.soroban_state_rent_fee_growth_factor" => {
-            Some("Growth factor applied to rent fees as state grows")
-        }
-        "contract_historical_data.fee_historical1_kb" => {
-            Some("Stroops charged per 1 KB of historical (archive) data")
-        }
-        "contract_events.tx_max_contract_events_size_bytes" => {
-            Some("Maximum total size of events (in bytes) per transaction")
-        }
-        "contract_events.fee_contract_events1_kb" => {
-            Some("Stroops charged per 1 KB of events (refundable fee)")
-        }
-        "contract_bandwidth.ledger_max_txs_size_bytes" => {
-            Some("Maximum total transaction size (in bytes) per ledger")
-        }
-        "contract_bandwidth.tx_max_size_bytes" => {
-            Some("Maximum size (in bytes) of a single transaction")
-        }
-        "contract_bandwidth.fee_tx_size1_kb" => {
-            Some("Stroops charged per 1 KB of transaction size (non-refundable fee)")
-        }
-        "state_archival.max_entry_ttl" => {
-            Some("Maximum time-to-live (in ledgers) for a contract data entry")
-        }
-        "state_archival.min_temporary_ttl" => {
-            Some("Minimum TTL (in ledgers) for temporary contract data entries")
-        }
-        "state_archival.min_persistent_ttl" => {
-            Some("Minimum TTL (in ledgers) for persistent contract data entries")
-        }
-        "state_archival.persistent_rent_rate_denominator" => {
-            Some("Denominator for the persistent entry rent rate formula")
-        }
-        "state_archival.temp_rent_rate_denominator" => {
-            Some("Denominator for the temporary entry rent rate formula")
-        }
-        "state_archival.max_entries_to_archive" => {
-            Some("Maximum entries archived in a single archival sweep")
-        }
-        "state_archival.live_soroban_state_size_window_sample_size" => {
-            Some("Number of samples in the live Soroban state size window")
-        }
-        "state_archival.live_soroban_state_size_window_sample_period" => {
-            Some("Period (in ledgers) between Soroban state size samples")
-        }
-        "state_archival.eviction_scan_size" => Some("Number of entries scanned per eviction sweep"),
-        "state_archival.starting_eviction_scan_level" => {
-            Some("B-tree level at which eviction scanning begins")
-        }
-        _ => None,
+        None => field_path
+            .split('_')
+            .map(|word| {
+                let mut chars = word.chars();
+                match chars.next() {
+                    Some(c) => c.to_uppercase().to_string() + &chars.as_str().to_lowercase(),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+/// Returns a human-readable display string for a field path.
+///
+/// Combines the setting display name with the humanized field name:
+/// `contract_compute.fee_rate_per_instructions_increment`
+/// → `Contract Compute V0 > Fee Rate Per Instructions Increment`
+pub fn field_display_name(field_path: &str) -> String {
+    let setting = setting_display_name(field_path);
+    if field_path.contains('.') {
+        let field = humanize_field_name(field_path);
+        format!("{setting} > {field}")
+    } else {
+        setting.to_string()
     }
 }
 
@@ -591,10 +553,8 @@ pub fn format_diff(diff: &ConfigDiff) -> String {
         } else {
             "📋"
         };
-        output.push_str(&format!("  {icon} {}\n", change.field_path));
-        if let Some(explanation) = change.explanation {
-            output.push_str(&format!("      ℹ️  {explanation}\n"));
-        }
+        let display = field_display_name(&change.field_path);
+        output.push_str(&format!("  {icon} {display}\n"));
         output.push_str(&format!("      Old: {}\n", change.old_value));
         output.push_str(&format!("      New: {}\n", change.new_value));
     }
@@ -604,4 +564,115 @@ pub fn format_diff(diff: &ConfigDiff) -> String {
     }
 
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config_snapshot::model::*;
+
+    fn make_snapshot(compute_fee: i64, bandwidth_fee: i64) -> ConfigSnapshot {
+        ConfigSnapshot {
+            network: "testnet".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            ledger: 100,
+            contract_compute: Some(ContractComputeV0 {
+                ledger_max_instructions: 1_000_000,
+                tx_max_instructions: 100_000,
+                fee_rate_per_instructions_increment: compute_fee,
+                tx_memory_limit: 100,
+            }),
+            contract_ledger_cost: None,
+            contract_historical_data: None,
+            contract_events: None,
+            contract_bandwidth: Some(ContractBandwidthV0 {
+                ledger_max_txs_size_bytes: 1_000_000,
+                tx_max_size_bytes: 100_000,
+                fee_tx_size1_kb: bandwidth_fee,
+            }),
+            state_archival: None,
+        }
+    }
+
+    #[test]
+    fn test_setting_display_name() {
+        assert_eq!(
+            setting_display_name("contract_compute.foo"),
+            "Contract Compute V0"
+        );
+        assert_eq!(
+            setting_display_name("contract_ledger_cost.bar"),
+            "Contract Ledger Cost V0"
+        );
+        assert_eq!(
+            setting_display_name("contract_historical_data.baz"),
+            "Contract Historical Data V0"
+        );
+        assert_eq!(
+            setting_display_name("contract_events.qux"),
+            "Contract Events V0"
+        );
+        assert_eq!(
+            setting_display_name("contract_bandwidth.quux"),
+            "Contract Bandwidth V0"
+        );
+        assert_eq!(
+            setting_display_name("state_archival.corge"),
+            "State Archival"
+        );
+    }
+
+    #[test]
+    fn test_humanize_field_name() {
+        assert_eq!(
+            humanize_field_name("contract_compute.fee_rate_per_instructions_increment"),
+            "Fee Rate Per Instructions Increment"
+        );
+        assert_eq!(
+            humanize_field_name("contract_bandwidth.fee_tx_size1_kb"),
+            "Fee Tx Size1 Kb"
+        );
+        assert_eq!(
+            humanize_field_name("state_archival.max_entry_ttl"),
+            "Max Entry Ttl"
+        );
+    }
+
+    #[test]
+    fn test_field_display_name() {
+        assert_eq!(
+            field_display_name("contract_compute.fee_rate_per_instructions_increment"),
+            "Contract Compute V0 > Fee Rate Per Instructions Increment"
+        );
+        assert_eq!(
+            field_display_name("state_archival.max_entry_ttl"),
+            "State Archival > Max Entry Ttl"
+        );
+    }
+
+    #[test]
+    fn test_format_diff_uses_human_readable_names() {
+        let old = make_snapshot(100, 5);
+        let new = make_snapshot(200, 5);
+        let diff = diff_snapshots(&old, &new);
+        let output = format_diff(&diff);
+        // Should show human-readable setting name, not raw prefix
+        assert!(output.contains("Contract Compute V0"));
+        assert!(
+            output.contains("Fee Rate Per Instructions Increment"),
+            "field names should be humanized: {output}"
+        );
+        // Should NOT show raw snake_case path
+        assert!(!output.contains("contract_compute.fee_rate_per_instructions_increment"));
+    }
+
+    #[test]
+    fn test_format_diff_multiple_settings_humanized() {
+        let old = make_snapshot(100, 5);
+        let new = make_snapshot(200, 10);
+        let diff = diff_snapshots(&old, &new);
+        let output = format_diff(&diff);
+        assert!(output.contains("Contract Compute V0"));
+        assert!(output.contains("Contract Bandwidth V0"));
+    }
 }

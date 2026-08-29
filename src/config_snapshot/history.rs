@@ -1,4 +1,5 @@
 use crate::config_snapshot::diff;
+use crate::config_snapshot::diff::field_display_name;
 use crate::config_snapshot::model::ConfigSnapshot;
 use crate::config_snapshot::store;
 use crate::error::AppResult;
@@ -101,9 +102,10 @@ pub fn format_change_log(network: &str, log: &[FieldHistoryEntry]) -> String {
         } else {
             "📋"
         };
+        let display = field_display_name(&entry.field_path);
         output.push_str(&format!(
-            "  {icon} [{}] (ledger {}) {}\n",
-            entry.timestamp, entry.ledger, entry.field_path
+            "  {icon} [{}] (ledger {}) {display}\n",
+            entry.timestamp, entry.ledger
         ));
         output.push_str(&format!(
             "      {} → {}\n",
@@ -133,9 +135,10 @@ pub fn format_last_changed(network: &str, entries: &[FieldHistoryEntry]) -> Stri
         } else {
             "📋"
         };
+        let display = field_display_name(&entry.field_path);
         output.push_str(&format!(
-            "  {icon} {} — last changed {} (ledger {}): {} → {}\n",
-            entry.field_path, entry.timestamp, entry.ledger, entry.old_value, entry.new_value
+            "  {icon} {display} — last changed {} (ledger {}): {} → {}\n",
+            entry.timestamp, entry.ledger, entry.old_value, entry.new_value
         ));
     }
 
