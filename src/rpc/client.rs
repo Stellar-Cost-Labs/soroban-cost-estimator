@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
+use crate::rpc::retry::with_retry;
 
 /// Resolves a network name to its well-known Soroban RPC endpoint.
 ///
@@ -162,49 +163,26 @@ impl RpcClient {
         });
 
         trace!(method, "sending RPC request");
-        match self.post_and_deserialize(method, &body, &self.url).await {
-            Ok(result) => Ok(result),
-            Err(e) if self.is_network_error(&e) => {
-                if let Some(ref fallback) = self.fallback_url {
-                    warn!(
-                        method,
-                        primary = %self.url,
-                        fallback = %fallback,
-                        error = %e,
-                        "primary RPC endpoint failed — trying fallback"
-                    );
-                    self.post_and_deserialize(method, &body, fallback).await
-                } else {
-                    Err(e)
-                }
+
+        let client = self.client.clone();
+        let url = self.url.clone();
+        let request_body = body.clone();
+
+        let response = with_retry(|| {
+            let client = client.clone();
+            let url = url.clone();
+            let request_body = request_body.clone();
+
+            async move {
+                client
+                    .post(&url)
+                    .json(&request_body)
+                    .send()
+                    .await
+                    .map_err(AppError::from)
             }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Check whether an error is a network-level failure (as opposed to an
-    /// RPC-level error returned inside a successful HTTP response).
-    fn is_network_error(&self, error: &AppError) -> bool {
-        match error {
-            AppError::Http(e) => {
-                // reqwest errors that indicate connectivity problems — these
-                // are the cases where a fallback endpoint might succeed.
-                e.is_connect() || e.is_timeout() || e.is_request()
-            }
-            _ => false,
-        }
-    }
-
-    /// POST to the given URL, parse the JSON-RPC response, and deserialize
-    /// the `result` field into `T`.
-    async fn post_and_deserialize<T: serde::de::DeserializeOwned>(
-        &self,
-        method: &str,
-        body: &Value,
-        url: &str,
-    ) -> AppResult<T> {
-        let response = self.client.post(url).json(body).send().await?;
-
+        })
+        .await?;
         let status = response.status();
         let response_body: Value = response.json().await?;
         if std::env::var("SCE_DEBUG_RPC").is_ok() {
