@@ -859,6 +859,102 @@ fn test_watch_unknown_network_is_non_fatal() {
     );
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// `wasm-info` — contractmeta display
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Encodes one `ScMetaEntry::ScMetaV0` union value (XDR): 4-byte
+/// discriminant 0, then `{ key, val }` as length-prefixed strings, each
+/// padded to a 4-byte boundary (XDR string padding).
+fn xdr_meta_entry(key: &str, val: &str) -> Vec<u8> {
+    let mut out = 0u32.to_be_bytes().to_vec();
+    for s in [key, val] {
+        out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+        out.extend_from_slice(s.as_bytes());
+        let padding = (4 - s.len() % 4) % 4;
+        out.extend_from_slice(&[0u8; 4][..padding]);
+    }
+    out
+}
+
+/// Wraps `payload` in a WASM custom section (id 0) named `name`.
+fn custom_section(name: &str, payload: &[u8]) -> Vec<u8> {
+    let mut content = Vec::new();
+    content.push(name.len() as u8);
+    content.extend_from_slice(name.as_bytes());
+    content.extend_from_slice(payload);
+
+    let mut section = vec![0u8];
+    let mut size = content.len() as u32;
+    loop {
+        let mut byte = (size & 0x7f) as u8;
+        size >>= 7;
+        if size != 0 {
+            byte |= 0x80;
+        }
+        section.push(byte);
+        if size == 0 {
+            break;
+        }
+    }
+    section.extend_from_slice(&content);
+    section
+}
+
+#[test]
+fn test_wasm_info_displays_contract_meta() {
+    // Extend the bare fixture with a contractmeta section and point wasm-info
+    // at it: name/version/description must be shown (table and JSON modes).
+    let mut bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&xdr_meta_entry("name", "MetaContract"));
+    payload.extend_from_slice(&xdr_meta_entry("version", "9.9.9"));
+    payload.extend_from_slice(&xdr_meta_entry("description", "A meta description"));
+    bytes.extend_from_slice(&custom_section("contractmetav0", &payload));
+
+    let home = temp_home("wasm-info-meta");
+    let path = home.join("meta.wasm");
+    std::fs::write(&path, &bytes).expect("write fixture");
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &["wasm-info", "--wasm", path.to_str().unwrap()],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "wasm-info should succeed; stderr: {stderr}");
+    assert!(stdout.contains("Contract meta: present"));
+    assert!(stdout.contains("name: MetaContract"));
+    assert!(stdout.contains("version: 9.9.9"));
+    assert!(stdout.contains("description: A meta description"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(["wasm-info", "--wasm", path.to_str().unwrap(), "--json"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run CLI");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    assert_eq!(parsed["contract_meta"]["name"], "MetaContract");
+    assert_eq!(parsed["contract_meta"]["version"], "9.9.9");
+    assert_eq!(parsed["contract_meta"]["description"], "A meta description");
+}
+
+#[test]
+fn test_wasm_info_reports_absent_contract_meta() {
+    let home = temp_home("wasm-info-no-meta");
+    let (stdout, stderr, code) = run_cli_in_home(
+        &["wasm-info", "--wasm", "tests/fixtures/minimal.wasm"],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "wasm-info should succeed; stderr: {stderr}");
+    assert!(
+        stdout.contains("Contract meta: absent"),
+        "bare WASM should report absent meta; got: {stdout}"
+    );
+}
+
 #[test]
 fn test_watch_interval_suffixes_are_parsed() {
     // `30m` must resolve to 1800s in the banner — the interval parser is unit
