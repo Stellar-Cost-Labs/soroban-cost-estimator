@@ -365,7 +365,7 @@ fn test_estimate_invalid_wasm_file() {
     let (_, stderr, code) = run_cli(&["estimate", "--wasm", bogus.to_str().unwrap()]);
     assert_eq!(code, 1, "invalid WASM should exit 1");
     assert!(
-        stderr.contains("WASM validation error"),
+        stderr.contains("failed to validate WASM"),
         "invalid bytes should fail validation; got: {stderr}"
     );
 }
@@ -381,7 +381,9 @@ fn test_estimate_unknown_network() {
     ]);
     assert_eq!(code, 1, "an unknown network should exit 1");
     assert!(
-        stderr.contains("RPC endpoint not configured for network: not-a-network"),
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
         "the error should name the unknown network; got: {stderr}"
     );
 }
@@ -625,7 +627,7 @@ fn test_estimate_all_invalid_wasm_file() {
     let (_, stderr, code) = run_cli(&["estimate-all", "--wasm", bogus.to_str().unwrap()]);
     assert_eq!(code, 1, "invalid WASM should exit 1");
     assert!(
-        stderr.contains("WASM validation error"),
+        stderr.contains("failed to validate WASM"),
         "invalid bytes should fail validation; got: {stderr}"
     );
 }
@@ -641,7 +643,9 @@ fn test_estimate_all_unknown_network() {
     ]);
     assert_eq!(code, 1, "an unknown network should exit 1");
     assert!(
-        stderr.contains("RPC endpoint not configured for network: not-a-network"),
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
         "the error should name the unknown network; got: {stderr}"
     );
 }
@@ -655,7 +659,9 @@ fn test_config_snapshot_unknown_network() {
     let (_, stderr, code) = run_cli(&["config", "snapshot", "--network", "not-a-network"]);
     assert_eq!(code, 1, "an unknown network should exit 1");
     assert!(
-        stderr.contains("RPC endpoint not configured for network: not-a-network"),
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
         "the error should name the unknown network; got: {stderr}"
     );
 }
@@ -673,7 +679,7 @@ fn test_config_diff_without_snapshots_errors() {
         run_cli_in_home(&["config", "diff", "--network", "testnet"], Some(&home));
     assert_eq!(code, 1, "diffing with no snapshots should exit 1");
     assert!(
-        stderr.contains("No snapshots available for network: testnet"),
+        stderr.contains("none available for network testnet"),
         "the error should name the network with no snapshots; got: {stderr}"
     );
 }
@@ -687,7 +693,7 @@ fn test_config_diff_against_missing_file_errors() {
     );
     assert_eq!(code, 1, "a missing --against file should exit 1");
     assert!(
-        stderr.contains("I/O error"),
+        stderr.contains("Error: failed to perform I/O"),
         "a missing snapshot file should surface as an I/O error; got: {stderr}"
     );
 }
@@ -704,7 +710,7 @@ fn test_config_diff_against_malformed_snapshot_errors() {
     );
     assert_eq!(code, 1, "a malformed snapshot should exit 1");
     assert!(
-        stderr.contains("Snapshot parse error"),
+        stderr.contains("Error: failed to parse snapshot"),
         "a malformed snapshot should surface as a parse error; got: {stderr}"
     );
 }
@@ -743,7 +749,7 @@ fn test_cache_warm_nonexistent_wasm_file() {
         "a missing WASM file should exit 1; stderr: {stderr}"
     );
     assert!(
-        stderr.contains("File not found") || stderr.contains("I/O error"),
+        stderr.contains("File not found") || stderr.contains("Error: failed to perform I/O"),
         "stderr: {stderr}"
     );
 }
@@ -756,7 +762,10 @@ fn test_cache_warm_invalid_wasm_file() {
 
     let (_, stderr, code) = run_cli(&["cache", "warm", "--wasm", bogus.to_str().unwrap()]);
     assert_eq!(code, 1, "invalid WASM should exit 1");
-    assert!(stderr.contains("WASM validation error"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("failed to validate WASM"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
@@ -771,7 +780,9 @@ fn test_cache_warm_unknown_network() {
     ]);
     assert_eq!(code, 1, "an unknown network should exit 1");
     assert!(
-        stderr.contains("RPC endpoint not configured for network: not-a-network"),
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
         "stderr: {stderr}"
     );
 }
@@ -802,11 +813,13 @@ fn test_config_diff_loads_valid_snapshot_before_network() {
     );
     assert_eq!(code, 1, "the unknown network should exit 1");
     assert!(
-        stderr.contains("RPC endpoint not configured for network: not-a-network"),
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
         "the snapshot should load cleanly and the network should be the failure; got: {stderr}"
     );
     assert!(
-        !stderr.contains("Snapshot parse error"),
+        !stderr.contains("Error: failed to parse snapshot"),
         "a valid snapshot must not be reported as malformed; got: {stderr}"
     );
 }
