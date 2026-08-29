@@ -364,3 +364,5 @@ Looking for something to work on? The
 [issue backlog](https://github.com/aigbagbobila/soroban-cost-estimator/issues)
 holds scoped issues with Summary / Acceptance Criteria / Tech Stack — good
 first tasks for the Drips Stellar Wave contributor sprints.
+
+Fixing issue 112
