@@ -1,6 +1,6 @@
 use comfy_table::Table;
 
-use crate::report::fee_calc::FeeBreakdown;
+use crate::report::fee_calc::{FeeBreakdown, stroops_to_xlm};
 
 /// Compute what percentage `part` is of `total`.
 ///
@@ -42,6 +42,20 @@ pub struct CostReport {
     pub ledger: u32,
     /// Network the simulation ran on.
     pub network: String,
+}
+
+/// Project the total resource fee for `count` invocations of the contract.
+///
+/// Returns the projected stroops and XLM cost for running the same contract
+/// function `count` times. The calculation is a simple multiplication of the
+/// per-invocation costs by the count.
+pub fn project_cost_for_invocations(
+    report: &CostReport,
+    count: u64,
+) -> (i64, String) {
+    let projected_stroops = report.fee.total_stroops.checked_mul(count as i64).unwrap_or(i64::MAX);
+    let projected_xlm = stroops_to_xlm(projected_stroops);
+    (projected_stroops, projected_xlm)
 }
 
 /// Formats a cost report as a human-readable table.
@@ -137,5 +151,122 @@ mod tests {
         assert_eq!(fee_percentage(1, 10), "10.0%");
         assert_eq!(fee_percentage(1, 3), "33.3%");
         assert_eq!(fee_percentage(2, 3), "66.7%");
+    }
+
+    #[test]
+    fn test_project_cost_for_invocations_single() {
+        let report = CostReport {
+            function: "increment".to_string(),
+            wasm_hash: "abc123def456".to_string(),
+            cpu_instructions: 532_502,
+            memory_bytes: 0,
+            tx_size: 156,
+            read_entries: 1,
+            write_entries: 1,
+            read_bytes: 0,
+            write_bytes: 136,
+            fee: FeeBreakdown {
+                non_refundable_stroops: 4_496,
+                refundable_stroops: 10_931,
+                cpu_fee_stroops: 372,
+                storage_fee_stroops: 4_063,
+                bandwidth_fee_stroops: 61,
+                total_stroops: 15_427,
+                total_xlm: "0.0015427".to_string(),
+            },
+            ledger: 3_894_195,
+            network: "testnet".to_string(),
+        };
+        let (stroops, xlm) = project_cost_for_invocations(&report, 1);
+        assert_eq!(stroops, 15_427);
+        assert_eq!(xlm, "0.0015427");
+    }
+
+    #[test]
+    fn test_project_cost_for_invocations_multiple() {
+        let report = CostReport {
+            function: "increment".to_string(),
+            wasm_hash: "abc123def456".to_string(),
+            cpu_instructions: 532_502,
+            memory_bytes: 0,
+            tx_size: 156,
+            read_entries: 1,
+            write_entries: 1,
+            read_bytes: 0,
+            write_bytes: 136,
+            fee: FeeBreakdown {
+                non_refundable_stroops: 4_496,
+                refundable_stroops: 10_931,
+                cpu_fee_stroops: 372,
+                storage_fee_stroops: 4_063,
+                bandwidth_fee_stroops: 61,
+                total_stroops: 15_427,
+                total_xlm: "0.0015427".to_string(),
+            },
+            ledger: 3_894_195,
+            network: "testnet".to_string(),
+        };
+        let (stroops, xlm) = project_cost_for_invocations(&report, 100);
+        assert_eq!(stroops, 1_542_700);
+        assert_eq!(xlm, "0.1542700");
+    }
+
+    #[test]
+    fn test_project_cost_for_invocations_zero() {
+        let report = CostReport {
+            function: "increment".to_string(),
+            wasm_hash: "abc123def456".to_string(),
+            cpu_instructions: 532_502,
+            memory_bytes: 0,
+            tx_size: 156,
+            read_entries: 1,
+            write_entries: 1,
+            read_bytes: 0,
+            write_bytes: 136,
+            fee: FeeBreakdown {
+                non_refundable_stroops: 4_496,
+                refundable_stroops: 10_931,
+                cpu_fee_stroops: 372,
+                storage_fee_stroops: 4_063,
+                bandwidth_fee_stroops: 61,
+                total_stroops: 15_427,
+                total_xlm: "0.0015427".to_string(),
+            },
+            ledger: 3_894_195,
+            network: "testnet".to_string(),
+        };
+        let (stroops, xlm) = project_cost_for_invocations(&report, 0);
+        assert_eq!(stroops, 0);
+        assert_eq!(xlm, "0.0000000");
+    }
+
+    #[test]
+    fn test_project_cost_for_invocations() {
+        let report = CostReport {
+            function: "increment".to_string(),
+            wasm_hash: "abc123def456".to_string(),
+            cpu_instructions: 532_502,
+            memory_bytes: 0,
+            tx_size: 156,
+            read_entries: 1,
+            write_entries: 1,
+            read_bytes: 0,
+            write_bytes: 136,
+            fee: FeeBreakdown {
+                non_refundable_stroops: 4_496,
+                refundable_stroops: 10_931,
+                cpu_fee_stroops: 372,
+                storage_fee_stroops: 4_063,
+                bandwidth_fee_stroops: 61,
+                total_stroops: 15_427,
+                total_xlm: "0.0015427".to_string(),
+            },
+            ledger: 3_894_195,
+            network: "testnet".to_string(),
+        };
+        // 100 invocations = 1,542,700 stroops (as described in issue #82)
+        let (stroops, xlm) = project_cost_for_invocations(&report, 100);
+        assert_eq!(stroops, 1_542_700);
+        assert_eq!(xlm, "0.1542700");
     }
 }
