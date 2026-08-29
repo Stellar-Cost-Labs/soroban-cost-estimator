@@ -53,6 +53,10 @@ pub enum Command {
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
         json: bool,
+
+        /// Path to second `.wasm` file to compare against (estimates both and shows cost delta).
+        #[arg(long, value_name = "WASM")]
+        diff: Option<String>,
     },
 
     /// Enumerate all public contract functions and estimate each one.
