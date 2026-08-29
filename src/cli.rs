@@ -200,6 +200,13 @@ pub enum ConfigAction {
         json: bool,
     },
 
+    /// List all saved config snapshots with their timestamp and ledger.
+    List {
+        /// Network whose snapshots to list.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+    },
+
     /// Diff the current network config against the most recent snapshot.
     Diff {
         /// Network to compare against.
