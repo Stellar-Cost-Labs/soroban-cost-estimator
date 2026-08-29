@@ -177,8 +177,9 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
         cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(&wasm, json),
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot { network, out, json } => {
-                cmd_config_snapshot(&network, out.as_deref(), json, rps, timeout).await
+cmd_config_snapshot(&network, out.as_deref(), json, rps, timeout).await
             }
+            cli::ConfigAction::List { network } => cmd_config_snapshot_list(&network),
             cli::ConfigAction::Diff {
                 network,
                 against,
@@ -1063,6 +1064,27 @@ async fn cmd_config_snapshot(
     }
     .instrument(span)
     .await
+}
+
+/// `config snapshot list` command: list all saved snapshots for a network.
+fn cmd_config_snapshot_list(network: &str) -> error::AppResult<()> {
+    let snapshots = config_snapshot::store::list_snapshots(network)?;
+
+    if snapshots.is_empty() {
+        println!("No snapshots found for network '{network}'.");
+        return Ok(());
+    }
+
+    println!("Config snapshots for network '{network}':");
+    for path in snapshots {
+        let path_str = path.to_string_lossy();
+        let snapshot = config_snapshot::store::load_snapshot_from_path(&path_str)?;
+        println!(
+            "  {}  ledger {}  {}",
+            snapshot.timestamp, snapshot.ledger, path_str
+        );
+    }
+    Ok(())
 }
 
 /// True when a config diff signals a network protocol/config upgrade.
