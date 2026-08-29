@@ -13,6 +13,14 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "N")]
     pub rps: Option<u64>,
 
+    /// Total request timeout for RPC calls in seconds.
+    ///
+    /// This is the maximum time allowed for the entire HTTP request
+    /// (connection + data transfer), separate from the connection timeout
+    /// which defaults to 10 seconds. Examples: "30", "60s", "120".
+    #[arg(long, global = true, value_name = "SECS")]
+    pub rpc_timeout: Option<u64>,
+
     #[command(subcommand)]
     pub command: Command,
 }

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Duration;
 
 use governor::{Quota, RateLimiter};
 use serde_json::Value;
@@ -72,6 +73,8 @@ pub struct RpcClient {
     dedup: Arc<Mutex<DedupState>>,
     /// Fixed-rate limiter shared by every network call, when enabled.
     limiter: Option<Arc<governor::DefaultDirectRateLimiter>>,
+    /// Total request timeout override from `--rpc-timeout`, if any.
+    request_timeout: Option<Duration>,
 }
 
 impl RpcClient {
@@ -89,12 +92,35 @@ impl RpcClient {
     /// disables rate limiting entirely. Values larger than `u32::MAX` are
     /// clamped.
     pub fn with_rate_limit(url: &str, rps: Option<u64>) -> Self {
-        debug!(url, rps, "creating RPC client");
+        Self::with_rate_limit_and_timeout(url, rps, None)
+    }
+
+    /// Create a new RPC client with rate limiting and an optional total
+    /// request timeout.
+    ///
+    /// The `request_timeout` controls the maximum time allowed for the entire
+    /// HTTP request lifecycle (connection + data transfer). When `None`,
+    /// `reqwest`'s default (no limit) applies. The connection timeout is
+    /// always 10 seconds, set on the underlying `reqwest::Client`.
+    pub fn with_rate_limit_and_timeout(
+        url: &str,
+        rps: Option<u64>,
+        request_timeout: Option<Duration>,
+    ) -> Self {
+        debug!(url, rps, ?request_timeout, "creating RPC client");
+        let mut builder = reqwest::Client::builder();
+        // Always set a connection timeout so TCP connects don't hang.
+        builder = builder.connect_timeout(Duration::from_secs(10));
+        if let Some(timeout) = request_timeout {
+            builder = builder.timeout(timeout);
+        }
+        let client = builder.build().expect("failed to build reqwest client");
         Self {
             url: url.to_string(),
-            client: reqwest::Client::new(),
+            client,
             dedup: Arc::new(Mutex::new(DedupState::default())),
             limiter: rps.and_then(build_rate_limiter),
+            request_timeout,
         }
     }
 
@@ -534,5 +560,118 @@ mod tests {
             start.elapsed().as_millis() < 45,
             "disabled rate limiting must not delay requests"
         );
+    }
+
+    // ── Timeout tests ──────────────────────────────────────────────
+
+    /// With a short timeout, a slow server must be aborted before the
+    /// response completes.
+    #[tokio::test]
+    async fn test_request_timeout_aborts_slow_response() {
+        use std::time::Duration;
+
+        // Spawn a stub that sleeps 200ms before responding.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        let n = stream.read(&mut buf).await.unwrap_or(0);
+                        if n == 0 || buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    // Sleep long enough to exceed the timeout.
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+
+        let url = format!("http://{addr}");
+        let client = RpcClient::with_rate_limit_and_timeout(
+            &url,
+            None,
+            Some(Duration::from_millis(50)),
+        );
+
+        let result = client
+            .call::<Value>("test.slow", serde_json::json!({"k": 1}))
+            .await;
+
+        assert!(result.is_err(), "timeout must produce an error");
+    }
+
+    /// Without an explicit timeout the same server should respond successfully.
+    #[tokio::test]
+    async fn test_no_timeout_allows_slow_response() {
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        let n = stream.read(&mut buf).await.unwrap_or(0);
+                        if n == 0 || buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+
+        let url = format!("http://{addr}");
+        // No request_timeout — only connect_timeout (10s default).
+        let client = RpcClient::with_rate_limit_and_timeout(&url, None, None);
+
+        let result = client
+            .call::<Value>("test.slow", serde_json::json!({"k": 1}))
+            .await;
+
+        assert!(result.is_ok(), "no-timeout should succeed: {result:?}");
+    }
+
+    /// The `with_rate_limit` constructor (legacy path) must still work
+    /// and produce a client that connects and requests without error.
+    #[tokio::test]
+    async fn test_with_rate_limit_backward_compat() {
+        let (url, counter) = spawn_json_rpc_stub(0).await;
+        let client = RpcClient::with_rate_limit(&url, None);
+
+        let _: Value = client
+            .call("test.method", serde_json::json!({"k": 1}))
+            .await
+            .expect("call should succeed");
+
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 }
