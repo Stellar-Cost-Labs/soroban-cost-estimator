@@ -1,26 +1,29 @@
 ---
 source: tests/report_snapshots.rs
+assertion_line: 76
 expression: JsonFormatter.format(&empty)
 ---
 {
-  "function": "(wasm upload)",
-  "wasm_hash": "0000000000000000",
   "cpu_instructions": 0,
-  "memory_bytes": 0,
-  "tx_size": 0,
-  "read_entries": 0,
-  "write_entries": 0,
-  "read_bytes": 0,
-  "write_bytes": 0,
   "fee": {
+    "bandwidth_fee_stroops": 0,
+    "cpu_fee_stroops": 0,
     "non_refundable_stroops": 0,
     "refundable_stroops": 0,
-    "cpu_fee_stroops": 0,
     "storage_fee_stroops": 0,
-    "bandwidth_fee_stroops": 0,
     "total_stroops": 0,
     "total_xlm": "0.0000000"
   },
+  "function": "(wasm upload)",
   "ledger": 0,
-  "network": "mainnet"
+  "memory_bytes": 0,
+  "network": "mainnet",
+  "read_bytes": 0,
+  "read_entries": 0,
+  "rpc_latency_ms": 0,
+  "suggestions": [],
+  "tx_size": 0,
+  "wasm_hash": "0000000000000000",
+  "write_bytes": 0,
+  "write_entries": 0
 }
