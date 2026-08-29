@@ -14,8 +14,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde_json::json;
 use sha2::Digest;
+use soroban_cost_estimator::cache;
 
 /// An RPC URL that is guaranteed not to answer: port 1 on loopback.
 /// Used to drive the network error path without leaving the machine.
@@ -480,28 +480,39 @@ fn test_estimate_rpc_url_overrides_unknown_network() {
 ///
 /// Mirrors the library's cache-key computation: `wasm_hash` is the SHA-256 of
 /// the WASM bytes and `args_hash` is the SHA-256 of the concatenated args
-/// (empty for no args).
+/// (empty for no args). The entry is written directly into the SQLite cache
+/// database so the `estimate` command's cache-hit path can find it.
 fn seed_cache_entry(home: &Path, timestamp: &str) {
     let wasm_bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
     let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_bytes));
     let args_hash = hex::encode(sha2::Sha256::digest(b""));
 
-    let cache_dir = home.join(".soroban-cost-estimator").join("cache");
-    std::fs::create_dir_all(&cache_dir).expect("create cache dir");
-    let path = cache_dir.join(format!("{wasm_hash}-(wasm upload)-{args_hash}.json"));
+    let dir = home.join(".soroban-cost-estimator");
+    std::fs::create_dir_all(&dir).expect("create data dir");
+    let db = dir.join("cache.db");
+    let conn = rusqlite::Connection::open(&db).expect("open cache db");
+    // Ensure the schema exists in this exact database before writing rows
+    // directly (the CLI reads the same path, so they must match).
+    cache::ensure_cache_schema(&conn).expect("ensure cache schema");
 
-    let entry = json!({
-        "wasm_hash": wasm_hash,
-        "function": "(wasm upload)",
-        "args_hash": args_hash,
-        "network": "testnet",
-        "ledger": 42,
-        "total_stroops": 1_000,
-        "cpu_instructions": 500,
-        "memory_bytes": 250,
-        "timestamp": timestamp,
-    });
-    std::fs::write(path, entry.to_string()).expect("write cache entry");
+    conn.execute(
+        "INSERT OR REPLACE INTO estimates \
+         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            1i64,
+            wasm_hash,
+            "(wasm upload)",
+            args_hash,
+            "testnet",
+            42i64,
+            1_000i64,
+            500i64,
+            250i64,
+            timestamp,
+        ],
+    )
+    .expect("seed cache entry");
 }
 
 #[test]
