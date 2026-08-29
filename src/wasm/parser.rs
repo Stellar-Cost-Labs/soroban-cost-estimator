@@ -2,9 +2,20 @@ use std::io::Cursor;
 use std::path::Path;
 
 use stellar_xdr::ReadXdr;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::error::{AppError, AppResult};
+
+/// Soroban network memory limit per transaction in bytes.
+/// Currently 40 MB (40,000,000 bytes).
+const SOROBAN_TX_MEMORY_LIMIT_BYTES: u64 = 40_000_000;
+
+/// WASM page size in bytes (64 KB).
+const WASM_PAGE_SIZE_BYTES: u64 = 65_536;
+
+/// Maximum number of WASM pages allowed by Soroban.
+/// Calculated as SOROBAN_TX_MEMORY_LIMIT_BYTES / WASM_PAGE_SIZE_BYTES.
+const SOROBAN_MAX_WASM_PAGES: u64 = SOROBAN_TX_MEMORY_LIMIT_BYTES / WASM_PAGE_SIZE_BYTES;
 
 /// Loads a compiled Soroban contract `.wasm` file from disk.
 ///
@@ -28,6 +39,11 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
 
     validate_wasm(&bytes)?;
     debug!("WASM validated");
+
+    // Check WASM memory limits against Soroban constraints
+    if let Some(warning) = validate_wasm_memory_limits(&bytes) {
+        warn!(warning = %warning, "WASM memory exceeds Soroban limits");
+    }
 
     let metadata = enumerate_module_metadata(&bytes)?;
     let (spec_functions, has_spec) = parse_contract_spec(&bytes).unwrap_or_default();
@@ -60,6 +76,79 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
 pub fn validate_wasm(bytes: &[u8]) -> AppResult<()> {
     wasmparser::validate(bytes).map_err(|e| AppError::WasmValidation(e.to_string()))?;
     Ok(())
+}
+
+/// Validates WASM memory limits against Soroban network constraints.
+///
+/// Returns a warning message if the WASM memory section exceeds Soroban limits,
+/// or `Ok(None)` if the memory is within limits.
+///
+/// Soroban enforces a per-transaction memory limit of 40 MB (approximately 610 WASM pages).
+/// If the WASM declares a memory that exceeds this limit, the contract will likely
+/// fail during simulation or execution.
+#[must_use]
+pub fn validate_wasm_memory_limits(bytes: &[u8]) -> Option<String> {
+    let mut memories = Vec::new();
+
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let Ok(wasmparser::Payload::MemorySection(section)) = payload {
+            for memory in section.flatten() {
+                memories.push(MemoryInfo {
+                    initial_pages: memory.initial,
+                    maximum_pages: memory.maximum,
+                    memory64: memory.memory64,
+                });
+            }
+        }
+    }
+
+    if memories.is_empty() {
+        return None;
+    }
+
+    let mut warnings = Vec::new();
+
+    for (idx, memory) in memories.iter().enumerate() {
+        let memory_label = if memories.len() == 1 {
+            "Memory".to_string()
+        } else {
+            format!("Memory[{}]", idx)
+        };
+
+        // Check initial pages
+        if memory.initial_pages > SOROBAN_MAX_WASM_PAGES {
+            let initial_bytes = memory.initial_pages * WASM_PAGE_SIZE_BYTES;
+            warnings.push(format!(
+                "{}: initial size {} pages ({} bytes) exceeds Soroban limit of {} pages ({} bytes)",
+                memory_label,
+                memory.initial_pages,
+                initial_bytes,
+                SOROBAN_MAX_WASM_PAGES,
+                SOROBAN_TX_MEMORY_LIMIT_BYTES
+            ));
+        }
+
+        // Check maximum pages if specified
+        if let Some(max_pages) = memory.maximum_pages {
+            if max_pages > SOROBAN_MAX_WASM_PAGES {
+                let max_bytes = max_pages * WASM_PAGE_SIZE_BYTES;
+                warnings.push(format!(
+                    "{}: maximum size {} pages ({} bytes) exceeds Soroban limit of {} pages ({} bytes)",
+                    memory_label,
+                    max_pages,
+                    max_bytes,
+                    SOROBAN_MAX_WASM_PAGES,
+                    SOROBAN_TX_MEMORY_LIMIT_BYTES
+                ));
+            }
+        }
+    }
+
+    if warnings.is_empty() {
+        None
+    } else {
+        Some(warnings.join("; "))
+    }
 }
 
 /// Enumerates exported function names from a validated WASM binary.
@@ -662,6 +751,10 @@ pub fn format_module_metadata(info: &WasmInfo) -> String {
                     memory.initial_pages
                 )),
             }
+            // Add memory limit validation warning
+            if let Some(warning) = validate_wasm_memory_limit_for_memory(memory) {
+                lines.push(format!("  WARNING: {warning}"));
+            }
         }
     }
     push_entries_generic(
@@ -679,6 +772,45 @@ pub fn format_module_metadata(info: &WasmInfo) -> String {
         |ex| format!("{} ({}) index {}", ex.name, ex.kind, ex.index),
     );
     lines.join("\n")
+}
+
+/// Validates a single memory entry against Soroban limits and returns a warning
+/// if it exceeds the limits.
+#[must_use]
+fn validate_wasm_memory_limit_for_memory(memory: &MemoryInfo) -> Option<String> {
+    let mut warnings = Vec::new();
+
+    // Check initial pages
+    if memory.initial_pages > SOROBAN_MAX_WASM_PAGES {
+        let initial_bytes = memory.initial_pages * WASM_PAGE_SIZE_BYTES;
+        warnings.push(format!(
+            "initial size {} pages ({} bytes) exceeds Soroban limit of {} pages ({} bytes)",
+            memory.initial_pages,
+            initial_bytes,
+            SOROBAN_MAX_WASM_PAGES,
+            SOROBAN_TX_MEMORY_LIMIT_BYTES
+        ));
+    }
+
+    // Check maximum pages if specified
+    if let Some(max_pages) = memory.maximum_pages {
+        if max_pages > SOROBAN_MAX_WASM_PAGES {
+            let max_bytes = max_pages * WASM_PAGE_SIZE_BYTES;
+            warnings.push(format!(
+                "maximum size {} pages ({} bytes) exceeds Soroban limit of {} pages ({} bytes)",
+                max_pages,
+                max_bytes,
+                SOROBAN_MAX_WASM_PAGES,
+                SOROBAN_TX_MEMORY_LIMIT_BYTES
+            ));
+        }
+    }
+
+    if warnings.is_empty() {
+        None
+    } else {
+        Some(warnings.join("; "))
+    }
 }
 
 /// Appends a counted, truncated list to `lines`, formatted by `fmt`.

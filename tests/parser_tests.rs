@@ -378,3 +378,129 @@ fn test_parse_contract_meta_real_fixture() {
     assert!(formatted.contains("rsver:"));
     assert!(formatted.contains("rssdkver:"));
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// WASM memory limit validation tests
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Tests that WASM with memory within Soroban limits does not produce warnings.
+#[test]
+fn test_validate_wasm_memory_limits_within_limits() {
+    let path = Path::new("tests/fixtures/minimal.wasm");
+    let bytes = std::fs::read(path).expect("read fixture");
+
+    let warning = soroban_cost_estimator::wasm::parser::validate_wasm_memory_limits(&bytes);
+    assert!(
+        warning.is_none(),
+        "WASM within limits should not produce warning, got: {:?}",
+        warning
+    );
+}
+
+/// Tests that WASM with no memory section does not produce warnings.
+#[test]
+fn test_validate_wasm_memory_limits_no_memory() {
+    // Create a minimal valid WASM with no memory section
+    let bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]; // magic + version only
+    let warning = soroban_cost_estimator::wasm::parser::validate_wasm_memory_limits(&bytes);
+    assert!(
+        warning.is_none(),
+        "WASM with no memory should not produce warning, got: {:?}",
+        warning
+    );
+}
+
+/// Tests that WASM with memory exceeding Soroban limits produces a warning.
+#[test]
+fn test_validate_wasm_memory_limits_exceeds_limits() {
+    // Create a WASM binary with a memory section that declares 1000 pages
+    // (exceeds the 610-page limit)
+    let mut bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]; // magic + version
+
+    // Memory section with 1000 initial pages (exceeds limit)
+    let memory_section = vec![0x05, 0x04, 0x01, 0x00, 0xe8, 0x07]; // section id, size, count, flags, initial (1000)
+    bytes.extend_from_slice(&memory_section);
+
+    let warning = soroban_cost_estimator::wasm::parser::validate_wasm_memory_limits(&bytes);
+    assert!(
+        warning.is_some(),
+        "WASM exceeding limits should produce warning"
+    );
+    let warning_text = warning.unwrap();
+    assert!(
+        warning_text.contains("exceeds Soroban limit"),
+        "Warning should mention exceeding limit, got: {warning_text}"
+    );
+    assert!(
+        warning_text.contains("1000 pages"),
+        "Warning should mention the actual page count, got: {warning_text}"
+    );
+}
+
+/// Tests that WASM with memory maximum exceeding Soroban limits produces a warning.
+#[test]
+fn test_validate_wasm_memory_limits_maximum_exceeds_limits() {
+    // Create a WASM binary with a memory section that declares initial=10, maximum=1000
+    let mut bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]; // magic + version
+
+    // Memory section with flags=0x03 (has maximum), initial=10, maximum=1000
+    let memory_section = vec![0x05, 0x05, 0x01, 0x03, 0x0a, 0xe8, 0x07]; // section id, size, count, flags, initial (10), maximum (1000)
+    bytes.extend_from_slice(&memory_section);
+
+    let warning = soroban_cost_estimator::wasm::parser::validate_wasm_memory_limits(&bytes);
+    assert!(
+        warning.is_some(),
+        "WASM exceeding limits should produce warning"
+    );
+    let warning_text = warning.unwrap();
+    assert!(
+        warning_text.contains("maximum size 1000 pages"),
+        "Warning should mention maximum size, got: {warning_text}"
+    );
+}
+
+/// Tests that the warning message includes both page count and byte size.
+#[test]
+fn test_validate_wasm_memory_limits_warning_format() {
+    // Create a WASM binary with a memory section that declares 700 pages
+    let mut bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]; // magic + version
+
+    // Memory section with 700 initial pages (exceeds 610-page limit)
+    let memory_section = vec![0x05, 0x04, 0x01, 0x00, 0xbc, 0x05]; // section id, size, count, flags, initial (700)
+    bytes.extend_from_slice(&memory_section);
+
+    let warning = soroban_cost_estimator::wasm::parser::validate_wasm_memory_limits(&bytes);
+    assert!(warning.is_some());
+    let warning_text = warning.unwrap();
+    assert!(
+        warning_text.contains("45875200 bytes"), // 700 * 65536
+        "Warning should include byte size, got: {warning_text}"
+    );
+    assert!(
+        warning_text.contains("610 pages"),
+        "Warning should include limit in pages, got: {warning_text}"
+    );
+    assert!(
+        warning_text.contains("40000000 bytes"),
+        "Warning should include limit in bytes, got: {warning_text}"
+    );
+}
+
+/// Tests that the format_module_metadata includes memory limit warnings.
+#[test]
+fn test_format_module_metadata_includes_memory_warnings() {
+    let path = Path::new("tests/fixtures/minimal.wasm");
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(path)
+        .expect("failed to load test WASM");
+
+    let summary = soroban_cost_estimator::wasm::parser::format_module_metadata(&wasm_info);
+    assert!(
+        summary.contains("memories:"),
+        "summary should list memories, got: {summary}"
+    );
+    // Minimal fixture should not have memory warnings
+    assert!(
+        !summary.contains("WARNING"),
+        "minimal fixture should not have memory warnings, got: {summary}"
+    );
+}
