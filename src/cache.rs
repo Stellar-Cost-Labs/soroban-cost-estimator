@@ -130,7 +130,10 @@ pub fn save_estimate(
     };
 
     let json = serde_json::to_string_pretty(&cached)?;
-    std::fs::write(&path, json)?;
+    let tid = format!("{:?}", std::thread::current().id());
+    let tmp = dir.join(format!("{filename}.{tid}.tmp"));
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, &path)?;
     debug!(path = %path.display(), function, network, ledger, "estimate cached");
     Ok(())
 }
