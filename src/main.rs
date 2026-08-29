@@ -440,9 +440,10 @@ async fn cmd_estimate_all(
         }
 
         let endpoint = rpc::client::resolve_endpoint(network, None)?;
-        let client = rpc::client::RpcClient::new(&endpoint);
+        let client = rpc::client::RpcClient::with_rate_limit(&endpoint, rps);
 
         let mut json_results: Vec<serde_json::Value> = Vec::new();
+        let mut fees: Vec<i64> = Vec::new();
         let total = wasm_info.functions.len();
         debug!(total, "enumerated functions");
 
@@ -450,7 +451,7 @@ async fn cmd_estimate_all(
             if !json_flag {
                 println!("[{}/{}] {}", i + 1, total, fn_info.name);
             }
-            let result = estimate_all_function(
+            let outcome = estimate_all_function(
                 &client,
                 &wasm_info,
                 fn_info,
@@ -460,10 +461,19 @@ async fn cmd_estimate_all(
                 json_flag,
             )
             .await?;
-            if let Some(value) = result {
-                json_results.push(value);
+            if let Some(outcome) = outcome {
+                if let Some(fee) = outcome.fee_stroops {
+                    fees.push(fee);
+                }
+                if let Some(value) = outcome.json {
+                    json_results.push(value);
+                }
             }
         }
+
+        // Aggregate fee range across every successfully estimated function
+        // (#83): min/max/average in stroops (and XLM) for the whole batch.
+        emit_fee_range_summary(&fees, json_flag, &mut json_results);
 
         if json_flag {
             println!("{}", serde_json::to_string_pretty(&json_results)?);
@@ -473,6 +483,68 @@ async fn cmd_estimate_all(
     }
     .instrument(span)
     .await
+}
+
+/// Emit the aggregate fee-range summary for an `estimate-all` batch (#83).
+///
+/// In JSON mode the summary is appended to `json_results` as a `(summary)`
+/// record carrying min/max/average in stroops and XLM; in human mode it is
+/// printed as three lines. When no function produced a fee, human mode prints
+/// a short notice and JSON mode emits nothing.
+fn emit_fee_range_summary(
+    fees: &[i64],
+    json_flag: bool,
+    json_results: &mut Vec<serde_json::Value>,
+) {
+    let Some(range) = report::fee_calc::fee_range(fees) else {
+        if !json_flag {
+            println!("No functions estimated; no fee range to report.");
+        }
+        return;
+    };
+
+    if json_flag {
+        json_results.push(serde_json::json!({
+            "function": "(summary)",
+            "status": "summary",
+            "functions_estimated": range.count,
+            "min_fee_stroops": range.min_stroops,
+            "max_fee_stroops": range.max_stroops,
+            "avg_fee_stroops": range.avg_stroops,
+            "min_fee_xlm": report::fee_calc::stroops_to_xlm(range.min_stroops),
+            "max_fee_xlm": report::fee_calc::stroops_to_xlm(range.max_stroops),
+            "avg_fee_xlm": report::fee_calc::stroops_to_xlm(range.avg_stroops),
+        }));
+        return;
+    }
+
+    println!();
+    println!("Fee range across {} function(s):", range.count);
+    println!(
+        "  min: {} stroops ({} XLM)",
+        range.min_stroops,
+        report::fee_calc::stroops_to_xlm(range.min_stroops)
+    );
+    println!(
+        "  max: {} stroops ({} XLM)",
+        range.max_stroops,
+        report::fee_calc::stroops_to_xlm(range.max_stroops)
+    );
+    println!(
+        "  avg: {} stroops ({} XLM)",
+        range.avg_stroops,
+        report::fee_calc::stroops_to_xlm(range.avg_stroops)
+    );
+}
+
+/// Outcome of estimating one exported function in `estimate-all`.
+struct EstimateAllOutcome {
+    /// JSON record for `--json` output mode, if the caller wants it.
+    json: Option<serde_json::Value>,
+    /// Total fee in stroops when the function was estimated successfully.
+    /// `None` for skipped/errored functions, which must not count toward
+    /// the aggregate fee range.
+    fee_stroops: Option<i64>,
 }
 
 /// Estimates one exported function against the network, printing its result
@@ -486,7 +558,7 @@ async fn estimate_all_function(
     wasm_hash: &str,
     network: &str,
     json_flag: bool,
-) -> error::AppResult<Option<serde_json::Value>> {
+) -> error::AppResult<Option<EstimateAllOutcome>> {
     use tracing::{Instrument, debug, info_span};
 
     let span =
@@ -496,11 +568,14 @@ async fn estimate_all_function(
             let reason = format!("needs --fn/--arg ({} param(s))", fn_info.param_count);
             debug!(reason, "skipping function");
             if json_flag {
-                return Ok(Some(serde_json::json!({
-                    "function": fn_info.name,
-                    "status": "skipped",
-                    "reason": reason,
-                })));
+                return Ok(Some(EstimateAllOutcome {
+                    json: Some(serde_json::json!({
+                        "function": fn_info.name,
+                        "status": "skipped",
+                        "reason": reason,
+                    })),
+                    fee_stroops: None,
+                }));
             }
             println!("── Estimating '{}' ── Skipped: {reason}", fn_info.name);
             return Ok(None);
@@ -516,11 +591,14 @@ async fn estimate_all_function(
             Err(e) => {
                 debug!(error = %e, "tx construction failed");
                 if json_flag {
-                    return Ok(Some(serde_json::json!({
-                        "function": fn_info.name,
-                        "status": "skipped",
-                        "reason": e.to_string(),
-                    })));
+                    return Ok(Some(EstimateAllOutcome {
+                        json: Some(serde_json::json!({
+                            "function": fn_info.name,
+                            "status": "skipped",
+                            "reason": e.to_string(),
+                        })),
+                        fee_stroops: None,
+                    }));
                 }
                 eprintln!("── Estimating '{}' ── Skipped: {e}", fn_info.name);
                 return Ok(None);
@@ -535,11 +613,14 @@ async fn estimate_all_function(
                     let msg = "simulation returned no cost data and no latest ledger — check --id and the RPC endpoint";
                     debug!(msg, "simulation missing data");
                     if json_flag {
-                        return Ok(Some(serde_json::json!({
-                            "function": fn_info.name,
-                            "status": "error",
-                            "error": msg,
-                        })));
+                        return Ok(Some(EstimateAllOutcome {
+                            json: Some(serde_json::json!({
+                                "function": fn_info.name,
+                                "status": "error",
+                                "error": msg,
+                            })),
+                            fee_stroops: None,
+                        }));
                     }
                     eprintln!("── Estimating '{}' ── Error: {msg}", fn_info.name);
                     return Ok(None);
@@ -572,30 +653,39 @@ async fn estimate_all_function(
                 );
 
                 if json_flag {
-                    Ok(Some(serde_json::json!({
-                        "function": fn_info.name,
-                        "status": "ok",
-                        "cpu_instructions": cpu,
-                        "memory_bytes": mem,
-                        "fee_stroops": fee,
-                        "fee_xlm": xlm,
-                        "ledger": ledger,
-                    })))
+                    Ok(Some(EstimateAllOutcome {
+                        json: Some(serde_json::json!({
+                            "function": fn_info.name,
+                            "status": "ok",
+                            "cpu_instructions": cpu,
+                            "memory_bytes": mem,
+                            "fee_stroops": fee,
+                            "fee_xlm": xlm,
+                            "ledger": ledger,
+                        })),
+                        fee_stroops: Some(fee),
+                    }))
                 } else {
                     println!(
                         "CPU: {cpu} insns | Mem: {mem} bytes | Fee: {fee} stroops ({xlm} XLM) | Ledger: {ledger}"
                     );
-                    Ok(None)
+                    Ok(Some(EstimateAllOutcome {
+                        json: None,
+                        fee_stroops: Some(fee),
+                    }))
                 }
             }
             Err(e) => {
                 debug!(error = %e, "simulation failed");
                 if json_flag {
-                    Ok(Some(serde_json::json!({
-                        "function": fn_info.name,
-                        "status": "error",
-                        "error": e.to_string(),
-                    })))
+                    Ok(Some(EstimateAllOutcome {
+                        json: Some(serde_json::json!({
+                            "function": fn_info.name,
+                            "status": "error",
+                            "error": e.to_string(),
+                        })),
+                        fee_stroops: None,
+                    }))
                 } else {
                     eprintln!("Skipped — simulation failed: {e}");
                     Ok(None)
