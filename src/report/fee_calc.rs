@@ -162,6 +162,56 @@ pub fn stroops_to_xlm(stroops: i64) -> String {
     }
 }
 
+/// Min/max/average fee summary across a set of estimates.
+///
+/// All values are in stroops. The average uses integer division — stroops
+/// are integers and floats are never used near fee math.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeeRange {
+    /// Number of estimates included in the summary.
+    pub count: usize,
+    /// Lowest fee, in stroops.
+    pub min_stroops: i64,
+    /// Highest fee, in stroops.
+    pub max_stroops: i64,
+    /// Average fee, in stroops (integer division, truncated toward zero).
+    pub avg_stroops: i64,
+}
+
+/// Compute the min/max/average fee over a slice of fees in stroops.
+///
+/// Returns `None` when the slice is empty — a fee range is undefined for
+/// zero estimates. The sum accumulates in `i128` so a large batch cannot
+/// overflow the accumulator, then the average is cast back to `i64`
+/// (which is always lossless: `avg <= max <= i64::MAX`).
+///
+/// # Network calls
+/// None — pure computation.
+#[must_use]
+pub fn fee_range(fees: &[i64]) -> Option<FeeRange> {
+    let count = fees.len();
+    if count == 0 {
+        return None;
+    }
+
+    let mut min_stroops = i64::MAX;
+    let mut max_stroops = i64::MIN;
+    let mut sum: i128 = 0;
+    for &fee in fees {
+        min_stroops = min_stroops.min(fee);
+        max_stroops = max_stroops.max(fee);
+        sum += i128::from(fee);
+    }
+
+    let avg_stroops = (sum / i128::from(count as u64)) as i64;
+    Some(FeeRange {
+        count,
+        min_stroops,
+        max_stroops,
+        avg_stroops,
+    })
+}
+
 /// Parse an XLM string to stroops (i64).
 pub fn xlm_to_stroops(xlm: &str) -> AppResult<i64> {
     let parts: Vec<&str> = xlm.split('.').collect();
@@ -252,6 +302,47 @@ mod tests {
         assert_eq!(breakdown.total_stroops, 5_000);
         assert_eq!(breakdown.non_refundable_stroops, 10_250);
         assert_eq!(breakdown.refundable_stroops, 0);
+    }
+
+    #[test]
+    fn test_fee_range_basic() {
+        let range = fee_range(&[100, 200, 300]).expect("non-empty range");
+        assert_eq!(range.count, 3);
+        assert_eq!(range.min_stroops, 100);
+        assert_eq!(range.max_stroops, 300);
+        assert_eq!(range.avg_stroops, 200);
+    }
+
+    #[test]
+    fn test_fee_range_single_entry() {
+        let range = fee_range(&[42]).expect("single entry");
+        assert_eq!(range.count, 1);
+        assert_eq!(range.min_stroops, 42);
+        assert_eq!(range.max_stroops, 42);
+        assert_eq!(range.avg_stroops, 42);
+    }
+
+    #[test]
+    fn test_fee_range_empty_is_none() {
+        assert!(fee_range(&[]).is_none(), "empty slice has no fee range");
+    }
+
+    #[test]
+    fn test_fee_range_avg_truncates_toward_zero() {
+        // 1_000_000 + 1_000_001 = 2_000_001; / 2 = 1_000_000 (integer div)
+        let range = fee_range(&[1_000_000, 1_000_001]).expect("non-empty");
+        assert_eq!(range.avg_stroops, 1_000_000);
+        // Negative fees (a defensive path) truncate toward zero as well.
+        let neg = fee_range(&[-5, 5]).expect("non-empty");
+        assert_eq!(neg.avg_stroops, 0);
+    }
+
+    #[test]
+    fn test_fee_range_unsorted_input() {
+        let range = fee_range(&[500, 10, 300, 40]).expect("non-empty");
+        assert_eq!(range.min_stroops, 10);
+        assert_eq!(range.max_stroops, 500);
+        assert_eq!(range.avg_stroops, (500 + 10 + 300 + 40) / 4);
     }
 
     #[test]
