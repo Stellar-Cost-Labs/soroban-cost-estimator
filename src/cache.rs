@@ -5,7 +5,8 @@
 //! command cross-references cached estimates to tell the user which ones
 //! are now stale due to network pricing changes.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, trace, warn};
@@ -64,11 +65,19 @@ pub struct CachedEstimate {
     pub timestamp: String,
 }
 
-/// Returns the cache directory path, creating it if needed.
-fn cache_dir() -> AppResult<PathBuf> {
+/// Returns the base data directory path: `~/.soroban-cost-estimator`,
+/// creating it if needed.
+fn data_dir() -> AppResult<PathBuf> {
     let home = dirs::home_dir()
         .ok_or_else(|| AppError::General("could not determine home directory".to_string()))?;
-    let dir = home.join(".soroban-cost-estimator").join("cache");
+    let dir = home.join(".soroban-cost-estimator");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Returns the cache directory path, creating it if needed.
+fn cache_dir() -> AppResult<PathBuf> {
+    let dir = data_dir()?.join("cache");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -121,7 +130,10 @@ pub fn save_estimate(
     };
 
     let json = serde_json::to_string_pretty(&cached)?;
-    std::fs::write(&path, json)?;
+    let tid = format!("{:?}", std::thread::current().id());
+    let tmp = dir.join(format!("{filename}.{tid}.tmp"));
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, &path)?;
     debug!(path = %path.display(), function, network, ledger, "estimate cached");
     Ok(())
 }
@@ -350,4 +362,131 @@ pub fn find_stale_estimates(
         .iter()
         .filter(|e| e.ledger < current_ledger)
         .collect()
+}
+
+/// Last-observed identity of a WASM file: its SHA-256 hash and modification
+/// time. Used to detect when a contract was recompiled or replaced so the
+/// stale cache entries from the previous build can be dropped automatically.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WasmFileRecord {
+    /// SHA-256 hash of the WASM bytes (hex), as last observed.
+    wasm_hash: String,
+    /// File mtime, in nanoseconds since the Unix epoch.
+    mtime_nanos: u64,
+}
+
+/// Registry mapping a canonical WASM file path to its last-observed identity.
+type WasmRegistry = HashMap<String, WasmFileRecord>;
+
+/// Path to the on-disk registry of WASM file identities.
+///
+/// Lives in the data directory (not the cache directory) so that the cache
+/// directory stays a flat list of `CachedEstimate` JSON files.
+fn registry_path() -> AppResult<PathBuf> {
+    Ok(data_dir()?.join("wasm-files.json"))
+}
+
+/// Load the WASM file registry, or an empty one if it does not exist yet.
+fn load_registry() -> AppResult<WasmRegistry> {
+    let path = registry_path()?;
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let content = std::fs::read_to_string(&path)?;
+    // A malformed registry (e.g. hand-edited) degrades to empty rather than
+    // failing the command; the next invalidation pass will rebuild it.
+    let registry: WasmRegistry = serde_json::from_str(&content).unwrap_or_default();
+    Ok(registry)
+}
+
+/// Persist the WASM file registry to disk.
+fn save_registry(registry: &WasmRegistry) -> AppResult<()> {
+    let path = registry_path()?;
+    let json = serde_json::to_string_pretty(registry)?;
+    std::fs::write(&path, json)?;
+    Ok(())
+}
+
+/// Remove every cached estimate produced from the given WASM hash.
+///
+/// Returns the number of cache files removed. Used by
+/// [`invalidate_if_wasm_changed`] to drop entries from a previous build once
+/// the WASM file has changed.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn remove_cached_estimates_for_wasm(wasm_hash: &str) -> AppResult<usize> {
+    let dir = cache_dir()?;
+    let mut removed = 0;
+
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().map(|e| e == "json").unwrap_or(false) {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(cached) = serde_json::from_str::<CachedEstimate>(&content) {
+                    if cached.wasm_hash == wasm_hash {
+                        std::fs::remove_file(&path)?;
+                        removed += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(removed)
+}
+
+/// Invalidate cache entries when a WASM file's mtime or hash has changed.
+///
+/// Called before estimates are saved for a freshly loaded WASM file. It
+/// compares the file's current hash and modification time against the last
+/// observed values in the registry; if either differs (the contract was
+/// recompiled or replaced), every cache entry keyed to the previous hash is
+/// removed so the new build's estimates start clean.
+///
+/// Returns `true` when stale entries were removed, `false` otherwise.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn invalidate_if_wasm_changed(wasm_path: &Path, current_hash: &str) -> AppResult<bool> {
+    let mtime_nanos = wasm_file_mtime_nanos(wasm_path)?;
+    let key = std::fs::canonicalize(wasm_path)
+        .unwrap_or_else(|_| wasm_path.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+
+    let mut registry = load_registry()?;
+    let changed = match registry.get(&key) {
+        Some(prev) if prev.wasm_hash != current_hash || prev.mtime_nanos != mtime_nanos => {
+            remove_cached_estimates_for_wasm(&prev.wasm_hash)?;
+            true
+        }
+        _ => false,
+    };
+
+    registry.insert(
+        key,
+        WasmFileRecord {
+            wasm_hash: current_hash.to_string(),
+            mtime_nanos,
+        },
+    );
+    save_registry(&registry)?;
+
+    Ok(changed)
+}
+
+/// Read a file's modification time as nanoseconds since the Unix epoch.
+///
+/// Falls back to `0` when the platform cannot report a modification time,
+/// rather than failing the whole command.
+fn wasm_file_mtime_nanos(wasm_path: &Path) -> AppResult<u64> {
+    let metadata = std::fs::metadata(wasm_path)?;
+    let modified = metadata.modified()?;
+    let nanos = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    Ok(nanos)
 }
