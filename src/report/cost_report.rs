@@ -42,6 +42,9 @@ pub struct CostReport {
     pub ledger: u32,
     /// Network the simulation ran on.
     pub network: String,
+    /// RPC round-trip time of the `simulateTransaction` call, in
+    /// milliseconds. Helps identify slow or overloaded RPC endpoints.
+    pub rpc_latency_ms: u64,
 }
 
 /// Formats a cost report as a human-readable table.
@@ -53,6 +56,7 @@ pub fn format_report_table(report: &CostReport) -> String {
         "Network: {} (ledger {})\n",
         report.network, report.ledger
     ));
+    output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
     output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
 
     let mut table = Table::new();
