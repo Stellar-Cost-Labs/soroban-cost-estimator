@@ -22,5 +22,6 @@ expression: JsonFormatter.format(&empty)
     "total_xlm": "0.0000000"
   },
   "ledger": 0,
-  "network": "mainnet"
+  "network": "mainnet",
+  "rpc_latency_ms": 0
 }

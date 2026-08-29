@@ -292,7 +292,11 @@ async fn cmd_estimate(
         let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
         debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
 
+        // Time the simulateTransaction round-trip so the report can flag
+        // slow RPC endpoints. Includes any retries performed by the client.
+        let rpc_start = std::time::Instant::now();
         let response = rpc::simulate::simulate_transaction(&client, &tx_b64).await?;
+        let rpc_latency_ms = rpc_start.elapsed().as_millis() as u64;
 
         if missing_simulation_data(&response) {
             return Err(error::AppError::SimulationFailed(
@@ -342,6 +346,7 @@ async fn cmd_estimate(
             fee: fee.clone(),
             ledger: latest_ledger,
             network: network.to_string(),
+            rpc_latency_ms,
         };
 
         let _ = cache::save_estimate(
