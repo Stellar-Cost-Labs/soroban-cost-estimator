@@ -163,6 +163,13 @@ Compare the current network config against the most recent (or explicit) snapsho
 soroban-cost-estimator config diff --network testnet [--against /path/to/snapshot.json]
 ```
 
+`--summary` prints a single line — `X pricing changes, Y non-pricing changes` —
+instead of the full diff, handy for CI status lines:
+
+```bash
+soroban-cost-estimator config diff --network testnet --summary
+```
+
 - Exits **0** if no changes detected
 - Exits **1** with a detailed field-by-field diff if pricing changed
 - **Auto-saves a snapshot of the new config** when a protocol upgrade is

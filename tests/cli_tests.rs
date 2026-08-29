@@ -180,7 +180,7 @@ fn test_config_diff_help() {
         code, 0,
         "config diff --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--network", "--against"] {
+    for flag in ["--network", "--against", "--summary"] {
         assert!(
             stdout.contains(flag),
             "diff help should mention {flag}; got: {stdout}"
@@ -790,6 +790,39 @@ fn test_cache_warm_unknown_network() {
 // ─────────────────────────────────────────────────────────────────────────
 // `config diff`
 // ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_config_diff_summary_flag_accepted() {
+    // `--summary` on config diff must be a recognized flag (the run still
+    // fails, but on the unknown network, not on the argument itself).
+    let home = temp_home("diff-summary-flag");
+    let path = home.join("snapshot.json");
+    std::fs::write(&path, snapshot_json("not-a-network", 1000)).expect("write fixture");
+
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against",
+            path.to_str().unwrap(),
+            "--summary",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "the unknown network should exit 1");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--summary should be a recognized argument; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
+        "the failure should come from the network, not the flag; got: {stderr}"
+    );
+}
 
 #[test]
 fn test_config_diff_loads_valid_snapshot_before_network() {
