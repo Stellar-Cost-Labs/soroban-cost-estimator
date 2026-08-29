@@ -94,6 +94,34 @@ impl ReportFormatter for TableFormatter {
             report.fee.total_stroops, report.fee.total_xlm,
         ));
 
+        // Historical cost comparison — delta vs previous cached estimate.
+        if let Some(ref delta) = report.delta {
+            output.push_str(&format!("\nDelta vs previous estimate (ledger {}):\n", delta.prev_ledger));
+            let pd = crate::report::cost_report::format_delta_i64;
+            let pct = crate::report::cost_report::delta_percentage;
+            output.push_str(&format!(
+                "  Fee:     {} stroops ({})\n",
+                pd(delta.fee_delta),
+                pct(delta.prev_fee_stroops as u64, report.fee.total_stroops as u64),
+            ));
+            output.push_str(&format!(
+                "  CPU:     {} insns ({})\n",
+                pd(delta.cpu_delta),
+                pct(delta.prev_cpu_instructions, report.cpu_instructions),
+            ));
+            output.push_str(&format!(
+                "  Memory:  {} bytes\n",
+                pd(delta.memory_delta),
+            ));
+            if delta.read_entries_delta != 0 || delta.write_entries_delta != 0 {
+                output.push_str(&format!(
+                    "  Entries: {}/{} (read/write)\n",
+                    pd(delta.read_entries_delta),
+                    pd(delta.write_entries_delta),
+                ));
+            }
+        }
+
         output
     }
 
@@ -140,8 +168,26 @@ impl ReportFormatter for CsvFormatter {
             "function,network,ledger,wasm_hash,cpu_instructions,memory_bytes,\
              read_entries,write_entries,read_bytes,write_bytes,tx_size,\
              non_refundable_stroops,refundable_stroops,total_stroops,total_xlm,\
-             rpc_latency_ms\n",
+             rpc_latency_ms,\
+             prev_ledger,prev_fee_stroops,cpu_delta,memory_delta,fee_delta\n",
         );
+
+        let (prev_ledger, prev_fee, cpu_delta, mem_delta, fee_delta) = match &report.delta {
+            Some(d) => (
+                d.prev_ledger.to_string(),
+                d.prev_fee_stroops.to_string(),
+                d.cpu_delta.to_string(),
+                d.memory_delta.to_string(),
+                d.fee_delta.to_string(),
+            ),
+            None => (
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ),
+        };
 
         let row = csv_row(&[
             &report.function,
@@ -160,6 +206,11 @@ impl ReportFormatter for CsvFormatter {
             &report.fee.total_stroops.to_string(),
             &report.fee.total_xlm,
             &report.rpc_latency_ms.to_string(),
+            &prev_ledger,
+            &prev_fee,
+            &cpu_delta,
+            &mem_delta,
+            &fee_delta,
         ]);
         output.push_str(&row);
         output.push('\n');
@@ -250,6 +301,32 @@ impl ReportFormatter for MarkdownFormatter {
             report.fee.total_stroops, report.fee.total_xlm,
         ));
 
+        // Historical cost comparison — delta vs previous cached estimate.
+        if let Some(ref delta) = report.delta {
+            output.push_str(&format!(
+                "\n### Delta vs Previous Estimate (ledger {})\n\n",
+                delta.prev_ledger
+            ));
+            output.push_str("| Metric | Delta |\n");
+            output.push_str("| --- | --- |\n");
+            let pd = crate::report::cost_report::format_delta_i64;
+            let pct = crate::report::cost_report::delta_percentage;
+            output.push_str(&format!(
+                "| Fee | {} stroops ({}) |\n",
+                pd(delta.fee_delta),
+                pct(delta.prev_fee_stroops as u64, report.fee.total_stroops as u64),
+            ));
+            output.push_str(&format!(
+                "| CPU | {} insns ({}) |\n",
+                pd(delta.cpu_delta),
+                pct(delta.prev_cpu_instructions, report.cpu_instructions),
+            ));
+            output.push_str(&format!(
+                "| Memory | {} bytes |\n",
+                pd(delta.memory_delta),
+            ));
+        }
+
         output
     }
 
@@ -328,6 +405,7 @@ mod tests {
             ledger: 3_894_195,
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
+            delta: None,
         }
     }
 
@@ -354,6 +432,7 @@ mod tests {
             ledger: 0,
             network: "mainnet".to_string(),
             rpc_latency_ms: 0,
+            delta: None,
         }
     }
 
@@ -464,7 +543,7 @@ mod tests {
         let first_line = output.lines().next().unwrap();
         assert!(first_line.starts_with("function,"));
         let field_count = first_line.split(',').count();
-        assert_eq!(field_count, 16);
+        assert_eq!(field_count, 21);
     }
 
     #[test]
