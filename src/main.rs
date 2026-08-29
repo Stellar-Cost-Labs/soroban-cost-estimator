@@ -179,6 +179,11 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::Snapshot { network, out, json } => {
                 cmd_config_snapshot(&network, out.as_deref(), json, rps, timeout).await
             }
+            cli::ConfigAction::Delete {
+                network,
+                timestamp,
+                older_than,
+            } => cmd_config_snapshot_delete(&network, timestamp.as_deref(), older_than),
             cli::ConfigAction::Diff {
                 network,
                 against,
@@ -1063,6 +1068,29 @@ async fn cmd_config_snapshot(
     }
     .instrument(span)
     .await
+}
+
+/// `config snapshot delete` command: remove a specific snapshot by timestamp or
+/// all snapshots older than N days.
+fn cmd_config_snapshot_delete(
+    network: &str,
+    timestamp: Option<&str>,
+    older_than_days: Option<u64>,
+) -> error::AppResult<()> {
+    if let Some(timestamp) = timestamp {
+        config_snapshot::store::delete_snapshot(network, timestamp)?;
+        println!("Deleted snapshot: {timestamp}");
+    }
+
+    if let Some(days) = older_than_days {
+        let deleted = config_snapshot::store::delete_snapshots_older_than(network, days)?;
+        println!("Deleted snapshots older than {days} day(s).");
+        for path in deleted {
+            println!("  {}", path.display());
+        }
+    }
+
+    Ok(())
 }
 
 /// True when a config diff signals a network protocol/config upgrade.
