@@ -14,6 +14,10 @@ pub enum OutputFormat {
 #[command(name = "soroban-cost-estimator")]
 #[command(about = "Estimate Soroban contract costs & track network pricing changes", long_about = None)]
 pub struct Cli {
+    /// Optional TOML config file path. Defaults to ~/.config/soroban-cost-estimator/config.toml.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub config: Option<String>,
+
     /// Select output format for commands that produce structured output.
     #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,

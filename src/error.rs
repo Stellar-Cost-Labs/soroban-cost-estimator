@@ -72,6 +72,9 @@ pub enum AppError {
     #[error("failed to process JSON: {0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("failed to process config: {0}")]
+    Config(String),
+
     // ── General ─────────────────────────────────────────────────────
     #[error("operation failed: {0}")]
     General(String),
