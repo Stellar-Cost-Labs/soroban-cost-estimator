@@ -74,6 +74,26 @@ pub struct CachedEstimate {
     pub timestamp: String,
 }
 
+/// Optional filters for [`query_estimates`].
+///
+/// Every field is optional; a `None` field means "no filter on this axis".
+/// All filters are combined with logical AND.
+#[derive(Debug, Clone, Default)]
+pub struct QueryFilter {
+    /// Case-insensitive substring match against the function name.
+    pub function: Option<String>,
+    /// Prefix match against the WASM SHA-256 hash (hex).
+    pub wasm_hash: Option<String>,
+    /// Inclusive lower bound on `total_stroops`.
+    pub min_stroops: Option<i64>,
+    /// Inclusive upper bound on `total_stroops`.
+    pub max_stroops: Option<i64>,
+    /// Inclusive lower bound on the estimate timestamp (ISO-8601).
+    pub from: Option<String>,
+    /// Inclusive upper bound on the estimate timestamp (ISO-8601).
+    pub to: Option<String>,
+}
+
 /// Returns the base data directory path: `~/.soroban-cost-estimator`,
 /// creating it if needed.
 fn data_dir() -> AppResult<PathBuf> {
@@ -385,6 +405,87 @@ pub fn list_cached_estimates(network: &str) -> AppResult<Vec<CachedEstimate>> {
 
     trace!(network, count = estimates.len(), "listed cached estimates");
     Ok(estimates)
+}
+
+/// Parse an ISO-8601 timestamp into a UTC `DateTime`.
+fn parse_ts(s: &str) -> AppResult<chrono::DateTime<chrono::Utc>> {
+    let dt = chrono::DateTime::parse_from_rfc3339(s)
+        .map_err(|e| AppError::General(format!("invalid timestamp {s:?}: {e}")))?;
+    Ok(dt.with_timezone(&chrono::Utc))
+}
+
+/// Query cached estimates for `network`, applying the optional filters in
+/// [`QueryFilter`].
+///
+/// Results are returned newest-first (by `timestamp`). The filters are:
+/// * `function` — case-insensitive substring match
+/// * `wasm_hash` — prefix match
+/// * `min_stroops` / `max_stroops` — inclusive `total_stroops` range
+/// * `from` / `to` — inclusive timestamp range (ISO-8601)
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn query_estimates(network: &str, filter: &QueryFilter) -> AppResult<Vec<CachedEstimate>> {
+    let mut estimates = list_cached_estimates(network)?;
+
+    // Newest-first ordering.
+    estimates.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+    let from_ts = match &filter.from {
+        Some(s) => Some(parse_ts(s)?),
+        None => None,
+    };
+    let to_ts = match &filter.to {
+        Some(s) => Some(parse_ts(s)?),
+        None => None,
+    };
+
+    let filtered: Vec<CachedEstimate> = estimates
+        .into_iter()
+        .filter(|e| {
+            if let Some(f) = &filter.function {
+                let f = f.to_lowercase();
+                if !e.function.to_lowercase().contains(f.as_str()) {
+                    return false;
+                }
+            }
+            if let Some(w) = &filter.wasm_hash {
+                if !e.wasm_hash.starts_with(w.as_str()) {
+                    return false;
+                }
+            }
+            if let Some(min) = filter.min_stroops {
+                if e.total_stroops < min {
+                    return false;
+                }
+            }
+            if let Some(max) = filter.max_stroops {
+                if e.total_stroops > max {
+                    return false;
+                }
+            }
+            if let Some(from) = &from_ts {
+                let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&e.timestamp) else {
+                    return false;
+                };
+                if ts.with_timezone(&chrono::Utc) < *from {
+                    return false;
+                }
+            }
+            if let Some(to) = &to_ts {
+                let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&e.timestamp) else {
+                    return false;
+                };
+                if ts.with_timezone(&chrono::Utc) > *to {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+
+    trace!(network, count = filtered.len(), "queried cached estimates");
+    Ok(filtered)
 }
 
 /// Integrity status of a single cache entry file.

@@ -216,6 +216,7 @@ fn test_cache_help() {
     let (stdout, stderr, code) = run_cli(&["cache", "--help"]);
     assert_eq!(code, 0, "cache --help should exit 0; stderr: {stderr}");
     assert!(stdout.contains("verify"), "cache help should list verify");
+    assert!(stdout.contains("query"), "cache help should list query");
 }
 
 #[test]
@@ -1008,5 +1009,85 @@ fn test_watch_interval_suffixes_are_parsed() {
     assert!(
         stdout.contains("every 1800s"),
         "`30m` should resolve to 1800s; got: {stdout}"
+    );
+}
+
+// ── cache query tests ────────────────────────────────────────────────
+
+#[test]
+fn test_cache_query_help() {
+    let (stdout, stderr, code) = run_cli(&["cache", "query", "--help"]);
+    assert_eq!(
+        code, 0,
+        "cache query --help should exit 0; stderr: {stderr}"
+    );
+    for flag in [
+        "--network",
+        "--function",
+        "--wasm-hash",
+        "--min-stroops",
+        "--max-stroops",
+        "--from",
+        "--to",
+        "--json",
+    ] {
+        assert!(
+            stdout.contains(flag),
+            "query help should mention {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_cache_query_empty_cache() {
+    let home = temp_home("cache-query-empty");
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(["cache", "query", "--network", "testnet"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .output()
+        .expect("failed to run cache query");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("No cached estimates match the query."),
+        "empty cache should report no results; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_query_empty_json() {
+    let home = temp_home("cache-query-empty-json");
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(["cache", "query", "--network", "testnet", "--json"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run cache query");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    assert_eq!(trimmed, "[]", "empty JSON should be []; got: {stdout}");
+}
+
+#[test]
+fn test_cache_query_json_flag_accepted() {
+    let home = temp_home("cache-query-json-flag");
+    // Save a cached estimate first via the test helper
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(["cache", "query", "--network", "testnet", "--json"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run cache query");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    // Should be valid JSON
+    assert!(
+        serde_json::from_str::<serde_json::Value>(trimmed).is_ok(),
+        "output should be valid JSON; got: {stdout}"
     );
 }
