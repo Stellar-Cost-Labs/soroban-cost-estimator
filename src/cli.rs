@@ -13,6 +13,12 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "N")]
     pub rps: Option<u64>,
 
+    /// Retry transient RPC failures up to N times (default 3), using
+    /// exponential backoff (500ms, then doubled between attempts). 0
+    /// disables retries entirely.
+    #[arg(long, global = true, value_name = "N", default_value = "3")]
+    pub max_retries: usize,
+
     #[command(subcommand)]
     pub command: Command,
 }

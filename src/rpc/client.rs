@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
-use crate::rpc::retry::with_retry;
+use crate::rpc::retry::{DEFAULT_MAX_RETRIES, with_retry};
 
 /// Resolves a network name to its well-known Soroban RPC endpoint.
 ///
@@ -72,6 +72,9 @@ pub struct RpcClient {
     dedup: Arc<Mutex<DedupState>>,
     /// Fixed-rate limiter shared by every network call, when enabled.
     limiter: Option<Arc<governor::DefaultDirectRateLimiter>>,
+    /// Maximum number of retries on transient (HTTP) failures, with
+    /// exponential backoff.
+    max_retries: usize,
 }
 
 impl RpcClient {
@@ -82,19 +85,33 @@ impl RpcClient {
     }
 
     /// Create a new RPC client pointing at the given URL, optionally capping
-    /// outbound requests to `rps` requests per second.
+    /// outbound requests to `rps` requests per second. Retries use the
+    /// [`DEFAULT_MAX_RETRIES`] default.
     ///
     /// The limiter spaces consecutive outbound calls at least `1/rps` seconds
     /// apart (a fixed-rate limiter with a burst of 1). `None` or `Some(0)`
     /// disables rate limiting entirely. Values larger than `u32::MAX` are
     /// clamped.
     pub fn with_rate_limit(url: &str, rps: Option<u64>) -> Self {
-        debug!(url, rps, "creating RPC client");
+        Self::with_rate_limit_and_retries(url, rps, DEFAULT_MAX_RETRIES)
+    }
+
+    /// Create a new RPC client pointing at the given URL, optionally capping
+    /// outbound requests to `rps` requests per second and retrying transient
+    /// RPC failures up to `max_retries` times with exponential backoff.
+    ///
+    /// The limiter spaces consecutive outbound calls at least `1/rps` seconds
+    /// apart (a fixed-rate limiter with a burst of 1). `None` or `Some(0)`
+    /// disables rate limiting entirely. Values larger than `u32::MAX` are
+    /// clamped. `max_retries` of `0` disables retries.
+    pub fn with_rate_limit_and_retries(url: &str, rps: Option<u64>, max_retries: usize) -> Self {
+        debug!(url, rps, max_retries, "creating RPC client");
         Self {
             url: url.to_string(),
             client: reqwest::Client::new(),
             dedup: Arc::new(Mutex::new(DedupState::default())),
             limiter: rps.and_then(build_rate_limiter),
+            max_retries,
         }
     }
 
@@ -179,7 +196,7 @@ impl RpcClient {
         let request_body = body.clone();
         let limiter = self.limiter.clone();
 
-        let response = with_retry(|| {
+        let response = with_retry(self.max_retries, || {
             let client = client.clone();
             let url = url.clone();
             let request_body = request_body.clone();
