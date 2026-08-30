@@ -1,4 +1,6 @@
 use clap::Parser;
+use comfy_table::Cell;
+use comfy_table::Table;
 use soroban_cost_estimator::cache;
 use soroban_cost_estimator::cli;
 use soroban_cost_estimator::config_snapshot;
@@ -10,6 +12,105 @@ use soroban_cost_estimator::wasm;
 use soroban_cost_estimator::xdr_helper;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
+
+/// Status of a single function in an `estimate-all` run.
+///
+/// Serialized as a lowercase string (`ok` / `skipped` / `error`) so the JSON
+/// array stays uniform across every function regardless of outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EstimateAllStatus {
+    Ok,
+    Skipped,
+    Error,
+}
+
+/// A well-typed, serializable result for one function in an `estimate-all`
+/// run.
+///
+/// Every entry carries the same fields, so `estimate-all --json` always emits
+/// a uniform array: `status` is always present, while `reason`/`error` and the
+/// resource/fee blocks are populated only for the relevant statuses (empty
+/// fields are omitted via `skip_serializing_if`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EstimateAllResult {
+    /// Name of the contract function that was (or would be) simulated.
+    pub function: String,
+    /// Outcome of estimating this function.
+    pub status: EstimateAllStatus,
+    /// Why the function was skipped (present only when `status` is `skipped`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Error message (present only when `status` is `error`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wasm_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_instructions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_entries: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_entries: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_bytes: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_bytes: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_size: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee: Option<report::fee_calc::FeeBreakdown>,
+}
+
+impl EstimateAllResult {
+    /// Build a `skipped` result (function could not be simulated).
+    fn skipped(function: &str, reason: impl Into<String>) -> Self {
+        Self {
+            function: function.to_string(),
+            status: EstimateAllStatus::Skipped,
+            reason: Some(reason.into()),
+            error: None,
+            wasm_hash: None,
+            network: None,
+            ledger: None,
+            cpu_instructions: None,
+            memory_bytes: None,
+            read_entries: None,
+            write_entries: None,
+            read_bytes: None,
+            write_bytes: None,
+            tx_size: None,
+            fee: None,
+        }
+    }
+
+    /// Build an `error` result (simulation failed).
+    fn errored(function: &str, error: impl Into<String>) -> Self {
+        Self {
+            function: function.to_string(),
+            status: EstimateAllStatus::Error,
+            reason: None,
+            error: Some(error.into()),
+            wasm_hash: None,
+            network: None,
+            ledger: None,
+            cpu_instructions: None,
+            memory_bytes: None,
+            read_entries: None,
+            write_entries: None,
+            read_bytes: None,
+            write_bytes: None,
+            tx_size: None,
+            fee: None,
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -66,9 +167,11 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::Snapshot { network, out, json } => {
                 cmd_config_snapshot(&network, out.as_deref(), json, rps).await
             }
-            cli::ConfigAction::Diff { network, against } => {
-                cmd_config_diff(&network, against.as_deref(), rps).await
-            }
+            cli::ConfigAction::Diff {
+                network,
+                against,
+                summary,
+            } => cmd_config_diff(&network, against.as_deref(), summary, rps).await,
             cli::ConfigAction::History { network } => cmd_config_history(&network),
             cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network),
             cli::ConfigAction::Validate { network } => cmd_config_validate(&network),
@@ -81,6 +184,25 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 json,
             } => cmd_cache_warm(&wasm, &network, id.as_deref(), json, rps).await,
             cli::CacheAction::Verify => cmd_cache_verify(),
+            cli::CacheAction::Query {
+                network,
+                function,
+                wasm_hash,
+                min_stroops,
+                max_stroops,
+                from,
+                to,
+                json,
+            } => cmd_cache_query(
+                &network,
+                function.as_deref(),
+                wasm_hash.as_deref(),
+                min_stroops,
+                max_stroops,
+                from.as_deref(),
+                to.as_deref(),
+                json,
+            ),
         },
         cli::Command::Watch { network, interval } => cmd_watch(&network, &interval, rps).await,
     }
@@ -356,6 +478,7 @@ async fn cmd_estimate(
             ledger: latest_ledger,
             network: network.to_string(),
             rpc_latency_ms,
+            rates: Some(fee_rates),
         };
 
         let _ = cache::save_estimate(
@@ -440,8 +563,15 @@ async fn cmd_estimate_all(
         let endpoint = rpc::client::resolve_endpoint(network, None)?;
         let client = rpc::client::RpcClient::with_rate_limit(&endpoint, rps);
 
-        let mut json_results: Vec<serde_json::Value> = Vec::new();
-        let mut fees: Vec<i64> = Vec::new();
+        // Fee rates are only needed to itemize the per-function fee breakdown
+        // in JSON output; skip the extra RPC calls in table mode.
+        let fee_rates = if json_flag {
+            Some(fetch_fee_rates(&client).await)
+        } else {
+            None
+        };
+
+        let mut json_results: Vec<EstimateAllResult> = Vec::new();
         let total = wasm_info.functions.len();
         debug!(total, "enumerated functions");
 
@@ -449,7 +579,7 @@ async fn cmd_estimate_all(
             if !json_flag {
                 println!("[{}/{}] {}", i + 1, total, fn_info.name);
             }
-            let outcome = estimate_all_function(
+            let result = estimate_all_function(
                 &client,
                 &wasm_info,
                 fn_info,
@@ -457,21 +587,19 @@ async fn cmd_estimate_all(
                 &wasm_hash,
                 network,
                 json_flag,
+                fee_rates.as_ref(),
             )
             .await?;
-            if let Some(outcome) = outcome {
-                if let Some(fee) = outcome.fee_stroops {
-                    fees.push(fee);
-                }
-                if let Some(value) = outcome.json {
-                    json_results.push(value);
-                }
-            }
+            json_results.push(result);
         }
 
         // Aggregate fee range across every successfully estimated function
-        // (#83): min/max/average in stroops (and XLM) for the whole batch.
-        emit_fee_range_summary(&fees, json_flag, &mut json_results);
+        // (#223): min/max/average in stroops (and XLM) for the whole batch.
+        let fees: Vec<i64> = json_results
+            .iter()
+            .filter_map(|r| r.fee.as_ref().map(|f| f.total_stroops))
+            .collect();
+        emit_fee_range_summary(&fees, json_flag);
 
         if json_flag {
             println!("{}", serde_json::to_string_pretty(&json_results)?);
@@ -483,70 +611,44 @@ async fn cmd_estimate_all(
     .await
 }
 
-/// Emit the aggregate fee-range summary for an `estimate-all` batch (#83).
+/// Emit the aggregate fee-range summary for an `estimate-all` batch (#223).
 ///
-/// In JSON mode the summary is appended to `json_results` as a `(summary)`
-/// record carrying min/max/average in stroops and XLM; in human mode it is
-/// printed as three lines. When no function produced a fee, human mode prints
-/// a short notice and JSON mode emits nothing.
-fn emit_fee_range_summary(
-    fees: &[i64],
-    json_flag: bool,
-    json_results: &mut Vec<serde_json::Value>,
-) {
-    let Some(range) = report::fee_calc::fee_range(fees) else {
-        if !json_flag {
-            println!("No functions estimated; no fee range to report.");
-        }
-        return;
-    };
-
+/// In human mode it is printed as three lines. The fee range is intentionally
+/// omitted from the structured JSON array (which already contains a per-function
+/// `fee` record); callers can derive min/max/average from those records.
+fn emit_fee_range_summary(fees: &[i64], json_flag: bool) {
     if json_flag {
-        json_results.push(serde_json::json!({
-            "function": "(summary)",
-            "status": "summary",
-            "functions_estimated": range.count,
-            "min_fee_stroops": range.min_stroops,
-            "max_fee_stroops": range.max_stroops,
-            "avg_fee_stroops": range.avg_stroops,
-            "min_fee_xlm": report::fee_calc::stroops_to_xlm(range.min_stroops),
-            "max_fee_xlm": report::fee_calc::stroops_to_xlm(range.max_stroops),
-            "avg_fee_xlm": report::fee_calc::stroops_to_xlm(range.avg_stroops),
-        }));
         return;
     }
+    let Some(range) = report::fee_calc::fee_range(fees) else {
+        println!("No functions estimated; no fee range to report.");
+        return;
+    };
 
     println!();
     println!("Fee range across {} function(s):", range.count);
     println!(
-        "  min: {} stroops ({} XLM)",
+        "  min: {} stroops ({})",
         range.min_stroops,
         report::fee_calc::stroops_to_xlm(range.min_stroops)
     );
     println!(
-        "  max: {} stroops ({} XLM)",
+        "  max: {} stroops ({})",
         range.max_stroops,
         report::fee_calc::stroops_to_xlm(range.max_stroops)
     );
     println!(
-        "  avg: {} stroops ({} XLM)",
+        "  avg: {} stroops ({})",
         range.avg_stroops,
         report::fee_calc::stroops_to_xlm(range.avg_stroops)
     );
 }
 
-/// Outcome of estimating one exported function in `estimate-all`.
-struct EstimateAllOutcome {
-    /// JSON record for `--json` output mode, if the caller wants it.
-    json: Option<serde_json::Value>,
-    /// Total fee in stroops when the function was estimated successfully.
-    /// `None` for skipped/errored functions, which must not count toward
-    /// the aggregate fee range.
-    fee_stroops: Option<i64>,
-}
-
-/// Estimates one exported function against the network, printing its result
-/// (non-JSON mode) or returning its JSON record (JSON mode).
+/// Estimates one exported function against the network, returning a well-typed
+/// [`EstimateAllResult`].
+///
+/// The returned record is always built; in table mode it is printed directly
+/// and discarded, while JSON mode collects every record into a uniform array.
 #[allow(clippy::too_many_lines)]
 async fn estimate_all_function(
     client: &rpc::client::RpcClient,
@@ -556,7 +658,8 @@ async fn estimate_all_function(
     wasm_hash: &str,
     network: &str,
     json_flag: bool,
-) -> error::AppResult<Option<EstimateAllOutcome>> {
+    fee_rates: Option<&report::fee_calc::FeeRates>,
+) -> error::AppResult<EstimateAllResult> {
     use tracing::{Instrument, debug, info_span};
 
     let span =
@@ -565,18 +668,10 @@ async fn estimate_all_function(
         if fn_info.param_count > 0 {
             let reason = format!("needs --fn/--arg ({} param(s))", fn_info.param_count);
             debug!(reason, "skipping function");
-            if json_flag {
-                return Ok(Some(EstimateAllOutcome {
-                    json: Some(serde_json::json!({
-                        "function": fn_info.name,
-                        "status": "skipped",
-                        "reason": reason,
-                    })),
-                    fee_stroops: None,
-                }));
+            if !json_flag {
+                println!("── Estimating '{}' ── Skipped: {reason}", fn_info.name);
             }
-            println!("── Estimating '{}' ── Skipped: {reason}", fn_info.name);
-            return Ok(None);
+            return Ok(EstimateAllResult::skipped(&fn_info.name, reason));
         }
 
         let tx_xdr = match xdr_helper::build_simulation_tx_envelope(
@@ -588,18 +683,10 @@ async fn estimate_all_function(
             Ok(tx) => tx,
             Err(e) => {
                 debug!(error = %e, "tx construction failed");
-                if json_flag {
-                    return Ok(Some(EstimateAllOutcome {
-                        json: Some(serde_json::json!({
-                            "function": fn_info.name,
-                            "status": "skipped",
-                            "reason": e.to_string(),
-                        })),
-                        fee_stroops: None,
-                    }));
+                if !json_flag {
+                    eprintln!("── Estimating '{}' ── Skipped: {e}", fn_info.name);
                 }
-                eprintln!("── Estimating '{}' ── Skipped: {e}", fn_info.name);
-                return Ok(None);
+                return Ok(EstimateAllResult::skipped(&fn_info.name, e.to_string()));
             }
         };
         let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
@@ -610,34 +697,27 @@ async fn estimate_all_function(
                 if missing_simulation_data(&resp) {
                     let msg = "simulation returned no cost data and no latest ledger — check --id and the RPC endpoint";
                     debug!(msg, "simulation missing data");
-                    if json_flag {
-                        return Ok(Some(EstimateAllOutcome {
-                            json: Some(serde_json::json!({
-                                "function": fn_info.name,
-                                "status": "error",
-                                "error": msg,
-                            })),
-                            fee_stroops: None,
-                        }));
+                    if !json_flag {
+                        eprintln!("── Estimating '{}' ── Error: {msg}", fn_info.name);
                     }
-                    eprintln!("── Estimating '{}' ── Error: {msg}", fn_info.name);
-                    return Ok(None);
+                    return Ok(EstimateAllResult::errored(&fn_info.name, msg));
                 }
 
-                let (cpu, mem, ..) = response_resources(&resp)?;
-                let fee = rpc::simulate::parse_resource_fee(&resp.min_resource_fee)
+                let (cpu, mem, read_entries, write_entries, read_bytes, write_bytes) =
+                    response_resources(&resp)?;
+                let total_fee = rpc::simulate::parse_resource_fee(&resp.min_resource_fee)
                     .unwrap_or(None)
                     .or(rpc::simulate::parse_transaction_data_resource_fee(
                         &resp.transaction_data,
                     )?)
                     .unwrap_or(0);
-                let xlm = report::fee_calc::stroops_to_xlm(fee);
+                let xlm = report::fee_calc::stroops_to_xlm(total_fee);
                 let ledger: u32 = resp
                     .latest_ledger
                     .and_then(|l| u32::try_from(l).ok())
                     .unwrap_or(0);
 
-                debug!(cpu, mem, fee, ledger, "simulation complete");
+                debug!(cpu, mem, total_fee, ledger, "simulation complete");
 
                 let _ = cache::save_estimate(
                     wasm_hash,
@@ -645,49 +725,65 @@ async fn estimate_all_function(
                     &[],
                     network,
                     ledger,
-                    fee,
+                    total_fee,
                     cpu,
                     mem,
                 );
 
-                if json_flag {
-                    Ok(Some(EstimateAllOutcome {
-                        json: Some(serde_json::json!({
-                            "function": fn_info.name,
-                            "status": "ok",
-                            "cpu_instructions": cpu,
-                            "memory_bytes": mem,
-                            "fee_stroops": fee,
-                            "fee_xlm": xlm,
-                            "ledger": ledger,
-                        })),
-                        fee_stroops: Some(fee),
-                    }))
-                } else {
+                // Itemize the fee breakdown only when we have the network's fee
+                // rates (JSON mode). Otherwise emit a minimal breakdown with just
+                // the authoritative total so the record shape stays consistent.
+                let fee = match fee_rates {
+                    Some(rates) => report::fee_calc::compute_fee_breakdown(
+                        total_fee,
+                        cpu,
+                        read_entries,
+                        write_entries,
+                        read_bytes,
+                        tx_xdr.len() as u32,
+                        *rates,
+                    ),
+                    None => report::fee_calc::FeeBreakdown {
+                        non_refundable_stroops: 0,
+                        refundable_stroops: 0,
+                        cpu_fee_stroops: 0,
+                        storage_fee_stroops: 0,
+                        bandwidth_fee_stroops: 0,
+                        total_stroops: total_fee,
+                        total_xlm: xlm.clone(),
+                    },
+                };
+
+                if !json_flag {
                     println!(
-                        "CPU: {cpu} insns | Mem: {mem} bytes | Fee: {fee} stroops ({xlm} XLM) | Ledger: {ledger}"
+                        "CPU: {cpu} insns | Mem: {mem} bytes | Fee: {total_fee} stroops ({xlm} XLM) | Ledger: {ledger}"
                     );
-                    Ok(Some(EstimateAllOutcome {
-                        json: None,
-                        fee_stroops: Some(fee),
-                    }))
                 }
+
+                Ok(EstimateAllResult {
+                    function: fn_info.name.clone(),
+                    status: EstimateAllStatus::Ok,
+                    reason: None,
+                    error: None,
+                    wasm_hash: Some(wasm_hash.to_string()),
+                    network: Some(network.to_string()),
+                    ledger: Some(ledger),
+                    cpu_instructions: Some(cpu),
+                    memory_bytes: Some(mem),
+                    read_entries: Some(read_entries),
+                    write_entries: Some(write_entries),
+                    read_bytes: Some(read_bytes),
+                    write_bytes: Some(write_bytes),
+                    tx_size: Some(tx_xdr.len() as u32),
+                    fee: Some(fee),
+                })
             }
             Err(e) => {
                 debug!(error = %e, "simulation failed");
-                if json_flag {
-                    Ok(Some(EstimateAllOutcome {
-                        json: Some(serde_json::json!({
-                            "function": fn_info.name,
-                            "status": "error",
-                            "error": e.to_string(),
-                        })),
-                        fee_stroops: None,
-                    }))
-                } else {
+                if !json_flag {
                     eprintln!("Skipped — simulation failed: {e}");
-                    Ok(None)
                 }
+                Ok(EstimateAllResult::errored(&fn_info.name, e.to_string()))
             }
         }
     }
@@ -879,6 +975,7 @@ fn upgrade_detected(diff: &config_snapshot::diff::ConfigDiff) -> bool {
 async fn cmd_config_diff(
     network: &str,
     against_path: Option<&str>,
+    summary: bool,
     rps: Option<u64>,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
@@ -905,25 +1002,35 @@ async fn cmd_config_diff(
             has_pricing = diff.has_pricing_changes,
             "diff computed"
         );
-        println!("{}", config_snapshot::diff::format_diff(&diff));
+        if summary {
+            println!("{}", config_snapshot::diff::format_diff_summary(&diff));
+        } else {
+            println!("{}", config_snapshot::diff::format_diff(&diff));
+        }
 
         if upgrade_detected(&diff) {
             match config_snapshot::store::save_snapshot(&new_snapshot, None) {
                 Ok(path) => {
                     info!(path = %path.display(), "auto-saved post-upgrade snapshot");
-                    println!(
-                        "  Protocol upgrade detected — new config auto-saved to {}",
-                        path.display()
-                    );
+                    if !summary {
+                        println!(
+                            "  Protocol upgrade detected — new config auto-saved to {}",
+                            path.display()
+                        );
+                    }
                 }
                 Err(e) => {
                     warn!(error = %e, "could not auto-save post-upgrade snapshot");
-                    eprintln!("  Warning: could not auto-save post-upgrade snapshot: {e}");
+                    if !summary {
+                        eprintln!("  Warning: could not auto-save post-upgrade snapshot: {e}");
+                    }
                 }
             }
         }
 
-        print_stale_estimates(network, new_snapshot.ledger);
+        if !summary {
+            print_stale_estimates(network, new_snapshot.ledger);
+        }
 
         if diff.has_pricing_changes {
             std::process::exit(1);
@@ -1193,6 +1300,72 @@ fn cmd_cache_verify() -> error::AppResult<()> {
     Ok(())
 }
 
+/// `cache query` command: list cached estimates matching the given filters.
+///
+/// Prints a table (or JSON when `--json` is passed). An empty result prints a
+/// friendly message instead of an empty table.
+///
+/// # Network calls
+/// None — pure file I/O.
+fn cmd_cache_query(
+    network: &str,
+    function: Option<&str>,
+    wasm_hash: Option<&str>,
+    min_stroops: Option<i64>,
+    max_stroops: Option<i64>,
+    from: Option<&str>,
+    to: Option<&str>,
+    json: bool,
+) -> error::AppResult<()> {
+    let filter = cache::QueryFilter {
+        function: function.map(str::to_string),
+        wasm_hash: wasm_hash.map(str::to_string),
+        min_stroops,
+        max_stroops,
+        from: from.map(str::to_string),
+        to: to.map(str::to_string),
+    };
+
+    let estimates = cache::query_estimates(network, &filter)?;
+
+    if estimates.is_empty() {
+        if json {
+            println!("[]");
+        } else {
+            println!("No cached estimates match the query.");
+        }
+        return Ok(());
+    }
+
+    if json {
+        let json = serde_json::json!(estimates);
+        println!("{json}");
+        return Ok(());
+    }
+
+    let mut table = Table::new();
+    table.set_header(vec![
+        "Function",
+        "Network",
+        "WASM Hash",
+        "Stroops",
+        "Ledger",
+        "Timestamp",
+    ]);
+    for e in &estimates {
+        table.add_row(vec![
+            Cell::new(e.function.as_str()),
+            Cell::new(e.network.as_str()),
+            Cell::new(e.wasm_hash.as_str()),
+            Cell::new(e.total_stroops),
+            Cell::new(e.ledger),
+            Cell::new(e.timestamp.as_str()),
+        ]);
+    }
+    println!("{table}");
+    Ok(())
+}
+
 /// `cache warm` command: pre-populate cache by estimating every exported function.
 async fn cmd_cache_warm(
     wasm_path: &str,
@@ -1206,6 +1379,8 @@ async fn cmd_cache_warm(
 
 #[cfg(test)]
 mod tests {
+    use super::EstimateAllResult;
+    use super::EstimateAllStatus;
     use super::parse_interval_secs;
     use super::upgrade_detected;
     use super::wasm_info_json;
@@ -1357,5 +1532,63 @@ mod tests {
         assert_eq!(value["functions"][0]["name"], "increment");
         assert_eq!(value["functions"][0]["params"][0]["name"], "step");
         assert_eq!(value["functions"][0]["params"][0]["type"], "I64");
+    }
+
+    #[test]
+    fn test_estimate_all_result_json_shape() {
+        let results = vec![
+            EstimateAllResult {
+                function: "inc".to_string(),
+                status: EstimateAllStatus::Ok,
+                reason: None,
+                error: None,
+                wasm_hash: Some("deadbeef".to_string()),
+                network: Some("testnet".to_string()),
+                ledger: Some(10),
+                cpu_instructions: Some(100),
+                memory_bytes: Some(0),
+                read_entries: Some(1),
+                write_entries: Some(1),
+                read_bytes: Some(0),
+                write_bytes: Some(10),
+                tx_size: Some(50),
+                fee: Some(soroban_cost_estimator::report::fee_calc::FeeBreakdown {
+                    non_refundable_stroops: 1,
+                    refundable_stroops: 2,
+                    cpu_fee_stroops: 1,
+                    storage_fee_stroops: 0,
+                    bandwidth_fee_stroops: 0,
+                    total_stroops: 3,
+                    total_xlm: "0.0000003".to_string(),
+                }),
+            },
+            EstimateAllResult::skipped("needs_args", "needs --fn/--arg (1 param(s))"),
+            EstimateAllResult::errored("bad", "boom"),
+        ];
+        let value: serde_json::Value = serde_json::to_value(&results).unwrap();
+
+        assert!(value.is_array());
+        assert_eq!(value.as_array().unwrap().len(), 3);
+
+        // ok entry carries status + resources + fee, but no reason/error.
+        let ok = &value[0];
+        assert_eq!(ok["status"], "ok");
+        assert_eq!(ok["function"], "inc");
+        assert_eq!(ok["cpu_instructions"], 100);
+        assert_eq!(ok["fee"]["total_stroops"], 3);
+        assert!(ok.get("reason").is_none());
+        assert!(ok.get("error").is_none());
+
+        // skipped entry carries status + reason, omits resources/fee.
+        let skipped = &value[1];
+        assert_eq!(skipped["status"], "skipped");
+        assert_eq!(skipped["reason"], "needs --fn/--arg (1 param(s))");
+        assert!(skipped.get("cpu_instructions").is_none());
+        assert!(skipped.get("fee").is_none());
+
+        // error entry carries status + error.
+        let errored = &value[2];
+        assert_eq!(errored["status"], "error");
+        assert_eq!(errored["error"], "boom");
     }
 }
