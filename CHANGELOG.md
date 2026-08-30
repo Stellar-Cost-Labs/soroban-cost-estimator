@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stellar contract invoke --cost`.
 - End-to-end integration tests in `tests/cli_tests.rs` covering every CLI
   command, its flags, and its offline error paths.
+- Mock Soroban RPC server (`tests/mock_rpc.rs`) for deterministic offline
+  testing: an in-process loopback JSON-RPC endpoint that serves fixture
+  `simulateTransaction` responses (XDR `transactionData` with known resource
+  usage) and all six `ConfigSetting` ledger entries, exercised at both the
+  library level and end-to-end through the real binary.
 
 ## [0.1.0] - 2026-08-13
 
