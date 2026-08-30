@@ -120,6 +120,9 @@ pub enum Command {
 
 #[derive(Subcommand, Debug)]
 pub enum CacheAction {
+    /// Show cache health: total entries, disk usage, age, per-network breakdown.
+    Stats,
+
     /// Check that every cached estimate is valid JSON and not corrupted.
     Verify,
 
