@@ -185,7 +185,7 @@ pub enum ConfigAction {
         json: bool,
     },
 
-    /// Diff the current network config against the most recent snapshot.
+    /// Diff the current network config against a snapshot, or compare two snapshots offline.
     Diff {
         /// Network to compare against.
         #[arg(long, default_value = "testnet")]
@@ -194,6 +194,10 @@ pub enum ConfigAction {
         /// Explicit snapshot path to compare against (defaults to latest).
         #[arg(long)]
         against: Option<String>,
+
+        /// Explicit snapshot path for the newer config when diffing offline.
+        #[arg(long)]
+        new: Option<String>,
 
         /// Print a single-line summary (counts of pricing/non-pricing changes)
         /// instead of the full diff. Useful for CI status lines.

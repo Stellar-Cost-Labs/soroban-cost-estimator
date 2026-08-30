@@ -170,8 +170,9 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::Diff {
                 network,
                 against,
+                new,
                 summary,
-            } => cmd_config_diff(&network, against.as_deref(), summary, rps).await,
+            } => cmd_config_diff(&network, against.as_deref(), new.as_deref(), summary, rps).await,
             cli::ConfigAction::History { network } => cmd_config_history(&network),
             cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network),
             cli::ConfigAction::Validate { network } => cmd_config_validate(&network),
@@ -975,6 +976,7 @@ fn upgrade_detected(diff: &config_snapshot::diff::ConfigDiff) -> bool {
 async fn cmd_config_diff(
     network: &str,
     against_path: Option<&str>,
+    new_path: Option<&str>,
     summary: bool,
     rps: Option<u64>,
 ) -> error::AppResult<()> {
@@ -994,7 +996,13 @@ async fn cmd_config_diff(
             }
         };
 
-        let new_snapshot = fetch_config_snapshot(network, rps).await?;
+        let new_snapshot = match new_path {
+            Some(path) => {
+                debug!(path, "loading newer snapshot from path");
+                config_snapshot::store::load_snapshot_from_path(path)?
+            }
+            None => fetch_config_snapshot(network, rps).await?,
+        };
 
         let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
         debug!(
@@ -1008,7 +1016,7 @@ async fn cmd_config_diff(
             println!("{}", config_snapshot::diff::format_diff(&diff));
         }
 
-        if upgrade_detected(&diff) {
+        if new_path.is_none() && upgrade_detected(&diff) {
             match config_snapshot::store::save_snapshot(&new_snapshot, None) {
                 Ok(path) => {
                     info!(path = %path.display(), "auto-saved post-upgrade snapshot");
@@ -1028,7 +1036,7 @@ async fn cmd_config_diff(
             }
         }
 
-        if !summary {
+        if new_path.is_none() && !summary {
             print_stale_estimates(network, new_snapshot.ledger);
         }
 

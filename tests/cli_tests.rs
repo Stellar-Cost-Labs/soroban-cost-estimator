@@ -869,6 +869,42 @@ fn test_config_diff_loads_valid_snapshot_before_network() {
     );
 }
 
+#[test]
+fn test_config_diff_offline_between_two_snapshot_files() {
+    let home = temp_home("diff-offline-snapshots");
+    let old_path = home.join("old.json");
+    let new_path = home.join("new.json");
+    std::fs::write(&old_path, snapshot_json("testnet", 100)).expect("write old snapshot");
+    std::fs::write(&new_path, snapshot_json("testnet", 200)).expect("write new snapshot");
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against",
+            old_path.to_str().unwrap(),
+            "--new",
+            new_path.to_str().unwrap(),
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(
+        code, 0,
+        "offline snapshot diff should succeed without RPC; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Config diff:"),
+        "stdout should print a diff; got: {stdout}"
+    );
+    assert!(
+        !stderr.contains("failed to locate RPC endpoint"),
+        "offline mode must skip RPC lookups; stderr: {stderr}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // `watch`
 // ─────────────────────────────────────────────────────────────────────────
