@@ -50,6 +50,48 @@ pub struct CostReport {
     /// serialized output; `None` when the rates were unavailable.
     #[serde(skip)]
     pub rates: Option<FeeRates>,
+    /// Change in total fee relative to the previous cached estimate for
+    /// the same WASM + function + args, if a prior estimate exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compare: Option<CostDelta>,
+}
+
+/// Total-cost delta versus the previous cached estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CostDelta {
+    pub previous_total_stroops: i64,
+    pub current_total_stroops: i64,
+    pub delta_stroops: i64,
+}
+
+impl CostDelta {
+    /// Build a cost delta from a previous and current total fee.
+    #[must_use]
+    pub fn new(previous_total_stroops: i64, current_total_stroops: i64) -> Self {
+        Self {
+            previous_total_stroops,
+            current_total_stroops,
+            delta_stroops: current_total_stroops - previous_total_stroops,
+        }
+    }
+
+    /// Human-readable delta string with sign, e.g. "+45 stroops".
+    #[must_use]
+    pub fn delta_label(&self) -> String {
+        let sign = match self.delta_stroops.cmp(&0) {
+            std::cmp::Ordering::Greater => "+".to_string(),
+            std::cmp::Ordering::Less => "-".to_string(),
+            std::cmp::Ordering::Equal => String::new(),
+        };
+        format!("{sign}{} stroops", self.delta_stroops.abs())
+    }
+
+    /// Include both the stroop delta and the equivalent XLM delta.
+    #[must_use]
+    pub fn total_delta_label(&self) -> String {
+        let xlm = crate::report::fee_calc::stroops_to_xlm(self.delta_stroops);
+        format!("{} ({} XLM)", self.delta_label(), xlm)
+    }
 }
 
 /// A concrete, actionable cost-optimization suggestion derived from a report.
@@ -174,6 +216,12 @@ pub fn format_report_table(report: &CostReport) -> String {
     ));
     output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
     output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
+    if let Some(compare) = &report.compare {
+        output.push_str(&format!(
+            "Cost delta vs previous estimate: {}\n\n",
+            compare.total_delta_label()
+        ));
+    }
 
     let mut table = Table::new();
 
@@ -259,6 +307,27 @@ mod tests {
         assert_eq!(fee_percentage(2, 3), "66.7%");
     }
 
+    #[test]
+    fn test_compare_delta_formatting() {
+        let delta = CostDelta {
+            previous_total_stroops: 100,
+            current_total_stroops: 145,
+            delta_stroops: 45,
+        };
+
+        assert_eq!(delta.delta_label(), "+45 stroops");
+        assert_eq!(delta.total_delta_label(), "+45 stroops (0.0000045 XLM)");
+
+        let negative = CostDelta {
+            previous_total_stroops: 200,
+            current_total_stroops: 150,
+            delta_stroops: -50,
+        };
+
+        assert_eq!(negative.delta_label(), "-50 stroops");
+        assert_eq!(negative.total_delta_label(), "-50 stroops (-0.0000050 XLM)");
+    }
+
     fn report_with_rates(rates: FeeRates) -> CostReport {
         CostReport {
             function: "increment".to_string(),
@@ -283,6 +352,7 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
             rates: Some(rates),
+            compare: None,
         }
     }
 

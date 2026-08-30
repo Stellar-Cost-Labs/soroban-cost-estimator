@@ -123,6 +123,7 @@ fn test_estimate_help() {
         "--id",
         "--arg",
         "--cache-ttl",
+        "--compare",
         "--json",
     ] {
         assert!(

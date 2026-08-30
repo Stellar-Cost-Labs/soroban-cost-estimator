@@ -42,6 +42,12 @@ impl ReportFormatter for TableFormatter {
         ));
         output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
         output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
+        if let Some(compare) = &report.compare {
+            output.push_str(&format!(
+                "Cost delta vs previous estimate: {}\n\n",
+                compare.total_delta_label()
+            ));
+        }
 
         let mut table = comfy_table::Table::new();
         table.set_header(vec!["Resource", "Consumed", "Fee (stroops)"]);
@@ -356,6 +362,7 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
             rates: None,
+            compare: None,
         }
     }
 
@@ -383,6 +390,7 @@ mod tests {
             network: "mainnet".to_string(),
             rpc_latency_ms: 0,
             rates: None,
+            compare: None,
         }
     }
 

@@ -141,6 +141,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             id,
             args,
             cache_ttl,
+            compare,
             json,
         } => {
             cmd_estimate(
@@ -151,6 +152,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 r#fn.as_deref(),
                 &args,
                 cache_ttl.as_deref(),
+                compare,
                 json,
                 rps,
             )
@@ -366,6 +368,7 @@ async fn cmd_estimate(
     fn_name: Option<&str>,
     args: &[String],
     cache_ttl: Option<&str>,
+    compare_flag: bool,
     json_flag: bool,
     rps: Option<u64>,
 ) -> error::AppResult<()> {
@@ -464,7 +467,13 @@ async fn cmd_estimate(
             fee_rates,
         );
 
-        let report = report::cost_report::CostReport {
+        let previous_estimate = if compare_flag {
+            cache::load_estimate(&wasm_hash, function_name, args)?
+        } else {
+            None
+        };
+
+        let mut report = report::cost_report::CostReport {
             function: function_name.to_string(),
             wasm_hash: wasm_hash.clone(),
             cpu_instructions,
@@ -479,7 +488,15 @@ async fn cmd_estimate(
             network: network.to_string(),
             rpc_latency_ms,
             rates: Some(fee_rates),
+            compare: None,
         };
+
+        if let Some(previous) = previous_estimate {
+            report.compare = Some(report::cost_report::CostDelta::new(
+                previous.total_stroops,
+                fee.total_stroops,
+            ));
+        }
 
         let _ = cache::save_estimate(
             &wasm_hash,

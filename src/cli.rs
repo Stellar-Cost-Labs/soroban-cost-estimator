@@ -50,6 +50,10 @@ pub enum Command {
         #[arg(long, value_name = "DURATION")]
         cache_ttl: Option<String>,
 
+        /// Show the total-cost delta versus the previous cached estimate.
+        #[arg(long)]
+        compare: bool,
+
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
         json: bool,
