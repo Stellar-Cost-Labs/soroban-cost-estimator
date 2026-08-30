@@ -53,6 +53,10 @@ pub enum Command {
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
         json: bool,
+
+        /// Preview what the command would do without executing RPC calls.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Enumerate all public contract functions and estimate each one.

@@ -137,6 +137,7 @@ pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
 fn open_db() -> AppResult<Connection> {
     let path = db_path()?;
     let conn = Connection::open(&path)?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
     ensure_cache_schema(&conn)?;
     Ok(conn)
 }
@@ -168,31 +169,46 @@ pub fn save_estimate(
     let args_hash = hash_args(args);
 
     let conn = open_db()?;
-    conn.execute(
-        "INSERT INTO estimates \
-         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
-         ON CONFLICT(wasm_hash, function, args_hash) DO UPDATE SET \
-            version = excluded.version, \
-            network = excluded.network, \
-            ledger = excluded.ledger, \
-            total_stroops = excluded.total_stroops, \
-            cpu_instructions = excluded.cpu_instructions, \
-            memory_bytes = excluded.memory_bytes, \
-            timestamp = excluded.timestamp",
-        rusqlite::params![
-            CACHE_SCHEMA_VERSION as i64,
-            wasm_hash,
-            function,
-            args_hash.as_str(),
-            network,
-            ledger as i64,
-            total_stroops,
-            cpu_instructions as i64,
-            memory_bytes as i64,
-            chrono::Utc::now().to_rfc3339(),
-        ],
-    )?;
+
+    let mut retries = 0;
+    loop {
+        let res = conn.execute(
+            "INSERT INTO estimates \
+             (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+             ON CONFLICT(wasm_hash, function, args_hash) DO UPDATE SET \
+                version = excluded.version, \
+                network = excluded.network, \
+                ledger = excluded.ledger, \
+                total_stroops = excluded.total_stroops, \
+                cpu_instructions = excluded.cpu_instructions, \
+                memory_bytes = excluded.memory_bytes, \
+                timestamp = excluded.timestamp",
+            rusqlite::params![
+                CACHE_SCHEMA_VERSION as i64,
+                wasm_hash,
+                function,
+                args_hash.as_str(),
+                network,
+                ledger as i64,
+                total_stroops,
+                cpu_instructions as i64,
+                memory_bytes as i64,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        );
+
+        match res {
+            Ok(_) => break,
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::DatabaseBusy && retries < 20 =>
+            {
+                retries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 
     debug!(function, network, ledger, "estimate cached (sqlite)");
     Ok(())

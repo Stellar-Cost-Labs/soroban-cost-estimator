@@ -142,6 +142,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             args,
             cache_ttl,
             json,
+            dry_run,
         } => {
             cmd_estimate(
                 &wasm,
@@ -152,6 +153,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 &args,
                 cache_ttl.as_deref(),
                 json,
+                dry_run,
                 rps,
             )
             .await
@@ -357,7 +359,7 @@ async fn fetch_fee_rates(client: &rpc::client::RpcClient) -> report::fee_calc::F
 /// `RpcClient`, which deduplicates identical requests — the same method with
 /// the same params — so a repeated WASM-upload envelope (when `--fn` is
 /// omitted) or identical fee-rate fetches transmit at most once.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn cmd_estimate(
     wasm_path: &str,
     network: &str,
@@ -367,6 +369,7 @@ async fn cmd_estimate(
     args: &[String],
     cache_ttl: Option<&str>,
     json_flag: bool,
+    dry_run: bool,
     rps: Option<u64>,
 ) -> error::AppResult<()> {
     use sha2::Digest;
@@ -378,6 +381,7 @@ async fn cmd_estimate(
         network,
         fn = fn_name.unwrap_or("(upload)"),
         has_contract_id = contract_id.is_some(),
+        dry_run,
     );
     async {
         info!("loading WASM");
@@ -389,24 +393,25 @@ async fn cmd_estimate(
 
         // Show the hash before anything else — the user can verify they are
         // simulating the intended file before any RPC traffic is sent.
-        if !json_flag {
+        if !json_flag && !dry_run {
             println!("WASM SHA-256: {wasm_hash}");
         }
 
         // With --cache-ttl, reuse a still-fresh cached estimate and skip the
         // (expensive) simulation entirely.
-        let ttl_secs = cache_ttl.map(parse_interval_secs);
-        if let Some(fresh) =
-            fresh_cached_estimate(&wasm_hash, &function_name, args, ttl_secs)?
-        {
-            let ttl_secs = ttl_secs.unwrap_or_default();
-            info!(ttl_secs, function = %function_name, "cache hit — reusing fresh estimate");
-            print_cached_estimate(&fresh, ttl_secs, json_flag);
-            return Ok(());
+        if !dry_run {
+            let ttl_secs = cache_ttl.map(parse_interval_secs);
+            if let Some(fresh) =
+                fresh_cached_estimate(&wasm_hash, &function_name, args, ttl_secs)?
+            {
+                let ttl_secs = ttl_secs.unwrap_or_default();
+                info!(ttl_secs, function = %function_name, "cache hit — reusing fresh estimate");
+                print_cached_estimate(&fresh, ttl_secs, json_flag);
+                return Ok(());
+            }
         }
 
         let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
-        let client = rpc::client::RpcClient::with_rate_limit(&endpoint, rps);
 
         let sc_vals: Vec<stellar_xdr::ScVal> = args
             .iter()
@@ -420,8 +425,27 @@ async fn cmd_estimate(
         xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
         debug!(arg_count = args.len(), "validated arguments against contract spec");
 
+        let tx_size = tx_xdr.len();
+
+        if dry_run {
+            info!("dry run requested — skipping RPC simulation");
+            print_dry_run_plan(
+                wasm_path,
+                &wasm_hash,
+                network,
+                &endpoint,
+                function_name,
+                contract_id,
+                args,
+                tx_size,
+                json_flag,
+            );
+            return Ok(());
+        }
+
+        let client = rpc::client::RpcClient::with_rate_limit(&endpoint, rps);
         let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
-        debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
+        debug!(tx_xdr_len = tx_size, "built simulation tx envelope");
 
         // Time the simulateTransaction round-trip so the report can flag
         // slow RPC endpoints. Includes any retries performed by the client.
@@ -1118,6 +1142,67 @@ fn print_cached_estimate(fresh: &cache::CachedEstimate, ttl_secs: u64, json_flag
             fresh.memory_bytes,
             fresh.ledger,
         );
+    }
+}
+
+#[derive(serde::Serialize)]
+struct DryRunPlan<'a> {
+    dry_run: bool,
+    wasm_path: &'a str,
+    wasm_hash: &'a str,
+    network: &'a str,
+    endpoint: &'a str,
+    function: &'a str,
+    contract_id: Option<&'a str>,
+    args: &'a [String],
+    tx_size: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_dry_run_plan(
+    wasm_path: &str,
+    wasm_hash: &str,
+    network: &str,
+    endpoint: &str,
+    function_name: &str,
+    contract_id: Option<&str>,
+    args: &[String],
+    tx_size: usize,
+    json_flag: bool,
+) {
+    if json_flag {
+        let plan = DryRunPlan {
+            dry_run: true,
+            wasm_path,
+            wasm_hash,
+            network,
+            endpoint,
+            function: function_name,
+            contract_id,
+            args,
+            tx_size,
+        };
+        if let Ok(json_str) = serde_json::to_string_pretty(&plan) {
+            println!("{json_str}");
+        }
+    } else {
+        println!("Dry-run simulation plan (no RPC calls made):");
+        println!("  WASM path:     {wasm_path}");
+        println!("  WASM SHA-256:  {wasm_hash}");
+        println!("  Network:       {network}");
+        println!("  RPC Endpoint:  {endpoint}");
+        println!("  Function:      {function_name}");
+        if let Some(id) = contract_id {
+            println!("  Contract ID:   {id}");
+        } else {
+            println!("  Contract ID:   (none - simulating WASM upload)");
+        }
+        if args.is_empty() {
+            println!("  Arguments:     (none)");
+        } else {
+            println!("  Arguments:     {}", args.join(", "));
+        }
+        println!("  Tx Size:       {tx_size} bytes");
     }
 }
 
