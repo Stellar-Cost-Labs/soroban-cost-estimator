@@ -37,9 +37,14 @@ where
     std::fs::create_dir_all(&tmp).expect("create temp home");
 
     let old_home = std::env::var_os("HOME");
-    // SAFETY: serialized by HOME_MUTEX, no other thread reads HOME during this block
+    let old_userprofile = std::env::var_os("USERPROFILE");
+    // SAFETY: serialized by HOME_MUTEX, no other thread reads these env vars
+    // during this block.
     unsafe {
         std::env::set_var("HOME", &tmp);
+        // `dirs::home_dir()` reads USERPROFILE on Windows (HOME alone is
+        // ignored there), so set both to keep the cache inside the temp dir.
+        std::env::set_var("USERPROFILE", &tmp);
     }
 
     // Run the test; catch panics so we can clean up regardless
@@ -55,14 +60,18 @@ where
         test(&tmp);
     });
 
-    // SAFETY: serialized by HOME_MUTEX, no other thread reads HOME during this block
-    if let Some(old) = old_home {
-        unsafe {
+    // SAFETY: serialized by HOME_MUTEX, no other thread reads these env vars
+    // during this block.
+    unsafe {
+        if let Some(old) = old_home {
             std::env::set_var("HOME", old);
-        }
-    } else {
-        unsafe {
+        } else {
             std::env::remove_var("HOME");
+        }
+        if let Some(old) = old_userprofile {
+            std::env::set_var("USERPROFILE", old);
+        } else {
+            std::env::remove_var("USERPROFILE");
         }
     }
 
