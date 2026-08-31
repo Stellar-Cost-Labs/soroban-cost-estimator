@@ -111,12 +111,13 @@ fn db_path() -> AppResult<PathBuf> {
 /// Centralized so both the normal cache path and callers that open the
 /// database directly (e.g. test helpers) create an identical schema.
 pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
-    // WAL lets concurrent readers and writers coexist, and busy_timeout makes
-    // contending writers wait instead of failing with SQLITE_BUSY.
+    // busy_timeout must be set before any DDL or journal_mode change so
+    // that concurrent connections wait instead of failing immediately.
+    conn.execute_batch("PRAGMA busy_timeout=10000;")?;
+    // WAL lets concurrent readers and writers coexist.
+    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
     conn.execute_batch(
-        "PRAGMA journal_mode=WAL; \
-         PRAGMA busy_timeout=5000; \
-         CREATE TABLE IF NOT EXISTS estimates (
+        "CREATE TABLE IF NOT EXISTS estimates (
             version          INTEGER NOT NULL,
             wasm_hash        TEXT NOT NULL,
             function         TEXT NOT NULL,
