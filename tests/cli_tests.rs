@@ -314,6 +314,53 @@ fn test_json_flag_accepted() {
 }
 
 #[test]
+fn test_format_flag_accepted() {
+    // Verify --format is a recognized argument for estimate, including the
+    // new markdown variant (#80).
+    for fmt in ["table", "json", "csv", "markdown"] {
+        let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--format", fmt]);
+        // Should fail because the file doesn't exist, NOT because --format is
+        // unknown or the value is invalid.
+        assert_ne!(code, 0, "should error on missing file for {fmt}");
+        assert!(
+            !stderr.contains("unrecognized") && !stderr.contains("invalid value"),
+            "--format {fmt} should be a recognized argument; stderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_format_invalid_value_rejected() {
+    // clap's value_parser must reject unknown formats before the command runs.
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--format", "xml"]);
+    assert_ne!(code, 0, "invalid --format value should error");
+    assert!(
+        stderr.contains("invalid value") || stderr.contains("possible values"),
+        "clap should reject unknown format; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_format_markdown_with_json_flag_accepted() {
+    // --format wins over the legacy --json flag; the combination must be
+    // accepted as valid arguments (failure here is a missing file, not an
+    // argument conflict).
+    let (_, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "test.wasm",
+        "--json",
+        "--format",
+        "markdown",
+    ]);
+    assert_ne!(code, 0, "should error on missing file");
+    assert!(
+        !stderr.contains("unrecognized") && !stderr.contains("cannot be used"),
+        "--json + --format markdown should be accepted; stderr: {stderr}"
+    );
+}
+
+#[test]
 fn test_short_wasm_flag_accepted() {
     // `-w` is the short form of `--wasm` on both estimate and estimate-all.
     let (_, stderr, code) = run_cli(&["estimate", "-w", "does-not-exist.wasm"]);
