@@ -1,4 +1,6 @@
 use clap::Parser;
+use comfy_table::Cell;
+use comfy_table::Table;
 use soroban_cost_estimator::cache;
 use soroban_cost_estimator::cli;
 use soroban_cost_estimator::config_snapshot;
@@ -182,6 +184,25 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 json,
             } => cmd_cache_warm(&wasm, &network, id.as_deref(), json, rps).await,
             cli::CacheAction::Verify => cmd_cache_verify(),
+            cli::CacheAction::Query {
+                network,
+                function,
+                wasm_hash,
+                min_stroops,
+                max_stroops,
+                from,
+                to,
+                json,
+            } => cmd_cache_query(
+                &network,
+                function.as_deref(),
+                wasm_hash.as_deref(),
+                min_stroops,
+                max_stroops,
+                from.as_deref(),
+                to.as_deref(),
+                json,
+            ),
         },
         cli::Command::Watch { network, interval } => cmd_watch(&network, &interval, rps).await,
     }
@@ -1276,6 +1297,72 @@ fn cmd_cache_verify() -> error::AppResult<()> {
         std::process::exit(1);
     }
 
+    Ok(())
+}
+
+/// `cache query` command: list cached estimates matching the given filters.
+///
+/// Prints a table (or JSON when `--json` is passed). An empty result prints a
+/// friendly message instead of an empty table.
+///
+/// # Network calls
+/// None — pure file I/O.
+fn cmd_cache_query(
+    network: &str,
+    function: Option<&str>,
+    wasm_hash: Option<&str>,
+    min_stroops: Option<i64>,
+    max_stroops: Option<i64>,
+    from: Option<&str>,
+    to: Option<&str>,
+    json: bool,
+) -> error::AppResult<()> {
+    let filter = cache::QueryFilter {
+        function: function.map(str::to_string),
+        wasm_hash: wasm_hash.map(str::to_string),
+        min_stroops,
+        max_stroops,
+        from: from.map(str::to_string),
+        to: to.map(str::to_string),
+    };
+
+    let estimates = cache::query_estimates(network, &filter)?;
+
+    if estimates.is_empty() {
+        if json {
+            println!("[]");
+        } else {
+            println!("No cached estimates match the query.");
+        }
+        return Ok(());
+    }
+
+    if json {
+        let json = serde_json::json!(estimates);
+        println!("{json}");
+        return Ok(());
+    }
+
+    let mut table = Table::new();
+    table.set_header(vec![
+        "Function",
+        "Network",
+        "WASM Hash",
+        "Stroops",
+        "Ledger",
+        "Timestamp",
+    ]);
+    for e in &estimates {
+        table.add_row(vec![
+            Cell::new(e.function.as_str()),
+            Cell::new(e.network.as_str()),
+            Cell::new(e.wasm_hash.as_str()),
+            Cell::new(e.total_stroops),
+            Cell::new(e.ledger),
+            Cell::new(e.timestamp.as_str()),
+        ]);
+    }
+    println!("{table}");
     Ok(())
 }
 
