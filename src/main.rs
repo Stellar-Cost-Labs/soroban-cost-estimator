@@ -389,6 +389,9 @@ async fn cmd_estimate(
     async {
         if let Some(diff_path) = diff_wasm_path {
             info!("running estimate diff between baseline and target WASM files");
+            let _ = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
+            let _ = wasm::parser::load_wasm(std::path::Path::new(diff_path))?;
+
             let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
             let client = rpc::client::RpcClient::with_rate_limit(&endpoint, rps);
 

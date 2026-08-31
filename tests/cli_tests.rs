@@ -1037,7 +1037,9 @@ fn test_estimate_diff_nonexistent_file() {
     ]);
     assert_ne!(code, 0, "nonexistent diff file should exit non-zero");
     assert!(
-        stderr.contains("WASM parse failed") || stderr.contains("No such file"),
+        stderr.contains("WASM parse failed")
+            || stderr.contains("No such file")
+            || stderr.contains("File not found"),
         "stderr should mention failure; got: {stderr}"
 // ── cache query tests ────────────────────────────────────────────────
 
@@ -1095,7 +1097,10 @@ fn test_estimate_diff_unreachable_rpc() {
     ]);
     assert_ne!(code, 0, "unreachable RPC should exit non-zero");
     assert!(
-        stderr.contains("RPC request failed") || stderr.contains("connect"),
+        stderr.contains("RPC request failed")
+            || stderr.contains("connect")
+            || stderr.contains("failed to send HTTP request")
+            || stderr.contains("error sending request"),
         "stderr should mention RPC failure; got: {stderr}"
 fn test_cache_query_empty_json() {
     let home = temp_home("cache-query-empty-json");
