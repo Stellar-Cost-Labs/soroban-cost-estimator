@@ -174,6 +174,10 @@ pub enum ConfigAction {
         /// instead of the full diff. Useful for CI status lines.
         #[arg(long)]
         summary: bool,
+
+        /// Output as JSON instead of a human-readable diff.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Show the full chronological change log across all stored snapshots.
