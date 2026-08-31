@@ -40,6 +40,7 @@ impl ReportFormatter for TableFormatter {
             "Network: {} (ledger {})\n",
             report.network, report.ledger
         ));
+        output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
         output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
 
         let mut table = comfy_table::Table::new();
@@ -93,6 +94,11 @@ impl ReportFormatter for TableFormatter {
             report.fee.total_stroops, report.fee.total_xlm,
         ));
 
+        output.push('\n');
+        output.push_str(&crate::report::cost_report::format_suggestions(
+            &report.suggest_optimizations(),
+        ));
+
         output
     }
 
@@ -112,7 +118,13 @@ pub struct JsonFormatter;
 
 impl ReportFormatter for JsonFormatter {
     fn format(&self, report: &CostReport) -> String {
-        serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string())
+        let mut value = serde_json::to_value(report).unwrap_or(serde_json::Value::Null);
+        let suggestions =
+            serde_json::to_value(report.suggest_optimizations()).unwrap_or(serde_json::Value::Null);
+        if let serde_json::Value::Object(ref mut map) = value {
+            map.insert("suggestions".to_string(), suggestions);
+        }
+        serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
     }
 
     fn name(&self) -> &'static str {
@@ -138,7 +150,8 @@ impl ReportFormatter for CsvFormatter {
         let mut output = String::from(
             "function,network,ledger,wasm_hash,cpu_instructions,memory_bytes,\
              read_entries,write_entries,read_bytes,write_bytes,tx_size,\
-             non_refundable_stroops,refundable_stroops,total_stroops,total_xlm\n",
+             non_refundable_stroops,refundable_stroops,total_stroops,total_xlm,\
+             rpc_latency_ms\n",
         );
 
         let row = csv_row(&[
@@ -157,6 +170,7 @@ impl ReportFormatter for CsvFormatter {
             &report.fee.refundable_stroops.to_string(),
             &report.fee.total_stroops.to_string(),
             &report.fee.total_xlm,
+            &report.rpc_latency_ms.to_string(),
         ]);
         output.push_str(&row);
         output.push('\n');
@@ -190,7 +204,11 @@ impl ReportFormatter for MarkdownFormatter {
             "- **Network:** {} (ledger {})\n",
             report.network, report.ledger
         ));
-        output.push_str(&format!("- **WASM hash:** `{}`\n\n", report.wasm_hash));
+        output.push_str(&format!("- **WASM hash:** `{}`\n", report.wasm_hash));
+        output.push_str(&format!(
+            "- **RPC round-trip:** {} ms\n\n",
+            report.rpc_latency_ms
+        ));
 
         // Resource table
         output.push_str("### Resources\n\n");
@@ -242,6 +260,22 @@ impl ReportFormatter for MarkdownFormatter {
             "| **Total** | **{}** ({}) | **100.0%** |\n",
             report.fee.total_stroops, report.fee.total_xlm,
         ));
+
+        // Optimization suggestions
+        output.push_str("\n### Optimization Suggestions\n\n");
+        let suggestions = report.suggest_optimizations();
+        if suggestions.is_empty() {
+            output.push_str(
+                "No cost optimizations identified (fee rates unavailable or no reducible resources).\n",
+            );
+        } else {
+            for s in &suggestions {
+                output.push_str(&format!(
+                    "- **{}**: {} (potential saving: {} stroops)\n",
+                    s.title, s.detail, s.potential_savings_stroops
+                ));
+            }
+        }
 
         output
     }
@@ -320,6 +354,8 @@ mod tests {
             },
             ledger: 3_894_195,
             network: "testnet".to_string(),
+            rpc_latency_ms: 87,
+            rates: None,
         }
     }
 
@@ -345,6 +381,8 @@ mod tests {
             },
             ledger: 0,
             network: "mainnet".to_string(),
+            rpc_latency_ms: 0,
+            rates: None,
         }
     }
 
@@ -363,6 +401,13 @@ mod tests {
         let output = formatter.format(&sample_report());
         assert!(output.contains("testnet"));
         assert!(output.contains("3894195"));
+    }
+
+    #[test]
+    fn test_table_formatter_contains_rpc_latency() {
+        let formatter = TableFormatter;
+        let output = formatter.format(&sample_report());
+        assert!(output.contains("RPC round-trip: 87 ms"));
     }
 
     #[test]
@@ -412,6 +457,7 @@ mod tests {
         assert_eq!(parsed["wasm_hash"], "abc123def456");
         assert_eq!(parsed["ledger"], 3_894_195);
         assert_eq!(parsed["network"], "testnet");
+        assert_eq!(parsed["rpc_latency_ms"], 87);
         assert_eq!(parsed["fee"]["total_stroops"], 15_427);
         assert_eq!(parsed["fee"]["total_xlm"], "0.0015427");
     }
@@ -447,7 +493,7 @@ mod tests {
         let first_line = output.lines().next().unwrap();
         assert!(first_line.starts_with("function,"));
         let field_count = first_line.split(',').count();
-        assert_eq!(field_count, 15);
+        assert_eq!(field_count, 16);
     }
 
     #[test]
@@ -544,6 +590,7 @@ mod tests {
         let output = formatter.format(&sample_report());
         assert!(output.contains("**Network:** testnet (ledger 3894195)"));
         assert!(output.contains("**WASM hash:** `abc123def456`"));
+        assert!(output.contains("**RPC round-trip:** 87 ms"));
     }
 
     #[test]
