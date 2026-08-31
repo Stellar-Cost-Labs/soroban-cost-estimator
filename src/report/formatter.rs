@@ -61,16 +61,35 @@ impl ReportFormatter for TableFormatter {
         output.push('\n');
 
         output.push_str("\nFee Breakdown:\n");
+        let total = report.fee.total_stroops;
         output.push_str(&format!(
-            "  Non-refundable: {} stroops\n",
-            report.fee.non_refundable_stroops
+            "  Non-refundable: {} stroops ({})\n",
+            report.fee.non_refundable_stroops,
+            crate::report::cost_report::fee_percentage(report.fee.non_refundable_stroops, total),
         ));
         output.push_str(&format!(
-            "  Refundable:     {} stroops\n",
-            report.fee.refundable_stroops
+            "  Refundable:     {} stroops ({})\n",
+            report.fee.refundable_stroops,
+            crate::report::cost_report::fee_percentage(report.fee.refundable_stroops, total),
+        ));
+        output.push_str("\n  Components (of non-refundable):\n");
+        output.push_str(&format!(
+            "    CPU:        {} stroops ({})\n",
+            report.fee.cpu_fee_stroops,
+            crate::report::cost_report::fee_percentage(report.fee.cpu_fee_stroops, total),
         ));
         output.push_str(&format!(
-            "  Total:          {} stroops ({})\n",
+            "    Storage:    {} stroops ({})\n",
+            report.fee.storage_fee_stroops,
+            crate::report::cost_report::fee_percentage(report.fee.storage_fee_stroops, total),
+        ));
+        output.push_str(&format!(
+            "    Bandwidth:  {} stroops ({})\n",
+            report.fee.bandwidth_fee_stroops,
+            crate::report::cost_report::fee_percentage(report.fee.bandwidth_fee_stroops, total),
+        ));
+        output.push_str(&format!(
+            "\n  Total:          {} stroops ({})\n",
             report.fee.total_stroops, report.fee.total_xlm,
         ));
 
@@ -190,18 +209,37 @@ impl ReportFormatter for MarkdownFormatter {
 
         // Fee breakdown
         output.push_str("\n### Fee Breakdown\n\n");
-        output.push_str("| Component | Stroops |\n");
-        output.push_str("| --- | --- |\n");
+        output.push_str("| Component | Stroops | % of Total |\n");
+        output.push_str("| --- | --- | --- |\n");
+        let total = report.fee.total_stroops;
+        let pct = crate::report::cost_report::fee_percentage;
         output.push_str(&format!(
-            "| Non-refundable | {} |\n",
-            report.fee.non_refundable_stroops
+            "| Non-refundable | {} | {} |\n",
+            report.fee.non_refundable_stroops,
+            pct(report.fee.non_refundable_stroops, total)
         ));
         output.push_str(&format!(
-            "| Refundable | {} |\n",
-            report.fee.refundable_stroops
+            "| Refundable | {} | {} |\n",
+            report.fee.refundable_stroops,
+            pct(report.fee.refundable_stroops, total)
         ));
         output.push_str(&format!(
-            "| **Total** | **{}** ({}) |\n",
+            "| CPU | {} | {} |\n",
+            report.fee.cpu_fee_stroops,
+            pct(report.fee.cpu_fee_stroops, total)
+        ));
+        output.push_str(&format!(
+            "| Storage | {} | {} |\n",
+            report.fee.storage_fee_stroops,
+            pct(report.fee.storage_fee_stroops, total)
+        ));
+        output.push_str(&format!(
+            "| Bandwidth | {} | {} |\n",
+            report.fee.bandwidth_fee_stroops,
+            pct(report.fee.bandwidth_fee_stroops, total)
+        ));
+        output.push_str(&format!(
+            "| **Total** | **{}** ({}) | **100.0%** |\n",
             report.fee.total_stroops, report.fee.total_xlm,
         ));
 
@@ -274,6 +312,9 @@ mod tests {
             fee: FeeBreakdown {
                 non_refundable_stroops: 4_496,
                 refundable_stroops: 10_931,
+                cpu_fee_stroops: 372,
+                storage_fee_stroops: 4_063,
+                bandwidth_fee_stroops: 61,
                 total_stroops: 15_427,
                 total_xlm: "0.0015427".to_string(),
             },
@@ -296,6 +337,9 @@ mod tests {
             fee: FeeBreakdown {
                 non_refundable_stroops: 0,
                 refundable_stroops: 0,
+                cpu_fee_stroops: 0,
+                storage_fee_stroops: 0,
+                bandwidth_fee_stroops: 0,
                 total_stroops: 0,
                 total_xlm: "0.0000000".to_string(),
             },

@@ -247,7 +247,9 @@ fn test_format_diff_with_changes() {
     let new = make_snapshot(200, 5);
     let d = diff::diff_snapshots(&old, &new);
     let output = diff::format_diff(&d);
-    assert!(output.contains("fee_rate_per_instructions_increment"));
+    // Should use human-readable setting and field names
+    assert!(output.contains("Contract Compute V0"));
+    assert!(output.contains("Fee Rate Per Instructions Increment"));
     assert!(output.contains("100"));
     assert!(output.contains("200"));
 }
