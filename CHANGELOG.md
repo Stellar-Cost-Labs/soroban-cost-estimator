@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `config diff --summary` — print a single-line summary
+  (`X pricing changes, Y non-pricing changes`) instead of the full diff, for CI
+  status lines. Exit code and auto-save side effects are unchanged.
 - `CHANGELOG.md` following the Keep a Changelog format.
 - `docs/migration.md` — migration guide for users coming from
   `stellar contract invoke --cost`.
