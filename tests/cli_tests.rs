@@ -33,7 +33,7 @@ fn run_cli_in_home(args: &[&str], home: Option<&Path>) -> (String, String, i32) 
     cmd.args(args);
     if let Some(home) = home {
         cmd.env("HOME", home);
-        // `dirs::home_dir()` reads USERPROFILE on Windows.
+        // The CLI prefers USERPROFILE on Windows when resolving its data dir.
         cmd.env("USERPROFILE", home);
     }
 
@@ -237,6 +237,7 @@ fn test_cache_verify_empty_cache_succeeds() {
     let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
         .args(["cache", "verify"])
         .env("HOME", &tmp)
+        .env("USERPROFILE", &tmp)
         .output()
         .expect("failed to run CLI");
 
