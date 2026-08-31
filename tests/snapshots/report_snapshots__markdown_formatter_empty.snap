@@ -1,5 +1,6 @@
 ---
 source: tests/report_snapshots.rs
+assertion_line: 95
 expression: MarkdownFormatter.format(&empty)
 ---
 ## Cost Report: `(wasm upload)`
@@ -30,3 +31,7 @@ expression: MarkdownFormatter.format(&empty)
 | Storage | 0 | 0.0% |
 | Bandwidth | 0 | 0.0% |
 | **Total** | **0** (0.0000000) | **100.0%** |
+
+### Optimization Suggestions
+
+No cost optimizations identified (fee rates unavailable or no reducible resources).
