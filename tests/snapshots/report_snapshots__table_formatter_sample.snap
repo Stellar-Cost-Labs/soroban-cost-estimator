@@ -1,5 +1,6 @@
 ---
 source: tests/report_snapshots.rs
+assertion_line: 64
 expression: TableFormatter.format(&report)
 ---
 Function: increment
@@ -35,3 +36,6 @@ Fee Breakdown:
     Bandwidth:  61 stroops (0.4%)
 
   Total:          15427 stroops (0.0015427)
+
+Optimization Suggestions:
+  No cost optimizations identified (fee rates unavailable or no reducible resources).

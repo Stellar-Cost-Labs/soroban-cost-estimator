@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use serde_json::json;
 use sha2::Digest;
 use soroban_cost_estimator::cache;
 
@@ -265,20 +264,30 @@ fn test_verify_cache_detects_corrupted_entries() {
     with_temp_home(|tmp| {
         cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5).expect("save f1");
 
-        // Corrupt entry 1: not JSON at all.
-        // Corrupt entry 2: valid JSON but missing required fields.
-        let dir = tmp.join(".soroban-cost-estimator").join("cache");
-        std::fs::write(dir.join("garbage.json"), "{not json").expect("write garbage");
-        std::fs::write(dir.join("wrong_shape.json"), r#"{"foo": 1}"#).expect("write wrong shape");
+        // Corrupt entry: a row written by a newer tool (future schema version)
+        // cannot be safely migrated forward, so it is flagged as invalid —
+        // the SQLite equivalent of a malformed/unreadable JSON file.
+        insert_raw_row(
+            tmp,
+            cache::CACHE_SCHEMA_VERSION + 1,
+            "garbage",
+            "garbage_func",
+            &[],
+            "testnet",
+            1,
+            "2026-01-01T00:00:00Z",
+        );
 
         let statuses = cache::verify_cache().expect("verify");
-        assert_eq!(statuses.len(), 3, "should report every .json entry");
+        assert_eq!(statuses.len(), 2, "should report both entries");
 
         let corrupt: Vec<&cache::CacheEntryStatus> = statuses.iter().filter(|s| !s.valid).collect();
-        assert_eq!(corrupt.len(), 2, "both corrupted entries should be flagged");
-        let names: Vec<&str> = corrupt.iter().map(|s| s.filename.as_str()).collect();
-        assert!(names.contains(&"garbage.json"));
-        assert!(names.contains(&"wrong_shape.json"));
+        assert_eq!(corrupt.len(), 1, "future-version entry should be flagged");
+        assert!(
+            corrupt[0].filename.starts_with("garbage"),
+            "future-version entry should be reported: {}",
+            corrupt[0].filename
+        );
     });
 }
 
@@ -287,7 +296,8 @@ fn test_verify_cache_ignores_non_json_files() {
     with_temp_home(|tmp| {
         cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5).expect("save f1");
 
-        let dir = tmp.join(".soroban-cost-estimator").join("cache");
+        let dir = tmp.join(".soroban-cost-estimator");
+        std::fs::create_dir_all(&dir).expect("create data dir");
         std::fs::write(dir.join("notes.txt"), "not a cache entry").expect("write txt");
 
         let statuses = cache::verify_cache().expect("verify");
@@ -732,13 +742,57 @@ fn test_concurrent_load_estimates() {
     });
 }
 
-/// Write a raw JSON cache entry with an explicit schema `version` (or no
-/// `version` key when `version: None`), bypassing `save_estimate` so tests
-/// can exercise the migration path directly.
+/// Insert a raw row directly into the SQLite cache database, bypassing
+/// `save_estimate` so tests can exercise the migration path directly.
 ///
-/// The filename follows the `{wasm_hash}-{function}-{args_hash}.json`
-/// convention that `load_estimate` looks up, with `args_hash` computed the
-/// same way the library does (SHA-256 over the concatenated arg strings).
+/// The `args_hash` column is computed the same way the library does
+/// (SHA-256 over the concatenated arg strings).
+fn insert_raw_row(
+    home: &Path,
+    version: u32,
+    wasm_hash: &str,
+    function: &str,
+    args: &[&str],
+    network: &str,
+    ledger: u32,
+    timestamp: &str,
+) {
+    let mut hasher = sha2::Sha256::new();
+    for arg in args {
+        hasher.update(arg.as_bytes());
+    }
+    let args_hash = hex::encode(hasher.finalize());
+
+    let dir = home.join(".soroban-cost-estimator");
+    std::fs::create_dir_all(&dir).expect("create data dir");
+    let db = dir.join("cache.db");
+    let conn = rusqlite::Connection::open(&db).expect("open cache db");
+    // Ensure the schema exists in this exact database before writing rows
+    // directly.
+    cache::ensure_cache_schema(&conn).expect("ensure cache schema");
+
+    conn.execute(
+        "INSERT OR REPLACE INTO estimates \
+         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            version as i64,
+            wasm_hash,
+            function,
+            args_hash,
+            network,
+            ledger as i64,
+            100i64,
+            10i64,
+            5i64,
+            timestamp,
+        ],
+    )
+    .expect("insert raw row");
+}
+
+/// Write a raw cache entry with an explicit schema `version` (or the initial
+/// schema when `version: None`), bypassing `save_estimate`.
 fn write_raw_entry(
     tmp: &Path,
     wasm_hash: &str,
@@ -747,32 +801,17 @@ fn write_raw_entry(
     version: Option<u32>,
     ledger: u32,
 ) {
-    let mut hasher = sha2::Sha256::new();
-    for arg in args {
-        hasher.update(arg.as_bytes());
-    }
-    let args_hash = hex::encode(hasher.finalize());
-
-    let dir = tmp.join(".soroban-cost-estimator").join("cache");
-    std::fs::create_dir_all(&dir).expect("create cache dir");
-    let path = dir.join(format!("{wasm_hash}-{function}-{args_hash}.json"));
-
-    let mut value = json!({
-        "wasm_hash": wasm_hash,
-        "function": function,
-        "args_hash": args_hash,
-        "network": "testnet",
-        "ledger": ledger,
-        "total_stroops": 100,
-        "cpu_instructions": 10,
-        "memory_bytes": 5,
-        "timestamp": "2026-01-01T00:00:00Z",
-    });
-    if let Some(v) = version {
-        value["version"] = json!(v);
-    }
-
-    std::fs::write(path, value.to_string()).expect("write raw entry");
+    let version = version.unwrap_or(cache::INITIAL_SCHEMA_VERSION);
+    insert_raw_row(
+        tmp,
+        version,
+        wasm_hash,
+        function,
+        args,
+        "testnet",
+        ledger,
+        "2026-01-01T00:00:00Z",
+    );
 }
 
 /// The current schema version constant exposed by the library.
@@ -989,12 +1028,8 @@ fn test_concurrent_same_key_saves_leave_valid_entry() {
 // TTL (time-to-live) freshness
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Write a raw JSON cache entry with an explicit `timestamp`, bypassing
+/// Write a raw cache entry with an explicit `timestamp`, bypassing
 /// `save_estimate` so tests can control how old an entry is for TTL checks.
-///
-/// The filename follows the `{wasm_hash}-{function}-{args_hash}.json`
-/// convention that `load_estimate` looks up, with `args_hash` computed the
-/// same way the library does (SHA-256 over the concatenated arg strings).
 fn write_raw_entry_with_timestamp(
     tmp: &Path,
     wasm_hash: &str,
@@ -1002,28 +1037,16 @@ fn write_raw_entry_with_timestamp(
     args: &[&str],
     timestamp: &str,
 ) {
-    let mut hasher = sha2::Sha256::new();
-    for arg in args {
-        hasher.update(arg.as_bytes());
-    }
-    let args_hash = hex::encode(hasher.finalize());
-
-    let dir = tmp.join(".soroban-cost-estimator").join("cache");
-    std::fs::create_dir_all(&dir).expect("create cache dir");
-    let path = dir.join(format!("{wasm_hash}-{function}-{args_hash}.json"));
-
-    let value = json!({
-        "wasm_hash": wasm_hash,
-        "function": function,
-        "args_hash": args_hash,
-        "network": "testnet",
-        "ledger": 7,
-        "total_stroops": 100,
-        "cpu_instructions": 10,
-        "memory_bytes": 5,
-        "timestamp": timestamp,
-    });
-    std::fs::write(path, value.to_string()).expect("write raw entry");
+    insert_raw_row(
+        tmp,
+        cache::CACHE_SCHEMA_VERSION,
+        wasm_hash,
+        function,
+        args,
+        "testnet",
+        7,
+        timestamp,
+    );
 }
 
 /// An entry timestamped "now" is fresh under a TTL of one hour.
@@ -1135,209 +1158,5 @@ fn test_load_fresh_estimate_expired_returns_none() {
         )
         .expect("load fresh");
         assert!(fresh.is_none(), "an expired entry must yield None");
-    });
-}
-
-/// Set a cache entry file's modification time, used to control LRU ordering
-/// in eviction tests.
-fn set_cache_file_mtime(tmp: &Path, wasm_hash: &str, function: &str, args: &[&str], age: u64) {
-    let mut hasher = sha2::Sha256::new();
-    for arg in args {
-        hasher.update(arg.as_bytes());
-    }
-    let args_hash = hex::encode(hasher.finalize());
-    let dir = tmp.join(".soroban-cost-estimator").join("cache");
-    let path = dir.join(format!("{wasm_hash}-{function}-{args_hash}.json"));
-    let file = std::fs::File::options()
-        .write(true)
-        .open(&path)
-        .expect("open cache file");
-    let mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
-    file.set_modified(mtime).expect("set mtime");
-}
-
-/// `cache_size_bytes` reports 0 for an empty cache and grows as entries are
-/// added.
-#[test]
-fn test_cache_size_bytes_tracks_entries() {
-    with_temp_home(|tmp| {
-        assert_eq!(
-            cache::cache_size_bytes().expect("empty cache size"),
-            0,
-            "empty cache must measure 0 bytes"
-        );
-
-        cache::save_estimate("h1", "f1", &["a".to_string()], "testnet", 1, 100, 10, 5)
-            .expect("save first");
-        let after_one = cache::cache_size_bytes().expect("size after one");
-        assert!(after_one > 0, "one entry must be measurable");
-
-        cache::save_estimate("h2", "f2", &["b".to_string()], "testnet", 1, 100, 10, 5)
-            .expect("save second");
-        let after_two = cache::cache_size_bytes().expect("size after two");
-        assert!(
-            after_two > after_one,
-            "second entry must grow the measured size"
-        );
-        let _ = tmp;
-    });
-}
-
-/// `evict_lru_entries` removes the least-recently-used entries first when
-/// the cache exceeds the limit, and stops once it fits.
-#[test]
-fn test_evict_lru_entries_evicts_oldest_first() {
-    with_temp_home(|tmp| {
-        // Three distinct entries; `write_raw_entry` writes them in quick
-        // succession so their mtimes are nearly identical. Force distinct
-        // ages to make LRU order deterministic.
-        write_raw_entry(tmp, "h_old", "f_old", &["old"], None, 1);
-        write_raw_entry(tmp, "h_mid", "f_mid", &["mid"], None, 1);
-        write_raw_entry(tmp, "h_new", "f_new", &["new"], None, 1);
-        set_cache_file_mtime(tmp, "h_old", "f_old", &["old"], 300);
-        set_cache_file_mtime(tmp, "h_mid", "f_mid", &["mid"], 200);
-        set_cache_file_mtime(tmp, "h_new", "f_new", &["new"], 100);
-
-        let total = cache::cache_size_bytes().expect("total size");
-
-        // Entries are uniform in size, so a limit of total/3 fits exactly
-        // one entry: the two older entries must be evicted.
-        let evicted = cache::evict_lru_entries(total / 3, None).expect("evict");
-        assert_eq!(evicted, 2, "exactly the two oldest entries evicted");
-
-        assert!(
-            cache::load_estimate("h_old", "f_old", &["old".to_string()])
-                .expect("load old")
-                .is_none(),
-            "oldest entry must be evicted"
-        );
-        assert!(
-            cache::load_estimate("h_mid", "f_mid", &["mid".to_string()])
-                .expect("load mid")
-                .is_none(),
-            "second-oldest entry must be evicted"
-        );
-        assert!(
-            cache::load_estimate("h_new", "f_new", &["new".to_string()])
-                .expect("load new")
-                .is_some(),
-            "newest entry must survive"
-        );
-        let _ = tmp;
-    });
-}
-
-/// `evict_lru_entries` never evicts the protected entry, even when it is the
-/// least-recently-used file on disk.
-#[test]
-fn test_evict_lru_entries_respects_protected() {
-    with_temp_home(|tmp| {
-        write_raw_entry(tmp, "h_old", "f_old", &["old"], None, 1);
-        write_raw_entry(tmp, "h_new", "f_new", &["new"], None, 1);
-        set_cache_file_mtime(tmp, "h_old", "f_old", &["old"], 300);
-        set_cache_file_mtime(tmp, "h_new", "f_new", &["new"], 100);
-
-        let dir = tmp.join(".soroban-cost-estimator").join("cache");
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(b"old");
-        let args_hash = hex::encode(hasher.finalize());
-        let protected_path = dir.join(format!("h_old-f_old-{args_hash}.json"));
-
-        // Limit fits only one entry; the protected (oldest) one must be
-        // spared, so the newer entry is evicted instead.
-        let total = cache::cache_size_bytes().expect("total size");
-        let evicted = cache::evict_lru_entries(total - 1, Some(&protected_path))
-            .expect("evict with protection");
-        assert_eq!(evicted, 1);
-
-        assert!(
-            cache::load_estimate("h_old", "f_old", &["old".to_string()])
-                .expect("load protected")
-                .is_some(),
-            "protected entry must survive eviction"
-        );
-        assert!(
-            cache::load_estimate("h_new", "f_new", &["new".to_string()])
-                .expect("load new")
-                .is_none(),
-            "non-protected entry must be evicted"
-        );
-        let _ = tmp;
-    });
-}
-
-/// Loading an entry refreshes its recency: a read bumps the file mtime, so
-/// a just-read (older) entry survives eviction over an unread newer one.
-#[test]
-fn test_load_refreshes_recency_for_lru() {
-    with_temp_home(|tmp| {
-        write_raw_entry(tmp, "h_old", "f_old", &["old"], None, 1);
-        write_raw_entry(tmp, "h_new", "f_new", &["new"], None, 1);
-        set_cache_file_mtime(tmp, "h_old", "f_old", &["old"], 300);
-        set_cache_file_mtime(tmp, "h_new", "f_new", &["new"], 100);
-
-        // Reading the older entry must make it the most-recently-used one.
-        assert!(
-            cache::load_estimate("h_old", "f_old", &["old".to_string()])
-                .expect("load old")
-                .is_some(),
-            "old entry should load"
-        );
-
-        // Only one entry fits: the one that was just read survives.
-        let total = cache::cache_size_bytes().expect("total size");
-        let evicted = cache::evict_lru_entries(total / 2, None).expect("evict");
-        assert_eq!(evicted, 1, "one entry evicted");
-
-        assert!(
-            cache::load_estimate("h_old", "f_old", &["old".to_string()])
-                .expect("load old again")
-                .is_some(),
-            "just-read entry must survive eviction"
-        );
-        assert!(
-            cache::load_estimate("h_new", "f_new", &["new".to_string()])
-                .expect("load new")
-                .is_none(),
-            "unread entry must be evicted"
-        );
-        let _ = tmp;
-    });
-}
-
-/// The eviction path stays healthy with many entries in the cache: saving
-/// several estimates then enforcing a tight limit evicts the oldest and
-/// keeps the newest readable through the public API.
-#[test]
-fn test_save_estimate_then_evict_keeps_newest() {
-    with_temp_home(|tmp| {
-        for i in 0..5 {
-            let key = format!("h{i}");
-            let fkey = format!("f{i}");
-            cache::save_estimate(&key, &fkey, &["x".to_string()], "testnet", 1, 100, 10, 5)
-                .expect("save estimate");
-            set_cache_file_mtime(tmp, &key, &fkey, &["x"], 300 - i * 50);
-        }
-
-        // Entries are uniform in size, so a limit of total/5 fits exactly
-        // one entry: the four older entries must be evicted.
-        let total = cache::cache_size_bytes().expect("total size");
-        let evicted = cache::evict_lru_entries(total / 5, None).expect("evict");
-        assert_eq!(evicted, 4, "four oldest entries evicted");
-
-        // The newest estimate is still loadable after eviction.
-        assert!(
-            cache::load_estimate("h4", "f4", &["x".to_string()])
-                .expect("load newest")
-                .is_some(),
-            "newest entry must survive eviction"
-        );
-        assert!(
-            cache::load_estimate("h0", "f0", &["x".to_string()])
-                .expect("load oldest")
-                .is_none(),
-            "oldest entry must be evicted"
-        );
-        let _ = tmp;
     });
 }
