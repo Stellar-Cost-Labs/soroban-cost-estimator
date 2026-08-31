@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Duration;
 
 use governor::{Quota, RateLimiter};
 use serde_json::Value;
@@ -88,11 +89,19 @@ impl RpcClient {
     /// apart (a fixed-rate limiter with a burst of 1). `None` or `Some(0)`
     /// disables rate limiting entirely. Values larger than `u32::MAX` are
     /// clamped.
+    ///
+    /// The underlying `reqwest::Client` is configured with connection pooling
+    /// and TCP keep-alive so that HTTP connections are reused across multiple
+    /// RPC calls within a single run, reducing handshake overhead.
     pub fn with_rate_limit(url: &str, rps: Option<u64>) -> Self {
         debug!(url, rps, "creating RPC client");
+        let client = reqwest::Client::builder()
+            .tcp_keepalive(Duration::from_secs(30))
+            .build()
+            .expect("failed to build reqwest client");
         Self {
             url: url.to_string(),
-            client: reqwest::Client::new(),
+            client,
             dedup: Arc::new(Mutex::new(DedupState::default())),
             limiter: rps.and_then(build_rate_limiter),
         }
