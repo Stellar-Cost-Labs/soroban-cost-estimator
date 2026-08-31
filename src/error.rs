@@ -72,6 +72,10 @@ pub enum AppError {
     #[error("failed to process JSON: {0}")]
     Json(#[from] serde_json::Error),
 
+    // ── Cache database ─────────────────────────────────────────────
+    #[error("failed to access cache database: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+
     // ── General ─────────────────────────────────────────────────────
     #[error("operation failed: {0}")]
     General(String),
