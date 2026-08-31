@@ -14,8 +14,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde_json::json;
 use sha2::Digest;
+use soroban_cost_estimator::cache;
 
 /// An RPC URL that is guaranteed not to answer: port 1 on loopback.
 /// Used to drive the network error path without leaving the machine.
@@ -180,7 +180,7 @@ fn test_config_diff_help() {
         code, 0,
         "config diff --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--network", "--against"] {
+    for flag in ["--network", "--against", "--summary"] {
         assert!(
             stdout.contains(flag),
             "diff help should mention {flag}; got: {stdout}"
@@ -216,6 +216,7 @@ fn test_cache_help() {
     let (stdout, stderr, code) = run_cli(&["cache", "--help"]);
     assert_eq!(code, 0, "cache --help should exit 0; stderr: {stderr}");
     assert!(stdout.contains("verify"), "cache help should list verify");
+    assert!(stdout.contains("query"), "cache help should list query");
 }
 
 #[test]
@@ -479,28 +480,39 @@ fn test_estimate_rpc_url_overrides_unknown_network() {
 ///
 /// Mirrors the library's cache-key computation: `wasm_hash` is the SHA-256 of
 /// the WASM bytes and `args_hash` is the SHA-256 of the concatenated args
-/// (empty for no args).
+/// (empty for no args). The entry is written directly into the SQLite cache
+/// database so the `estimate` command's cache-hit path can find it.
 fn seed_cache_entry(home: &Path, timestamp: &str) {
     let wasm_bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
     let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_bytes));
     let args_hash = hex::encode(sha2::Sha256::digest(b""));
 
-    let cache_dir = home.join(".soroban-cost-estimator").join("cache");
-    std::fs::create_dir_all(&cache_dir).expect("create cache dir");
-    let path = cache_dir.join(format!("{wasm_hash}-(wasm upload)-{args_hash}.json"));
+    let dir = home.join(".soroban-cost-estimator");
+    std::fs::create_dir_all(&dir).expect("create data dir");
+    let db = dir.join("cache.db");
+    let conn = rusqlite::Connection::open(&db).expect("open cache db");
+    // Ensure the schema exists in this exact database before writing rows
+    // directly (the CLI reads the same path, so they must match).
+    cache::ensure_cache_schema(&conn).expect("ensure cache schema");
 
-    let entry = json!({
-        "wasm_hash": wasm_hash,
-        "function": "(wasm upload)",
-        "args_hash": args_hash,
-        "network": "testnet",
-        "ledger": 42,
-        "total_stroops": 1_000,
-        "cpu_instructions": 500,
-        "memory_bytes": 250,
-        "timestamp": timestamp,
-    });
-    std::fs::write(path, entry.to_string()).expect("write cache entry");
+    conn.execute(
+        "INSERT OR REPLACE INTO estimates \
+         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            1i64,
+            wasm_hash,
+            "(wasm upload)",
+            args_hash,
+            "testnet",
+            42i64,
+            1_000i64,
+            500i64,
+            250i64,
+            timestamp,
+        ],
+    )
+    .expect("seed cache entry");
 }
 
 #[test]
@@ -792,6 +804,39 @@ fn test_cache_warm_unknown_network() {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[test]
+fn test_config_diff_summary_flag_accepted() {
+    // `--summary` on config diff must be a recognized flag (the run still
+    // fails, but on the unknown network, not on the argument itself).
+    let home = temp_home("diff-summary-flag");
+    let path = home.join("snapshot.json");
+    std::fs::write(&path, snapshot_json("not-a-network", 1000)).expect("write fixture");
+
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against",
+            path.to_str().unwrap(),
+            "--summary",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "the unknown network should exit 1");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--summary should be a recognized argument; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
+        "the failure should come from the network, not the flag; got: {stderr}"
+    );
+}
+
+#[test]
 fn test_config_diff_loads_valid_snapshot_before_network() {
     // A well-formed snapshot must get past loading — the next failure has to
     // come from the network, not from the snapshot. This pins the ordering:
@@ -975,5 +1020,85 @@ fn test_watch_interval_suffixes_are_parsed() {
     assert!(
         stdout.contains("every 1800s"),
         "`30m` should resolve to 1800s; got: {stdout}"
+    );
+}
+
+// ── cache query tests ────────────────────────────────────────────────
+
+#[test]
+fn test_cache_query_help() {
+    let (stdout, stderr, code) = run_cli(&["cache", "query", "--help"]);
+    assert_eq!(
+        code, 0,
+        "cache query --help should exit 0; stderr: {stderr}"
+    );
+    for flag in [
+        "--network",
+        "--function",
+        "--wasm-hash",
+        "--min-stroops",
+        "--max-stroops",
+        "--from",
+        "--to",
+        "--json",
+    ] {
+        assert!(
+            stdout.contains(flag),
+            "query help should mention {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_cache_query_empty_cache() {
+    let home = temp_home("cache-query-empty");
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(["cache", "query", "--network", "testnet"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .output()
+        .expect("failed to run cache query");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("No cached estimates match the query."),
+        "empty cache should report no results; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_query_empty_json() {
+    let home = temp_home("cache-query-empty-json");
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(["cache", "query", "--network", "testnet", "--json"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run cache query");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    assert_eq!(trimmed, "[]", "empty JSON should be []; got: {stdout}");
+}
+
+#[test]
+fn test_cache_query_json_flag_accepted() {
+    let home = temp_home("cache-query-json-flag");
+    // Save a cached estimate first via the test helper
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(["cache", "query", "--network", "testnet", "--json"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run cache query");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    // Should be valid JSON
+    assert!(
+        serde_json::from_str::<serde_json::Value>(trimmed).is_ok(),
+        "output should be valid JSON; got: {stdout}"
     );
 }

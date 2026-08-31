@@ -94,6 +94,11 @@ impl ReportFormatter for TableFormatter {
             report.fee.total_stroops, report.fee.total_xlm,
         ));
 
+        output.push('\n');
+        output.push_str(&crate::report::cost_report::format_suggestions(
+            &report.suggest_optimizations(),
+        ));
+
         output
     }
 
@@ -113,7 +118,13 @@ pub struct JsonFormatter;
 
 impl ReportFormatter for JsonFormatter {
     fn format(&self, report: &CostReport) -> String {
-        serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string())
+        let mut value = serde_json::to_value(report).unwrap_or(serde_json::Value::Null);
+        let suggestions =
+            serde_json::to_value(report.suggest_optimizations()).unwrap_or(serde_json::Value::Null);
+        if let serde_json::Value::Object(ref mut map) = value {
+            map.insert("suggestions".to_string(), suggestions);
+        }
+        serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
     }
 
     fn name(&self) -> &'static str {
@@ -250,6 +261,22 @@ impl ReportFormatter for MarkdownFormatter {
             report.fee.total_stroops, report.fee.total_xlm,
         ));
 
+        // Optimization suggestions
+        output.push_str("\n### Optimization Suggestions\n\n");
+        let suggestions = report.suggest_optimizations();
+        if suggestions.is_empty() {
+            output.push_str(
+                "No cost optimizations identified (fee rates unavailable or no reducible resources).\n",
+            );
+        } else {
+            for s in &suggestions {
+                output.push_str(&format!(
+                    "- **{}**: {} (potential saving: {} stroops)\n",
+                    s.title, s.detail, s.potential_savings_stroops
+                ));
+            }
+        }
+
         output
     }
 
@@ -328,6 +355,7 @@ mod tests {
             ledger: 3_894_195,
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
+            rates: None,
         }
     }
 
@@ -354,6 +382,7 @@ mod tests {
             ledger: 0,
             network: "mainnet".to_string(),
             rpc_latency_ms: 0,
+            rates: None,
         }
     }
 
