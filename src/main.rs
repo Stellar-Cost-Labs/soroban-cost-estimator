@@ -63,6 +63,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             let fmt = if json { "json".to_string() } else { format };
             cmd_estimate_all(&wasm, &network, id.as_deref(), &fmt).await
         },
+        cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(&wasm, json),
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot { network, out, json } => {
                 cmd_config_snapshot(&network, out.as_deref(), json).await
@@ -72,11 +73,18 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             }
             cli::ConfigAction::History { network } => cmd_config_history(&network),
             cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network),
+            cli::ConfigAction::Validate { network } => cmd_config_validate(&network),
         },
-        cli::Command::Watch { network, interval } => cmd_watch(&network, &interval).await,
         cli::Command::Cache { action } => match action {
+            cli::CacheAction::Warm {
+                wasm,
+                network,
+                id,
+                json,
+            } => cmd_cache_warm(&wasm, &network, id.as_deref(), json).await,
             cli::CacheAction::Verify => cmd_cache_verify(),
         },
+        cli::Command::Watch { network, interval } => cmd_watch(&network, &interval).await,
     }
 }
 
@@ -224,6 +232,12 @@ async fn fetch_fee_rates(client: &rpc::client::RpcClient) -> report::fee_calc::F
 }
 
 /// `estimate` command: simulate a single invocation and print cost report.
+///
+/// All RPC traffic (simulation and fee-rate fetches) goes through one
+/// `RpcClient`, which deduplicates identical requests — the same method with
+/// the same params — so a repeated WASM-upload envelope (when `--fn` is
+/// omitted) or identical fee-rate fetches transmit at most once.
+#[allow(clippy::too_many_lines)]
 async fn cmd_estimate(
     wasm_path: &str,
     network: &str,
@@ -275,6 +289,10 @@ async fn cmd_estimate(
 
         let tx_xdr =
             xdr_helper::build_simulation_tx_envelope(&wasm_info.bytes, contract_id, fn_name, &sc_vals)?;
+
+        xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
+        debug!(arg_count = args.len(), "validated arguments against contract spec");
+
         let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
         debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
 
@@ -355,6 +373,11 @@ async fn cmd_estimate(
 }
 
 /// `estimate-all` command: enumerate all functions and estimate each.
+///
+/// Every function shares a single deduplicating `RpcClient`. Batch runs that
+/// hit the same request twice — the shared WASM-upload path when a function
+/// envelope is built against an undeployed contract, or identical fee-rate
+/// lookups — transmit each distinct `(method, params)` pair only once.
 async fn cmd_estimate_all(
     wasm_path: &str,
     network: &str,
@@ -372,6 +395,8 @@ async fn cmd_estimate_all(
 
         let text_mode = format == "table" || format == "markdown";
         if text_mode {
+            println!("{}", wasm::parser::format_module_metadata(&wasm_info));
+            println!();
             println!(
                 "Enumerated {} function(s) in WASM:",
                 wasm_info.functions.len()
@@ -622,6 +647,69 @@ async fn estimate_all_function(
     .await
 }
 
+/// `wasm-info` command: print WASM metadata without making any RPC calls.
+///
+/// Shows the exported functions, contract-spec presence, binary size, and
+/// SHA-256 hash — everything "cheap" to derive from the file itself.
+///
+/// # Network calls
+/// None — pure file I/O + parsing.
+fn cmd_wasm_info(wasm_path: &str, json_flag: bool) -> error::AppResult<()> {
+    use sha2::Digest;
+
+    let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
+    let hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
+
+    if json_flag {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&wasm_info_json(wasm_path, &wasm_info, &hash))?
+        );
+        return Ok(());
+    }
+
+    println!("WASM info: {wasm_path}");
+    println!("  Size:      {} bytes", wasm_info.bytes.len());
+    println!("  SHA-256:   {hash}");
+    println!("  Functions: {}", wasm_info.functions.len());
+    for (i, fn_info) in wasm_info.functions.iter().enumerate() {
+        println!("    [{}] {}", i + 1, wasm::parser::format_function(fn_info));
+    }
+    println!(
+        "  Contract spec: {}",
+        if wasm_info.has_spec {
+            "present (typed params decoded from contractspecv0)"
+        } else {
+            "absent (bare WASM exports only)"
+        }
+    );
+    Ok(())
+}
+
+/// Builds the JSON representation of WASM metadata for `wasm-info --json`.
+fn wasm_info_json(
+    wasm_path: &str,
+    wasm_info: &wasm::parser::WasmInfo,
+    hash: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "path": wasm_path,
+        "size": wasm_info.bytes.len(),
+        "sha256": hash,
+        "has_spec": wasm_info.has_spec,
+        "functions": wasm_info.functions.iter().map(|f| {
+            serde_json::json!({
+                "name": f.name,
+                "param_count": f.param_count,
+                "result_count": f.result_count,
+                "params": f.params.iter().map(|p| {
+                    serde_json::json!({ "name": p.name, "type": p.type_name })
+                }).collect::<Vec<_>>(),
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
 /// Fetches the current network config settings and builds a snapshot.
 ///
 /// Shared by `config snapshot`, `config diff`, and `watch`.
@@ -860,6 +948,37 @@ fn print_cached_estimate(fresh: &cache::CachedEstimate, ttl_secs: u64, json_flag
     }
 }
 
+/// `config validate` command: check all stored snapshots for integrity.
+fn cmd_config_validate(network: &str) -> error::AppResult<()> {
+    let statuses = config_snapshot::store::validate_all_snapshots(network)?;
+
+    if statuses.is_empty() {
+        println!("No snapshots found for network '{network}'.");
+        return Ok(());
+    }
+
+    let total = statuses.len();
+    let invalid: Vec<_> = statuses.iter().filter(|s| !s.valid).collect();
+
+    println!("Validated {total} snapshot(s) for network '{network}'.");
+
+    if invalid.is_empty() {
+        println!("All snapshots are valid.");
+    } else {
+        println!("{}/{} snapshot(s) failed validation:", invalid.len(), total);
+        for status in &invalid {
+            println!(
+                "  - {}: {}",
+                status.filename,
+                status.error.as_deref().unwrap_or("unknown error")
+            );
+        }
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
 /// Parse an interval like `3600`, `3600s`, `30m`, `1h`, or `1d` into seconds.
 ///
 /// Defaults to one hour on unparseable input.
@@ -1004,14 +1123,26 @@ fn cmd_cache_verify() -> error::AppResult<()> {
     Ok(())
 }
 
+/// `cache warm` command: pre-populate cache by estimating every exported function.
+async fn cmd_cache_warm(
+    wasm_path: &str,
+    network: &str,
+    contract_id: Option<&str>,
+    json_flag: bool,
+) -> error::AppResult<()> {
+    cmd_estimate_all(wasm_path, network, contract_id, json_flag).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_interval_secs;
     use super::upgrade_detected;
+    use super::wasm_info_json;
     use soroban_cost_estimator::config_snapshot::diff;
     use soroban_cost_estimator::config_snapshot::model::{
         ConfigSnapshot, ContractComputeV0, ContractLedgerCostV0,
     };
+    use soroban_cost_estimator::wasm::parser::{FunctionInfo, ParamInfo, WasmInfo};
 
     fn snapshot_with_compute_fee(fee: i64) -> ConfigSnapshot {
         ConfigSnapshot {
@@ -1121,5 +1252,36 @@ mod tests {
 
         assert!(!diff.has_pricing_changes);
         assert!(!upgrade_detected(&diff));
+    }
+
+    #[test]
+    fn test_wasm_info_json_structure() {
+        let info = WasmInfo {
+            bytes: vec![0u8; 44],
+            has_spec: true,
+            functions: vec![FunctionInfo {
+                name: "increment".to_string(),
+                param_count: 1,
+                result_count: 1,
+                params: vec![ParamInfo {
+                    name: "step".to_string(),
+                    type_name: "I64".to_string(),
+                    type_def: stellar_xdr::ScSpecTypeDef::I64,
+                }],
+            }],
+            start_function: None,
+            memories: Vec::new(),
+            imports: Vec::new(),
+            exports: Vec::new(),
+        };
+        let value = wasm_info_json("/tmp/contract.wasm", &info, "deadbeef");
+
+        assert_eq!(value["path"], "/tmp/contract.wasm");
+        assert_eq!(value["size"], 44);
+        assert_eq!(value["sha256"], "deadbeef");
+        assert_eq!(value["has_spec"], true);
+        assert_eq!(value["functions"][0]["name"], "increment");
+        assert_eq!(value["functions"][0]["params"][0]["name"], "step");
+        assert_eq!(value["functions"][0]["params"][0]["type"], "I64");
     }
 }

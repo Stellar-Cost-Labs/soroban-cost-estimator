@@ -90,6 +90,7 @@ fn test_help_output() {
         "help should list estimate-all"
     );
     assert!(stdout.contains("config"), "help should list config command");
+    assert!(stdout.contains("cache"), "help should list cache command");
     assert!(stdout.contains("watch"), "help should list watch command");
 }
 
@@ -737,6 +738,77 @@ fn test_config_diff_against_malformed_snapshot_errors() {
         "a malformed snapshot should surface as a parse error; got: {stderr}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// `cache warm`
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_cache_warm_help() {
+    let (stdout, stderr, code) = run_cli(&["cache", "warm", "--help"]);
+    assert_eq!(code, 0, "cache warm --help should exit 0; stderr: {stderr}");
+    for flag in ["--wasm", "--network", "--id", "--json"] {
+        assert!(
+            stdout.contains(flag),
+            "cache warm help should mention {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_cache_warm_missing_wasm_errors() {
+    let (_, stderr, code) = run_cli(&["cache", "warm"]);
+    assert_ne!(code, 0, "cache warm without --wasm should error");
+    assert!(
+        stderr.contains("error") || stderr.contains("required"),
+        "stderr should indicate error: {stderr}"
+    );
+}
+
+#[test]
+fn test_cache_warm_nonexistent_wasm_file() {
+    let (_, stderr, code) = run_cli(&["cache", "warm", "--wasm", "no/such/file.wasm"]);
+    assert_eq!(
+        code, 1,
+        "a missing WASM file should exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("File not found") || stderr.contains("I/O error"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_cache_warm_invalid_wasm_file() {
+    let home = temp_home("warm-invalid-wasm");
+    let bogus = home.join("bogus.wasm");
+    std::fs::write(&bogus, b"not a real wasm").expect("write fixture");
+
+    let (_, stderr, code) = run_cli(&["cache", "warm", "--wasm", bogus.to_str().unwrap()]);
+    assert_eq!(code, 1, "invalid WASM should exit 1");
+    assert!(stderr.contains("WASM validation error"), "stderr: {stderr}");
+}
+
+#[test]
+fn test_cache_warm_unknown_network() {
+    let (_, stderr, code) = run_cli(&[
+        "cache",
+        "warm",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--network",
+        "not-a-network",
+    ]);
+    assert_eq!(code, 1, "an unknown network should exit 1");
+    assert!(
+        stderr.contains("RPC endpoint not configured for network: not-a-network"),
+        "stderr: {stderr}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `config diff`
+// ─────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn test_config_diff_loads_valid_snapshot_before_network() {

@@ -15,6 +15,9 @@ expression: JsonFormatter.format(&empty)
   "fee": {
     "non_refundable_stroops": 0,
     "refundable_stroops": 0,
+    "cpu_fee_stroops": 0,
+    "storage_fee_stroops": 0,
+    "bandwidth_fee_stroops": 0,
     "total_stroops": 0,
     "total_xlm": "0.0000000"
   },
