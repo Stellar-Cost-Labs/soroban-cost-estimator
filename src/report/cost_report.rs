@@ -104,6 +104,11 @@ pub struct CostReport {
     /// no cached entry was found.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta: Option<CostDelta>,
+    /// Fee rates used to compute the breakdown (carried so optimization
+    /// suggestions can quantify per-resource savings). Excluded from
+    /// serialized output; `None` when the rates were unavailable.
+    #[serde(skip)]
+    pub rates: Option<FeeRates>,
 }
 
 /// Compute a [`CostDelta`] between a previous cached estimate and the
@@ -130,11 +135,6 @@ pub fn compute_delta(
         read_entries_delta: current.read_entries as i64 - prev_read_entries as i64,
         write_entries_delta: current.write_entries as i64 - prev_write_entries as i64,
     }
-    /// Fee rates used to compute the breakdown (carried so optimization
-    /// suggestions can quantify per-resource savings). Excluded from
-    /// serialized output; `None` when the rates were unavailable.
-    #[serde(skip)]
-    pub rates: Option<FeeRates>,
 }
 
 /// A concrete, actionable cost-optimization suggestion derived from a report.
@@ -409,6 +409,7 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 0,
             delta: None,
+            rates: None,
         };
 
         let delta = compute_delta(15_000, 500, 100, 900, 1, 2, &report);
@@ -449,6 +450,7 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 0,
             delta: None,
+            rates: None,
         };
 
         let delta = compute_delta(10_000, 500, 200, 1500, 3, 2, &report);
@@ -458,6 +460,8 @@ mod tests {
         assert_eq!(delta.fee_delta, -2_000); // 8_000 - 10_000
         assert_eq!(delta.read_entries_delta, -3); // 0 - 3
         assert_eq!(delta.write_entries_delta, -1); // 1 - 2
+    }
+
     fn report_with_rates(rates: FeeRates) -> CostReport {
         CostReport {
             function: "increment".to_string(),

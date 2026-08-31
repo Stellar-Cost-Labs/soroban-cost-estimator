@@ -770,30 +770,6 @@ async fn estimate_all_function(
                     mem,
                 );
 
-                if json_flag {
-                    let mut record = serde_json::json!({
-                        "function": fn_info.name,
-                        "status": "ok",
-                        "cpu_instructions": cpu,
-                        "memory_bytes": mem,
-                        "fee_stroops": fee,
-                        "fee_xlm": xlm,
-                        "ledger": ledger,
-                    });
-                    if let Some(prev) = &prev_estimate {
-                        record["delta"] = serde_json::json!({
-                            "prev_ledger": prev.ledger,
-                            "prev_fee_stroops": prev.total_stroops,
-                            "cpu_delta": cpu as i64 - prev.cpu_instructions as i64,
-                            "memory_delta": mem as i64 - prev.memory_bytes as i64,
-                            "fee_delta": fee - prev.total_stroops,
-                        });
-                    }
-                    Ok(Some(EstimateAllOutcome {
-                        json: Some(record),
-                        fee_stroops: Some(fee),
-                    }))
-                } else {
                 // Itemize the fee breakdown only when we have the network's fee
                 // rates (JSON mode). Otherwise emit a minimal breakdown with just
                 // the authoritative total so the record shape stays consistent.
@@ -823,17 +799,13 @@ async fn estimate_all_function(
                         "CPU: {cpu} insns | Mem: {mem} bytes | Fee: {total_fee} stroops ({xlm} XLM) | Ledger: {ledger}"
                     );
                     if let Some(prev) = &prev_estimate {
-                        let fee_delta = fee - prev.total_stroops;
+                        let fee_delta = fee.total_stroops - prev.total_stroops;
                         let cpu_delta = cpu as i64 - prev.cpu_instructions as i64;
                         println!(
                             "  Δ vs cached (ledger {}): fee {fee_delta:+} stroops | CPU {cpu_delta:+} insns",
                             prev.ledger
                         );
                     }
-                    Ok(Some(EstimateAllOutcome {
-                        json: None,
-                        fee_stroops: Some(fee),
-                    }))
                 }
 
                 Ok(EstimateAllResult {
