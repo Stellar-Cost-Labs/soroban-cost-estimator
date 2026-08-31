@@ -7,6 +7,7 @@
 
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use rusqlite::Connection;
 use serde::Deserialize;
@@ -17,6 +18,11 @@ use tracing::warn;
 
 use crate::error::AppError;
 use crate::error::AppResult;
+
+/// Check whether a rusqlite error is `SQLITE_BUSY`.
+fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
+    err.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
+}
 
 /// Current cache-entry schema version.
 ///
@@ -90,6 +96,14 @@ pub struct QueryFilter {
     pub to: Option<String>,
 }
 
+/// Global lock for serializing cache writes.
+///
+/// SQLite WAL mode allows concurrent readers, but only one writer at a time.
+/// Under heavy contention (e.g. multiple threads writing the same key),
+/// `busy_timeout` alone may not prevent `SQLITE_BUSY`. This mutex ensures
+/// writes are serialized at the application level.
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
+
 /// Returns the base data directory path: `~/.soroban-cost-estimator`,
 /// creating it if needed.
 fn data_dir() -> AppResult<PathBuf> {
@@ -141,6 +155,35 @@ fn open_db() -> AppResult<Connection> {
     Ok(conn)
 }
 
+/// Retry limit and base delay for `SQLITE_BUSY` backoff.
+const MAX_RETRIES: u32 = 5;
+const BASE_RETRY_DELAY_MS: u64 = 10;
+
+/// Execute a SQLite write operation, retrying on `SQLITE_BUSY` with
+/// exponential backoff.
+fn execute_with_retry<F, T>(mut operation: F) -> AppResult<T>
+where
+    F: FnMut() -> Result<T, rusqlite::Error>,
+{
+    let mut delay = BASE_RETRY_DELAY_MS;
+    for attempt in 0..MAX_RETRIES {
+        match operation() {
+            Ok(val) => return Ok(val),
+            Err(e) if is_sqlite_busy(&e) && attempt < MAX_RETRIES - 1 => {
+                warn!(
+                    attempt,
+                    delay_ms = delay,
+                    "SQLITE_BUSY, retrying after backoff"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+                delay *= 2;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    unreachable!()
+}
+
 /// Save an estimate result to the cache.
 ///
 /// # Arguments
@@ -167,32 +210,37 @@ pub fn save_estimate(
 ) -> AppResult<()> {
     let args_hash = hash_args(args);
 
+    let _guard = WRITE_LOCK
+        .lock()
+        .map_err(|e| AppError::General(format!("cache write lock poisoned: {e}")))?;
     let conn = open_db()?;
-    conn.execute(
-        "INSERT INTO estimates \
-         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
-         ON CONFLICT(wasm_hash, function, args_hash) DO UPDATE SET \
-            version = excluded.version, \
-            network = excluded.network, \
-            ledger = excluded.ledger, \
-            total_stroops = excluded.total_stroops, \
-            cpu_instructions = excluded.cpu_instructions, \
-            memory_bytes = excluded.memory_bytes, \
-            timestamp = excluded.timestamp",
-        rusqlite::params![
-            CACHE_SCHEMA_VERSION as i64,
-            wasm_hash,
-            function,
-            args_hash.as_str(),
-            network,
-            ledger as i64,
-            total_stroops,
-            cpu_instructions as i64,
-            memory_bytes as i64,
-            chrono::Utc::now().to_rfc3339(),
-        ],
-    )?;
+    execute_with_retry(|| {
+        conn.execute(
+            "INSERT INTO estimates \
+             (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+             ON CONFLICT(wasm_hash, function, args_hash) DO UPDATE SET \
+                version = excluded.version, \
+                network = excluded.network, \
+                ledger = excluded.ledger, \
+                total_stroops = excluded.total_stroops, \
+                cpu_instructions = excluded.cpu_instructions, \
+                memory_bytes = excluded.memory_bytes, \
+                timestamp = excluded.timestamp",
+            rusqlite::params![
+                CACHE_SCHEMA_VERSION as i64,
+                wasm_hash,
+                function,
+                args_hash.as_str(),
+                network,
+                ledger as i64,
+                total_stroops,
+                cpu_instructions as i64,
+                memory_bytes as i64,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )
+    })?;
 
     debug!(function, network, ledger, "estimate cached (sqlite)");
     Ok(())
@@ -579,8 +627,13 @@ fn save_registry(registry: &WasmRegistry) -> AppResult<()> {
 /// # Network calls
 /// None — pure SQLite I/O.
 pub fn remove_cached_estimates_for_wasm(wasm_hash: &str) -> AppResult<usize> {
+    let _guard = WRITE_LOCK
+        .lock()
+        .map_err(|e| AppError::General(format!("cache write lock poisoned: {e}")))?;
     let conn = open_db()?;
-    let removed = conn.execute("DELETE FROM estimates WHERE wasm_hash = ?1", [wasm_hash])?;
+    let removed = execute_with_retry(|| {
+        conn.execute("DELETE FROM estimates WHERE wasm_hash = ?1", [wasm_hash])
+    })?;
     Ok(removed)
 }
 
