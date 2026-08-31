@@ -440,6 +440,8 @@ mod tests {
             },
             ledger: 1000,
             network: "testnet".to_string(),
+            rpc_latency_ms: 0,
+            rates: None,
         };
 
         let target = CostReport {
@@ -463,6 +465,8 @@ mod tests {
             },
             ledger: 1000,
             network: "testnet".to_string(),
+            rpc_latency_ms: 0,
+            rates: None,
         };
 
         let diff = CostReportDiff::compute(&baseline, &target);
@@ -480,6 +484,8 @@ mod tests {
 
         let json = format_diff_json(&diff);
         assert!(json.contains("\"cpu_instructions\": 50"));
+    }
+
     fn report_with_rates(rates: FeeRates) -> CostReport {
         CostReport {
             function: "increment".to_string(),

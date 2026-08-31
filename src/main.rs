@@ -455,8 +455,6 @@ async fn cmd_estimate(
         let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
         let client = rpc::client::RpcClient::with_rate_limit(&endpoint, rps);
 
-        let report = estimate_single_file(
-            wasm_path,
         let sc_vals: Vec<stellar_xdr::ScVal> = args
             .iter()
             .map(|a| xdr_helper::parse_arg_scval(a))
@@ -535,12 +533,11 @@ async fn cmd_estimate(
             function_name,
             args,
             network,
-            contract_id,
-            fn_name,
-            args,
-            &client,
-        )
-        .await?;
+            latest_ledger,
+            fee.total_stroops,
+            cpu_instructions,
+            memory_bytes,
+        );
 
         if json_flag {
             println!("{}", JsonFormatter.format(&report));
@@ -598,7 +595,9 @@ async fn estimate_single_file(
     let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
     debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
 
+    let rpc_start = std::time::Instant::now();
     let response = rpc::simulate::simulate_transaction(client, &tx_b64).await?;
+    let rpc_latency_ms = rpc_start.elapsed().as_millis() as u64;
 
     if missing_simulation_data(&response) {
         return Err(error::AppError::SimulationFailed(
@@ -654,6 +653,8 @@ async fn estimate_single_file(
         fee: fee.clone(),
         ledger: latest_ledger,
         network: network.to_string(),
+        rpc_latency_ms,
+        rates: Some(fee_rates),
     };
 
     let _ = cache::save_estimate(

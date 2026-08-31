@@ -1041,6 +1041,9 @@ fn test_estimate_diff_nonexistent_file() {
             || stderr.contains("No such file")
             || stderr.contains("File not found"),
         "stderr should mention failure; got: {stderr}"
+    );
+}
+
 // ── cache query tests ────────────────────────────────────────────────
 
 #[test]
@@ -1102,6 +1105,10 @@ fn test_estimate_diff_unreachable_rpc() {
             || stderr.contains("failed to send HTTP request")
             || stderr.contains("error sending request"),
         "stderr should mention RPC failure; got: {stderr}"
+    );
+}
+
+#[test]
 fn test_cache_query_empty_json() {
     let home = temp_home("cache-query-empty-json");
     let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
