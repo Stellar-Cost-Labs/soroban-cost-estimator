@@ -26,6 +26,11 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "N")]
     pub rps: Option<u64>,
 
+    /// HTTP request timeout for RPC calls, in seconds (applies to every
+    /// network call).
+    #[arg(long, global = true, value_name = "SECS", default_value_t = 30)]
+    pub timeout: u64,
+
     #[command(subcommand)]
     pub command: Command,
 }
