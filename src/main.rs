@@ -132,6 +132,7 @@ async fn main() {
 
 async fn run(args: cli::Cli) -> error::AppResult<()> {
     let rps = args.rps;
+    let timeout = args.timeout;
     match args.command {
         cli::Command::Estimate {
             wasm,
@@ -155,6 +156,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 json,
                 rps,
                 diff.as_deref(),
+                timeout,
             )
             .await
         }
@@ -163,17 +165,17 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             network,
             id,
             json,
-        } => cmd_estimate_all(&wasm, &network, id.as_deref(), json, rps).await,
+        } => cmd_estimate_all(&wasm, &network, id.as_deref(), json, rps, timeout).await,
         cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(&wasm, json),
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot { network, out, json } => {
-                cmd_config_snapshot(&network, out.as_deref(), json, rps).await
+                cmd_config_snapshot(&network, out.as_deref(), json, rps, timeout).await
             }
             cli::ConfigAction::Diff {
                 network,
                 against,
                 summary,
-            } => cmd_config_diff(&network, against.as_deref(), summary, rps).await,
+            } => cmd_config_diff(&network, against.as_deref(), summary, rps, timeout).await,
             cli::ConfigAction::History { network } => cmd_config_history(&network),
             cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network),
             cli::ConfigAction::Validate { network } => cmd_config_validate(&network),
@@ -184,7 +186,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 network,
                 id,
                 json,
-            } => cmd_cache_warm(&wasm, &network, id.as_deref(), json, rps).await,
+            } => cmd_cache_warm(&wasm, &network, id.as_deref(), json, rps, timeout).await,
             cli::CacheAction::Verify => cmd_cache_verify(),
             cli::CacheAction::Query {
                 network,
@@ -206,7 +208,9 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 json,
             ),
         },
-        cli::Command::Watch { network, interval } => cmd_watch(&network, &interval, rps).await,
+        cli::Command::Watch { network, interval } => {
+            cmd_watch(&network, &interval, rps, timeout).await
+        }
     }
 }
 
@@ -374,6 +378,7 @@ async fn cmd_estimate(
     json_flag: bool,
     rps: Option<u64>,
     diff_wasm_path: Option<&str>,
+    timeout: u64,
 ) -> error::AppResult<()> {
     use sha2::Digest;
     use tracing::{Instrument, info_span};
@@ -453,7 +458,11 @@ async fn cmd_estimate(
         }
 
         let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
-        let client = rpc::client::RpcClient::with_rate_limit(&endpoint, rps);
+        let client = rpc::client::RpcClient::with_options(
+            &endpoint,
+            rps,
+            std::time::Duration::from_secs(timeout),
+        );
 
         let sc_vals: Vec<stellar_xdr::ScVal> = args
             .iter()
@@ -688,6 +697,7 @@ async fn cmd_estimate_all(
     contract_id: Option<&str>,
     json_flag: bool,
     rps: Option<u64>,
+    timeout: u64,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -732,7 +742,11 @@ async fn cmd_estimate_all(
         }
 
         let endpoint = rpc::client::resolve_endpoint(network, None)?;
-        let client = rpc::client::RpcClient::with_rate_limit(&endpoint, rps);
+        let client = rpc::client::RpcClient::with_options(
+            &endpoint,
+            rps,
+            std::time::Duration::from_secs(timeout),
+        );
 
         // Fee rates are only needed to itemize the per-function fee breakdown
         // in JSON output; skip the extra RPC calls in table mode.
@@ -1046,6 +1060,7 @@ fn wasm_info_json(
 async fn fetch_config_snapshot(
     network: &str,
     rps: Option<u64>,
+    timeout: u64,
 ) -> error::AppResult<config_snapshot::model::ConfigSnapshot> {
     use tracing::Instrument;
     use tracing::{debug, info_span};
@@ -1053,7 +1068,11 @@ async fn fetch_config_snapshot(
     let span = info_span!("fetch_config_snapshot", network);
     async {
         let endpoint = rpc::client::resolve_endpoint(network, None)?;
-        let client = rpc::client::RpcClient::with_rate_limit(&endpoint, rps);
+        let client = rpc::client::RpcClient::with_options(
+            &endpoint,
+            rps,
+            std::time::Duration::from_secs(timeout),
+        );
         debug!("fetching all config settings");
         let raw_entries = rpc::config::fetch_all_config_settings(&client).await?;
         debug!(entries = raw_entries.len(), "received config entries");
@@ -1107,6 +1126,7 @@ async fn cmd_config_snapshot(
     out_path: Option<&str>,
     json_flag: bool,
     rps: Option<u64>,
+    timeout: u64,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -1114,7 +1134,7 @@ async fn cmd_config_snapshot(
     let span = info_span!("cmd_config_snapshot", network);
     async {
         info!("taking config snapshot");
-        let snapshot = fetch_config_snapshot(network, rps).await?;
+        let snapshot = fetch_config_snapshot(network, rps, timeout).await?;
 
         let path = config_snapshot::store::save_snapshot(&snapshot, out_path)?;
         info!(path = %path.display(), ledger = snapshot.ledger, "snapshot saved");
@@ -1148,6 +1168,7 @@ async fn cmd_config_diff(
     against_path: Option<&str>,
     summary: bool,
     rps: Option<u64>,
+    timeout: u64,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::{debug, info_span};
@@ -1165,7 +1186,7 @@ async fn cmd_config_diff(
             }
         };
 
-        let new_snapshot = fetch_config_snapshot(network, rps).await?;
+        let new_snapshot = fetch_config_snapshot(network, rps, timeout).await?;
 
         let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
         debug!(
@@ -1370,10 +1391,11 @@ async fn watch_poll_once(
     network: &str,
     first: &mut bool,
     rps: Option<u64>,
+    timeout: u64,
 ) -> error::AppResult<()> {
     use tracing::{debug, warn};
 
-    match fetch_config_snapshot(network, rps).await {
+    match fetch_config_snapshot(network, rps, timeout).await {
         Ok(snapshot) => {
             if !*first {
                 if let Ok(old_snapshot) = config_snapshot::store::load_latest_snapshot(network) {
@@ -1403,7 +1425,12 @@ async fn watch_poll_once(
 /// Polls immediately, then on `interval`, until SIGINT (Ctrl-C) or SIGTERM
 /// is received — then exits cleanly with code 0. The in-flight poll is
 /// cancelled rather than writing a partial snapshot.
-async fn cmd_watch(network: &str, interval: &str, rps: Option<u64>) -> error::AppResult<()> {
+async fn cmd_watch(
+    network: &str,
+    interval: &str,
+    rps: Option<u64>,
+    timeout: u64,
+) -> error::AppResult<()> {
     use tracing::info;
 
     let interval_secs: u64 = parse_interval_secs(interval);
@@ -1424,7 +1451,7 @@ async fn cmd_watch(network: &str, interval: &str, rps: Option<u64>) -> error::Ap
                 return Ok(());
             }
             () = async {
-                let _ = watch_poll_once(network, &mut first, rps).await;
+                let _ = watch_poll_once(network, &mut first, rps, timeout).await;
                 tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
             } => {}
         }
@@ -1544,8 +1571,9 @@ async fn cmd_cache_warm(
     contract_id: Option<&str>,
     json_flag: bool,
     rps: Option<u64>,
+    timeout: u64,
 ) -> error::AppResult<()> {
-    cmd_estimate_all(wasm_path, network, contract_id, json_flag, rps).await
+    cmd_estimate_all(wasm_path, network, contract_id, json_flag, rps, timeout).await
 }
 
 #[cfg(test)]
