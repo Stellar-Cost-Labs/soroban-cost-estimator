@@ -994,7 +994,7 @@ fn test_format_diff_non_pricing_no_warning() {
     let d = diff::diff_snapshots(&old, &new);
     let output = diff::format_diff(&d);
     assert!(!output.contains("Pricing changes detected"));
-    assert!(output.contains("tx_max_instructions"));
+    assert!(output.contains("Tx Max Instructions"));
 }
 
 #[test]
@@ -1018,8 +1018,8 @@ fn test_format_diff_shows_addition_and_removal_icons() {
     let d = diff::diff_snapshots(&old, &new);
     let output = diff::format_diff(&d);
     // Both additions are pricing changes, so they should show the pricing icon
-    assert!(output.contains("contract_compute"));
-    assert!(output.contains("contract_ledger_cost"));
+    assert!(output.contains("Contract Compute V0"));
+    assert!(output.contains("Contract Ledger Cost V0"));
 }
 
 // ── Edge cases: every section present in both but different values ─────────
