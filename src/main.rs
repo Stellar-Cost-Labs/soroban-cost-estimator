@@ -1197,14 +1197,15 @@ async fn shutdown_signal() -> error::AppResult<()> {
 /// Makes one batched `getLedgerEntries` RPC call.
 async fn watch_poll_once(
     network: &str,
-    first: &mut bool,
+    first: &std::sync::atomic::AtomicBool,
     rps: Option<u64>,
 ) -> error::AppResult<()> {
+    use std::sync::atomic::Ordering;
     use tracing::{debug, warn};
 
     match fetch_config_snapshot(network, rps).await {
         Ok(snapshot) => {
-            if !*first {
+            if !first.load(Ordering::SeqCst) {
                 if let Ok(old_snapshot) = config_snapshot::store::load_latest_snapshot(network) {
                     let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &snapshot);
                     if !diff.changes.is_empty() {
@@ -1217,7 +1218,7 @@ async fn watch_poll_once(
             }
 
             let _ = config_snapshot::store::save_snapshot(&snapshot, None);
-            *first = false;
+            first.store(false, Ordering::SeqCst);
         }
         Err(e) => {
             warn!(error = %e, "failed to fetch config");
@@ -1230,9 +1231,11 @@ async fn watch_poll_once(
 /// `watch` command: poll network config and print diffs.
 ///
 /// Polls immediately, then on `interval`, until SIGINT (Ctrl-C) or SIGTERM
-/// is received — then exits cleanly with code 0. The in-flight poll is
-/// cancelled rather than writing a partial snapshot.
+/// is received — then exits cleanly with code 0. A second signal while a
+/// poll is still finishing force-exits with code 130.
 async fn cmd_watch(network: &str, interval: &str, rps: Option<u64>) -> error::AppResult<()> {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
     use tracing::info;
 
     let interval_secs: u64 = parse_interval_secs(interval);
@@ -1243,19 +1246,58 @@ async fn cmd_watch(network: &str, interval: &str, rps: Option<u64>) -> error::Ap
         network, interval_secs
     );
 
-    let mut first = true;
+    let network = network.to_string();
+    let first = Arc::new(AtomicBool::new(true));
+    let mut poll_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut poll_in_flight = false;
+    let mut shutting_down = false;
+
     loop {
+        if poll_task.is_none() && !shutting_down {
+            let network = network.clone();
+            let first = Arc::clone(&first);
+            poll_task = Some(tokio::spawn(async move {
+                let _ = watch_poll_once(&network, &*first, rps).await;
+            }));
+            poll_in_flight = true;
+        }
+
         tokio::select! {
             signal = shutdown_signal() => {
                 signal?;
+                if shutting_down {
+                    eprintln!("Received second stop signal — force exiting.");
+                    std::process::exit(130);
+                }
+                shutting_down = true;
                 info!("received stop signal");
-                println!("Received stop signal — exiting cleanly.");
-                return Ok(());
+                println!("Received stop signal — waiting for in-flight poll to finish...");
+                if !poll_in_flight {
+                    return Ok(());
+                }
             }
-            () = async {
-                let _ = watch_poll_once(network, &mut first, rps).await;
-                tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
-            } => {}
+            _ = async {
+                if let Some(task) = poll_task.as_mut() {
+                    let _ = task.await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                poll_task = None;
+                poll_in_flight = false;
+                if shutting_down {
+                    return Ok(());
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(interval_secs)) => {}
+                    signal = shutdown_signal() => {
+                        signal?;
+                        info!("received stop signal");
+                        println!("Received stop signal — exiting cleanly.");
+                        return Ok(());
+                    }
+                }
+            }
         }
     }
 }
