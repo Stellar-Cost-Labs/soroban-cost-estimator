@@ -1130,7 +1130,8 @@ async fn cmd_cache_warm(
     contract_id: Option<&str>,
     json_flag: bool,
 ) -> error::AppResult<()> {
-    cmd_estimate_all(wasm_path, network, contract_id, json_flag).await
+    let fmt = if json_flag { "json" } else { "table" };
+    cmd_estimate_all(wasm_path, network, contract_id, fmt).await
 }
 
 #[cfg(test)]
