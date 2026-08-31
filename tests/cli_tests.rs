@@ -336,6 +336,44 @@ fn test_estimate_cache_ttl_flag_accepted() {
     );
 }
 
+#[test]
+fn test_timeout_flag_accepted() {
+    // Verify --timeout is a recognized global argument for estimate.
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--timeout", "10"]);
+    // Should fail because the file doesn't exist, NOT because --timeout is unknown.
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--timeout should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_timeout_flag_accepted_before_subcommand() {
+    // Global flags must also be accepted before the subcommand.
+    let (_, stderr, code) = run_cli(&["--timeout", "10", "estimate", "--wasm", "test.wasm"]);
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--timeout before the subcommand should be recognized; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_help_lists_global_flags() {
+    // Global flags (--rps, --timeout) must appear in subcommand help.
+    let (stdout, stderr, code) = run_cli(&["estimate", "--help"]);
+    assert_eq!(code, 0, "estimate --help should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("--timeout"),
+        "help should list --timeout; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("--rps"),
+        "help should list --rps; got: {stdout}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // `estimate` — runtime error paths (all offline)
 // ─────────────────────────────────────────────────────────────────────────
