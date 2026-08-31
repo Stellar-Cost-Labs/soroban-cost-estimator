@@ -71,6 +71,10 @@ pub enum Command {
         #[arg(long, default_value = "testnet")]
         network: String,
 
+        /// Explicit RPC URL (overrides network-based resolution).
+        #[arg(long)]
+        rpc_url: Option<String>,
+
         /// Deployed contract ID (64 hex chars) to invoke each function against.
         #[arg(long)]
         id: Option<String>,

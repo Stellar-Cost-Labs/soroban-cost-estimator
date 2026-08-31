@@ -159,9 +159,21 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
         cli::Command::EstimateAll {
             wasm,
             network,
+            rpc_url,
             id,
             json,
-        } => cmd_estimate_all(&wasm, &network, id.as_deref(), json, rps, max_retries).await,
+        } => {
+            cmd_estimate_all(
+                &wasm,
+                &network,
+                rpc_url.as_deref(),
+                id.as_deref(),
+                json,
+                rps,
+                max_retries,
+            )
+            .await
+        }
         cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(&wasm, json),
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot { network, out, json } => {
@@ -499,6 +511,7 @@ async fn cmd_estimate(
 async fn cmd_estimate_all(
     wasm_path: &str,
     network: &str,
+    rpc_url: Option<&str>,
     contract_id: Option<&str>,
     json_flag: bool,
     rps: Option<u64>,
@@ -546,7 +559,7 @@ async fn cmd_estimate_all(
             }
         }
 
-        let endpoint = rpc::client::resolve_endpoint(network, None)?;
+        let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
         let client =
             rpc::client::RpcClient::with_rate_limit_and_retries(&endpoint, rps, max_retries);
 
@@ -1306,7 +1319,16 @@ async fn cmd_cache_warm(
     rps: Option<u64>,
     max_retries: usize,
 ) -> error::AppResult<()> {
-    cmd_estimate_all(wasm_path, network, contract_id, json_flag, rps, max_retries).await
+    cmd_estimate_all(
+        wasm_path,
+        network,
+        None,
+        contract_id,
+        json_flag,
+        rps,
+        max_retries,
+    )
+    .await
 }
 
 #[cfg(test)]
