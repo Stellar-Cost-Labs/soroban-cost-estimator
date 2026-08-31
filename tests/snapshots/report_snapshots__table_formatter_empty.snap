@@ -1,5 +1,6 @@
 ---
 source: tests/report_snapshots.rs
+assertion_line: 65
 expression: TableFormatter.format(&empty)
 ---
 Function: (wasm upload)
@@ -35,3 +36,6 @@ Fee Breakdown:
     Bandwidth:  0 stroops (0.0%)
 
   Total:          0 stroops (0.0000000)
+
+Optimization Suggestions:
+  No cost optimizations identified (fee rates unavailable or no reducible resources).
