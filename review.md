@@ -4,7 +4,7 @@
 **Review date:** 2026-08-05
 **Scope:** Full review — what the project is, what has been built, current state (freshly re-verified today), code/quality assessment, and **precisely what remains**.
 **Method:** All quality gates re-run locally on 2026-08-05; live repo state pulled via `gh` and `git`; prior Drips verification audit (2026-08-03) condensed into the Appendix.
-
+<!-- review -->
 ---
 
 ## Executive summary
