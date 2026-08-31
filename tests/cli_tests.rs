@@ -200,6 +200,56 @@ fn test_watch_help() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn test_watch_clean_exit_on_sigint() {
+    use std::process::Command;
+    use std::thread;
+    use std::time::Duration;
+
+    let home = temp_home("watch-sigint");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "watch",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            DEAD_RPC,
+            "--interval",
+            "3600",
+        ])
+        .env("HOME", &home)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn watch");
+
+    // Give the process a moment to start up and then make sure it's still alive.
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        child.try_wait().expect("try_wait failed").is_none(),
+        "watch exited before SIGINT was sent"
+    );
+
+    // Send SIGINT (Ctrl-C) as a test of graceful shutdown.
+    let status = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .expect("failed to send SIGINT");
+    assert!(status.success(), "kill -INT command failed");
+
+    let output = child.wait_with_output().expect("failed to wait for watch");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "watch should exit 0 on SIGINT; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Argument parsing errors
 // ─────────────────────────────────────────────────────────────────────────
