@@ -8,6 +8,16 @@ use clap::{Parser, Subcommand};
 #[command(name = "soroban-cost-estimator")]
 #[command(about = "Estimate Soroban contract costs & track network pricing changes", long_about = None)]
 pub struct Cli {
+    /// Cap RPC requests at N per second (fixed-rate spacing; applies to
+    /// every network call, e.g. batch runs like estimate-all). 0 disables.
+    #[arg(long, global = true, value_name = "N")]
+    pub rps: Option<u64>,
+
+    /// HTTP request timeout for RPC calls, in seconds (applies to every
+    /// network call).
+    #[arg(long, global = true, value_name = "SECS", default_value_t = 30)]
+    pub timeout: u64,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -126,6 +136,41 @@ pub enum CacheAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Query cached estimates with optional filters.
+    Query {
+        /// Network to filter by.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+
+        /// Filter by function name (case-insensitive substring match).
+        #[arg(long)]
+        function: Option<String>,
+
+        /// Filter by WASM hash prefix.
+        #[arg(long)]
+        wasm_hash: Option<String>,
+
+        /// Minimum total fee in stroops.
+        #[arg(long, value_name = "STROOPS")]
+        min_stroops: Option<i64>,
+
+        /// Maximum total fee in stroops.
+        #[arg(long, value_name = "STROOPS")]
+        max_stroops: Option<i64>,
+
+        /// Earliest timestamp (ISO-8601, e.g. "2024-06-01T00:00:00Z").
+        #[arg(long, value_name = "TIMESTAMP")]
+        from: Option<String>,
+
+        /// Latest timestamp (ISO-8601, e.g. "2024-12-31T23:59:59Z").
+        #[arg(long, value_name = "TIMESTAMP")]
+        to: Option<String>,
+
+        /// Output as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -155,9 +200,10 @@ pub enum ConfigAction {
         #[arg(long)]
         against: Option<String>,
 
-        /// Show only pricing-related field changes.
+        /// Print a single-line summary (counts of pricing/non-pricing changes)
+        /// instead of the full diff. Useful for CI status lines.
         #[arg(long)]
-        pricing_only: bool,
+        summary: bool,
     },
 
     /// Show the full chronological change log across all stored snapshots.
