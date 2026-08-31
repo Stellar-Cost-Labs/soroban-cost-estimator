@@ -105,12 +105,36 @@ fn db_path() -> AppResult<PathBuf> {
     Ok(data_dir()?.join("cache.db"))
 }
 
+/// Helper to determine whether a SQLite error represents database locking or busy contention.
+fn is_sqlite_busy_or_locked(err: &rusqlite::Error) -> bool {
+    match err {
+        rusqlite::Error::SqliteFailure(e, _) => {
+            e.code == rusqlite::ErrorCode::DatabaseBusy
+                || e.code == rusqlite::ErrorCode::DatabaseLocked
+                || e.extended_code == 5
+                || e.extended_code == 6
+                || e.extended_code == 261
+                || e.extended_code == 517
+        }
+        _ => false,
+    }
+}
+
+/// Helper to determine whether an AppError wraps a SQLite busy or locked error.
+fn is_app_error_busy_or_locked(err: &AppError) -> bool {
+    match err {
+        AppError::Sqlite(e) => is_sqlite_busy_or_locked(e),
+        _ => false,
+    }
+}
+
 /// Create the `estimates` table (and tune journal mode) on an already-open
 /// connection if it does not exist yet.
 ///
 /// Centralized so both the normal cache path and callers that open the
 /// database directly (e.g. test helpers) create an identical schema.
 pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
     // WAL lets concurrent readers and writers coexist, and busy_timeout makes
     // contending writers wait instead of failing with SQLITE_BUSY.
     conn.execute_batch(
@@ -136,10 +160,25 @@ pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
 /// Open a connection to the cache database and ensure the schema exists.
 fn open_db() -> AppResult<Connection> {
     let path = db_path()?;
-    let conn = Connection::open(&path)?;
-    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
-    ensure_cache_schema(&conn)?;
-    Ok(conn)
+    let mut retries = 0;
+    loop {
+        let open_res = Connection::open(&path)
+            .map_err(AppError::Sqlite)
+            .and_then(|conn| {
+                let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+                ensure_cache_schema(&conn)?;
+                Ok(conn)
+            });
+
+        match open_res {
+            Ok(conn) => return Ok(conn),
+            Err(ref e) if is_app_error_busy_or_locked(e) && retries < 30 => {
+                retries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Save an estimate result to the cache.
@@ -168,10 +207,18 @@ pub fn save_estimate(
 ) -> AppResult<()> {
     let args_hash = hash_args(args);
 
-    let conn = open_db()?;
-
     let mut retries = 0;
     loop {
+        let conn = match open_db() {
+            Ok(conn) => conn,
+            Err(ref e) if is_app_error_busy_or_locked(e) && retries < 30 => {
+                retries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+
         let res = conn.execute(
             "INSERT INTO estimates \
              (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
@@ -200,9 +247,7 @@ pub fn save_estimate(
 
         match res {
             Ok(_) => break,
-            Err(rusqlite::Error::SqliteFailure(err, _))
-                if err.code == rusqlite::ErrorCode::DatabaseBusy && retries < 20 =>
-            {
+            Err(ref err) if is_sqlite_busy_or_locked(err) && retries < 30 => {
                 retries += 1;
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
