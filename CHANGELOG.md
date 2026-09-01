@@ -9,15 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `rpc::ws` — a WebSocket JSON-RPC 2.0 client (`WsRpcClient`) with an
-  `events` subscription for real-time event streaming, plus
-  `resolve_ws_endpoint` for deriving `wss://…/ws` endpoints from well-known
-  network URLs. Future-proofing for live monitoring of config changes.
+- `--timeout` global flag — configurable HTTP request timeout for RPC calls
+  in seconds (default 30).
+- `config diff --summary` — print a single-line summary
+  (`X pricing changes, Y non-pricing changes`) instead of the full diff, for CI
+  status lines. Exit code and auto-save side effects are unchanged.
 - `CHANGELOG.md` following the Keep a Changelog format.
 - `docs/migration.md` — migration guide for users coming from
   `stellar contract invoke --cost`.
 - End-to-end integration tests in `tests/cli_tests.rs` covering every CLI
   command, its flags, and its offline error paths.
+- CI build matrix running fmt, clippy, build, and tests on Linux, macOS, and
+  Windows for cross-platform compatibility.
 
 ## [0.1.0] - 2026-08-13
 
