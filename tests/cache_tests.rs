@@ -37,32 +37,42 @@ where
     std::fs::create_dir_all(&tmp).expect("create temp home");
 
     let old_home = std::env::var_os("HOME");
-    // SAFETY: serialized by HOME_MUTEX, no other thread reads HOME during this block
+    let old_userprofile = std::env::var_os("USERPROFILE");
+    // SAFETY: serialized by HOME_MUTEX, no other thread reads these env vars
+    // during this block.
     unsafe {
         std::env::set_var("HOME", &tmp);
+        // The library prefers $HOME on Unix and $USERPROFILE on Windows when
+        // resolving the data dir, so set both to keep the cache inside the
+        // temp dir on every platform.
+        std::env::set_var("USERPROFILE", &tmp);
     }
 
     // Run the test; catch panics so we can clean up regardless
     let result = std::panic::catch_unwind(|| {
         // Verify the cache dir resolves inside the temp dir
-        let home = dirs::home_dir().expect("home dir");
+        let data_dir = soroban_cost_estimator::paths::data_dir().expect("data dir");
         assert!(
-            home.starts_with(&tmp),
-            "HOME should point to temp dir: {} vs {}",
-            home.display(),
+            data_dir.starts_with(&tmp),
+            "data dir should point to temp dir: {} vs {}",
+            data_dir.display(),
             tmp.display()
         );
         test(&tmp);
     });
 
-    // SAFETY: serialized by HOME_MUTEX, no other thread reads HOME during this block
-    if let Some(old) = old_home {
-        unsafe {
+    // SAFETY: serialized by HOME_MUTEX, no other thread reads these env vars
+    // during this block.
+    unsafe {
+        if let Some(old) = old_home {
             std::env::set_var("HOME", old);
-        }
-    } else {
-        unsafe {
+        } else {
             std::env::remove_var("HOME");
+        }
+        if let Some(old) = old_userprofile {
+            std::env::set_var("USERPROFILE", old);
+        } else {
+            std::env::remove_var("USERPROFILE");
         }
     }
 
