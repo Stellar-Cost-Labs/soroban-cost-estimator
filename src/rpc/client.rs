@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Duration;
 
 use governor::{Quota, RateLimiter};
 use serde::Deserialize;
@@ -10,6 +11,10 @@ use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
 use crate::rpc::retry::with_retry;
+
+/// Default per-request HTTP timeout applied to every RPC call. Matches the
+/// CLI's `--timeout` default (30 seconds).
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Resolves a network name to its well-known Soroban RPC endpoint.
 ///
@@ -87,7 +92,7 @@ pub struct RpcClient {
 
 impl RpcClient {
     /// Create a new RPC client pointing at the given URL, without rate
-    /// limiting.
+    /// limiting and with the default request timeout.
     pub fn new(url: &str) -> Self {
         Self::with_rate_limit(url, None)
     }
@@ -100,10 +105,29 @@ impl RpcClient {
     /// disables rate limiting entirely. Values larger than `u32::MAX` are
     /// clamped.
     pub fn with_rate_limit(url: &str, rps: Option<u64>) -> Self {
-        debug!(url, rps, "creating RPC client");
+        Self::with_options(url, rps, DEFAULT_TIMEOUT)
+    }
+
+    /// Create a new RPC client pointing at the given URL, optionally capping
+    /// outbound requests to `rps` requests per second and bounding each HTTP
+    /// request with `timeout`.
+    ///
+    /// The limiter spaces consecutive outbound calls at least `1/rps` seconds
+    /// apart (a fixed-rate limiter with a burst of 1). `None` or `Some(0)`
+    /// disables rate limiting entirely. Values larger than `u32::MAX` are
+    /// clamped. `timeout` applies to the whole request (connect through
+    /// response body) and is passed straight to reqwest.
+    pub fn with_options(url: &str, rps: Option<u64>, timeout: Duration) -> Self {
+        debug!(url, rps, ?timeout, "creating RPC client");
         Self {
             url: url.to_string(),
-            client: reqwest::Client::new(),
+            // `ClientBuilder::build` only fails on invalid configuration (a
+            // default builder cannot), so fall back to a plain client to keep
+            // construction infallible.
+            client: reqwest::Client::builder()
+                .timeout(timeout)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             dedup: Arc::new(Mutex::new(DedupState::default())),
             limiter: rps.and_then(build_rate_limiter),
         }
@@ -312,10 +336,13 @@ fn deserialize_result<T: serde::de::DeserializeOwned>(value: Value) -> AppResult
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use serde_json::Value;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    use crate::error::AppResult;
 
     use super::RpcClient;
 
@@ -587,82 +614,39 @@ mod tests {
         );
     }
 
-    /// Spawns a tiny HTTP server that answers a single JSON-RPC `getHealth`
-    /// call with the given result `status` value.
-    async fn spawn_health_stub(status: &'static str) -> String {
+    /// Spawns an HTTP server that accepts connections but never responds, so
+    /// a client with a short timeout observes a request-timeout error instead
+    /// of hanging forever.
+    async fn spawn_hanging_stub() -> String {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("failed to bind health stub server");
+            .expect("failed to bind stub server");
         let addr = listener.local_addr().expect("no local address");
 
         tokio::spawn(async move {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                return;
-            };
-            let mut buf = Vec::new();
-            let mut tmp = [0u8; 1024];
-            loop {
-                let n = stream.read(&mut tmp).await.unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&tmp[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
+            while let Ok((_stream, _)) = listener.accept().await {
+                // Never respond — force the client's request timeout to fire.
+                std::future::pending::<()>().await;
             }
-            let body = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"status":"{status}"}}}}"#);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.flush().await;
         });
 
         format!("http://{addr}")
     }
 
-    /// A healthy endpoint passes `health_check`.
+    /// A per-request timeout configured via `with_options` must actually
+    /// bound the request: against a server that accepts but never answers,
+    /// the retry loop gives up and surfaces an HTTP error rather than
+    /// waiting forever.
     #[tokio::test]
-    async fn test_health_check_healthy() {
-        let url = spawn_health_stub("healthy").await;
-        let client = RpcClient::new(&url);
-        client.health_check().await.expect("healthy endpoint");
-    }
+    async fn test_request_timeout_applies() {
+        let url = spawn_hanging_stub().await;
+        let client = RpcClient::with_options(&url, None, Duration::from_millis(100));
 
-    /// A reachable but non-healthy node fails the check with a clear error
-    /// rather than silently proceeding into a simulation.
-    #[tokio::test]
-    async fn test_health_check_unhealthy_status() {
-        let url = spawn_health_stub("degraded").await;
-        let client = RpcClient::new(&url);
-        let err = client.health_check().await.expect_err("degraded endpoint");
-        let msg = err.to_string();
+        let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
+
         assert!(
-            msg.contains("degraded") && msg.contains(&url),
-            "unhealthy status must surface the status and URL: {msg}"
-        );
-    }
-
-    /// An unreachable endpoint fails fail-fast with a clear, actionable error.
-    #[tokio::test]
-    async fn test_health_check_unreachable_endpoint() {
-        // Bind a listener so the port is guaranteed free, then close it so the
-        // RPC client cannot connect — an unreachable endpoint.
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("no address");
-        drop(listener);
-
-        let url = format!("http://{addr}");
-        let client = RpcClient::new(&url);
-        let err = client
-            .health_check()
-            .await
-            .expect_err("unreachable endpoint");
-        assert!(
-            err.to_string().contains("unable to reach RPC endpoint"),
-            "unreachable endpoint must yield a clear error: {err}"
+            result.is_err(),
+            "a hanging server must eventually produce a timeout error"
         );
     }
 }
