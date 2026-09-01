@@ -60,7 +60,7 @@ fn full_snapshot() -> ConfigSnapshot {
         state_archival: Some(StateArchivalV0 {
             max_entry_ttl: 4096,
             min_temporary_ttl: 16,
-            min_persistent_ttl: 2073600,
+            min_persistent_ttl: 2_073_600,
             persistent_rent_rate_denominator: 100_000,
             temp_rent_rate_denominator: 50_000,
             max_entries_to_archive: 100,
@@ -72,6 +72,7 @@ fn full_snapshot() -> ConfigSnapshot {
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn snapshot_with(
     compute: bool,
     ledger_cost: bool,
@@ -143,7 +144,7 @@ fn snapshot_with(
             Some(StateArchivalV0 {
                 max_entry_ttl: 4096,
                 min_temporary_ttl: 16,
-                min_persistent_ttl: 2073600,
+                min_persistent_ttl: 2_073_600,
                 persistent_rent_rate_denominator: 100_000,
                 temp_rent_rate_denominator: 50_000,
                 max_entries_to_archive: 100,
@@ -750,10 +751,10 @@ fn test_state_archival_all_individual_fields() {
             "min_persistent_ttl" => sa.min_persistent_ttl = val,
             "max_entries_to_archive" => sa.max_entries_to_archive = val,
             "live_soroban_state_size_window_sample_size" => {
-                sa.live_soroban_state_size_window_sample_size = val
+                sa.live_soroban_state_size_window_sample_size = val;
             }
             "live_soroban_state_size_window_sample_period" => {
-                sa.live_soroban_state_size_window_sample_period = val
+                sa.live_soroban_state_size_window_sample_period = val;
             }
             "eviction_scan_size" => sa.eviction_scan_size = val,
             "starting_eviction_scan_level" => sa.starting_eviction_scan_level = val,
