@@ -13,6 +13,7 @@ pub mod cache;
 pub mod cli;
 pub mod config_snapshot;
 pub mod error;
+pub mod paths;
 pub mod report;
 pub mod rpc;
 pub mod wasm;

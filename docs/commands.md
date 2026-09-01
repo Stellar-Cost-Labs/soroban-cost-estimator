@@ -662,8 +662,8 @@ All commands accept:
 
 | Flag | Description |
 |------|-------------|
-| `--format <FORMAT>` | Select `table`, `json`, `csv`, or `markdown` output; defaults to `table` |
-| `--rps <N>` | Cap RPC requests per second |
+| `--rps <N>` | Cap RPC requests at N per second (0 disables) |
+| `--timeout <SECS>` | HTTP request timeout for RPC calls in seconds (default `30`) |
 | `--help` / `-h` | Print command-specific help |
 
 `--format` applies to report-producing commands. The legacy `--json` flag remains supported as an alias for `--format json` where it was previously available.
