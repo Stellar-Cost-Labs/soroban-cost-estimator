@@ -168,11 +168,11 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             wasm,
             network,
             id,
-            format,
             json,
+            format,
         } => {
-            let fmt = if json { "json".to_string() } else { format };
-            cmd_estimate_all(&wasm, &network, id.as_deref(), &fmt, rps, timeout).await
+            let format = format.unwrap_or_else(|| if json { "json" } else { "table" }.to_string());
+            cmd_estimate_all(&wasm, &network, id.as_deref(), &format, rps, timeout).await
         }
         cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(&wasm, json),
         cli::Command::Config { action } => match action {

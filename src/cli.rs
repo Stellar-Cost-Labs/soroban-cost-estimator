@@ -79,13 +79,14 @@ pub enum Command {
         #[arg(long)]
         id: Option<String>,
 
-        /// Output format: table, json, csv, markdown.
-        #[arg(long, default_value = "table")]
-        format: String,
-
-        /// Output as JSON (deprecated: use --format json instead).
-        #[arg(long, conflicts_with = "format")]
+        /// Output as JSON instead of a human-readable list.
+        #[arg(long)]
         json: bool,
+
+        /// Output format: table (default), json, csv, or markdown.
+        /// Overrides `--json` when both are supplied.
+        #[arg(long, value_parser = ["table", "json", "csv", "markdown"])]
+        format: Option<String>,
     },
 
     /// Print WASM metadata (functions, contract spec, size, hash) without any RPC calls.

@@ -435,8 +435,10 @@ fn test_estimate_all_format_flag_accepted() {
 }
 
 #[test]
-fn test_estimate_all_format_csv_conflicts_with_json() {
-    // --format and --json should be mutually exclusive.
+fn test_estimate_all_format_wins_over_json() {
+    // --format should take precedence over the legacy --json flag.
+    // Both flags are accepted; the combination fails only because
+    // test.wasm doesn't exist, NOT because of an argument conflict.
     let (_, stderr, code) = run_cli(&[
         "estimate-all",
         "--wasm",
@@ -445,10 +447,21 @@ fn test_estimate_all_format_csv_conflicts_with_json() {
         "csv",
         "--json",
     ]);
-    assert_ne!(code, 0, "--format and --json should conflict; stderr: {stderr}");
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
     assert!(
-        stderr.contains("cannot") || stderr.contains("conflicts"),
-        "the error should mention the conflict; stderr: {stderr}"
+        !stderr.contains("cannot") && !stderr.contains("conflicts"),
+        "--format and --json should NOT conflict; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_all_format_invalid_value_rejected() {
+    // clap's value_parser must reject unknown formats before the command runs.
+    let (_, stderr, code) = run_cli(&["estimate-all", "--wasm", "test.wasm", "--format", "xml"]);
+    assert_ne!(code, 0, "invalid --format value should error");
+    assert!(
+        stderr.contains("invalid value") || stderr.contains("possible values"),
+        "clap should reject unknown format; stderr: {stderr}"
     );
 }
 
