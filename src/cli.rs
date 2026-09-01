@@ -13,6 +13,11 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "N")]
     pub rps: Option<u64>,
 
+    /// HTTP request timeout for RPC calls, in seconds (applies to every
+    /// network call).
+    #[arg(long, global = true, value_name = "SECS", default_value_t = 30)]
+    pub timeout: u64,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -53,6 +58,11 @@ pub enum Command {
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
         json: bool,
+
+        /// Output format: table (default), json, csv, or markdown.
+        /// Overrides `--json` when both are supplied.
+        #[arg(long, value_parser = ["table", "json", "csv", "markdown"])]
+        format: Option<String>,
     },
 
     /// Enumerate all public contract functions and estimate each one.
@@ -128,6 +138,41 @@ pub enum CacheAction {
         id: Option<String>,
 
         /// Output as JSON instead of a human-readable list.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Query cached estimates with optional filters.
+    Query {
+        /// Network to filter by.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+
+        /// Filter by function name (case-insensitive substring match).
+        #[arg(long)]
+        function: Option<String>,
+
+        /// Filter by WASM hash prefix.
+        #[arg(long)]
+        wasm_hash: Option<String>,
+
+        /// Minimum total fee in stroops.
+        #[arg(long, value_name = "STROOPS")]
+        min_stroops: Option<i64>,
+
+        /// Maximum total fee in stroops.
+        #[arg(long, value_name = "STROOPS")]
+        max_stroops: Option<i64>,
+
+        /// Earliest timestamp (ISO-8601, e.g. "2024-06-01T00:00:00Z").
+        #[arg(long, value_name = "TIMESTAMP")]
+        from: Option<String>,
+
+        /// Latest timestamp (ISO-8601, e.g. "2024-12-31T23:59:59Z").
+        #[arg(long, value_name = "TIMESTAMP")]
+        to: Option<String>,
+
+        /// Output as JSON instead of a table.
         #[arg(long)]
         json: bool,
     },
