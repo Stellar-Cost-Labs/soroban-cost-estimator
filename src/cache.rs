@@ -107,9 +107,7 @@ static WRITE_LOCK: Mutex<()> = Mutex::new(());
 /// Returns the base data directory path: `~/.soroban-cost-estimator`,
 /// creating it if needed.
 fn data_dir() -> AppResult<PathBuf> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| AppError::General("could not determine home directory".to_string()))?;
-    let dir = home.join(".soroban-cost-estimator");
+    let dir = crate::paths::data_dir()?;
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
