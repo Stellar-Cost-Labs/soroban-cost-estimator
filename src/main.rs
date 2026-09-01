@@ -6,7 +6,9 @@ use soroban_cost_estimator::cli;
 use soroban_cost_estimator::config_snapshot;
 use soroban_cost_estimator::error;
 use soroban_cost_estimator::report;
-use soroban_cost_estimator::report::formatter::{JsonFormatter, ReportFormatter, TableFormatter};
+use soroban_cost_estimator::report::formatter::{
+    ReportFormatter, TableFormatter, formatter_by_name,
+};
 use soroban_cost_estimator::rpc;
 use soroban_cost_estimator::wasm;
 use soroban_cost_estimator::xdr_helper;
@@ -132,7 +134,7 @@ async fn main() {
 
 async fn run(args: cli::Cli) -> error::AppResult<()> {
     let rps = args.rps;
-    let max_retries = args.max_retries;
+    let timeout = args.timeout;
     match args.command {
         cli::Command::Estimate {
             wasm,
@@ -143,7 +145,11 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             args,
             cache_ttl,
             json,
+            format,
         } => {
+            // `--format` wins when both it and the legacy `--json` flag are
+            // supplied; otherwise fall back to the JSON/table defaults.
+            let format = format.unwrap_or_else(|| if json { "json" } else { "table" }.to_string());
             cmd_estimate(
                 &wasm,
                 &network,
@@ -152,9 +158,9 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 r#fn.as_deref(),
                 &args,
                 cache_ttl.as_deref(),
-                json,
+                &format,
                 rps,
-                max_retries,
+                timeout,
             )
             .await
         }
@@ -163,17 +169,17 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             network,
             id,
             json,
-        } => cmd_estimate_all(&wasm, &network, id.as_deref(), json, rps, max_retries).await,
+        } => cmd_estimate_all(&wasm, &network, id.as_deref(), json, rps, timeout).await,
         cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(&wasm, json),
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot { network, out, json } => {
-                cmd_config_snapshot(&network, out.as_deref(), json, rps, max_retries).await
+                cmd_config_snapshot(&network, out.as_deref(), json, rps, timeout).await
             }
             cli::ConfigAction::Diff {
                 network,
                 against,
                 summary,
-            } => cmd_config_diff(&network, against.as_deref(), summary, rps, max_retries).await,
+            } => cmd_config_diff(&network, against.as_deref(), summary, rps, timeout).await,
             cli::ConfigAction::History { network } => cmd_config_history(&network),
             cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network),
             cli::ConfigAction::Validate { network } => cmd_config_validate(&network),
@@ -184,7 +190,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 network,
                 id,
                 json,
-            } => cmd_cache_warm(&wasm, &network, id.as_deref(), json, rps, max_retries).await,
+            } => cmd_cache_warm(&wasm, &network, id.as_deref(), json, rps, timeout).await,
             cli::CacheAction::Verify => cmd_cache_verify(),
             cli::CacheAction::Query {
                 network,
@@ -207,7 +213,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             ),
         },
         cli::Command::Watch { network, interval } => {
-            cmd_watch(&network, &interval, rps, max_retries).await
+            cmd_watch(&network, &interval, rps, timeout).await
         }
     }
 }
@@ -370,10 +376,12 @@ async fn cmd_estimate(
     fn_name: Option<&str>,
     args: &[String],
     cache_ttl: Option<&str>,
-    json_flag: bool,
+    format: &str,
     rps: Option<u64>,
-    max_retries: usize,
+    timeout: u64,
 ) -> error::AppResult<()> {
+    let json_flag = format == "json";
+    let table_mode = format == "table";
     use sha2::Digest;
     use tracing::{Instrument, info_span};
 
@@ -394,7 +402,9 @@ async fn cmd_estimate(
 
         // Show the hash before anything else — the user can verify they are
         // simulating the intended file before any RPC traffic is sent.
-        if !json_flag {
+        // Only the human-readable table mode gets this header; machine
+        // formats (json/csv/markdown) emit their own self-contained output.
+        if table_mode {
             println!("WASM SHA-256: {wasm_hash}");
         }
 
@@ -411,8 +421,11 @@ async fn cmd_estimate(
         }
 
         let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
-        let client =
-            rpc::client::RpcClient::with_rate_limit_and_retries(&endpoint, rps, max_retries);
+        let client = rpc::client::RpcClient::with_options(
+            &endpoint,
+            rps,
+            std::time::Duration::from_secs(timeout),
+        );
 
         let sc_vals: Vec<stellar_xdr::ScVal> = args
             .iter()
@@ -499,10 +512,9 @@ async fn cmd_estimate(
         );
         info!(total_stroops = fee.total_stroops, total_xlm = %fee.total_xlm, "estimate complete");
 
-        if json_flag {
-            println!("{}", JsonFormatter.format(&report));
-        } else {
-            println!("{}", TableFormatter.format(&report));
+        match formatter_by_name(format) {
+            Some(formatter) => println!("{}", formatter.format(&report)),
+            None => println!("{}", TableFormatter.format(&report)),
         }
 
         Ok(())
@@ -523,7 +535,7 @@ async fn cmd_estimate_all(
     contract_id: Option<&str>,
     json_flag: bool,
     rps: Option<u64>,
-    max_retries: usize,
+    timeout: u64,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -568,8 +580,11 @@ async fn cmd_estimate_all(
         }
 
         let endpoint = rpc::client::resolve_endpoint(network, None)?;
-        let client =
-            rpc::client::RpcClient::with_rate_limit_and_retries(&endpoint, rps, max_retries);
+        let client = rpc::client::RpcClient::with_options(
+            &endpoint,
+            rps,
+            std::time::Duration::from_secs(timeout),
+        );
 
         // Fee rates are only needed to itemize the per-function fee breakdown
         // in JSON output; skip the extra RPC calls in table mode.
@@ -883,7 +898,7 @@ fn wasm_info_json(
 async fn fetch_config_snapshot(
     network: &str,
     rps: Option<u64>,
-    max_retries: usize,
+    timeout: u64,
 ) -> error::AppResult<config_snapshot::model::ConfigSnapshot> {
     use tracing::Instrument;
     use tracing::{debug, info_span};
@@ -891,8 +906,11 @@ async fn fetch_config_snapshot(
     let span = info_span!("fetch_config_snapshot", network);
     async {
         let endpoint = rpc::client::resolve_endpoint(network, None)?;
-        let client =
-            rpc::client::RpcClient::with_rate_limit_and_retries(&endpoint, rps, max_retries);
+        let client = rpc::client::RpcClient::with_options(
+            &endpoint,
+            rps,
+            std::time::Duration::from_secs(timeout),
+        );
         debug!("fetching all config settings");
         let raw_entries = rpc::config::fetch_all_config_settings(&client).await?;
         debug!(entries = raw_entries.len(), "received config entries");
@@ -946,7 +964,7 @@ async fn cmd_config_snapshot(
     out_path: Option<&str>,
     json_flag: bool,
     rps: Option<u64>,
-    max_retries: usize,
+    timeout: u64,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -954,7 +972,7 @@ async fn cmd_config_snapshot(
     let span = info_span!("cmd_config_snapshot", network);
     async {
         info!("taking config snapshot");
-        let snapshot = fetch_config_snapshot(network, rps, max_retries).await?;
+        let snapshot = fetch_config_snapshot(network, rps, timeout).await?;
 
         let path = config_snapshot::store::save_snapshot(&snapshot, out_path)?;
         info!(path = %path.display(), ledger = snapshot.ledger, "snapshot saved");
@@ -988,7 +1006,7 @@ async fn cmd_config_diff(
     against_path: Option<&str>,
     summary: bool,
     rps: Option<u64>,
-    max_retries: usize,
+    timeout: u64,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::{debug, info_span};
@@ -1006,7 +1024,7 @@ async fn cmd_config_diff(
             }
         };
 
-        let new_snapshot = fetch_config_snapshot(network, rps, max_retries).await?;
+        let new_snapshot = fetch_config_snapshot(network, rps, timeout).await?;
 
         let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
         debug!(
@@ -1211,11 +1229,11 @@ async fn watch_poll_once(
     network: &str,
     first: &mut bool,
     rps: Option<u64>,
-    max_retries: usize,
+    timeout: u64,
 ) -> error::AppResult<()> {
     use tracing::{debug, warn};
 
-    match fetch_config_snapshot(network, rps, max_retries).await {
+    match fetch_config_snapshot(network, rps, timeout).await {
         Ok(snapshot) => {
             if !*first {
                 if let Ok(old_snapshot) = config_snapshot::store::load_latest_snapshot(network) {
@@ -1249,7 +1267,7 @@ async fn cmd_watch(
     network: &str,
     interval: &str,
     rps: Option<u64>,
-    max_retries: usize,
+    timeout: u64,
 ) -> error::AppResult<()> {
     use tracing::info;
 
@@ -1271,7 +1289,7 @@ async fn cmd_watch(
                 return Ok(());
             }
             () = async {
-                let _ = watch_poll_once(network, &mut first, rps, max_retries).await;
+                let _ = watch_poll_once(network, &mut first, rps, timeout).await;
                 tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
             } => {}
         }
@@ -1391,9 +1409,9 @@ async fn cmd_cache_warm(
     contract_id: Option<&str>,
     json_flag: bool,
     rps: Option<u64>,
-    max_retries: usize,
+    timeout: u64,
 ) -> error::AppResult<()> {
-    cmd_estimate_all(wasm_path, network, contract_id, json_flag, rps, max_retries).await
+    cmd_estimate_all(wasm_path, network, contract_id, json_flag, rps, timeout).await
 }
 
 #[cfg(test)]
