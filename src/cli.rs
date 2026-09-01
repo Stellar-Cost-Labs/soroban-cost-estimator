@@ -13,11 +13,10 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "N")]
     pub rps: Option<u64>,
 
-    /// Retry transient RPC failures up to N times (default 3), using
-    /// exponential backoff (500ms, then doubled between attempts). 0
-    /// disables retries entirely.
-    #[arg(long, global = true, value_name = "N", default_value = "3")]
-    pub max_retries: usize,
+    /// HTTP request timeout for RPC calls, in seconds (applies to every
+    /// network call).
+    #[arg(long, global = true, value_name = "SECS", default_value_t = 30)]
+    pub timeout: u64,
 
     #[command(subcommand)]
     pub command: Command,
@@ -59,6 +58,11 @@ pub enum Command {
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
         json: bool,
+
+        /// Output format: table (default), json, csv, or markdown.
+        /// Overrides `--json` when both are supplied.
+        #[arg(long, value_parser = ["table", "json", "csv", "markdown"])]
+        format: Option<String>,
     },
 
     /// Enumerate all public contract functions and estimate each one.

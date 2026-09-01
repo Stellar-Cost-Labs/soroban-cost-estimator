@@ -7,9 +7,7 @@ use crate::error::{AppError, AppResult};
 
 /// Returns the base data directory: `~/.soroban-cost-estimator`.
 fn data_dir() -> AppResult<PathBuf> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| AppError::General("could not determine home directory".to_string()))?;
-    Ok(home.join(".soroban-cost-estimator"))
+    crate::paths::data_dir()
 }
 
 /// Returns the snapshots directory, creating it if needed.
