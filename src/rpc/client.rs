@@ -227,13 +227,6 @@ impl RpcClient {
         .await?;
         let status = response.status();
         let response_body: Value = response.json().await?;
-        if std::env::var("SCE_DEBUG_RPC").is_ok() {
-            debug!(
-                method,
-                response = %serde_json::to_string(&response_body).unwrap_or_default(),
-                "RPC response"
-            );
-        }
 
         if let Some(error) = response_body.get("error") {
             let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
@@ -242,7 +235,7 @@ impl RpcClient {
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown error")
                 .to_string();
-            debug!(method, code, message, "RPC error");
+            debug!(method, code, message, "RPC error response");
             return Err(AppError::Rpc {
                 status: code,
                 message,
@@ -254,6 +247,12 @@ impl RpcClient {
             message: "response missing 'result' field".to_string(),
         })?;
 
+        debug!(
+            method,
+            status = %status,
+            result = %serde_json::to_string(result).unwrap_or_default(),
+            "RPC response received"
+        );
         trace!(method, "RPC call succeeded");
         Ok(result.clone())
     }
@@ -597,5 +596,120 @@ mod tests {
             result.is_err(),
             "a hanging server must eventually produce a timeout error"
         );
+    }
+}
+
+/// Parse a `"Key: Value"` string into an HTTP header name and value.
+///
+/// Returns an error if the format is invalid (missing colon, empty key,
+/// or non-ASCII characters in the header name).
+fn parse_header(raw: &str) -> Result<(HeaderName, HeaderValue), String> {
+    let colon_pos = raw.find(':').ok_or("missing ':' separator")?;
+    let name_str = raw[..colon_pos].trim();
+    let value_str = raw[colon_pos + 1..].trim();
+
+    if name_str.is_empty() {
+        return Err("empty header name".to_string());
+    }
+
+    let name = HeaderName::from_bytes(name_str.as_bytes())
+        .map_err(|e| format!("invalid header name: {e}"))?;
+    let value = HeaderValue::from_str(value_str)
+        .map_err(|e| format!("invalid header value: {e}"))?;
+
+    Ok((name, value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_header_valid() {
+        let (name, value) = parse_header("X-API-Key: secret123").unwrap();
+        assert_eq!(name.as_str(), "x-api-key");
+        assert_eq!(value.to_str().unwrap(), "secret123");
+    }
+
+    #[test]
+    fn test_parse_header_with_spaces() {
+        let (name, value) = parse_header(" Authorization : Bearer tok ").unwrap();
+        assert_eq!(name.as_str(), "authorization");
+        assert_eq!(value.to_str().unwrap(), "Bearer tok");
+    }
+
+    #[test]
+    fn test_parse_header_missing_colon() {
+        assert!(parse_header("NoColon").is_err());
+    }
+
+    #[test]
+    fn test_parse_header_empty_name() {
+        assert!(parse_header(": value").is_err());
+    }
+
+    #[test]
+    fn test_parse_header_empty_value() {
+        let (name, value) = parse_header("X-Custom:").unwrap();
+        assert_eq!(name.as_str(), "x-custom");
+        assert_eq!(value.to_str().unwrap(), "");
+    }
+
+    #[test]
+    fn test_parse_header_value_with_colons() {
+        let (name, value) = parse_header("X-Auth: token:with:colons").unwrap();
+        assert_eq!(name.as_str(), "x-auth");
+        assert_eq!(value.to_str().unwrap(), "token:with:colons");
+    }
+
+    #[test]
+    fn test_with_headers_empty() {
+        let client = RpcClient::with_headers("http://localhost", &[]);
+        assert!(client.headers.is_empty());
+    }
+
+    #[test]
+    fn test_with_headers_stores_parsed() {
+        let client = RpcClient::with_headers(
+            "http://localhost",
+            &[
+                "X-API-Key: secret".to_string(),
+                "Authorization: Bearer tok".to_string(),
+            ],
+        );
+        assert_eq!(client.headers.len(), 2);
+        assert_eq!(
+            client.headers.get("x-api-key").unwrap().to_str().unwrap(),
+            "secret"
+        );
+        assert_eq!(
+            client.headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer tok"
+        );
+    }
+
+    #[test]
+    fn test_with_headers_skips_malformed() {
+        let client = RpcClient::with_headers(
+            "http://localhost",
+            &[
+                "Good: ok".to_string(),
+                "NoColonHere".to_string(),
+                "Also-Bad:".to_string(),
+            ],
+        );
+        // Only the valid header should be stored.
+        assert_eq!(client.headers.len(), 1);
+        assert!(client.headers.contains_key("good"));
+    }
+
+    #[test]
+    fn test_rpc_client_new_has_no_custom_headers() {
+        let client = RpcClient::new("http://localhost");
+        assert!(client.headers.is_empty());
     }
 }

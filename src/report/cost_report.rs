@@ -15,6 +15,145 @@ pub fn fee_percentage(part: i64, total: i64) -> String {
     }
 }
 
+/// Maximum width of the bar in the ASCII cost breakdown chart (characters).
+const CHART_BAR_WIDTH: usize = 40;
+
+/// A single row in the ASCII cost breakdown chart.
+#[derive(Debug, Clone)]
+pub struct ChartEntry {
+    /// Display label for the fee component.
+    pub label: String,
+    /// Fee amount in stroops.
+    pub stroops: i64,
+    /// The rendered ASCII bar (e.g. `"########################"`).
+    pub bar: String,
+    /// Percentage of total (e.g. `" (29.1%)"`), empty when total is 0.
+    pub pct: String,
+}
+
+/// Render an ASCII bar chart showing the relative cost of each fee component.
+///
+/// The chart is appended to the cost report output to give a quick visual
+/// summary of where the fee is going. Only non-zero components are shown.
+///
+/// # Output format
+///
+/// ```text
+/// Fee Breakdown Chart:
+///
+///   Non-refundable | ########################              |  4496 (29.1%)
+///   Refundable     | ###################################### | 10931 (70.9%)
+/// ```
+///
+/// # Arguments
+/// * `total_stroops` — total fee in stroops (used for percentage calculation;
+///   if 0, percentages are omitted).
+/// * `non_refundable` — non-refundable fee in stroops.
+/// * `refundable` — refundable fee in stroops.
+#[must_use]
+pub fn format_cost_breakdown_chart(
+    total_stroops: i64,
+    non_refundable: i64,
+    refundable: i64,
+) -> String {
+    let entries = build_chart_entries(total_stroops, non_refundable, refundable);
+    render_chart(&entries)
+}
+
+/// Build the chart entries from fee values.
+///
+/// Returns a `Vec<ChartEntry>` sorted by descending stroops value. Zero-value
+/// components are excluded.
+#[must_use]
+pub fn build_chart_entries(
+    total_stroops: i64,
+    non_refundable: i64,
+    refundable: i64,
+) -> Vec<ChartEntry> {
+    let max_stroops = non_refundable.max(refundable);
+    let has_total = total_stroops > 0;
+
+    let mut entries: Vec<ChartEntry> = Vec::new();
+
+    if non_refundable > 0 {
+        let bar = render_bar(non_refundable, max_stroops);
+        let pct = if has_total {
+            format!(" ({:.1}%)", non_refundable as f64 / total_stroops as f64 * 100.0)
+        } else {
+            String::new()
+        };
+        entries.push(ChartEntry {
+            label: "Non-refundable".to_string(),
+            stroops: non_refundable,
+            bar,
+            pct,
+        });
+    }
+
+    if refundable > 0 {
+        let bar = render_bar(refundable, max_stroops);
+        let pct = if has_total {
+            format!(" ({:.1}%)", refundable as f64 / total_stroops as f64 * 100.0)
+        } else {
+            String::new()
+        };
+        entries.push(ChartEntry {
+            label: "Refundable".to_string(),
+            stroops: refundable,
+            bar,
+            pct,
+        });
+    }
+
+    // Sort by descending stroops so the largest component is first.
+    entries.sort_by(|a, b| b.stroops.cmp(&a.stroops));
+    entries
+}
+
+/// Render the chart entries into a formatted string.
+#[must_use]
+fn render_chart(entries: &[ChartEntry]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+
+    // Find the longest label to align the bars.
+    let label_width = entries.iter().map(|e| e.label.len()).max().unwrap_or(0);
+    let mut output = String::from("\nFee Breakdown Chart:\n\n");
+
+    for entry in entries {
+        let padded_label = format!("{:<width$}", entry.label, width = label_width);
+        let stroops_str = format_stroops_aligned(entry.stroops);
+        output.push_str(&format!(
+            "  {} | {} | {}{}\n",
+            padded_label, entry.bar, stroops_str, entry.pct
+        ));
+    }
+
+    output
+}
+
+/// Render a single ASCII bar proportional to `value` relative to `max`.
+///
+/// The bar uses `#` characters and is right-padded with spaces to
+/// `CHART_BAR_WIDTH`. When `value` equals `max`, the bar is full width.
+/// When `value` is 0, the bar is empty.
+#[must_use]
+fn render_bar(value: i64, max: i64) -> String {
+    if max <= 0 {
+        return " ".repeat(CHART_BAR_WIDTH);
+    }
+    let filled = ((value as f64 / max as f64) * CHART_BAR_WIDTH as f64).round() as usize;
+    let filled = filled.min(CHART_BAR_WIDTH);
+    format!("{}{}", "#".repeat(filled), " ".repeat(CHART_BAR_WIDTH - filled))
+}
+
+/// Format a stroops value with right-alignment for column display.
+#[must_use]
+fn format_stroops_aligned(stroops: i64) -> String {
+    format!("{:>6}", stroops)
+}
+
 /// A complete cost report for a single contract invocation.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CostReport {
@@ -225,6 +364,13 @@ pub fn format_report_table(report: &CostReport) -> String {
     output.push_str(&format!(
         "\n  Total:          {} stroops ({})\n",
         report.fee.total_stroops, report.fee.total_xlm,
+    ));
+
+    // ASCII bar chart for visual cost breakdown
+    output.push_str(&format_cost_breakdown_chart(
+        report.fee.total_stroops,
+        report.fee.non_refundable_stroops,
+        report.fee.refundable_stroops,
     ));
 
     output

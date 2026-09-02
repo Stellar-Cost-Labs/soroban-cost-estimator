@@ -116,14 +116,17 @@ impl EstimateAllResult {
 
 #[tokio::main]
 async fn main() {
+    let args = cli::Cli::parse();
+
+    let default_level = if args.verbose { "debug" } else { "info" };
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(default_level)),
         )
         .init();
 
-    let args = cli::Cli::parse();
-    info!(command = ?args.command, "starting soroban-cost-estimator");
+    info!(command = ?args.command, verbose = args.verbose, "starting soroban-cost-estimator");
 
     if let Err(err) = run(args).await {
         error!(error = %err, "command failed");
