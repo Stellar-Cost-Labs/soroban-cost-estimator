@@ -1,12 +1,19 @@
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Duration;
 
+use governor::{Quota, RateLimiter};
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
 use crate::rpc::retry::with_retry;
+
+/// Default per-request HTTP timeout applied to every RPC call. Matches the
+/// CLI's `--timeout` default (30 seconds).
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Resolves a network name to its well-known Soroban RPC endpoint.
 ///
@@ -58,21 +65,60 @@ struct DedupState {
 ///
 /// Identical in-flight or completed requests (same method + params) are
 /// deduplicated so a batch operation sends each distinct request only once.
+///
+/// An optional fixed-rate limiter (requests per second) can be attached to
+/// cap the rate of *outbound* HTTP calls, so batch operations such as
+/// `estimate-all` do not hammer the RPC endpoint and trip its rate limits.
+/// Deduplicated requests that never reach the network are not throttled.
 #[derive(Debug)]
 pub struct RpcClient {
     url: String,
     client: reqwest::Client,
     dedup: Arc<Mutex<DedupState>>,
+    /// Fixed-rate limiter shared by every network call, when enabled.
+    limiter: Option<Arc<governor::DefaultDirectRateLimiter>>,
 }
 
 impl RpcClient {
-    /// Create a new RPC client pointing at the given URL.
+    /// Create a new RPC client pointing at the given URL, without rate
+    /// limiting and with the default request timeout.
     pub fn new(url: &str) -> Self {
-        debug!(url, "creating RPC client");
+        Self::with_rate_limit(url, None)
+    }
+
+    /// Create a new RPC client pointing at the given URL, optionally capping
+    /// outbound requests to `rps` requests per second.
+    ///
+    /// The limiter spaces consecutive outbound calls at least `1/rps` seconds
+    /// apart (a fixed-rate limiter with a burst of 1). `None` or `Some(0)`
+    /// disables rate limiting entirely. Values larger than `u32::MAX` are
+    /// clamped.
+    pub fn with_rate_limit(url: &str, rps: Option<u64>) -> Self {
+        Self::with_options(url, rps, DEFAULT_TIMEOUT)
+    }
+
+    /// Create a new RPC client pointing at the given URL, optionally capping
+    /// outbound requests to `rps` requests per second and bounding each HTTP
+    /// request with `timeout`.
+    ///
+    /// The limiter spaces consecutive outbound calls at least `1/rps` seconds
+    /// apart (a fixed-rate limiter with a burst of 1). `None` or `Some(0)`
+    /// disables rate limiting entirely. Values larger than `u32::MAX` are
+    /// clamped. `timeout` applies to the whole request (connect through
+    /// response body) and is passed straight to reqwest.
+    pub fn with_options(url: &str, rps: Option<u64>, timeout: Duration) -> Self {
+        debug!(url, rps, ?timeout, "creating RPC client");
         Self {
             url: url.to_string(),
-            client: reqwest::Client::new(),
+            // `ClientBuilder::build` only fails on invalid configuration (a
+            // default builder cannot), so fall back to a plain client to keep
+            // construction infallible.
+            client: reqwest::Client::builder()
+                .timeout(timeout)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             dedup: Arc::new(Mutex::new(DedupState::default())),
+            limiter: rps.and_then(build_rate_limiter),
         }
     }
 
@@ -155,13 +201,21 @@ impl RpcClient {
         let client = self.client.clone();
         let url = self.url.clone();
         let request_body = body.clone();
+        let limiter = self.limiter.clone();
 
         let response = with_retry(|| {
             let client = client.clone();
             let url = url.clone();
             let request_body = request_body.clone();
+            let limiter = limiter.clone();
 
             async move {
+                // Every outbound attempt (including retries) consumes a
+                // token, so the wire rate never exceeds the configured
+                // requests-per-second cap.
+                if let Some(limiter) = &limiter {
+                    limiter.until_ready().await;
+                }
                 client
                     .post(&url)
                     .json(&request_body)
@@ -204,6 +258,22 @@ impl RpcClient {
     }
 }
 
+/// Builds an optional fixed-rate limiter for `rps` requests per second.
+///
+/// Returns `None` when `rps` is zero (no limit) or when a valid period
+/// cannot be derived (a defensive case — any `rps >= 1` yields a valid
+/// period). The limiter uses a burst of 1, so consecutive outbound calls
+/// are spaced exactly `1/rps` seconds apart.
+fn build_rate_limiter(rps: u64) -> Option<Arc<governor::DefaultDirectRateLimiter>> {
+    if rps == 0 {
+        return None;
+    }
+    let rps = NonZeroU32::new(u32::try_from(rps).unwrap_or(u32::MAX))?;
+    let period = std::time::Duration::from_secs_f64(1.0 / f64::from(rps.get()));
+    let quota = Quota::with_period(period)?.allow_burst(NonZeroU32::new(1)?);
+    Some(Arc::new(RateLimiter::direct(quota)))
+}
+
 /// Deserializes a raw JSON-RPC `result` value into the caller's type.
 fn deserialize_result<T: serde::de::DeserializeOwned>(value: Value) -> AppResult<T> {
     serde_json::from_value(value)
@@ -214,10 +284,13 @@ fn deserialize_result<T: serde::de::DeserializeOwned>(value: Value) -> AppResult
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use serde_json::Value;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    use crate::error::AppResult;
 
     use super::RpcClient;
 
@@ -402,6 +475,126 @@ mod tests {
             counter.load(Ordering::SeqCst),
             2,
             "follower retried once after the leader's failure"
+        );
+    }
+
+    /// With a 20 req/s cap (50 ms spacing), two back-to-back *distinct*
+    /// requests must be spaced ~50 ms apart — the limiter must actually
+    /// throttle the wire.
+    #[tokio::test]
+    async fn test_rate_limiter_spaces_outbound_requests() {
+        let (url, counter) = spawn_json_rpc_stub(0).await;
+        let client = RpcClient::with_rate_limit(&url, Some(20));
+
+        let start = std::time::Instant::now();
+        let _: Value = client
+            .call("test.method", serde_json::json!({"k": 1}))
+            .await
+            .expect("first call");
+        let _: Value = client
+            .call("test.method", serde_json::json!({"k": 2}))
+            .await
+            .expect("second call");
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "both distinct requests must hit the network"
+        );
+        assert!(
+            elapsed.as_millis() >= 45,
+            "20 req/s must space requests ~50 ms apart; elapsed: {elapsed:?}"
+        );
+    }
+
+    /// Rate limiting must only throttle requests that actually reach the
+    /// network: an identical request served from the dedup cache skips the
+    /// limiter entirely and returns immediately.
+    #[tokio::test]
+    async fn test_rate_limiter_preserves_dedup() {
+        let (url, counter) = spawn_json_rpc_stub(0).await;
+        let client = RpcClient::with_rate_limit(&url, Some(20));
+        let params = serde_json::json!({"k": "v"});
+
+        let start = std::time::Instant::now();
+        let _: Value = client
+            .call("test.method", params.clone())
+            .await
+            .expect("first call");
+        let _: Value = client
+            .call("test.method", params)
+            .await
+            .expect("deduped call");
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "identical requests must hit the network once"
+        );
+        assert!(
+            start.elapsed().as_millis() < 45,
+            "a deduped request must not wait on the rate limiter"
+        );
+    }
+
+    /// The default constructor must not throttle anything; `Some(0)` must be
+    /// treated as "no limit" rather than a zero-period limiter.
+    #[tokio::test]
+    async fn test_no_rate_limit_when_disabled() {
+        let (url, counter) = spawn_json_rpc_stub(0).await;
+        let client = RpcClient::with_rate_limit(&url, Some(0));
+
+        let start = std::time::Instant::now();
+        let _: Value = client
+            .call("test.method", serde_json::json!({"k": 1}))
+            .await
+            .expect("first call");
+        let _: Value = client
+            .call("test.method", serde_json::json!({"k": 2}))
+            .await
+            .expect("second call");
+
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        assert!(
+            start.elapsed().as_millis() < 45,
+            "disabled rate limiting must not delay requests"
+        );
+    }
+
+    /// Spawns an HTTP server that accepts connections but never responds, so
+    /// a client with a short timeout observes a request-timeout error instead
+    /// of hanging forever.
+    async fn spawn_hanging_stub() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind stub server");
+        let addr = listener.local_addr().expect("no local address");
+
+        tokio::spawn(async move {
+            while let Ok((_stream, _)) = listener.accept().await {
+                // Never respond — force the client's request timeout to fire.
+                std::future::pending::<()>().await;
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    /// A per-request timeout configured via `with_options` must actually
+    /// bound the request: against a server that accepts but never answers,
+    /// the retry loop gives up and surfaces an HTTP error rather than
+    /// waiting forever.
+    #[tokio::test]
+    async fn test_request_timeout_applies() {
+        let url = spawn_hanging_stub().await;
+        let client = RpcClient::with_options(&url, None, Duration::from_millis(100));
+
+        let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
+
+        assert!(
+            result.is_err(),
+            "a hanging server must eventually produce a timeout error"
         );
     }
 }
