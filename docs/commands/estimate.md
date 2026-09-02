@@ -8,6 +8,7 @@ Simulate a single contract invocation and print the cost report.
 Usage: soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
 
 Options:
+      --format <FORMAT>    Output format: table, json, csv, or markdown [default: table]
   -w, --wasm <WASM>        Path to the compiled Soroban contract `.wasm` file
       --network <NETWORK>  Network to simulate against [default: testnet]
       --rpc-url <RPC_URL>  Explicit RPC URL (overrides network-based resolution)
@@ -123,5 +124,5 @@ soroban-cost-estimator estimate \
 }
 ```
 
-Use `--json` when feeding the result into a CI pipeline or another tool. The
+Use `--format json`, `--format csv`, or `--format markdown` when feeding the result into CI, spreadsheets, or documentation. `--json` remains a backward-compatible alias for `--format json`. The
 result is also written to the estimate cache(see [Caching](../concepts/caching.md)).

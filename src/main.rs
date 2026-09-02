@@ -132,6 +132,7 @@ async fn main() {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run(args: cli::Cli) -> error::AppResult<()> {
     let rps = args.rps;
     let timeout = args.timeout;
@@ -361,6 +362,15 @@ async fn fetch_fee_rates(client: &rpc::client::RpcClient) -> report::fee_calc::F
     rates
 }
 
+fn output_format_name(format: cli::OutputFormat) -> &'static str {
+    match format {
+        cli::OutputFormat::Table => "table",
+        cli::OutputFormat::Json => "json",
+        cli::OutputFormat::Csv => "csv",
+        cli::OutputFormat::Markdown => "markdown",
+    }
+}
+
 /// `estimate` command: simulate a single invocation and print cost report.
 ///
 /// All RPC traffic (simulation and fee-rate fetches) goes through one
@@ -416,7 +426,7 @@ async fn cmd_estimate(
         {
             let ttl_secs = ttl_secs.unwrap_or_default();
             info!(ttl_secs, function = %function_name, "cache hit — reusing fresh estimate");
-            print_cached_estimate(&fresh, ttl_secs, json_flag);
+            print_cached_estimate(&fresh, ttl_secs, format == cli::OutputFormat::Json);
             return Ok(());
         }
 
@@ -535,7 +545,7 @@ async fn cmd_estimate_all(
     wasm_path: &str,
     network: &str,
     contract_id: Option<&str>,
-    json_flag: bool,
+    format: cli::OutputFormat,
     rps: Option<u64>,
     timeout: u64,
 ) -> error::AppResult<()> {
@@ -552,7 +562,7 @@ async fn cmd_estimate_all(
         use sha2::Digest;
         let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
 
-        if !json_flag {
+        if format == cli::OutputFormat::Table {
             println!("WASM SHA-256: {wasm_hash}");
             println!();
             println!("{}", wasm::parser::format_module_metadata(&wasm_info));
@@ -601,7 +611,7 @@ async fn cmd_estimate_all(
         debug!(total, "enumerated functions");
 
         for (i, fn_info) in wasm_info.functions.iter().enumerate() {
-            if !json_flag {
+            if format == cli::OutputFormat::Table {
                 println!("[{}/{}] {}", i + 1, total, fn_info.name);
             }
             let result = estimate_all_function(
@@ -626,8 +636,11 @@ async fn cmd_estimate_all(
             .collect();
         emit_fee_range_summary(&fees, json_flag);
 
-        if json_flag {
-            println!("{}", serde_json::to_string_pretty(&json_results)?);
+        match format {
+            cli::OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&json_results)?),
+            cli::OutputFormat::Csv => print_estimate_all_csv(&json_results),
+            cli::OutputFormat::Markdown => print_estimate_all_markdown(&json_results),
+            cli::OutputFormat::Table => {}
         }
 
         Ok(())
@@ -827,16 +840,36 @@ async fn estimate_all_function(
 ///
 /// # Network calls
 /// None — pure file I/O + parsing.
-fn cmd_wasm_info(wasm_path: &str, json_flag: bool) -> error::AppResult<()> {
+fn cmd_wasm_info(wasm_path: &str, format: cli::OutputFormat) -> error::AppResult<()> {
     use sha2::Digest;
 
     let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
     let hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
 
-    if json_flag {
+    if format == cli::OutputFormat::Json {
         println!(
             "{}",
             serde_json::to_string_pretty(&wasm_info_json(wasm_path, &wasm_info, &hash))?
+        );
+        return Ok(());
+    }
+    if format == cli::OutputFormat::Csv {
+        println!("path,size,sha256,has_spec,function_count");
+        println!(
+            "{wasm_path},{},{},{},{}",
+            wasm_info.bytes.len(),
+            hash,
+            wasm_info.has_spec,
+            wasm_info.functions.len()
+        );
+        return Ok(());
+    }
+    if format == cli::OutputFormat::Markdown {
+        println!(
+            "# WASM Info\n\n| Field | Value |\n| --- | --- |\n| Path | `{wasm_path}` |\n| Size | {} bytes |\n| SHA-256 | `{hash}` |\n| Contract spec | {} |\n| Functions | {} |",
+            wasm_info.bytes.len(),
+            wasm_info.has_spec,
+            wasm_info.functions.len()
         );
         return Ok(());
     }
@@ -968,7 +1001,7 @@ fn print_stale_estimates(network: &str, ledger: u32) {
 async fn cmd_config_snapshot(
     network: &str,
     out_path: Option<&str>,
-    json_flag: bool,
+    format: cli::OutputFormat,
     rps: Option<u64>,
     timeout: u64,
 ) -> error::AppResult<()> {
@@ -983,8 +1016,17 @@ async fn cmd_config_snapshot(
         let path = config_snapshot::store::save_snapshot(&snapshot, out_path)?;
         info!(path = %path.display(), ledger = snapshot.ledger, "snapshot saved");
 
-        if json_flag {
+        if format == cli::OutputFormat::Json {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            return Ok(());
+        }
+        if format == cli::OutputFormat::Csv {
+            println!("network,ledger,timestamp,path");
+            println!("{},{},{},{}", snapshot.network, snapshot.ledger, snapshot.timestamp, path.display());
+            return Ok(());
+        }
+        if format == cli::OutputFormat::Markdown {
+            println!("# Config Snapshot\n\n| Field | Value |\n| --- | --- |\n| Network | {} |\n| Ledger | {} |\n| Timestamp | {} |\n| Path | `{}` |", snapshot.network, snapshot.ledger, snapshot.timestamp, path.display());
             return Ok(());
         }
         println!("Config snapshot saved to: {}", path.display());
@@ -1413,7 +1455,7 @@ async fn cmd_cache_warm(
     wasm_path: &str,
     network: &str,
     contract_id: Option<&str>,
-    json_flag: bool,
+    format: cli::OutputFormat,
     rps: Option<u64>,
     timeout: u64,
 ) -> error::AppResult<()> {

@@ -666,6 +666,8 @@ All commands accept:
 | `--timeout <SECS>` | HTTP request timeout for RPC calls in seconds (default `30`) |
 | `--help` / `-h` | Print command-specific help |
 
+`--format` applies to report-producing commands. The legacy `--json` flag remains supported as an alias for `--format json` where it was previously available.
+
 ## Network Resolution
 
 By default, commands use these RPC endpoints:
