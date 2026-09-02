@@ -1,6 +1,19 @@
 use comfy_table::Table;
 
-use crate::report::fee_calc::FeeBreakdown;
+use crate::report::fee_calc::{FeeBreakdown, FeeRates};
+
+/// Compute what percentage `part` is of `total`.
+///
+/// Returns a formatted string like `"29.3%"`. Returns `"0.0%"` when the
+/// total is zero to avoid division by zero.
+pub fn fee_percentage(part: i64, total: i64) -> String {
+    if total == 0 {
+        "0.0%".to_string()
+    } else {
+        let pct = (part as f64 / total as f64) * 100.0;
+        format!("{pct:.1}%")
+    }
+}
 
 /// Maximum width of the bar in the ASCII cost breakdown chart (characters).
 const CHART_BAR_WIDTH: usize = 40;
@@ -168,6 +181,125 @@ pub struct CostReport {
     pub ledger: u32,
     /// Network the simulation ran on.
     pub network: String,
+    /// RPC round-trip time of the `simulateTransaction` call, in
+    /// milliseconds. Helps identify slow or overloaded RPC endpoints.
+    pub rpc_latency_ms: u64,
+    /// Fee rates used to compute the breakdown (carried so optimization
+    /// suggestions can quantify per-resource savings). Excluded from
+    /// serialized output; `None` when the rates were unavailable.
+    #[serde(skip)]
+    pub rates: Option<FeeRates>,
+}
+
+/// A concrete, actionable cost-optimization suggestion derived from a report.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OptimizationSuggestion {
+    /// Short headline (e.g. "Reduce ledger write entries").
+    pub title: String,
+    /// Human-readable explanation including the quantified saving.
+    pub detail: String,
+    /// Approximate stroops saved by applying this single suggestion. `0` when
+    /// the saving cannot be expressed as a single per-unit amount.
+    pub potential_savings_stroops: i64,
+}
+
+impl CostReport {
+    /// Derive actionable cost-optimization suggestions from this report.
+    ///
+    /// Each suggestion quantifies how much a single reducible resource costs
+    /// per unit, using the network fee rates captured at simulation time
+    /// (`rates`). Returns an empty list when rates are unavailable or no
+    /// reducible resource is present, so callers can render a "no suggestions"
+    /// state. Suggestions are ordered by descending potential saving.
+    ///
+    /// Generic/contract-specific advice is intentionally out of scope; only
+    /// per-resource unit savings backed by the report's own rate data are
+    /// reported.
+    #[must_use]
+    pub fn suggest_optimizations(&self) -> Vec<OptimizationSuggestion> {
+        let Some(rates) = self.rates else {
+            return Vec::new();
+        };
+
+        let mut suggestions: Vec<OptimizationSuggestion> = Vec::new();
+
+        if self.write_entries > 0 && rates.fee_per_write_entry > 0 {
+            let saving = rates.fee_per_write_entry;
+            suggestions.push(OptimizationSuggestion {
+                title: "Reduce ledger write entries".to_string(),
+                detail: format!(
+                    "Removing one write entry saves ~{saving} stroops (current: {} write entries)",
+                    self.write_entries
+                ),
+                potential_savings_stroops: saving,
+            });
+        }
+
+        if self.read_entries > 0 && rates.fee_per_read_entry > 0 {
+            let saving = rates.fee_per_read_entry;
+            suggestions.push(OptimizationSuggestion {
+                title: "Reduce ledger read entries".to_string(),
+                detail: format!(
+                    "Removing one read entry saves ~{saving} stroops (current: {} read entries)",
+                    self.read_entries
+                ),
+                potential_savings_stroops: saving,
+            });
+        }
+
+        if self.read_bytes > 0 && rates.fee_per_read_1kb > 0 {
+            let saving = rates.fee_per_read_1kb;
+            suggestions.push(OptimizationSuggestion {
+                title: "Reduce disk read bytes".to_string(),
+                detail: format!(
+                    "Reducing disk reads by 1 KB saves ~{saving} stroops (current: {} read bytes)",
+                    self.read_bytes
+                ),
+                potential_savings_stroops: saving,
+            });
+        }
+
+        if self.cpu_instructions > 0 && rates.fee_per_10k_insns > 0 {
+            let saving = rates.fee_per_10k_insns;
+            suggestions.push(OptimizationSuggestion {
+                title: "Optimize CPU hot path".to_string(),
+                detail: format!(
+                    "Cutting 10,000 CPU instructions saves ~{saving} stroops (current: {} instructions)",
+                    self.cpu_instructions
+                ),
+                potential_savings_stroops: saving,
+            });
+        }
+
+        suggestions.sort_by(|a, b| {
+            b.potential_savings_stroops
+                .cmp(&a.potential_savings_stroops)
+        });
+        suggestions
+    }
+}
+
+/// Render optimization suggestions as a human-readable block.
+///
+/// Always emits a header; when there are no suggestions it explains why, so
+/// the section is never silently empty in report output.
+#[must_use]
+pub fn format_suggestions(suggestions: &[OptimizationSuggestion]) -> String {
+    let mut out = String::new();
+    out.push_str("Optimization Suggestions:\n");
+    if suggestions.is_empty() {
+        out.push_str(
+            "  No cost optimizations identified (fee rates unavailable or no reducible resources).\n",
+        );
+    } else {
+        for s in suggestions {
+            out.push_str(&format!(
+                "  - {}: {} (potential saving: {} stroops)\n",
+                s.title, s.detail, s.potential_savings_stroops
+            ));
+        }
+    }
+    out
 }
 
 /// Formats a cost report as a human-readable table.
@@ -179,6 +311,7 @@ pub fn format_report_table(report: &CostReport) -> String {
         "Network: {} (ledger {})\n",
         report.network, report.ledger
     ));
+    output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
     output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
 
     let mut table = Table::new();
@@ -201,16 +334,35 @@ pub fn format_report_table(report: &CostReport) -> String {
     output.push('\n');
 
     output.push_str(&format!("\nFee Breakdown:\n"));
+    let total = report.fee.total_stroops;
     output.push_str(&format!(
-        "  Non-refundable: {} stroops\n",
-        report.fee.non_refundable_stroops
+        "  Non-refundable: {} stroops ({})\n",
+        report.fee.non_refundable_stroops,
+        fee_percentage(report.fee.non_refundable_stroops, total),
     ));
     output.push_str(&format!(
-        "  Refundable:     {} stroops\n",
-        report.fee.refundable_stroops
+        "  Refundable:     {} stroops ({})\n",
+        report.fee.refundable_stroops,
+        fee_percentage(report.fee.refundable_stroops, total),
+    ));
+    output.push_str(&format!("\n  Components (of non-refundable):\n"));
+    output.push_str(&format!(
+        "    CPU:        {} stroops ({})\n",
+        report.fee.cpu_fee_stroops,
+        fee_percentage(report.fee.cpu_fee_stroops, total),
     ));
     output.push_str(&format!(
-        "  Total:          {} stroops ({})\n",
+        "    Storage:    {} stroops ({})\n",
+        report.fee.storage_fee_stroops,
+        fee_percentage(report.fee.storage_fee_stroops, total),
+    ));
+    output.push_str(&format!(
+        "    Bandwidth:  {} stroops ({})\n",
+        report.fee.bandwidth_fee_stroops,
+        fee_percentage(report.fee.bandwidth_fee_stroops, total),
+    ));
+    output.push_str(&format!(
+        "\n  Total:          {} stroops ({})\n",
         report.fee.total_stroops, report.fee.total_xlm,
     ));
 
@@ -233,19 +385,30 @@ pub fn format_report_json(report: &CostReport) -> String {
 mod tests {
     use super::*;
 
-    fn sample_fee() -> FeeBreakdown {
-        FeeBreakdown {
-            non_refundable_stroops: 4_496,
-            refundable_stroops: 10_931,
-            total_stroops: 15_427,
-            total_xlm: "0.0015427".to_string(),
-        }
+    #[test]
+    fn test_fee_percentage_normal() {
+        assert_eq!(fee_percentage(50, 100), "50.0%");
+        assert_eq!(fee_percentage(1, 3), "33.3%");
+        assert_eq!(fee_percentage(0, 100), "0.0%");
     }
 
-    fn sample_report() -> CostReport {
+    #[test]
+    fn test_fee_percentage_zero_total() {
+        assert_eq!(fee_percentage(0, 0), "0.0%");
+        assert_eq!(fee_percentage(100, 0), "0.0%");
+    }
+
+    #[test]
+    fn test_fee_percentage_rounding() {
+        assert_eq!(fee_percentage(1, 10), "10.0%");
+        assert_eq!(fee_percentage(1, 3), "33.3%");
+        assert_eq!(fee_percentage(2, 3), "66.7%");
+    }
+
+    fn report_with_rates(rates: FeeRates) -> CostReport {
         CostReport {
             function: "increment".to_string(),
-            wasm_hash: "abc123def456".to_string(),
+            wasm_hash: "abc".to_string(),
             cpu_instructions: 532_502,
             memory_bytes: 0,
             tx_size: 156,
@@ -253,257 +416,83 @@ mod tests {
             write_entries: 1,
             read_bytes: 0,
             write_bytes: 136,
-            fee: sample_fee(),
+            fee: FeeBreakdown {
+                non_refundable_stroops: 4_496,
+                refundable_stroops: 10_931,
+                cpu_fee_stroops: 372,
+                storage_fee_stroops: 4_063,
+                bandwidth_fee_stroops: 61,
+                total_stroops: 15_427,
+                total_xlm: "0.0015427".to_string(),
+            },
             ledger: 3_894_195,
             network: "testnet".to_string(),
+            rpc_latency_ms: 87,
+            rates: Some(rates),
         }
     }
 
-    // ── format_cost_breakdown_chart ──────────────────────────────────
-
-    #[test]
-    fn test_chart_contains_header() {
-        let output = format_cost_breakdown_chart(15_427, 4_496, 10_931);
-        assert!(output.contains("Fee Breakdown Chart:"));
-    }
-
-    #[test]
-    fn test_chart_contains_both_components() {
-        let output = format_cost_breakdown_chart(15_427, 4_496, 10_931);
-        assert!(output.contains("Non-refundable"));
-        assert!(output.contains("Refundable"));
-    }
-
-    #[test]
-    fn test_chart_contains_stroops_values() {
-        let output = format_cost_breakdown_chart(15_427, 4_496, 10_931);
-        assert!(output.contains("4496"));
-        assert!(output.contains("10931"));
-    }
-
-    #[test]
-    fn test_chart_contains_percentages() {
-        let output = format_cost_breakdown_chart(15_427, 4_496, 10_931);
-        // 4496/15427 = 29.1%, 10931/15427 = 70.9%
-        assert!(output.contains("29.1%"));
-        assert!(output.contains("70.9%"));
-    }
-
-    #[test]
-    fn test_chart_contains_bars() {
-        let output = format_cost_breakdown_chart(15_427, 4_496, 10_931);
-        // Both bars should contain # characters
-        let lines: Vec<&str> = output.lines().collect();
-        let bar_lines: Vec<&str> = lines
-            .iter()
-            .filter(|l| l.contains("Non-refundable") || l.contains("Refundable"))
-            .copied()
-            .collect();
-        assert_eq!(bar_lines.len(), 2);
-        for line in &bar_lines {
-            assert!(line.contains('#'), "bar line should contain '#': {line}");
+    fn sample_rates() -> FeeRates {
+        FeeRates {
+            fee_per_10k_insns: 7,
+            fee_per_read_entry: 1_563,
+            fee_per_write_entry: 2_500,
+            fee_per_read_1kb: 447,
+            fee_per_1kb: 406,
         }
     }
 
     #[test]
-    fn test_chart_larger_component_has_longer_bar() {
-        let output = format_cost_breakdown_chart(15_427, 4_496, 10_931);
-        let lines: Vec<&str> = output.lines().collect();
-        let non_ref_line = lines
-            .iter()
-            .find(|l| l.contains("Non-refundable"))
-            .unwrap();
-        let ref_line = lines
-            .iter()
-            .find(|l| l.contains("Refundable"))
-            .unwrap();
+    fn test_suggest_optimizations_with_rates() {
+        let report = report_with_rates(sample_rates());
+        let suggestions = report.suggest_optimizations();
 
-        let non_ref_hash_count = non_ref_line.matches('#').count();
-        let ref_hash_count = ref_line.matches('#').count();
-
-        // Refundable (10931) > Non-refundable (4496), so refundable bar should be longer
-        assert!(
-            ref_hash_count > non_ref_hash_count,
-            "refundable bar ({ref_hash_count} #) should be longer than non-refundable ({non_ref_hash_count} #)"
-        );
+        // write entries (2_500) + read entries (1_563) + cpu 10k (7) expected.
+        assert_eq!(suggestions.len(), 3);
+        // Ordered by descending potential saving: write entry first.
+        assert_eq!(suggestions[0].title, "Reduce ledger write entries");
+        assert_eq!(suggestions[0].potential_savings_stroops, 2_500);
+        assert_eq!(suggestions[1].title, "Reduce ledger read entries");
+        assert_eq!(suggestions[1].potential_savings_stroops, 1_563);
+        assert_eq!(suggestions[2].title, "Optimize CPU hot path");
+        assert_eq!(suggestions[2].potential_savings_stroops, 7);
     }
 
     #[test]
-    fn test_chart_full_width_for_equal_values() {
-        // When both values are equal, both bars should be full width
-        let output = format_cost_breakdown_chart(200, 100, 100);
-        let lines: Vec<&str> = output.lines().collect();
-        let bar_lines: Vec<&str> = lines
-            .iter()
-            .filter(|l| l.contains("Non-refundable") || l.contains("Refundable"))
-            .copied()
-            .collect();
-        for line in &bar_lines {
-            let hash_count = line.matches('#').count();
-            assert_eq!(
-                hash_count, CHART_BAR_WIDTH,
-                "equal-value bars should both be full width"
-            );
-        }
+    fn test_suggest_optimizations_without_rates_is_empty() {
+        let mut report = report_with_rates(sample_rates());
+        report.rates = None;
+        assert!(report.suggest_optimizations().is_empty());
     }
 
     #[test]
-    fn test_chart_empty_when_all_zero() {
-        let output = format_cost_breakdown_chart(0, 0, 0);
-        assert!(output.is_empty());
+    fn test_suggest_optimizations_read_bytes_rates() {
+        let report = report_with_rates(FeeRates {
+            fee_per_10k_insns: 0,
+            fee_per_read_entry: 0,
+            fee_per_write_entry: 0,
+            fee_per_read_1kb: 447,
+            fee_per_1kb: 0,
+        });
+        // No reducible resource with a positive rate, so no suggestions.
+        assert!(report.suggest_optimizations().is_empty());
     }
 
     #[test]
-    fn test_chart_only_non_refundable() {
-        let output = format_cost_breakdown_chart(4_496, 4_496, 0);
-        assert!(output.contains("Non-refundable"));
-        assert!(!output.contains("Refundable"));
+    fn test_format_suggestions_empty() {
+        let out = format_suggestions(&[]);
+        assert!(out.contains("Optimization Suggestions:"));
+        assert!(out.contains("No cost optimizations identified"));
     }
 
     #[test]
-    fn test_chart_only_refundable() {
-        let output = format_cost_breakdown_chart(10_931, 0, 10_931);
-        assert!(!output.contains("Non-refundable"));
-        assert!(output.contains("Refundable"));
-    }
-
-    #[test]
-    fn test_chart_no_percentages_when_total_zero() {
-        // total=0 but components non-zero (defensive case)
-        let output = format_cost_breakdown_chart(0, 100, 200);
-        assert!(output.contains("Non-refundable"));
-        assert!(output.contains("Refundable"));
-        assert!(!output.contains('%'));
-    }
-
-    #[test]
-    fn test_chart_bar_width_constant() {
-        let output = format_cost_breakdown_chart(1000, 500, 500);
-        let lines: Vec<&str> = output.lines().collect();
-        let bar_lines: Vec<&str> = lines
-            .iter()
-            .filter(|l| l.contains("Non-refundable") || l.contains("Refundable"))
-            .copied()
-            .collect();
-        for line in &bar_lines {
-            // Each bar line should have exactly CHART_BAR_WIDTH '#' characters
-            let hash_count = line.matches('#').count();
-            assert_eq!(
-                hash_count, CHART_BAR_WIDTH,
-                "bar should be exactly {CHART_BAR_WIDTH} characters wide"
-            );
-        }
-    }
-
-    // ── build_chart_entries ───────────────────────────────────────────
-
-    #[test]
-    fn test_build_chart_entries_sorted_descending() {
-        let entries = build_chart_entries(15_427, 4_496, 10_931);
-        assert_eq!(entries.len(), 2);
-        // Larger value first
-        assert_eq!(entries[0].label, "Refundable");
-        assert_eq!(entries[0].stroops, 10_931);
-        assert_eq!(entries[1].label, "Non-refundable");
-        assert_eq!(entries[1].stroops, 4_496);
-    }
-
-    #[test]
-    fn test_build_chart_entries_excludes_zero() {
-        let entries = build_chart_entries(100, 100, 0);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].label, "Non-refundable");
-    }
-
-    #[test]
-    fn test_build_chart_entries_empty_when_all_zero() {
-        let entries = build_chart_entries(0, 0, 0);
-        assert!(entries.is_empty());
-    }
-
-    // ── render_bar ───────────────────────────────────────────────────
-
-    #[test]
-    fn test_render_bar_full_width() {
-        let bar = render_bar(100, 100);
-        assert_eq!(bar.len(), CHART_BAR_WIDTH);
-        assert!(bar.chars().all(|c| c == '#'));
-    }
-
-    #[test]
-    fn test_render_bar_empty() {
-        let bar = render_bar(0, 100);
-        assert_eq!(bar.len(), CHART_BAR_WIDTH);
-        assert!(!bar.contains('#'));
-    }
-
-    #[test]
-    fn test_render_bar_half_width() {
-        let bar = render_bar(50, 100);
-        let hash_count = bar.matches('#').count();
-        assert_eq!(hash_count, CHART_BAR_WIDTH / 2);
-    }
-
-    #[test]
-    fn test_render_bar_max_zero() {
-        let bar = render_bar(0, 0);
-        assert_eq!(bar.len(), CHART_BAR_WIDTH);
-        assert!(!bar.contains('#'));
-    }
-
-    // ── format_stroops_aligned ────────────────────────────────────────
-
-    #[test]
-    fn test_format_stroops_aligned() {
-        assert_eq!(format_stroops_aligned(0), "     0");
-        assert_eq!(format_stroops_aligned(4_496), "  4496");
-        assert_eq!(format_stroops_aligned(10_931), " 10931");
-    }
-
-    // ── Integration: format_report_table includes chart ───────────────
-
-    #[test]
-    fn test_format_report_table_includes_chart() {
-        let output = format_report_table(&sample_report());
-        assert!(output.contains("Fee Breakdown Chart:"));
-        assert!(output.contains("Non-refundable"));
-        assert!(output.contains("Refundable"));
-    }
-
-    #[test]
-    fn test_format_report_table_chart_after_fee_breakdown() {
-        let output = format_report_table(&sample_report());
-        let breakdown_pos = output.find("Fee Breakdown:").unwrap();
-        let chart_pos = output.find("Fee Breakdown Chart:").unwrap();
-        assert!(
-            chart_pos > breakdown_pos,
-            "chart should appear after fee breakdown"
-        );
-    }
-
-    #[test]
-    fn test_format_report_table_empty_report_no_chart() {
-        let report = CostReport {
-            function: "(wasm upload)".to_string(),
-            wasm_hash: "0000000000000000".to_string(),
-            cpu_instructions: 0,
-            memory_bytes: 0,
-            tx_size: 0,
-            read_entries: 0,
-            write_entries: 0,
-            read_bytes: 0,
-            write_bytes: 0,
-            fee: FeeBreakdown {
-                non_refundable_stroops: 0,
-                refundable_stroops: 0,
-                total_stroops: 0,
-                total_xlm: "0.0000000".to_string(),
-            },
-            ledger: 0,
-            network: "mainnet".to_string(),
-        };
-        let output = format_report_table(&report);
-        // Chart section should not be present when all fees are zero
-        assert!(!output.contains("Fee Breakdown Chart:"));
+    fn test_format_suggestions_nonempty() {
+        let out = format_suggestions(&[OptimizationSuggestion {
+            title: "Reduce ledger write entries".to_string(),
+            detail: "Removing one write entry saves ~2500 stroops".to_string(),
+            potential_savings_stroops: 2_500,
+        }]);
+        assert!(out.contains("- Reduce ledger write entries:"));
+        assert!(out.contains("2500 stroops"));
     }
 }

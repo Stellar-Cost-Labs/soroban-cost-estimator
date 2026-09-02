@@ -1,11 +1,13 @@
 ---
 source: tests/report_snapshots.rs
+assertion_line: 91
 expression: MarkdownFormatter.format(&report)
 ---
 ## Cost Report: `increment`
 
 - **Network:** testnet (ledger 3894195)
 - **WASM hash:** `abc123def456`
+- **RPC round-trip:** 87 ms
 
 ### Resources
 
@@ -21,8 +23,15 @@ expression: MarkdownFormatter.format(&report)
 
 ### Fee Breakdown
 
-| Component | Stroops |
-| --- | --- |
-| Non-refundable | 4496 |
-| Refundable | 10931 |
-| **Total** | **15427** (0.0015427) |
+| Component | Stroops | % of Total |
+| --- | --- | --- |
+| Non-refundable | 4496 | 29.1% |
+| Refundable | 10931 | 70.9% |
+| CPU | 372 | 2.4% |
+| Storage | 4063 | 26.3% |
+| Bandwidth | 61 | 0.4% |
+| **Total** | **15427** (0.0015427) | **100.0%** |
+
+### Optimization Suggestions
+
+No cost optimizations identified (fee rates unavailable or no reducible resources).
