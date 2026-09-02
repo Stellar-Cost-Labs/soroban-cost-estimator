@@ -139,7 +139,7 @@ fn test_estimate_all_help() {
         code, 0,
         "estimate-all --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--wasm", "--network", "--id", "--json"] {
+    for flag in ["--wasm", "--network", "--id", "--json", "--format"] {
         assert!(
             stdout.contains(flag),
             "estimate-all help should mention {flag}; got: {stdout}"
@@ -419,6 +419,49 @@ fn test_help_lists_global_flags() {
     assert!(
         stdout.contains("--rps"),
         "help should list --rps; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_estimate_all_format_flag_accepted() {
+    // Verify --format is a recognized argument for estimate-all.
+    let (_, stderr, code) = run_cli(&["estimate-all", "--wasm", "test.wasm", "--format", "csv"]);
+    // Should fail because the file doesn't exist, NOT because --format is unknown.
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--format should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_all_format_wins_over_json() {
+    // --format should take precedence over the legacy --json flag.
+    // Both flags are accepted; the combination fails only because
+    // test.wasm doesn't exist, NOT because of an argument conflict.
+    let (_, stderr, code) = run_cli(&[
+        "estimate-all",
+        "--wasm",
+        "test.wasm",
+        "--format",
+        "csv",
+        "--json",
+    ]);
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("cannot") && !stderr.contains("conflicts"),
+        "--format and --json should NOT conflict; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_all_format_invalid_value_rejected() {
+    // clap's value_parser must reject unknown formats before the command runs.
+    let (_, stderr, code) = run_cli(&["estimate-all", "--wasm", "test.wasm", "--format", "xml"]);
+    assert_ne!(code, 0, "invalid --format value should error");
+    assert!(
+        stderr.contains("invalid value") || stderr.contains("possible values"),
+        "clap should reject unknown format; stderr: {stderr}"
     );
 }
 
