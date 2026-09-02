@@ -161,6 +161,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 &format,
                 rps,
                 timeout,
+                repeat,
             )
             .await
         }
@@ -379,6 +380,7 @@ async fn cmd_estimate(
     format: &str,
     rps: Option<u64>,
     timeout: u64,
+    repeat: u64,
 ) -> error::AppResult<()> {
     let json_flag = format == "json";
     let table_mode = format == "table";
@@ -393,6 +395,8 @@ async fn cmd_estimate(
         has_contract_id = contract_id.is_some(),
     );
     async {
+        let runs = repeat.max(1);
+
         info!("loading WASM");
         let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
         debug!(functions = wasm_info.functions.len(), has_spec = wasm_info.has_spec, "WASM loaded");
@@ -409,15 +413,18 @@ async fn cmd_estimate(
         }
 
         // With --cache-ttl, reuse a still-fresh cached estimate and skip the
-        // (expensive) simulation entirely.
-        let ttl_secs = cache_ttl.map(parse_interval_secs);
-        if let Some(fresh) =
-            fresh_cached_estimate(&wasm_hash, &function_name, args, ttl_secs)?
-        {
-            let ttl_secs = ttl_secs.unwrap_or_default();
-            info!(ttl_secs, function = %function_name, "cache hit — reusing fresh estimate");
-            print_cached_estimate(&fresh, ttl_secs, json_flag);
-            return Ok(());
+        // (expensive) simulation entirely. Only meaningful for a single run —
+        // a benchmark must always re-simulate.
+        if runs == 1 {
+            let ttl_secs = cache_ttl.map(parse_interval_secs);
+            if let Some(fresh) =
+                fresh_cached_estimate(&wasm_hash, &function_name, args, ttl_secs)?
+            {
+                let ttl_secs = ttl_secs.unwrap_or_default();
+                info!(ttl_secs, function = %function_name, "cache hit — reusing fresh estimate");
+                print_cached_estimate(&fresh, ttl_secs, json_flag);
+                return Ok(());
+            }
         }
 
         let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
@@ -442,75 +449,57 @@ async fn cmd_estimate(
         let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
         debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
 
-        // Time the simulateTransaction round-trip so the report can flag
-        // slow RPC endpoints. Includes any retries performed by the client.
-        let rpc_start = std::time::Instant::now();
-        let response = rpc::simulate::simulate_transaction(&client, &tx_b64).await?;
-        let rpc_latency_ms = rpc_start.elapsed().as_millis() as u64;
-
-        if missing_simulation_data(&response) {
-            return Err(error::AppError::SimulationFailed(
-                "simulation returned no cost data and no latest ledger — check --id, --fn, and the RPC endpoint".to_string(),
-            ));
-        }
-
-        let (cpu_instructions, memory_bytes, read_entries, write_entries, read_bytes, write_bytes) =
-            response_resources(&response)?;
-
-        let latest_ledger: u32 = response
-            .latest_ledger
-            .and_then(|l| u32::try_from(l).ok())
-            .unwrap_or(0);
-
-        let total_fee_stroops = rpc::simulate::parse_resource_fee(&response.min_resource_fee)
-            .unwrap_or(None)
-            .or(rpc::simulate::parse_transaction_data_resource_fee(
-                &response.transaction_data,
-            )?)
-            .unwrap_or(0);
-
-        debug!(cpu_instructions, memory_bytes, latest_ledger, total_fee_stroops, "simulation complete");
-
+        // Fee rates are the same for every run; fetch once, before the loop.
         let fee_rates = fetch_fee_rates(&client).await;
 
-        let fee = report::fee_calc::compute_fee_breakdown(
-            total_fee_stroops,
-            cpu_instructions,
-            read_entries,
-            write_entries,
-            read_bytes,
-            tx_xdr.len() as u32,
-            fee_rates,
-        );
+        let mut samples: Vec<(u64, i64)> = Vec::with_capacity(runs as usize);
+        let mut reports: Vec<report::cost_report::CostReport> =
+            Vec::with_capacity(runs as usize);
 
-        let report = report::cost_report::CostReport {
-            function: function_name.to_string(),
-            wasm_hash: wasm_hash.clone(),
-            cpu_instructions,
-            memory_bytes,
-            tx_size: tx_xdr.len() as u32,
-            read_entries,
-            write_entries,
-            read_bytes,
-            write_bytes,
-            fee: fee.clone(),
-            ledger: latest_ledger,
-            network: network.to_string(),
-            rpc_latency_ms,
-            rates: Some(fee_rates),
-        };
+        for run in 1..=runs {
+            let report = estimate_once(
+                &client,
+                &tx_b64,
+                tx_xdr.len() as u32,
+                &wasm_hash,
+                &function_name,
+                network,
+                fee_rates,
+            )
+            .await?;
+            samples.push((report.rpc_latency_ms, report.fee.total_stroops));
+            info!(
+                run,
+                total = runs,
+                latency_ms = report.rpc_latency_ms,
+                fee_stroops = report.fee.total_stroops,
+                "benchmark run complete"
+            );
+            reports.push(report);
+        }
 
-        let _ = cache::save_estimate(
-            &wasm_hash,
-            function_name,
-            args,
-            network,
-            latest_ledger,
-            fee.total_stroops,
-            cpu_instructions,
-            memory_bytes,
-        );
-        info!(total_stroops = fee.total_stroops, total_xlm = %fee.total_xlm, "estimate complete");
+        let mut output = reports
+            .pop()
+            .ok_or_else(|| error::AppError::SimulationFailed("no runs completed".to_string()))?;
+
+        // Persist a single-run estimate exactly as before; benchmark runs are
+        // never written to the cache.
+        if runs == 1 {
+            let _ = cache::save_estimate(
+                &wasm_hash,
+                &function_name,
+                args,
+                network,
+                output.ledger,
+                output.fee.total_stroops,
+                output.cpu_instructions,
+                output.memory_bytes,
+            );
+            info!(total_stroops = output.fee.total_stroops, total_xlm = %output.fee.total_xlm, "estimate complete");
+        } else {
+            output.benchmark = Some(report::cost_report::compute_benchmark_summary(&samples));
+            info!(runs, "benchmark complete");
+        }
 
         match formatter_by_name(format) {
             Some(formatter) => println!("{}", formatter.format(&report)),
@@ -521,6 +510,84 @@ async fn cmd_estimate(
     }
     .instrument(span)
     .await
+}
+
+/// Simulate one invocation and build a [`report::cost_report::CostReport`].
+///
+/// Times the `simulateTransaction` round-trip (including any client retries),
+/// extracts the resource usage and the authoritative resource fee, and
+/// computes the fee breakdown from the network's fee rates. Used once per
+/// run by `cmd_estimate`, including the `--repeat N` benchmark loop.
+async fn estimate_once(
+    client: &rpc::client::RpcClient,
+    tx_b64: &str,
+    tx_size: u32,
+    wasm_hash: &str,
+    function_name: &str,
+    network: &str,
+    fee_rates: report::fee_calc::FeeRates,
+) -> error::AppResult<report::cost_report::CostReport> {
+    use tracing::debug;
+
+    // Time the simulateTransaction round-trip so the report can flag
+    // slow RPC endpoints. Includes any retries performed by the client.
+    let rpc_start = std::time::Instant::now();
+    let response = rpc::simulate::simulate_transaction(client, tx_b64).await?;
+    let rpc_latency_ms = rpc_start.elapsed().as_millis() as u64;
+
+    if missing_simulation_data(&response) {
+        return Err(error::AppError::SimulationFailed(
+            "simulation returned no cost data and no latest ledger — check --id, --fn, and the RPC endpoint".to_string(),
+        ));
+    }
+
+    let (cpu_instructions, memory_bytes, read_entries, write_entries, read_bytes, write_bytes) =
+        response_resources(&response)?;
+
+    let latest_ledger: u32 = response
+        .latest_ledger
+        .and_then(|l| u32::try_from(l).ok())
+        .unwrap_or(0);
+
+    let total_fee_stroops = rpc::simulate::parse_resource_fee(&response.min_resource_fee)
+        .unwrap_or(None)
+        .or(rpc::simulate::parse_transaction_data_resource_fee(
+            &response.transaction_data,
+        )?)
+        .unwrap_or(0);
+
+    debug!(
+        cpu_instructions,
+        memory_bytes, latest_ledger, total_fee_stroops, "simulation complete"
+    );
+
+    let fee = report::fee_calc::compute_fee_breakdown(
+        total_fee_stroops,
+        cpu_instructions,
+        read_entries,
+        write_entries,
+        read_bytes,
+        tx_size,
+        fee_rates,
+    );
+
+    Ok(report::cost_report::CostReport {
+        function: function_name.to_string(),
+        wasm_hash: wasm_hash.to_string(),
+        cpu_instructions,
+        memory_bytes,
+        tx_size,
+        read_entries,
+        write_entries,
+        read_bytes,
+        write_bytes,
+        fee,
+        ledger: latest_ledger,
+        network: network.to_string(),
+        rpc_latency_ms,
+        rates: Some(fee_rates),
+        benchmark: None,
+    })
 }
 
 /// `estimate-all` command: enumerate all functions and estimate each.

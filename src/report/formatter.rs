@@ -99,6 +99,12 @@ impl ReportFormatter for TableFormatter {
             &report.suggest_optimizations(),
         ));
 
+        if let Some(benchmark) = &report.benchmark {
+            output.push_str(&crate::report::cost_report::format_benchmark_summary(
+                benchmark,
+            ));
+        }
+
         output
     }
 
@@ -356,6 +362,7 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
             rates: None,
+            benchmark: None,
         }
     }
 
@@ -383,6 +390,7 @@ mod tests {
             network: "mainnet".to_string(),
             rpc_latency_ms: 0,
             rates: None,
+            benchmark: None,
         }
     }
 
@@ -431,6 +439,25 @@ mod tests {
     fn test_table_formatter_name() {
         let formatter = TableFormatter;
         assert_eq!(formatter.name(), "table");
+    }
+
+    #[test]
+    fn test_table_formatter_renders_benchmark_summary_when_present() {
+        let mut report = sample_report();
+        report.benchmark = Some(crate::report::cost_report::compute_benchmark_summary(&[
+            (100, 1_000),
+            (300, 3_000),
+        ]));
+        let output = TableFormatter.format(&report);
+        assert!(output.contains("Benchmark Summary:"));
+        assert!(output.contains("Runs:                    2"));
+        assert!(output.contains("RPC latency (ms):        min 100 | max 300 | avg 200 | p95 300"));
+    }
+
+    #[test]
+    fn test_table_formatter_omits_benchmark_summary_when_absent() {
+        let output = TableFormatter.format(&sample_report());
+        assert!(!output.contains("Benchmark Summary:"));
     }
 
     #[test]

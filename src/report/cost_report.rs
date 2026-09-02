@@ -50,6 +50,129 @@ pub struct CostReport {
     /// serialized output; `None` when the rates were unavailable.
     #[serde(skip)]
     pub rates: Option<FeeRates>,
+    /// Aggregate latency/fee statistics when this report is the representative
+    /// output of an `estimate --repeat N` benchmark. `None` for a single run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub benchmark: Option<BenchmarkSummary>,
+}
+
+/// Aggregate benchmark statistics over multiple runs of one simulation.
+///
+/// Computed from per-run `(rpc_latency_ms, total_fee_stroops)` samples by
+/// `estimate --repeat N` so developers can judge RPC latency and fee
+/// stability when benchmarking a contract invocation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BenchmarkSummary {
+    /// Number of simulation runs the benchmark collected.
+    pub runs: u64,
+    /// Fastest RPC round-trip across runs (ms).
+    pub min_latency_ms: u64,
+    /// Slowest RPC round-trip across runs (ms).
+    pub max_latency_ms: u64,
+    /// Mean RPC round-trip across runs (ms).
+    pub avg_latency_ms: u64,
+    /// 95th-percentile RPC round-trip across runs (ms), nearest-rank.
+    pub p95_latency_ms: u64,
+    /// Lowest total fee across runs (stroops).
+    pub min_fee_stroops: i64,
+    /// Highest total fee across runs (stroops).
+    pub max_fee_stroops: i64,
+    /// Mean total fee across runs (stroops).
+    pub avg_fee_stroops: i64,
+    /// Population variance of the total fee across runs (stroops²).
+    pub fee_variance: f64,
+}
+
+/// Compute a benchmark summary from per-run `(latency_ms, fee_stroops)` samples.
+///
+/// Returns a zeroed summary for an empty sample set (defensive; callers pass
+/// at least one run). Latency percentiles use the nearest-rank method, the
+/// fee variance is the population variance in stroops², and the fee average
+/// uses integer division exactly like `fee_calc::fee_range`.
+///
+/// # Network calls
+/// None — pure computation.
+#[must_use]
+pub fn compute_benchmark_summary(samples: &[(u64, i64)]) -> BenchmarkSummary {
+    let runs = u64::try_from(samples.len()).unwrap_or(u64::MAX);
+    if samples.is_empty() {
+        return BenchmarkSummary {
+            runs: 0,
+            min_latency_ms: 0,
+            max_latency_ms: 0,
+            avg_latency_ms: 0,
+            p95_latency_ms: 0,
+            min_fee_stroops: 0,
+            max_fee_stroops: 0,
+            avg_fee_stroops: 0,
+            fee_variance: 0.0,
+        };
+    }
+
+    let mut latencies: Vec<u64> = samples.iter().map(|(latency, _)| *latency).collect();
+    latencies.sort_unstable();
+    let mut fees: Vec<i64> = samples.iter().map(|(_, fee)| *fee).collect();
+    fees.sort_unstable();
+
+    let latency_sum: u128 = latencies.iter().map(|l| u128::from(*l)).sum();
+    let fee_sum: i128 = fees.iter().map(|f| i128::from(*f)).sum();
+    let count = samples.len();
+
+    // Nearest-rank 95th percentile: the ceiling of 0.95 * N, 1-indexed.
+    let rank = (count as f64 * 0.95).ceil() as usize;
+    let p95_latency_ms = latencies[rank.saturating_sub(1).min(count - 1)];
+
+    let mean_fee = (fee_sum / i128::from(count as u64)) as i64;
+    let mean_fee_f64 = mean_fee as f64;
+    let fee_variance = if count > 1 {
+        let sum_sq: f64 = fees
+            .iter()
+            .map(|f| {
+                let diff = *f as f64 - mean_fee_f64;
+                diff * diff
+            })
+            .sum();
+        sum_sq / count as f64
+    } else {
+        0.0
+    };
+
+    BenchmarkSummary {
+        runs,
+        min_latency_ms: latencies[0],
+        max_latency_ms: latencies[count - 1],
+        avg_latency_ms: (latency_sum / u128::from(count as u64)) as u64,
+        p95_latency_ms,
+        min_fee_stroops: fees[0],
+        max_fee_stroops: fees[count - 1],
+        avg_fee_stroops: mean_fee,
+        fee_variance,
+    }
+}
+
+/// Render a benchmark summary as a human-readable block.
+///
+/// Always emits a header followed by one latency line and one fee line.
+#[must_use]
+pub fn format_benchmark_summary(benchmark: &BenchmarkSummary) -> String {
+    let mut out = String::new();
+    out.push_str("\nBenchmark Summary:\n");
+    out.push_str(&format!("  Runs:                    {}\n", benchmark.runs));
+    out.push_str(&format!(
+        "  RPC latency (ms):        min {} | max {} | avg {} | p95 {}\n",
+        benchmark.min_latency_ms,
+        benchmark.max_latency_ms,
+        benchmark.avg_latency_ms,
+        benchmark.p95_latency_ms,
+    ));
+    out.push_str(&format!(
+        "  Total fee (stroops):     min {} | max {} | avg {} | variance {:.2}\n",
+        benchmark.min_fee_stroops,
+        benchmark.max_fee_stroops,
+        benchmark.avg_fee_stroops,
+        benchmark.fee_variance,
+    ));
+    out
 }
 
 /// A concrete, actionable cost-optimization suggestion derived from a report.
@@ -283,6 +406,7 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
             rates: Some(rates),
+            benchmark: None,
         }
     }
 
@@ -348,5 +472,79 @@ mod tests {
         }]);
         assert!(out.contains("- Reduce ledger write entries:"));
         assert!(out.contains("2500 stroops"));
+    }
+
+    // ── Benchmark summary ─────────────────────────────────────────────
+
+    #[test]
+    fn test_benchmark_summary_computes_latency_stats() {
+        let summary = compute_benchmark_summary(&[
+            (500, 5_000),
+            (100, 1_000),
+            (300, 3_000),
+            (400, 4_000),
+            (200, 2_000),
+        ]);
+
+        assert_eq!(summary.runs, 5);
+        assert_eq!(summary.min_latency_ms, 100);
+        assert_eq!(summary.max_latency_ms, 500);
+        assert_eq!(summary.avg_latency_ms, 300);
+        // nearest-rank: ceil(0.95 * 5) = 5 → the 5th (max) latency.
+        assert_eq!(summary.p95_latency_ms, 500);
+    }
+
+    #[test]
+    fn test_benchmark_summary_computes_fee_stats() {
+        let summary = compute_benchmark_summary(&[
+            (100, 1_000),
+            (200, 2_000),
+            (300, 3_000),
+            (400, 4_000),
+            (500, 5_000),
+        ]);
+
+        assert_eq!(summary.min_fee_stroops, 1_000);
+        assert_eq!(summary.max_fee_stroops, 5_000);
+        assert_eq!(summary.avg_fee_stroops, 3_000);
+        // population variance of [1000..5000] around mean 3000:
+        // (4e6 + 1e6 + 0 + 1e6 + 4e6) / 5 = 2e6.
+        assert!((summary.fee_variance - 2_000_000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_benchmark_summary_p95_nearest_rank() {
+        // 20 samples 1..=20 → 95th percentile is the 19th value.
+        let samples: Vec<(u64, i64)> = (1..=20).map(|i| (i, i as i64)).collect();
+        let summary = compute_benchmark_summary(&samples);
+        assert_eq!(summary.p95_latency_ms, 19);
+
+        // 1 sample → p95 equals the only value.
+        let single = compute_benchmark_summary(&[(77, 42)]);
+        assert_eq!(single.p95_latency_ms, 77);
+        assert!(single.fee_variance.abs() < f64::EPSILON);
+        assert_eq!(single.min_fee_stroops, 42);
+        assert_eq!(single.max_fee_stroops, 42);
+    }
+
+    #[test]
+    fn test_benchmark_summary_empty_is_zeroed() {
+        let summary = compute_benchmark_summary(&[]);
+        assert_eq!(summary.runs, 0);
+        assert_eq!(summary.min_latency_ms, 0);
+        assert_eq!(summary.max_fee_stroops, 0);
+        assert!(summary.fee_variance.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_format_benchmark_summary_renders_lines() {
+        let summary = compute_benchmark_summary(&[(100, 1_000), (300, 3_000)]);
+        let out = format_benchmark_summary(&summary);
+        assert!(out.contains("Benchmark Summary:"));
+        assert!(out.contains("Runs:                    2"));
+        assert!(out.contains("RPC latency (ms):        min 100 | max 300 | avg 200 | p95 300"));
+        assert!(out.contains(
+            "Total fee (stroops):     min 1000 | max 3000 | avg 2000 | variance 1000000.00"
+        ));
     }
 }
