@@ -509,6 +509,8 @@ async fn cmd_estimate(
             fee.total_stroops,
             cpu_instructions,
             memory_bytes,
+            Some(rpc_latency_ms),
+            true,
         );
         info!(total_stroops = fee.total_stroops, total_xlm = %fee.total_xlm, "estimate complete");
 
@@ -715,8 +717,10 @@ async fn estimate_all_function(
         let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
         debug!(tx_xdr_len = tx_xdr.len(), "built tx envelope");
 
+        let sim_start = std::time::Instant::now();
         match rpc::simulate::simulate_transaction(client, &tx_b64).await {
             Ok(resp) => {
+                let duration_ms = Some(sim_start.elapsed().as_millis() as u64);
                 if missing_simulation_data(&resp) {
                     let msg = "simulation returned no cost data and no latest ledger — check --id and the RPC endpoint";
                     debug!(msg, "simulation missing data");
@@ -751,6 +755,8 @@ async fn estimate_all_function(
                     total_fee,
                     cpu,
                     mem,
+                    duration_ms,
+                    true,
                 );
 
                 // Itemize the fee breakdown only when we have the network's fee
