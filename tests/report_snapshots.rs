@@ -18,11 +18,16 @@ fn sample_report() -> CostReport {
         fee: FeeBreakdown {
             non_refundable_stroops: 4_496,
             refundable_stroops: 10_931,
+            cpu_fee_stroops: 372,
+            storage_fee_stroops: 4_063,
+            bandwidth_fee_stroops: 61,
             total_stroops: 15_427,
             total_xlm: "0.0015427".to_string(),
         },
         ledger: 3_894_195,
         network: "testnet".to_string(),
+        rpc_latency_ms: 87,
+        rates: None,
     }
 }
 
@@ -40,11 +45,16 @@ fn empty_report() -> CostReport {
         fee: FeeBreakdown {
             non_refundable_stroops: 0,
             refundable_stroops: 0,
+            cpu_fee_stroops: 0,
+            storage_fee_stroops: 0,
+            bandwidth_fee_stroops: 0,
             total_stroops: 0,
             total_xlm: "0.0000000".to_string(),
         },
         ledger: 0,
         network: "mainnet".to_string(),
+        rpc_latency_ms: 0,
+        rates: None,
     }
 }
 
