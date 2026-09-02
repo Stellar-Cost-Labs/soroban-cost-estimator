@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stellar contract invoke --cost`.
 - End-to-end integration tests in `tests/cli_tests.rs` covering every CLI
   command, its flags, and its offline error paths.
+- CI build matrix running fmt, clippy, build, and tests on Linux, macOS, and
+  Windows for cross-platform compatibility.
 
 ## [0.1.0] - 2026-08-13
 

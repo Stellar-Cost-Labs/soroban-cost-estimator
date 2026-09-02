@@ -62,6 +62,10 @@ pub enum Command {
         /// Path to second `.wasm` file to compare against (estimates both and shows cost delta).
         #[arg(long, value_name = "WASM")]
         diff: Option<String>,
+        /// Output format: table (default), json, csv, or markdown.
+        /// Overrides `--json` when both are supplied.
+        #[arg(long, value_parser = ["table", "json", "csv", "markdown"])]
+        format: Option<String>,
     },
 
     /// Enumerate all public contract functions and estimate each one.
@@ -81,6 +85,11 @@ pub enum Command {
         /// Output as JSON instead of a human-readable list.
         #[arg(long)]
         json: bool,
+
+        /// Output format: table (default), json, csv, or markdown.
+        /// Overrides `--json` when both are supplied.
+        #[arg(long, value_parser = ["table", "json", "csv", "markdown"])]
+        format: Option<String>,
     },
 
     /// Print WASM metadata (functions, contract spec, size, hash) without any RPC calls.
