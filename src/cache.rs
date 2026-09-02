@@ -25,7 +25,7 @@ use crate::error::AppResult;
 /// migrated forward through [`migrate_to_latest`]; entries written by a
 /// *newer* tool (version greater than this) are rejected rather than
 /// silently misread.
-pub const CACHE_SCHEMA_VERSION: u32 = 1;
+pub const CACHE_SCHEMA_VERSION: u32 = 2;
 
 /// Implicit schema version of cache entries written before the `version`
 /// field existed.
@@ -35,6 +35,14 @@ pub const CACHE_SCHEMA_VERSION: u32 = 1;
 /// the first schema version and require no transformation to reach the
 /// current schema.
 pub const INITIAL_SCHEMA_VERSION: u32 = 1;
+
+/// Previous schema version before `duration_ms` and `success` columns.
+pub const PREVIOUS_SCHEMA_VERSION: u32 = 1;
+
+/// serde default for the `success` field — most estimates succeed.
+fn default_true() -> bool {
+    true
+}
 
 /// serde default for the `version` field, applied when an older (or hand
 /// written) entry omits it. Legacy entries predating the version field are
@@ -68,6 +76,12 @@ pub struct CachedEstimate {
     pub memory_bytes: u64,
     /// ISO-8601 timestamp of when the estimate was made.
     pub timestamp: String,
+    /// Simulation wall-clock duration in milliseconds (`None` if unknown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Whether the simulation succeeded.
+    #[serde(default = "default_true")]
+    pub success: bool,
 }
 
 /// Optional filters for [`query_estimates`].
@@ -127,6 +141,8 @@ pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
             cpu_instructions INTEGER NOT NULL,
             memory_bytes     INTEGER NOT NULL,
             timestamp        TEXT NOT NULL,
+            duration_ms      INTEGER,
+            success          INTEGER NOT NULL DEFAULT 1,
             PRIMARY KEY (wasm_hash, function, args_hash)
         );",
     )?;
@@ -181,6 +197,8 @@ fn open_db() -> AppResult<Connection> {
 /// * `total_stroops` - Total resource fee in stroops.
 /// * `cpu_instructions` - CPU instructions consumed.
 /// * `memory_bytes` - Memory bytes consumed.
+/// * `duration_ms` - Wall-clock duration of the simulation in milliseconds.
+/// * `success` - Whether the simulation succeeded.
 ///
 /// # Network calls
 /// None — local SQLite I/O.
@@ -193,14 +211,16 @@ pub fn save_estimate(
     total_stroops: i64,
     cpu_instructions: u64,
     memory_bytes: u64,
+    duration_ms: Option<u64>,
+    success: bool,
 ) -> AppResult<()> {
     let args_hash = hash_args(args);
 
     let conn = open_db()?;
     conn.execute(
         "INSERT INTO estimates \
-         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, duration_ms, success) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
          ON CONFLICT(wasm_hash, function, args_hash) DO UPDATE SET \
             version = excluded.version, \
             network = excluded.network, \
@@ -208,7 +228,9 @@ pub fn save_estimate(
             total_stroops = excluded.total_stroops, \
             cpu_instructions = excluded.cpu_instructions, \
             memory_bytes = excluded.memory_bytes, \
-            timestamp = excluded.timestamp",
+            timestamp = excluded.timestamp, \
+            duration_ms = excluded.duration_ms, \
+            success = excluded.success",
         rusqlite::params![
             CACHE_SCHEMA_VERSION as i64,
             wasm_hash,
@@ -220,6 +242,8 @@ pub fn save_estimate(
             cpu_instructions as i64,
             memory_bytes as i64,
             chrono::Utc::now().to_rfc3339(),
+            duration_ms.map(|v| v as i64),
+            success as i64,
         ],
     )?;
 
@@ -240,6 +264,8 @@ fn estimate_from_row(row: &rusqlite::Row<'_>) -> Result<CachedEstimate, rusqlite
         cpu_instructions: row.get::<_, i64>(7)? as u64,
         memory_bytes: row.get::<_, i64>(8)? as u64,
         timestamp: row.get(9)?,
+        duration_ms: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
+        success: row.get::<_, i64>(11)? != 0,
     })
 }
 
@@ -264,8 +290,13 @@ pub fn migrate_to_latest(cached: CachedEstimate) -> AppResult<CachedEstimate> {
         v if v > CACHE_SCHEMA_VERSION => Err(AppError::General(format!(
             "cache entry schema v{v} is newer than supported v{CACHE_SCHEMA_VERSION}"
         ))),
-        // Nothing below the current schema exists yet; future schema changes
-        // add per-step migrations here, e.g. v1 -> v2.
+        // v1 entries lack duration_ms and success columns; supply defaults.
+        PREVIOUS_SCHEMA_VERSION => {
+            migrated.duration_ms = None;
+            migrated.success = true;
+            migrated.version = CACHE_SCHEMA_VERSION;
+            Ok(migrated)
+        }
         v if v < CACHE_SCHEMA_VERSION => {
             migrated.version = CACHE_SCHEMA_VERSION;
             Ok(migrated)
@@ -295,7 +326,7 @@ pub fn load_estimate(
     let conn = open_db()?;
     let mut stmt = conn.prepare(
         "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-         cpu_instructions, memory_bytes, timestamp \
+         cpu_instructions, memory_bytes, timestamp, duration_ms, success \
          FROM estimates WHERE wasm_hash = ?1 AND function = ?2 AND args_hash = ?3",
     )?;
 
@@ -368,7 +399,7 @@ pub fn list_cached_estimates(network: &str) -> AppResult<Vec<CachedEstimate>> {
     let conn = open_db()?;
     let mut stmt = conn.prepare(
         "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-         cpu_instructions, memory_bytes, timestamp \
+         cpu_instructions, memory_bytes, timestamp, duration_ms, success \
          FROM estimates WHERE network = ?1 ORDER BY timestamp DESC",
     )?;
 
@@ -524,6 +555,8 @@ pub fn verify_cache() -> AppResult<Vec<CacheEntryStatus>> {
             cpu_instructions: 0,
             memory_bytes: 0,
             timestamp: String::new(),
+            duration_ms: None,
+            success: true,
         };
         let valid = migrate_to_latest(cached).is_ok();
 
