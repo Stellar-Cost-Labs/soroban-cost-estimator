@@ -76,6 +76,9 @@ hex = "0.4.3"
 # Hashing
 sha2 = "0.11.0"
 
+# SQLite-backed estimate cache
+rusqlite = { version = "0.37", features = ["bundled"] }
+
 # Timestamps
 chrono = { version = "0.4.45", features = ["serde"] }
 
@@ -88,11 +91,13 @@ thiserror = "2.0.19"
 # Structured tracing / logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+governor = "0.10.4"
 
 [dev-dependencies]
 insta = "1.40.0"
 proptest = "1.11.0"
 criterion = "0.5"
+rusqlite = { version = "0.37", features = ["bundled"] }
 
 [profile.release]
 lto = true

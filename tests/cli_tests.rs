@@ -14,8 +14,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde_json::json;
 use sha2::Digest;
+use soroban_cost_estimator::cache;
 
 /// An RPC URL that is guaranteed not to answer: port 1 on loopback.
 /// Used to drive the network error path without leaving the machine.
@@ -33,7 +33,7 @@ fn run_cli_in_home(args: &[&str], home: Option<&Path>) -> (String, String, i32) 
     cmd.args(args);
     if let Some(home) = home {
         cmd.env("HOME", home);
-        // `dirs::home_dir()` reads USERPROFILE on Windows.
+        // The CLI prefers USERPROFILE on Windows when resolving its data dir.
         cmd.env("USERPROFILE", home);
     }
 
@@ -139,7 +139,7 @@ fn test_estimate_all_help() {
         code, 0,
         "estimate-all --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--wasm", "--network", "--id", "--json"] {
+    for flag in ["--wasm", "--network", "--id", "--json", "--format"] {
         assert!(
             stdout.contains(flag),
             "estimate-all help should mention {flag}; got: {stdout}"
@@ -180,7 +180,7 @@ fn test_config_diff_help() {
         code, 0,
         "config diff --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--network", "--against"] {
+    for flag in ["--network", "--against", "--summary"] {
         assert!(
             stdout.contains(flag),
             "diff help should mention {flag}; got: {stdout}"
@@ -216,6 +216,7 @@ fn test_cache_help() {
     let (stdout, stderr, code) = run_cli(&["cache", "--help"]);
     assert_eq!(code, 0, "cache --help should exit 0; stderr: {stderr}");
     assert!(stdout.contains("verify"), "cache help should list verify");
+    assert!(stdout.contains("query"), "cache help should list query");
 }
 
 #[test]
@@ -236,6 +237,7 @@ fn test_cache_verify_empty_cache_succeeds() {
     let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
         .args(["cache", "verify"])
         .env("HOME", &tmp)
+        .env("USERPROFILE", &tmp)
         .output()
         .expect("failed to run CLI");
 
@@ -313,6 +315,53 @@ fn test_json_flag_accepted() {
 }
 
 #[test]
+fn test_format_flag_accepted() {
+    // Verify --format is a recognized argument for estimate, including the
+    // new markdown variant (#80).
+    for fmt in ["table", "json", "csv", "markdown"] {
+        let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--format", fmt]);
+        // Should fail because the file doesn't exist, NOT because --format is
+        // unknown or the value is invalid.
+        assert_ne!(code, 0, "should error on missing file for {fmt}");
+        assert!(
+            !stderr.contains("unrecognized") && !stderr.contains("invalid value"),
+            "--format {fmt} should be a recognized argument; stderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_format_invalid_value_rejected() {
+    // clap's value_parser must reject unknown formats before the command runs.
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--format", "xml"]);
+    assert_ne!(code, 0, "invalid --format value should error");
+    assert!(
+        stderr.contains("invalid value") || stderr.contains("possible values"),
+        "clap should reject unknown format; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_format_markdown_with_json_flag_accepted() {
+    // --format wins over the legacy --json flag; the combination must be
+    // accepted as valid arguments (failure here is a missing file, not an
+    // argument conflict).
+    let (_, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "test.wasm",
+        "--json",
+        "--format",
+        "markdown",
+    ]);
+    assert_ne!(code, 0, "should error on missing file");
+    assert!(
+        !stderr.contains("unrecognized") && !stderr.contains("cannot be used"),
+        "--json + --format markdown should be accepted; stderr: {stderr}"
+    );
+}
+
+#[test]
 fn test_short_wasm_flag_accepted() {
     // `-w` is the short form of `--wasm` on both estimate and estimate-all.
     let (_, stderr, code) = run_cli(&["estimate", "-w", "does-not-exist.wasm"]);
@@ -332,6 +381,87 @@ fn test_estimate_cache_ttl_flag_accepted() {
     assert!(
         !stderr.contains("unexpected argument"),
         "--cache-ttl should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_timeout_flag_accepted() {
+    // Verify --timeout is a recognized global argument for estimate.
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--timeout", "10"]);
+    // Should fail because the file doesn't exist, NOT because --timeout is unknown.
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--timeout should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_timeout_flag_accepted_before_subcommand() {
+    // Global flags must also be accepted before the subcommand.
+    let (_, stderr, code) = run_cli(&["--timeout", "10", "estimate", "--wasm", "test.wasm"]);
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--timeout before the subcommand should be recognized; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_help_lists_global_flags() {
+    // Global flags (--rps, --timeout) must appear in subcommand help.
+    let (stdout, stderr, code) = run_cli(&["estimate", "--help"]);
+    assert_eq!(code, 0, "estimate --help should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("--timeout"),
+        "help should list --timeout; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("--rps"),
+        "help should list --rps; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_estimate_all_format_flag_accepted() {
+    // Verify --format is a recognized argument for estimate-all.
+    let (_, stderr, code) = run_cli(&["estimate-all", "--wasm", "test.wasm", "--format", "csv"]);
+    // Should fail because the file doesn't exist, NOT because --format is unknown.
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--format should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_all_format_wins_over_json() {
+    // --format should take precedence over the legacy --json flag.
+    // Both flags are accepted; the combination fails only because
+    // test.wasm doesn't exist, NOT because of an argument conflict.
+    let (_, stderr, code) = run_cli(&[
+        "estimate-all",
+        "--wasm",
+        "test.wasm",
+        "--format",
+        "csv",
+        "--json",
+    ]);
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("cannot") && !stderr.contains("conflicts"),
+        "--format and --json should NOT conflict; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_all_format_invalid_value_rejected() {
+    // clap's value_parser must reject unknown formats before the command runs.
+    let (_, stderr, code) = run_cli(&["estimate-all", "--wasm", "test.wasm", "--format", "xml"]);
+    assert_ne!(code, 0, "invalid --format value should error");
+    assert!(
+        stderr.contains("invalid value") || stderr.contains("possible values"),
+        "clap should reject unknown format; stderr: {stderr}"
     );
 }
 
@@ -365,7 +495,7 @@ fn test_estimate_invalid_wasm_file() {
     let (_, stderr, code) = run_cli(&["estimate", "--wasm", bogus.to_str().unwrap()]);
     assert_eq!(code, 1, "invalid WASM should exit 1");
     assert!(
-        stderr.contains("WASM validation error"),
+        stderr.contains("failed to validate WASM"),
         "invalid bytes should fail validation; got: {stderr}"
     );
 }
@@ -381,7 +511,9 @@ fn test_estimate_unknown_network() {
     ]);
     assert_eq!(code, 1, "an unknown network should exit 1");
     assert!(
-        stderr.contains("RPC endpoint not configured for network: not-a-network"),
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
         "the error should name the unknown network; got: {stderr}"
     );
 }
@@ -477,28 +609,39 @@ fn test_estimate_rpc_url_overrides_unknown_network() {
 ///
 /// Mirrors the library's cache-key computation: `wasm_hash` is the SHA-256 of
 /// the WASM bytes and `args_hash` is the SHA-256 of the concatenated args
-/// (empty for no args).
+/// (empty for no args). The entry is written directly into the SQLite cache
+/// database so the `estimate` command's cache-hit path can find it.
 fn seed_cache_entry(home: &Path, timestamp: &str) {
     let wasm_bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
     let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_bytes));
     let args_hash = hex::encode(sha2::Sha256::digest(b""));
 
-    let cache_dir = home.join(".soroban-cost-estimator").join("cache");
-    std::fs::create_dir_all(&cache_dir).expect("create cache dir");
-    let path = cache_dir.join(format!("{wasm_hash}-(wasm upload)-{args_hash}.json"));
+    let dir = home.join(".soroban-cost-estimator");
+    std::fs::create_dir_all(&dir).expect("create data dir");
+    let db = dir.join("cache.db");
+    let conn = rusqlite::Connection::open(&db).expect("open cache db");
+    // Ensure the schema exists in this exact database before writing rows
+    // directly (the CLI reads the same path, so they must match).
+    cache::ensure_cache_schema(&conn).expect("ensure cache schema");
 
-    let entry = json!({
-        "wasm_hash": wasm_hash,
-        "function": "(wasm upload)",
-        "args_hash": args_hash,
-        "network": "testnet",
-        "ledger": 42,
-        "total_stroops": 1_000,
-        "cpu_instructions": 500,
-        "memory_bytes": 250,
-        "timestamp": timestamp,
-    });
-    std::fs::write(path, entry.to_string()).expect("write cache entry");
+    conn.execute(
+        "INSERT OR REPLACE INTO estimates \
+         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            1i64,
+            wasm_hash,
+            "(wasm upload)",
+            args_hash,
+            "testnet",
+            42i64,
+            1_000i64,
+            500i64,
+            250i64,
+            timestamp,
+        ],
+    )
+    .expect("seed cache entry");
 }
 
 #[test]
@@ -625,7 +768,7 @@ fn test_estimate_all_invalid_wasm_file() {
     let (_, stderr, code) = run_cli(&["estimate-all", "--wasm", bogus.to_str().unwrap()]);
     assert_eq!(code, 1, "invalid WASM should exit 1");
     assert!(
-        stderr.contains("WASM validation error"),
+        stderr.contains("failed to validate WASM"),
         "invalid bytes should fail validation; got: {stderr}"
     );
 }
@@ -641,7 +784,9 @@ fn test_estimate_all_unknown_network() {
     ]);
     assert_eq!(code, 1, "an unknown network should exit 1");
     assert!(
-        stderr.contains("RPC endpoint not configured for network: not-a-network"),
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
         "the error should name the unknown network; got: {stderr}"
     );
 }
@@ -655,7 +800,9 @@ fn test_config_snapshot_unknown_network() {
     let (_, stderr, code) = run_cli(&["config", "snapshot", "--network", "not-a-network"]);
     assert_eq!(code, 1, "an unknown network should exit 1");
     assert!(
-        stderr.contains("RPC endpoint not configured for network: not-a-network"),
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
         "the error should name the unknown network; got: {stderr}"
     );
 }
@@ -673,7 +820,7 @@ fn test_config_diff_without_snapshots_errors() {
         run_cli_in_home(&["config", "diff", "--network", "testnet"], Some(&home));
     assert_eq!(code, 1, "diffing with no snapshots should exit 1");
     assert!(
-        stderr.contains("No snapshots available for network: testnet"),
+        stderr.contains("none available for network testnet"),
         "the error should name the network with no snapshots; got: {stderr}"
     );
 }
@@ -687,7 +834,7 @@ fn test_config_diff_against_missing_file_errors() {
     );
     assert_eq!(code, 1, "a missing --against file should exit 1");
     assert!(
-        stderr.contains("I/O error"),
+        stderr.contains("Error: failed to perform I/O"),
         "a missing snapshot file should surface as an I/O error; got: {stderr}"
     );
 }
@@ -704,7 +851,7 @@ fn test_config_diff_against_malformed_snapshot_errors() {
     );
     assert_eq!(code, 1, "a malformed snapshot should exit 1");
     assert!(
-        stderr.contains("Snapshot parse error"),
+        stderr.contains("Error: failed to parse snapshot"),
         "a malformed snapshot should surface as a parse error; got: {stderr}"
     );
 }
@@ -743,7 +890,7 @@ fn test_cache_warm_nonexistent_wasm_file() {
         "a missing WASM file should exit 1; stderr: {stderr}"
     );
     assert!(
-        stderr.contains("File not found") || stderr.contains("I/O error"),
+        stderr.contains("File not found") || stderr.contains("Error: failed to perform I/O"),
         "stderr: {stderr}"
     );
 }
@@ -756,7 +903,10 @@ fn test_cache_warm_invalid_wasm_file() {
 
     let (_, stderr, code) = run_cli(&["cache", "warm", "--wasm", bogus.to_str().unwrap()]);
     assert_eq!(code, 1, "invalid WASM should exit 1");
-    assert!(stderr.contains("WASM validation error"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("failed to validate WASM"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
@@ -771,7 +921,9 @@ fn test_cache_warm_unknown_network() {
     ]);
     assert_eq!(code, 1, "an unknown network should exit 1");
     assert!(
-        stderr.contains("RPC endpoint not configured for network: not-a-network"),
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
         "stderr: {stderr}"
     );
 }
@@ -779,6 +931,39 @@ fn test_cache_warm_unknown_network() {
 // ─────────────────────────────────────────────────────────────────────────
 // `config diff`
 // ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_config_diff_summary_flag_accepted() {
+    // `--summary` on config diff must be a recognized flag (the run still
+    // fails, but on the unknown network, not on the argument itself).
+    let home = temp_home("diff-summary-flag");
+    let path = home.join("snapshot.json");
+    std::fs::write(&path, snapshot_json("not-a-network", 1000)).expect("write fixture");
+
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against",
+            path.to_str().unwrap(),
+            "--summary",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "the unknown network should exit 1");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--summary should be a recognized argument; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
+        "the failure should come from the network, not the flag; got: {stderr}"
+    );
+}
 
 #[test]
 fn test_config_diff_loads_valid_snapshot_before_network() {
@@ -802,11 +987,13 @@ fn test_config_diff_loads_valid_snapshot_before_network() {
     );
     assert_eq!(code, 1, "the unknown network should exit 1");
     assert!(
-        stderr.contains("RPC endpoint not configured for network: not-a-network"),
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
         "the snapshot should load cleanly and the network should be the failure; got: {stderr}"
     );
     assert!(
-        !stderr.contains("Snapshot parse error"),
+        !stderr.contains("Error: failed to parse snapshot"),
         "a valid snapshot must not be reported as malformed; got: {stderr}"
     );
 }
@@ -846,6 +1033,102 @@ fn test_watch_unknown_network_is_non_fatal() {
     );
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// `wasm-info` — contractmeta display
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Encodes one `ScMetaEntry::ScMetaV0` union value (XDR): 4-byte
+/// discriminant 0, then `{ key, val }` as length-prefixed strings, each
+/// padded to a 4-byte boundary (XDR string padding).
+fn xdr_meta_entry(key: &str, val: &str) -> Vec<u8> {
+    let mut out = 0u32.to_be_bytes().to_vec();
+    for s in [key, val] {
+        out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+        out.extend_from_slice(s.as_bytes());
+        let padding = (4 - s.len() % 4) % 4;
+        out.extend_from_slice(&[0u8; 4][..padding]);
+    }
+    out
+}
+
+/// Wraps `payload` in a WASM custom section (id 0) named `name`.
+fn custom_section(name: &str, payload: &[u8]) -> Vec<u8> {
+    let mut content = Vec::new();
+    content.push(name.len() as u8);
+    content.extend_from_slice(name.as_bytes());
+    content.extend_from_slice(payload);
+
+    let mut section = vec![0u8];
+    let mut size = content.len() as u32;
+    loop {
+        let mut byte = (size & 0x7f) as u8;
+        size >>= 7;
+        if size != 0 {
+            byte |= 0x80;
+        }
+        section.push(byte);
+        if size == 0 {
+            break;
+        }
+    }
+    section.extend_from_slice(&content);
+    section
+}
+
+#[test]
+fn test_wasm_info_displays_contract_meta() {
+    // Extend the bare fixture with a contractmeta section and point wasm-info
+    // at it: name/version/description must be shown (table and JSON modes).
+    let mut bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&xdr_meta_entry("name", "MetaContract"));
+    payload.extend_from_slice(&xdr_meta_entry("version", "9.9.9"));
+    payload.extend_from_slice(&xdr_meta_entry("description", "A meta description"));
+    bytes.extend_from_slice(&custom_section("contractmetav0", &payload));
+
+    let home = temp_home("wasm-info-meta");
+    let path = home.join("meta.wasm");
+    std::fs::write(&path, &bytes).expect("write fixture");
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &["wasm-info", "--wasm", path.to_str().unwrap()],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "wasm-info should succeed; stderr: {stderr}");
+    assert!(stdout.contains("Contract meta: present"));
+    assert!(stdout.contains("name: MetaContract"));
+    assert!(stdout.contains("version: 9.9.9"));
+    assert!(stdout.contains("description: A meta description"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(["wasm-info", "--wasm", path.to_str().unwrap(), "--json"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run CLI");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    assert_eq!(parsed["contract_meta"]["name"], "MetaContract");
+    assert_eq!(parsed["contract_meta"]["version"], "9.9.9");
+    assert_eq!(parsed["contract_meta"]["description"], "A meta description");
+}
+
+#[test]
+fn test_wasm_info_reports_absent_contract_meta() {
+    let home = temp_home("wasm-info-no-meta");
+    let (stdout, stderr, code) = run_cli_in_home(
+        &["wasm-info", "--wasm", "tests/fixtures/minimal.wasm"],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "wasm-info should succeed; stderr: {stderr}");
+    assert!(
+        stdout.contains("Contract meta: absent"),
+        "bare WASM should report absent meta; got: {stdout}"
+    );
+}
+
 #[test]
 fn test_watch_interval_suffixes_are_parsed() {
     // `30m` must resolve to 1800s in the banner — the interval parser is unit
@@ -866,5 +1149,85 @@ fn test_watch_interval_suffixes_are_parsed() {
     assert!(
         stdout.contains("every 1800s"),
         "`30m` should resolve to 1800s; got: {stdout}"
+    );
+}
+
+// ── cache query tests ────────────────────────────────────────────────
+
+#[test]
+fn test_cache_query_help() {
+    let (stdout, stderr, code) = run_cli(&["cache", "query", "--help"]);
+    assert_eq!(
+        code, 0,
+        "cache query --help should exit 0; stderr: {stderr}"
+    );
+    for flag in [
+        "--network",
+        "--function",
+        "--wasm-hash",
+        "--min-stroops",
+        "--max-stroops",
+        "--from",
+        "--to",
+        "--json",
+    ] {
+        assert!(
+            stdout.contains(flag),
+            "query help should mention {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_cache_query_empty_cache() {
+    let home = temp_home("cache-query-empty");
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(["cache", "query", "--network", "testnet"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .output()
+        .expect("failed to run cache query");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("No cached estimates match the query."),
+        "empty cache should report no results; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_query_empty_json() {
+    let home = temp_home("cache-query-empty-json");
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(["cache", "query", "--network", "testnet", "--json"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run cache query");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    assert_eq!(trimmed, "[]", "empty JSON should be []; got: {stdout}");
+}
+
+#[test]
+fn test_cache_query_json_flag_accepted() {
+    let home = temp_home("cache-query-json-flag");
+    // Save a cached estimate first via the test helper
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(["cache", "query", "--network", "testnet", "--json"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run cache query");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    // Should be valid JSON
+    assert!(
+        serde_json::from_str::<serde_json::Value>(trimmed).is_ok(),
+        "output should be valid JSON; got: {stdout}"
     );
 }
