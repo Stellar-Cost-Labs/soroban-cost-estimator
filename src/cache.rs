@@ -107,9 +107,7 @@ pub struct QueryFilter {
 /// Returns the base data directory path: `~/.soroban-cost-estimator`,
 /// creating it if needed.
 fn data_dir() -> AppResult<PathBuf> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| AppError::General("could not determine home directory".to_string()))?;
-    let dir = home.join(".soroban-cost-estimator");
+    let dir = crate::paths::data_dir()?;
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -125,11 +123,13 @@ fn db_path() -> AppResult<PathBuf> {
 /// Centralized so both the normal cache path and callers that open the
 /// database directly (e.g. test helpers) create an identical schema.
 pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
-    // WAL lets concurrent readers and writers coexist, and busy_timeout makes
-    // contending writers wait instead of failing with SQLITE_BUSY.
+    // busy_timeout makes contending writers wait instead of failing with
+    // SQLITE_BUSY. It is set first so the busy handler is installed before
+    // any statement that can take a lock. The WAL journal-mode switch is the
+    // one exception the busy handler does not cover (it needs exclusive
+    // access), so it is handled separately below.
     conn.execute_batch(
-        "PRAGMA journal_mode=WAL; \
-         PRAGMA busy_timeout=5000; \
+        "PRAGMA busy_timeout=5000; \
          CREATE TABLE IF NOT EXISTS estimates (
             version          INTEGER NOT NULL,
             wasm_hash        TEXT NOT NULL,
@@ -146,27 +146,36 @@ pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
             PRIMARY KEY (wasm_hash, function, args_hash)
         );",
     )?;
-    // Migrate v1 databases that lack duration_ms / success columns.
-    let has_duration_ms: bool = conn
-        .prepare("PRAGMA table_info(estimates)")
-        .ok()
-        .and_then(|mut stmt| {
-            let rows = stmt.query_map([], |row| row.get::<_, String>(1)).ok()?;
-            for row in rows.flatten() {
-                if row == "duration_ms" {
-                    return Some(true);
-                }
-            }
-            Some(false)
-        })
-        .unwrap_or(false);
-    if !has_duration_ms {
-        conn.execute_batch(
-            "ALTER TABLE estimates ADD COLUMN duration_ms INTEGER; \
-             ALTER TABLE estimates ADD COLUMN success INTEGER NOT NULL DEFAULT 1;",
-        )?;
-    }
+    enable_wal_if_possible(conn);
     Ok(())
+}
+
+/// Best-effort switch to WAL journal mode.
+///
+/// WAL lets concurrent readers and writers coexist; it is a performance
+/// optimization and correctness never depends on it. Switching journal modes
+/// requires exclusive access to the database file, and SQLite's busy handler
+/// does **not** cover that particular lock, so a connection racing another
+/// opener of a fresh database can see `SQLITE_BUSY` even with a long
+/// `busy_timeout` set. Short-circuit when the file is already in WAL mode
+/// (the common case after the first open), retry briefly during the initial
+/// creation race, and otherwise continue with the file's current journal
+/// mode (rollback) rather than failing the whole operation.
+fn enable_wal_if_possible(conn: &Connection) {
+    let Ok(mode) = conn.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0)) else {
+        return;
+    };
+    if mode == "wal" {
+        return;
+    }
+    for attempt in 0..5u32 {
+        if conn.execute_batch("PRAGMA journal_mode=WAL;").is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(
+            u64::from(attempt + 1) * 25,
+        ));
+    }
 }
 
 /// Open a connection to the cache database and ensure the schema exists.

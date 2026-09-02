@@ -33,7 +33,7 @@ fn run_cli_in_home(args: &[&str], home: Option<&Path>) -> (String, String, i32) 
     cmd.args(args);
     if let Some(home) = home {
         cmd.env("HOME", home);
-        // `dirs::home_dir()` reads USERPROFILE on Windows.
+        // The CLI prefers USERPROFILE on Windows when resolving its data dir.
         cmd.env("USERPROFILE", home);
     }
 
@@ -237,6 +237,7 @@ fn test_cache_verify_empty_cache_succeeds() {
     let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
         .args(["cache", "verify"])
         .env("HOME", &tmp)
+        .env("USERPROFILE", &tmp)
         .output()
         .expect("failed to run CLI");
 
@@ -314,6 +315,53 @@ fn test_json_flag_accepted() {
 }
 
 #[test]
+fn test_format_flag_accepted() {
+    // Verify --format is a recognized argument for estimate, including the
+    // new markdown variant (#80).
+    for fmt in ["table", "json", "csv", "markdown"] {
+        let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--format", fmt]);
+        // Should fail because the file doesn't exist, NOT because --format is
+        // unknown or the value is invalid.
+        assert_ne!(code, 0, "should error on missing file for {fmt}");
+        assert!(
+            !stderr.contains("unrecognized") && !stderr.contains("invalid value"),
+            "--format {fmt} should be a recognized argument; stderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_format_invalid_value_rejected() {
+    // clap's value_parser must reject unknown formats before the command runs.
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--format", "xml"]);
+    assert_ne!(code, 0, "invalid --format value should error");
+    assert!(
+        stderr.contains("invalid value") || stderr.contains("possible values"),
+        "clap should reject unknown format; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_format_markdown_with_json_flag_accepted() {
+    // --format wins over the legacy --json flag; the combination must be
+    // accepted as valid arguments (failure here is a missing file, not an
+    // argument conflict).
+    let (_, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "test.wasm",
+        "--json",
+        "--format",
+        "markdown",
+    ]);
+    assert_ne!(code, 0, "should error on missing file");
+    assert!(
+        !stderr.contains("unrecognized") && !stderr.contains("cannot be used"),
+        "--json + --format markdown should be accepted; stderr: {stderr}"
+    );
+}
+
+#[test]
 fn test_short_wasm_flag_accepted() {
     // `-w` is the short form of `--wasm` on both estimate and estimate-all.
     let (_, stderr, code) = run_cli(&["estimate", "-w", "does-not-exist.wasm"]);
@@ -333,6 +381,44 @@ fn test_estimate_cache_ttl_flag_accepted() {
     assert!(
         !stderr.contains("unexpected argument"),
         "--cache-ttl should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_timeout_flag_accepted() {
+    // Verify --timeout is a recognized global argument for estimate.
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--timeout", "10"]);
+    // Should fail because the file doesn't exist, NOT because --timeout is unknown.
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--timeout should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_timeout_flag_accepted_before_subcommand() {
+    // Global flags must also be accepted before the subcommand.
+    let (_, stderr, code) = run_cli(&["--timeout", "10", "estimate", "--wasm", "test.wasm"]);
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--timeout before the subcommand should be recognized; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_help_lists_global_flags() {
+    // Global flags (--rps, --timeout) must appear in subcommand help.
+    let (stdout, stderr, code) = run_cli(&["estimate", "--help"]);
+    assert_eq!(code, 0, "estimate --help should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("--timeout"),
+        "help should list --timeout; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("--rps"),
+        "help should list --rps; got: {stdout}"
     );
 }
 
