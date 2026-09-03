@@ -226,6 +226,10 @@ pub enum ConfigAction {
         /// Print the snapshot as JSON instead of the summary lines.
         #[arg(long)]
         json: bool,
+
+        /// Automatically delete snapshots older than N days.
+        #[arg(long)]
+        retain: Option<u64>,
     },
 
     /// Diff the current network config against the most recent snapshot.
