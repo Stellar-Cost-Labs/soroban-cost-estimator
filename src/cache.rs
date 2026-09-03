@@ -1,26 +1,37 @@
-//! Estimate result caching.
+//! Estimate result caching (SQLite-backed).
 //!
-//! Stores past `estimate` results in `~/.soroban-cost-estimator/cache/`,
-//! keyed by `wasm_hash-function_name-args_hash.json`. The `config diff`
+//! Stores past `estimate` results in a single SQLite database at
+//! `~/.soroban-cost-estimator/cache.db`. The `config diff`
 //! command cross-references cached estimates to tell the user which ones
 //! are now stale due to network pricing changes.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Mutex;
 
-use serde::{Deserialize, Serialize};
-use tracing::{debug, trace, warn};
+use rusqlite::Connection;
+use serde::Deserialize;
+use serde::Serialize;
+use tracing::debug;
+use tracing::trace;
+use tracing::warn;
 
-use crate::error::{AppError, AppResult};
+use crate::error::AppError;
+use crate::error::AppResult;
+
+/// Check whether a rusqlite error is `SQLITE_BUSY`.
+fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
+    err.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
+}
 
 /// Current cache-entry schema version.
 ///
-/// Bump this whenever the on-disk `CachedEstimate` JSON shape changes.
+/// Bump this whenever the on-disk `CachedEstimate` shape changes.
 /// Entries written by a version of the tool with an older schema are
 /// migrated forward through [`migrate_to_latest`]; entries written by a
 /// *newer* tool (version greater than this) are rejected rather than
 /// silently misread.
-pub const CACHE_SCHEMA_VERSION: u32 = 1;
+pub const CACHE_SCHEMA_VERSION: u32 = 2;
 
 /// Implicit schema version of cache entries written before the `version`
 /// field existed.
@@ -31,14 +42,13 @@ pub const CACHE_SCHEMA_VERSION: u32 = 1;
 /// current schema.
 pub const INITIAL_SCHEMA_VERSION: u32 = 1;
 
-/// Maximum total size of the estimate cache, in bytes.
-///
-/// When saving a new estimate would push the cache past this limit, the
-/// least-recently-used entries are evicted until the cache fits under the
-/// limit. The limit is a fixed constant rather than a user-configurable
-/// setting; entries are ranked by file modification time, which is refreshed
-/// on read (see [`load_estimate`]) so recently used entries survive eviction.
-pub const MAX_CACHE_SIZE_BYTES: u64 = 100 * 1024 * 1024; // 100 MiB
+/// Previous schema version before `duration_ms` and `success` columns.
+pub const PREVIOUS_SCHEMA_VERSION: u32 = 1;
+
+/// serde default for the `success` field — most estimates succeed.
+fn default_true() -> bool {
+    true
+}
 
 /// serde default for the `version` field, applied when an older (or hand
 /// written) entry omits it. Legacy entries predating the version field are
@@ -72,28 +82,153 @@ pub struct CachedEstimate {
     pub memory_bytes: u64,
     /// ISO-8601 timestamp of when the estimate was made.
     pub timestamp: String,
+    /// Simulation wall-clock duration in milliseconds (`None` if unknown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Whether the simulation succeeded.
+    #[serde(default = "default_true")]
+    pub success: bool,
 }
+
+/// Optional filters for [`query_estimates`].
+///
+/// Every field is optional; a `None` field means "no filter on this axis".
+/// All filters are combined with logical AND.
+#[derive(Debug, Clone, Default)]
+pub struct QueryFilter {
+    /// Case-insensitive substring match against the function name.
+    pub function: Option<String>,
+    /// Prefix match against the WASM SHA-256 hash (hex).
+    pub wasm_hash: Option<String>,
+    /// Inclusive lower bound on `total_stroops`.
+    pub min_stroops: Option<i64>,
+    /// Inclusive upper bound on `total_stroops`.
+    pub max_stroops: Option<i64>,
+    /// Inclusive lower bound on the estimate timestamp (ISO-8601).
+    pub from: Option<String>,
+    /// Inclusive upper bound on the estimate timestamp (ISO-8601).
+    pub to: Option<String>,
+}
+
+/// Global lock for serializing cache writes.
+///
+/// SQLite WAL mode allows concurrent readers, but only one writer at a time.
+/// Under heavy contention (e.g. multiple threads writing the same key),
+/// `busy_timeout` alone may not prevent `SQLITE_BUSY`. This mutex ensures
+/// writes are serialized at the application level.
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Returns the base data directory path: `~/.soroban-cost-estimator`,
 /// creating it if needed.
 fn data_dir() -> AppResult<PathBuf> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| AppError::General("could not determine home directory".to_string()))?;
-    let dir = home.join(".soroban-cost-estimator");
+    let dir = crate::paths::data_dir()?;
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
-/// Returns the cache directory path, creating it if needed.
-fn cache_dir() -> AppResult<PathBuf> {
-    let dir = data_dir()?.join("cache");
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
+/// Path to the SQLite cache database.
+fn db_path() -> AppResult<PathBuf> {
+    Ok(data_dir()?.join("cache.db"))
 }
 
-/// Build a filename for a cached estimate.
-fn cache_filename(wasm_hash: &str, function: &str, args_hash: &str) -> String {
-    format!("{wasm_hash}-{function}-{args_hash}.json")
+/// Create the `estimates` table (and tune journal mode) on an already-open
+/// connection if it does not exist yet.
+///
+/// Centralized so both the normal cache path and callers that open the
+/// database directly (e.g. test helpers) create an identical schema.
+pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
+    // busy_timeout makes contending writers wait instead of failing with
+    // SQLITE_BUSY. It is set first so the busy handler is installed before
+    // any statement that can take a lock. The WAL journal-mode switch is the
+    // one exception the busy handler does not cover (it needs exclusive
+    // access), so it is handled separately below.
+    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS estimates (
+            version          INTEGER NOT NULL,
+            wasm_hash        TEXT NOT NULL,
+            function         TEXT NOT NULL,
+            args_hash        TEXT NOT NULL,
+            network          TEXT NOT NULL,
+            ledger           INTEGER NOT NULL,
+            total_stroops    INTEGER NOT NULL,
+            cpu_instructions INTEGER NOT NULL,
+            memory_bytes     INTEGER NOT NULL,
+            timestamp        TEXT NOT NULL,
+            duration_ms      INTEGER,
+            success          INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (wasm_hash, function, args_hash)
+        );",
+    )?;
+    enable_wal_if_possible(conn);
+    Ok(())
+}
+
+/// Best-effort switch to WAL journal mode.
+///
+/// WAL lets concurrent readers and writers coexist; it is a performance
+/// optimization and correctness never depends on it. Switching journal modes
+/// requires exclusive access to the database file, and SQLite's busy handler
+/// does **not** cover that particular lock, so a connection racing another
+/// opener of a fresh database can see `SQLITE_BUSY` even with a long
+/// `busy_timeout` set. Short-circuit when the file is already in WAL mode
+/// (the common case after the first open), retry briefly during the initial
+/// creation race, and otherwise continue with the file's current journal
+/// mode (rollback) rather than failing the whole operation.
+fn enable_wal_if_possible(conn: &Connection) {
+    let Ok(mode) = conn.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0)) else {
+        return;
+    };
+    if mode == "wal" {
+        let _ = conn.execute_batch("PRAGMA synchronous=NORMAL;");
+        return;
+    }
+    for attempt in 0..10u32 {
+        if conn.execute_batch("PRAGMA journal_mode=WAL;").is_ok() {
+            let _ = conn.execute_batch("PRAGMA synchronous=NORMAL;");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(
+            u64::from(attempt + 1) * 50,
+        ));
+    }
+}
+
+/// Open a connection to the cache database and ensure the schema exists.
+fn open_db() -> AppResult<Connection> {
+    let path = db_path()?;
+    let conn = Connection::open(&path)?;
+    ensure_cache_schema(&conn)?;
+    Ok(conn)
+}
+
+/// Retry limit and base delay for `SQLITE_BUSY` backoff.
+const MAX_RETRIES: u32 = 5;
+const BASE_RETRY_DELAY_MS: u64 = 10;
+
+/// Execute a SQLite write operation, retrying on `SQLITE_BUSY` with
+/// exponential backoff.
+fn execute_with_retry<F, T>(mut operation: F) -> AppResult<T>
+where
+    F: FnMut() -> Result<T, rusqlite::Error>,
+{
+    let mut delay = BASE_RETRY_DELAY_MS;
+    for attempt in 0..MAX_RETRIES {
+        match operation() {
+            Ok(val) => return Ok(val),
+            Err(e) if is_sqlite_busy(&e) && attempt < MAX_RETRIES - 1 => {
+                warn!(
+                    attempt,
+                    delay_ms = delay,
+                    "SQLITE_BUSY, retrying after backoff"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+                delay *= 2;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    unreachable!()
 }
 
 /// Save an estimate result to the cache.
@@ -107,9 +242,11 @@ fn cache_filename(wasm_hash: &str, function: &str, args_hash: &str) -> String {
 /// * `total_stroops` - Total resource fee in stroops.
 /// * `cpu_instructions` - CPU instructions consumed.
 /// * `memory_bytes` - Memory bytes consumed.
+/// * `duration_ms` - Wall-clock duration of the simulation in milliseconds.
+/// * `success` - Whether the simulation succeeded.
 ///
 /// # Network calls
-/// None — pure file I/O.
+/// None — local SQLite I/O.
 pub fn save_estimate(
     wasm_hash: &str,
     function: &str,
@@ -119,120 +256,65 @@ pub fn save_estimate(
     total_stroops: i64,
     cpu_instructions: u64,
     memory_bytes: u64,
+    duration_ms: Option<u64>,
+    success: bool,
 ) -> AppResult<()> {
     let args_hash = hash_args(args);
-    let dir = cache_dir()?;
-    let filename = cache_filename(wasm_hash, function, &args_hash);
-    let path = dir.join(&filename);
 
-    let cached = CachedEstimate {
-        version: CACHE_SCHEMA_VERSION,
-        wasm_hash: wasm_hash.to_string(),
-        function: function.to_string(),
-        args_hash,
-        network: network.to_string(),
-        ledger,
-        total_stroops,
-        cpu_instructions,
-        memory_bytes,
-        timestamp: chrono::Utc::now().to_rfc3339(),
-    };
+    let _guard = WRITE_LOCK
+        .lock()
+        .map_err(|e| AppError::General(format!("cache write lock poisoned: {e}")))?;
+    let conn = open_db()?;
+    conn.execute(
+        "INSERT INTO estimates \
+         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, duration_ms, success) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+         ON CONFLICT(wasm_hash, function, args_hash) DO UPDATE SET \
+            version = excluded.version, \
+            network = excluded.network, \
+            ledger = excluded.ledger, \
+            total_stroops = excluded.total_stroops, \
+            cpu_instructions = excluded.cpu_instructions, \
+            memory_bytes = excluded.memory_bytes, \
+            timestamp = excluded.timestamp, \
+            duration_ms = excluded.duration_ms, \
+            success = excluded.success",
+        rusqlite::params![
+            CACHE_SCHEMA_VERSION as i64,
+            wasm_hash,
+            function,
+            args_hash.as_str(),
+            network,
+            ledger as i64,
+            total_stroops,
+            cpu_instructions as i64,
+            memory_bytes as i64,
+            chrono::Utc::now().to_rfc3339(),
+            duration_ms.map(|v| v as i64),
+            success as i64,
+        ],
+    )?;
 
-    let json = serde_json::to_string_pretty(&cached)?;
-    let tid = format!("{:?}", std::thread::current().id());
-    let tmp = dir.join(format!("{filename}.{tid}.tmp"));
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, &path)?;
-
-    // Adding an entry may push the cache past its maximum size; evict
-    // least-recently-used entries to bring it back under the limit. The
-    // entry just written is the most recently used, so it is never the
-    // first eviction candidate.
-    let evicted = evict_lru_entries(MAX_CACHE_SIZE_BYTES, Some(&path))?;
-    if evicted > 0 {
-        warn!(evicted, "cache size limit reached; evicted LRU entries");
-    }
-
-    debug!(path = %path.display(), function, network, ledger, "estimate cached");
+    debug!(function, network, ledger, "estimate cached (sqlite)");
     Ok(())
 }
 
-/// Total size in bytes of all `.json` entries currently in the cache.
-///
-/// Only `.json` files count toward the cache size; transient `*.tmp`
-/// write-ahead files are ignored.
-///
-/// # Network calls
-/// None — pure file I/O.
-pub fn cache_size_bytes() -> AppResult<u64> {
-    let dir = cache_dir()?;
-    total_json_bytes(&dir)
-}
-
-/// Sum the size of every `.json` file in `dir`.
-fn total_json_bytes(dir: &Path) -> AppResult<u64> {
-    let mut total: u64 = 0;
-    if !dir.exists() {
-        return Ok(total);
-    }
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().map(|e| e == "json").unwrap_or(false) {
-            total = total.saturating_add(entry.metadata()?.len());
-        }
-    }
-    Ok(total)
-}
-
-/// Evict least-recently-used cache entries until the cache holds at most
-/// `limit_bytes` of `.json` data.
-///
-/// Entries are ranked by file modification time (oldest first). The file at
-/// `protected` — if any — is never evicted, so callers can keep the entry
-/// they just wrote. Returns the number of entries evicted.
-///
-/// # Network calls
-/// None — pure file I/O.
-pub fn evict_lru_entries(limit_bytes: u64, protected: Option<&Path>) -> AppResult<usize> {
-    let dir = cache_dir()?;
-    if !dir.exists() {
-        return Ok(0);
-    }
-
-    let mut entries: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
-    let mut total: u64 = 0;
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().map(|e| e == "json").unwrap_or(false) {
-            let metadata = entry.metadata()?;
-            let mtime = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-            total = total.saturating_add(metadata.len());
-            entries.push((mtime, metadata.len(), path));
-        }
-    }
-
-    // Sort oldest-first so eviction removes the least-recently-used entries.
-    entries.sort_by_key(|entry| entry.0);
-
-    let mut evicted = 0;
-    for (_mtime, size, path) in entries {
-        if total <= limit_bytes {
-            break;
-        }
-        if protected.is_some_and(|p| p == path) {
-            // Never evict the protected entry; skip it and continue checking
-            // other (older) candidates.
-            continue;
-        }
-        std::fs::remove_file(&path)?;
-        total = total.saturating_sub(size);
-        evicted += 1;
-        trace!(path = %path.display(), "evicted LRU cache entry");
-    }
-
-    Ok(evicted)
+/// Reconstruct a [`CachedEstimate`] from a SQLite row.
+fn estimate_from_row(row: &rusqlite::Row<'_>) -> Result<CachedEstimate, rusqlite::Error> {
+    Ok(CachedEstimate {
+        version: row.get(0)?,
+        wasm_hash: row.get(1)?,
+        function: row.get(2)?,
+        args_hash: row.get(3)?,
+        network: row.get(4)?,
+        ledger: row.get::<_, i64>(5)? as u32,
+        total_stroops: row.get(6)?,
+        cpu_instructions: row.get::<_, i64>(7)? as u64,
+        memory_bytes: row.get::<_, i64>(8)? as u64,
+        timestamp: row.get(9)?,
+        duration_ms: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
+        success: row.get::<_, i64>(11)? != 0,
+    })
 }
 
 /// Carry a cached estimate forward to the current schema version.
@@ -256,8 +338,13 @@ pub fn migrate_to_latest(cached: CachedEstimate) -> AppResult<CachedEstimate> {
         v if v > CACHE_SCHEMA_VERSION => Err(AppError::General(format!(
             "cache entry schema v{v} is newer than supported v{CACHE_SCHEMA_VERSION}"
         ))),
-        // Nothing below the current schema exists yet; future schema changes
-        // add per-step migrations here, e.g. v1 -> v2.
+        // v1 entries lack duration_ms and success columns; supply defaults.
+        PREVIOUS_SCHEMA_VERSION => {
+            migrated.duration_ms = None;
+            migrated.success = true;
+            migrated.version = CACHE_SCHEMA_VERSION;
+            Ok(migrated)
+        }
         v if v < CACHE_SCHEMA_VERSION => {
             migrated.version = CACHE_SCHEMA_VERSION;
             Ok(migrated)
@@ -283,28 +370,23 @@ pub fn load_estimate(
     args: &[String],
 ) -> AppResult<Option<CachedEstimate>> {
     let args_hash = hash_args(args);
-    let dir = cache_dir()?;
-    let filename = cache_filename(wasm_hash, function, &args_hash);
-    let path = dir.join(&filename);
 
-    if !path.exists() {
-        return Ok(None);
+    let conn = open_db()?;
+    let mut stmt = conn.prepare(
+        "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
+         cpu_instructions, memory_bytes, timestamp, duration_ms, success \
+         FROM estimates WHERE wasm_hash = ?1 AND function = ?2 AND args_hash = ?3",
+    )?;
+
+    let mut rows = stmt.query(rusqlite::params![wasm_hash, function, args_hash.as_str()])?;
+    match rows.next()? {
+        None => Ok(None),
+        Some(row) => {
+            let cached = estimate_from_row(row)?;
+            let cached = migrate_to_latest(cached)?;
+            Ok(Some(cached))
+        }
     }
-
-    let content = std::fs::read_to_string(&path)?;
-    let cached: CachedEstimate =
-        serde_json::from_str(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))?;
-    let cached = migrate_to_latest(cached)?;
-
-    // A successful read makes this entry recently used: bump its mtime so
-    // LRU eviction (which ranks by mtime) prefers evicting entries that
-    // have not been read in a while. A failure here is non-fatal — the read
-    // itself succeeded and the mtime is only an eviction hint.
-    if let Ok(file) = std::fs::File::options().write(true).open(&path) {
-        let _ = file.set_modified(std::time::SystemTime::now());
-    }
-
-    Ok(Some(cached))
 }
 
 /// Whether a cached estimate is still fresh, i.e. its timestamp is within
@@ -333,7 +415,7 @@ pub fn is_cache_entry_fresh(entry: &CachedEstimate, ttl: std::time::Duration) ->
 /// expired — both mean "re-simulate".
 ///
 /// # Network calls
-/// None — pure file I/O.
+/// None — pure SQLite I/O.
 pub fn load_fresh_estimate(
     wasm_hash: &str,
     function: &str,
@@ -360,26 +442,24 @@ pub fn load_fresh_estimate(
 /// Find all cached estimates for a given network.
 ///
 /// Used by `config diff` to check which cached estimates are now stale
-/// after a pricing change.
+/// after a pricing change. Results are ordered newest-first.
 pub fn list_cached_estimates(network: &str) -> AppResult<Vec<CachedEstimate>> {
-    let dir = cache_dir()?;
+    let conn = open_db()?;
+    let mut stmt = conn.prepare(
+        "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
+         cpu_instructions, memory_bytes, timestamp, duration_ms, success \
+         FROM estimates WHERE network = ?1 ORDER BY timestamp DESC",
+    )?;
+
+    let rows = stmt.query_map([network], estimate_from_row)?;
+
     let mut estimates = Vec::new();
-
-    if !dir.exists() {
-        return Ok(estimates);
-    }
-
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().map(|e| e == "json").unwrap_or(false) {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Ok(cached) = serde_json::from_str::<CachedEstimate>(&content) {
-                    if cached.network == network {
-                        estimates.push(cached);
-                    }
-                }
-            }
+    for row in rows {
+        let cached = row?;
+        // Skip entries we cannot safely migrate forward (e.g. written by a
+        // newer tool); they do not belong in a network listing.
+        if let Ok(cached) = migrate_to_latest(cached) {
+            estimates.push(cached);
         }
     }
 
@@ -387,74 +467,249 @@ pub fn list_cached_estimates(network: &str) -> AppResult<Vec<CachedEstimate>> {
     Ok(estimates)
 }
 
+/// Parse an ISO-8601 timestamp into a UTC `DateTime`.
+fn parse_ts(s: &str) -> AppResult<chrono::DateTime<chrono::Utc>> {
+    let dt = chrono::DateTime::parse_from_rfc3339(s)
+        .map_err(|e| AppError::General(format!("invalid timestamp {s:?}: {e}")))?;
+    Ok(dt.with_timezone(&chrono::Utc))
+}
+
+/// Query cached estimates for `network`, applying the optional filters in
+/// [`QueryFilter`].
+///
+/// Results are returned newest-first (by `timestamp`). The filters are:
+/// * `function` — case-insensitive substring match
+/// * `wasm_hash` — prefix match
+/// * `min_stroops` / `max_stroops` — inclusive `total_stroops` range
+/// * `from` / `to` — inclusive timestamp range (ISO-8601)
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn query_estimates(network: &str, filter: &QueryFilter) -> AppResult<Vec<CachedEstimate>> {
+    let mut estimates = list_cached_estimates(network)?;
+
+    // Newest-first ordering.
+    estimates.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+    let from_ts = match &filter.from {
+        Some(s) => Some(parse_ts(s)?),
+        None => None,
+    };
+    let to_ts = match &filter.to {
+        Some(s) => Some(parse_ts(s)?),
+        None => None,
+    };
+
+    let filtered: Vec<CachedEstimate> = estimates
+        .into_iter()
+        .filter(|e| {
+            if let Some(f) = &filter.function {
+                let f = f.to_lowercase();
+                if !e.function.to_lowercase().contains(f.as_str()) {
+                    return false;
+                }
+            }
+            if let Some(w) = &filter.wasm_hash {
+                if !e.wasm_hash.starts_with(w.as_str()) {
+                    return false;
+                }
+            }
+            if let Some(min) = filter.min_stroops {
+                if e.total_stroops < min {
+                    return false;
+                }
+            }
+            if let Some(max) = filter.max_stroops {
+                if e.total_stroops > max {
+                    return false;
+                }
+            }
+            if let Some(from) = &from_ts {
+                let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&e.timestamp) else {
+                    return false;
+                };
+                if ts.with_timezone(&chrono::Utc) < *from {
+                    return false;
+                }
+            }
+            if let Some(to) = &to_ts {
+                let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&e.timestamp) else {
+                    return false;
+                };
+                if ts.with_timezone(&chrono::Utc) > *to {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+
+    trace!(network, count = filtered.len(), "queried cached estimates");
+    Ok(filtered)
+}
+
+/// Export every cached estimate as a deterministic, JSON-serializable list.
+///
+/// All rows are read from the SQLite cache, migrated to the current schema,
+/// and sorted by (wasm_hash, function, args_hash) so repeated exports are
+/// stable. A malformed or unsupported entry returns an error rather than
+/// producing an incomplete backup.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+pub fn export_cached_estimates() -> AppResult<Vec<CachedEstimate>> {
+    let conn = open_db()?;
+    let mut stmt = conn.prepare(
+        "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
+         cpu_instructions, memory_bytes, timestamp \
+         FROM estimates ORDER BY wasm_hash, function, args_hash",
+    )?;
+
+    let rows = stmt.query_map([], estimate_from_row)?;
+
+    let mut estimates = Vec::new();
+    for row in rows {
+        let cached = row?;
+        estimates.push(migrate_to_latest(cached)?);
+    }
+
+    debug!(count = estimates.len(), "exported cached estimates");
+    Ok(estimates)
+}
+
 /// Integrity status of a single cache entry file.
 #[derive(Debug, Clone)]
 pub struct CacheEntryStatus {
-    /// File name of the cache entry (e.g. `"abc123-my_func-def456.json"`).
+    /// Synthesized identity of the cache entry
+    /// (e.g. `"abc123-my_func-def456.json"`).
     pub filename: String,
-    /// Schema version parsed from the entry, if it deserialized at all.
+    /// Schema version parsed from the entry.
     pub version: Option<u32>,
-    /// Whether the file parsed as a valid, readable `CachedEstimate`.
+    /// Whether the entry parsed as a valid, readable `CachedEstimate`.
     /// Entries carrying a schema newer than the current one are not valid.
     pub valid: bool,
 }
 
 /// Verify the integrity of every entry in the estimate cache.
 ///
-/// Reads each `.json` file in the cache directory and checks that it parses
-/// as a valid [`CachedEstimate`]. Returns one status per entry, sorted by
-/// filename. Files that are unreadable, invalid JSON, or missing required
-/// fields are reported as not valid.
+/// Reads each row in the SQLite database and checks that it parses as a valid
+/// [`CachedEstimate`] and carries a schema this tool can read. Entries from the
+/// future (version > current) parse fine but are not migratable to the current
+/// schema, so they are flagged.
 ///
 /// # Network calls
-/// None — pure file I/O.
+/// None — pure SQLite I/O.
 pub fn verify_cache() -> AppResult<Vec<CacheEntryStatus>> {
-    let dir = cache_dir()?;
+    let conn = open_db()?;
+    let mut stmt = conn.prepare("SELECT version, wasm_hash, function, args_hash FROM estimates")?;
+
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, u32>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+
     let mut statuses = Vec::new();
+    for row in rows {
+        let (version, wasm_hash, function, args_hash) = row?;
+        let filename = format!("{wasm_hash}-{function}-{args_hash}.json");
 
-    if !dir.exists() {
-        return Ok(statuses);
-    }
+        // A row counts as valid when it both parses as a `CachedEstimate` and
+        // carries a schema this tool can read. Entries from the future
+        // (version > current) parse fine but are not migratable, so they are
+        // flagged.
+        let cached = CachedEstimate {
+            version,
+            wasm_hash,
+            function,
+            args_hash,
+            network: String::new(),
+            ledger: 0,
+            total_stroops: 0,
+            cpu_instructions: 0,
+            memory_bytes: 0,
+            timestamp: String::new(),
+            duration_ms: None,
+            success: true,
+        };
+        let valid = migrate_to_latest(cached).is_ok();
 
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().map(|e| e == "json").unwrap_or(false) {
-            let filename = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            // A file counts as valid when it both parses as a
-            // `CachedEstimate` and carries a schema this tool can read.
-            // Entries from the future (version > current) parse fine but are
-            // not migratable to the current schema, so they are flagged.
-            let (valid, version) = match std::fs::read_to_string(&path) {
-                Ok(content) => match serde_json::from_str::<CachedEstimate>(&content) {
-                    Ok(parsed) => {
-                        let version = Some(parsed.version);
-                        let valid = migrate_to_latest(parsed).is_ok();
-                        (valid, version)
-                    }
-                    Err(_) => (false, None),
-                },
-                Err(_) => (false, None),
-            };
-
-            if !valid {
-                warn!(filename, "corrupt or unsupported cache entry");
-            }
-            statuses.push(CacheEntryStatus {
-                filename,
-                version,
-                valid,
-            });
+        if !valid {
+            warn!(filename, "corrupt or unsupported cache entry");
         }
+
+        statuses.push(CacheEntryStatus {
+            filename,
+            version: Some(version),
+            valid,
+        });
     }
 
     statuses.sort_by(|a, b| a.filename.cmp(&b.filename));
     debug!(total = statuses.len(), "cache verification complete");
     Ok(statuses)
+}
+
+/// Aggregate statistics for the estimate cache.
+#[derive(Debug, Clone)]
+pub struct CacheStats {
+    /// Total number of cached estimates across all networks.
+    pub total_entries: usize,
+    /// Disk usage of the SQLite database file in bytes.
+    pub disk_bytes: u64,
+    /// Timestamp of the oldest entry (ISO-8601), if any.
+    pub oldest_entry: Option<String>,
+    /// Timestamp of the newest entry (ISO-8601), if any.
+    pub newest_entry: Option<String>,
+    /// Per-network breakdown: (network, count).
+    pub per_network: Vec<(String, usize)>,
+}
+
+/// Compute aggregate cache statistics.
+///
+/// Reads the SQLite database metadata (file size) and queries the
+/// `estimates` table for total count, timestamp bounds, and a
+/// `GROUP BY network` breakdown.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+pub fn cache_stats() -> AppResult<CacheStats> {
+    let path = db_path()?;
+    let disk_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+    let conn = open_db()?;
+
+    // Total count.
+    let total_entries: usize =
+        conn.query_row("SELECT COUNT(*) FROM estimates", [], |row| row.get(0))?;
+
+    // Oldest and newest timestamps.
+    let oldest_entry: Option<String> = conn
+        .query_row("SELECT MIN(timestamp) FROM estimates", [], |row| row.get(0))
+        .ok();
+    let newest_entry: Option<String> = conn
+        .query_row("SELECT MAX(timestamp) FROM estimates", [], |row| row.get(0))
+        .ok();
+
+    // Per-network breakdown.
+    let mut stmt = conn.prepare(
+        "SELECT network, COUNT(*) FROM estimates GROUP BY network ORDER BY COUNT(*) DESC",
+    )?;
+    let per_network: Vec<(String, usize)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    debug!(total_entries, disk_bytes, "cache stats computed");
+    Ok(CacheStats {
+        total_entries,
+        disk_bytes,
+        oldest_entry,
+        newest_entry,
+        per_network,
+    })
 }
 
 /// Check which cached estimates are now stale (simulated at an earlier ledger).
@@ -482,12 +737,12 @@ struct WasmFileRecord {
 }
 
 /// Registry mapping a canonical WASM file path to its last-observed identity.
-type WasmRegistry = HashMap<String, WasmFileRecord>;
+type WasmRegistry = std::collections::HashMap<String, WasmFileRecord>;
 
 /// Path to the on-disk registry of WASM file identities.
 ///
-/// Lives in the data directory (not the cache directory) so that the cache
-/// directory stays a flat list of `CachedEstimate` JSON files.
+/// Lives in the data directory (not the cache database) so that WASM identity
+/// tracking stays independent of estimate storage.
 fn registry_path() -> AppResult<PathBuf> {
     Ok(data_dir()?.join("wasm-files.json"))
 }
@@ -496,7 +751,7 @@ fn registry_path() -> AppResult<PathBuf> {
 fn load_registry() -> AppResult<WasmRegistry> {
     let path = registry_path()?;
     if !path.exists() {
-        return Ok(HashMap::new());
+        return Ok(std::collections::HashMap::new());
     }
     let content = std::fs::read_to_string(&path)?;
     // A malformed registry (e.g. hand-edited) degrades to empty rather than
@@ -515,31 +770,20 @@ fn save_registry(registry: &WasmRegistry) -> AppResult<()> {
 
 /// Remove every cached estimate produced from the given WASM hash.
 ///
-/// Returns the number of cache files removed. Used by
+/// Returns the number of cache rows removed. Used by
 /// [`invalidate_if_wasm_changed`] to drop entries from a previous build once
 /// the WASM file has changed.
 ///
 /// # Network calls
-/// None — pure file I/O.
+/// None — pure SQLite I/O.
 pub fn remove_cached_estimates_for_wasm(wasm_hash: &str) -> AppResult<usize> {
-    let dir = cache_dir()?;
-    let mut removed = 0;
-
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().map(|e| e == "json").unwrap_or(false) {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Ok(cached) = serde_json::from_str::<CachedEstimate>(&content) {
-                    if cached.wasm_hash == wasm_hash {
-                        std::fs::remove_file(&path)?;
-                        removed += 1;
-                    }
-                }
-            }
-        }
-    }
-
+    let _guard = WRITE_LOCK
+        .lock()
+        .map_err(|e| AppError::General(format!("cache write lock poisoned: {e}")))?;
+    let conn = open_db()?;
+    let removed = execute_with_retry(|| {
+        conn.execute("DELETE FROM estimates WHERE wasm_hash = ?1", [wasm_hash])
+    })?;
     Ok(removed)
 }
 

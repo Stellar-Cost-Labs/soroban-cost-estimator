@@ -1,17 +1,35 @@
 use clap::{Parser, Subcommand};
 
+/// Build version string with metadata from build.rs
+fn build_version() -> &'static str {
+    concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (",
+        env!("GIT_HASH"),
+        " ",
+        env!("BUILD_DATE"),
+        ")"
+    )
+}
+
 /// Estimate Soroban contract resource costs with network config-drift tracking.
 ///
 /// Wraps Stellar's `simulateTransaction` RPC and adds awareness of how the
 /// network's resource-pricing configuration changes over time.
 #[derive(Parser, Debug)]
 #[command(name = "soroban-cost-estimator")]
+#[command(version = build_version())]
 #[command(about = "Estimate Soroban contract costs & track network pricing changes", long_about = None)]
 pub struct Cli {
     /// Cap RPC requests at N per second (fixed-rate spacing; applies to
     /// every network call, e.g. batch runs like estimate-all). 0 disables.
     #[arg(long, global = true, value_name = "N")]
     pub rps: Option<u64>,
+
+    /// HTTP request timeout for RPC calls, in seconds (applies to every
+    /// network call).
+    #[arg(long, global = true, value_name = "SECS", default_value_t = 30)]
+    pub timeout: u64,
 
     #[command(subcommand)]
     pub command: Command,
@@ -53,6 +71,15 @@ pub enum Command {
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
         json: bool,
+
+        /// Output format: table (default), json, csv, or markdown.
+        /// Overrides `--json` when both are supplied.
+        #[arg(long, value_parser = ["table", "json", "csv", "markdown"])]
+        format: Option<String>,
+
+        /// Number of decimal places for XLM fee values (0..=18, default 7).
+        #[arg(long, default_value_t = 7)]
+        precision: u32,
     },
 
     /// Enumerate all public contract functions and estimate each one.
@@ -72,6 +99,15 @@ pub enum Command {
         /// Output as JSON instead of a human-readable list.
         #[arg(long)]
         json: bool,
+
+        /// Output format: table (default), json, csv, or markdown.
+        /// Overrides `--json` when both are supplied.
+        #[arg(long, value_parser = ["table", "json", "csv", "markdown"])]
+        format: Option<String>,
+
+        /// Number of decimal places for XLM fee values (0..=18, default 7).
+        #[arg(long, default_value_t = 7)]
+        precision: u32,
     },
 
     /// Print WASM metadata (functions, contract spec, size, hash) without any RPC calls.
@@ -110,6 +146,13 @@ pub enum Command {
 
 #[derive(Subcommand, Debug)]
 pub enum CacheAction {
+    /// Export every cached estimate as a JSON array.
+    Export {
+        /// Write the JSON array to a file instead of standard output.
+        #[arg(long, short)]
+        out: Option<String>,
+    },
+
     /// Check that every cached estimate is valid JSON and not corrupted.
     Verify,
 
@@ -128,6 +171,41 @@ pub enum CacheAction {
         id: Option<String>,
 
         /// Output as JSON instead of a human-readable list.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Query cached estimates with optional filters.
+    Query {
+        /// Network to filter by.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+
+        /// Filter by function name (case-insensitive substring match).
+        #[arg(long)]
+        function: Option<String>,
+
+        /// Filter by WASM hash prefix.
+        #[arg(long)]
+        wasm_hash: Option<String>,
+
+        /// Minimum total fee in stroops.
+        #[arg(long, value_name = "STROOPS")]
+        min_stroops: Option<i64>,
+
+        /// Maximum total fee in stroops.
+        #[arg(long, value_name = "STROOPS")]
+        max_stroops: Option<i64>,
+
+        /// Earliest timestamp (ISO-8601, e.g. "2024-06-01T00:00:00Z").
+        #[arg(long, value_name = "TIMESTAMP")]
+        from: Option<String>,
+
+        /// Latest timestamp (ISO-8601, e.g. "2024-12-31T23:59:59Z").
+        #[arg(long, value_name = "TIMESTAMP")]
+        to: Option<String>,
+
+        /// Output as JSON instead of a table.
         #[arg(long)]
         json: bool,
     },

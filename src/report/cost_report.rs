@@ -1,6 +1,6 @@
 use comfy_table::Table;
 
-use crate::report::fee_calc::FeeBreakdown;
+use crate::report::fee_calc::{FeeBreakdown, FeeRates};
 
 /// Compute what percentage `part` is of `total`.
 ///
@@ -45,6 +45,122 @@ pub struct CostReport {
     /// RPC round-trip time of the `simulateTransaction` call, in
     /// milliseconds. Helps identify slow or overloaded RPC endpoints.
     pub rpc_latency_ms: u64,
+    /// Fee rates used to compute the breakdown (carried so optimization
+    /// suggestions can quantify per-resource savings). Excluded from
+    /// serialized output; `None` when the rates were unavailable.
+    #[serde(skip)]
+    pub rates: Option<FeeRates>,
+}
+
+/// A concrete, actionable cost-optimization suggestion derived from a report.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OptimizationSuggestion {
+    /// Short headline (e.g. "Reduce ledger write entries").
+    pub title: String,
+    /// Human-readable explanation including the quantified saving.
+    pub detail: String,
+    /// Approximate stroops saved by applying this single suggestion. `0` when
+    /// the saving cannot be expressed as a single per-unit amount.
+    pub potential_savings_stroops: i64,
+}
+
+impl CostReport {
+    /// Derive actionable cost-optimization suggestions from this report.
+    ///
+    /// Each suggestion quantifies how much a single reducible resource costs
+    /// per unit, using the network fee rates captured at simulation time
+    /// (`rates`). Returns an empty list when rates are unavailable or no
+    /// reducible resource is present, so callers can render a "no suggestions"
+    /// state. Suggestions are ordered by descending potential saving.
+    ///
+    /// Generic/contract-specific advice is intentionally out of scope; only
+    /// per-resource unit savings backed by the report's own rate data are
+    /// reported.
+    #[must_use]
+    pub fn suggest_optimizations(&self) -> Vec<OptimizationSuggestion> {
+        let Some(rates) = self.rates else {
+            return Vec::new();
+        };
+
+        let mut suggestions: Vec<OptimizationSuggestion> = Vec::new();
+
+        if self.write_entries > 0 && rates.fee_per_write_entry > 0 {
+            let saving = rates.fee_per_write_entry;
+            suggestions.push(OptimizationSuggestion {
+                title: "Reduce ledger write entries".to_string(),
+                detail: format!(
+                    "Removing one write entry saves ~{saving} stroops (current: {} write entries)",
+                    self.write_entries
+                ),
+                potential_savings_stroops: saving,
+            });
+        }
+
+        if self.read_entries > 0 && rates.fee_per_read_entry > 0 {
+            let saving = rates.fee_per_read_entry;
+            suggestions.push(OptimizationSuggestion {
+                title: "Reduce ledger read entries".to_string(),
+                detail: format!(
+                    "Removing one read entry saves ~{saving} stroops (current: {} read entries)",
+                    self.read_entries
+                ),
+                potential_savings_stroops: saving,
+            });
+        }
+
+        if self.read_bytes > 0 && rates.fee_per_read_1kb > 0 {
+            let saving = rates.fee_per_read_1kb;
+            suggestions.push(OptimizationSuggestion {
+                title: "Reduce disk read bytes".to_string(),
+                detail: format!(
+                    "Reducing disk reads by 1 KB saves ~{saving} stroops (current: {} read bytes)",
+                    self.read_bytes
+                ),
+                potential_savings_stroops: saving,
+            });
+        }
+
+        if self.cpu_instructions > 0 && rates.fee_per_10k_insns > 0 {
+            let saving = rates.fee_per_10k_insns;
+            suggestions.push(OptimizationSuggestion {
+                title: "Optimize CPU hot path".to_string(),
+                detail: format!(
+                    "Cutting 10,000 CPU instructions saves ~{saving} stroops (current: {} instructions)",
+                    self.cpu_instructions
+                ),
+                potential_savings_stroops: saving,
+            });
+        }
+
+        suggestions.sort_by(|a, b| {
+            b.potential_savings_stroops
+                .cmp(&a.potential_savings_stroops)
+        });
+        suggestions
+    }
+}
+
+/// Render optimization suggestions as a human-readable block.
+///
+/// Always emits a header; when there are no suggestions it explains why, so
+/// the section is never silently empty in report output.
+#[must_use]
+pub fn format_suggestions(suggestions: &[OptimizationSuggestion]) -> String {
+    let mut out = String::new();
+    out.push_str("Optimization Suggestions:\n");
+    if suggestions.is_empty() {
+        out.push_str(
+            "  No cost optimizations identified (fee rates unavailable or no reducible resources).\n",
+        );
+    } else {
+        for s in suggestions {
+            out.push_str(&format!(
+                "  - {}: {} (potential saving: {} stroops)\n",
+                s.title, s.detail, s.potential_savings_stroops
+            ));
+        }
+    }
+    out
 }
 
 /// Formats a cost report as a human-readable table.
@@ -141,5 +257,156 @@ mod tests {
         assert_eq!(fee_percentage(1, 10), "10.0%");
         assert_eq!(fee_percentage(1, 3), "33.3%");
         assert_eq!(fee_percentage(2, 3), "66.7%");
+    }
+
+    fn report_with_rates(rates: FeeRates) -> CostReport {
+        CostReport {
+            function: "increment".to_string(),
+            wasm_hash: "abc".to_string(),
+            cpu_instructions: 532_502,
+            memory_bytes: 0,
+            tx_size: 156,
+            read_entries: 1,
+            write_entries: 1,
+            read_bytes: 0,
+            write_bytes: 136,
+            fee: FeeBreakdown {
+                non_refundable_stroops: 4_496,
+                refundable_stroops: 10_931,
+                cpu_fee_stroops: 372,
+                storage_fee_stroops: 4_063,
+                bandwidth_fee_stroops: 61,
+                total_stroops: 15_427,
+                total_xlm: "0.0015427".to_string(),
+            },
+            ledger: 3_894_195,
+            network: "testnet".to_string(),
+            rpc_latency_ms: 87,
+            rates: Some(rates),
+        }
+    }
+
+    fn sample_rates() -> FeeRates {
+        FeeRates {
+            fee_per_10k_insns: 7,
+            fee_per_read_entry: 1_563,
+            fee_per_write_entry: 2_500,
+            fee_per_read_1kb: 447,
+            fee_per_1kb: 406,
+        }
+    }
+
+    #[test]
+    fn test_suggest_optimizations_with_rates() {
+        let report = report_with_rates(sample_rates());
+        let suggestions = report.suggest_optimizations();
+
+        // write entries (2_500) + read entries (1_563) + cpu 10k (7) expected.
+        assert_eq!(suggestions.len(), 3);
+        // Ordered by descending potential saving: write entry first.
+        assert_eq!(suggestions[0].title, "Reduce ledger write entries");
+        assert_eq!(suggestions[0].potential_savings_stroops, 2_500);
+        assert_eq!(suggestions[1].title, "Reduce ledger read entries");
+        assert_eq!(suggestions[1].potential_savings_stroops, 1_563);
+        assert_eq!(suggestions[2].title, "Optimize CPU hot path");
+        assert_eq!(suggestions[2].potential_savings_stroops, 7);
+    }
+
+    #[test]
+    fn test_suggest_optimizations_without_rates_is_empty() {
+        let mut report = report_with_rates(sample_rates());
+        report.rates = None;
+        assert!(report.suggest_optimizations().is_empty());
+    }
+
+    #[test]
+    fn test_suggest_optimizations_read_bytes_rates() {
+        let report = report_with_rates(FeeRates {
+            fee_per_10k_insns: 0,
+            fee_per_read_entry: 0,
+            fee_per_write_entry: 0,
+            fee_per_read_1kb: 447,
+            fee_per_1kb: 0,
+        });
+        // No reducible resource with a positive rate, so no suggestions.
+        assert!(report.suggest_optimizations().is_empty());
+    }
+
+    #[test]
+    fn test_format_suggestions_empty() {
+        let out = format_suggestions(&[]);
+        assert!(out.contains("Optimization Suggestions:"));
+        assert!(out.contains("No cost optimizations identified"));
+    }
+
+    #[test]
+    fn test_format_suggestions_nonempty() {
+        let out = format_suggestions(&[OptimizationSuggestion {
+            title: "Reduce ledger write entries".to_string(),
+            detail: "Removing one write entry saves ~2500 stroops".to_string(),
+            potential_savings_stroops: 2_500,
+        }]);
+        assert!(out.contains("- Reduce ledger write entries:"));
+        assert!(out.contains("2500 stroops"));
+    }
+
+    #[test]
+    fn test_format_report_table_and_json_populated_footprint() {
+        let report = report_with_rates(sample_rates());
+
+        // Table verification
+        let table_out = format_report_table(&report);
+        assert!(table_out.contains("Read Entries"));
+        assert!(table_out.contains("Write Entries"));
+        assert!(table_out.contains("Read Bytes"));
+        assert!(table_out.contains("Write Bytes"));
+        assert!(table_out.contains("136")); // write_bytes
+
+        // JSON verification
+        let json_out = format_report_json(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json_out).expect("valid json");
+        assert_eq!(parsed["read_entries"], 1);
+        assert_eq!(parsed["write_entries"], 1);
+        assert_eq!(parsed["read_bytes"], 0);
+        assert_eq!(parsed["write_bytes"], 136);
+    }
+
+    #[test]
+    fn test_format_report_table_and_json_zero_footprint() {
+        let report = CostReport {
+            function: "(wasm upload)".to_string(),
+            wasm_hash: "0000".to_string(),
+            cpu_instructions: 0,
+            memory_bytes: 0,
+            tx_size: 0,
+            read_entries: 0,
+            write_entries: 0,
+            read_bytes: 0,
+            write_bytes: 0,
+            fee: FeeBreakdown {
+                non_refundable_stroops: 0,
+                refundable_stroops: 0,
+                cpu_fee_stroops: 0,
+                storage_fee_stroops: 0,
+                bandwidth_fee_stroops: 0,
+                total_stroops: 0,
+                total_xlm: "0.0000000".to_string(),
+            },
+            ledger: 0,
+            network: "testnet".to_string(),
+            rpc_latency_ms: 0,
+            rates: None,
+        };
+
+        let table_out = format_report_table(&report);
+        assert!(table_out.contains("Read Entries"));
+        assert!(table_out.contains("Write Entries"));
+
+        let json_out = format_report_json(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json_out).expect("valid json");
+        assert_eq!(parsed["read_entries"], 0);
+        assert_eq!(parsed["write_entries"], 0);
+        assert_eq!(parsed["read_bytes"], 0);
+        assert_eq!(parsed["write_bytes"], 0);
     }
 }
