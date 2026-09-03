@@ -215,6 +215,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::Validate { network } => cmd_config_validate(&network),
         },
         cli::Command::Cache { action } => match action {
+            cli::CacheAction::Export { out } => cmd_cache_export(out.as_deref()),
             cli::CacheAction::Warm {
                 wasm,
                 network,
@@ -1429,6 +1430,65 @@ async fn cmd_watch(
 }
 
 /// `cache verify` command: check every cache entry parses as valid JSON.
+/// `cache stats` command: show cache health overview.
+///
+/// Prints total entries, disk usage, age (oldest/newest), and per-network
+/// breakdown. Useful for checking whether the cache is being populated and
+/// how much disk space it consumes.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+fn cmd_cache_stats() -> error::AppResult<()> {
+    let stats = cache::cache_stats()?;
+
+    if stats.total_entries == 0 {
+        println!("Cache is empty — no cached estimates.");
+        return Ok(());
+    }
+
+    println!("Cache Statistics");
+    println!("================");
+    println!("  Total entries:  {}", stats.total_entries);
+    println!("  Disk usage:     {}", format_bytes(stats.disk_bytes));
+    println!(
+        "  Oldest entry:   {}",
+        stats.oldest_entry.as_deref().unwrap_or("n/a")
+    );
+    println!(
+        "  Newest entry:   {}",
+        stats.newest_entry.as_deref().unwrap_or("n/a")
+    );
+
+    if !stats.per_network.is_empty() {
+        println!("\nPer-network breakdown:");
+        for (network, count) in &stats.per_network {
+            println!(
+                "  {network}: {count} entr{}",
+                if *count == 1 { "y" } else { "ies" }
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Format a byte count as a human-readable string (KB, MB, GB).
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 ///
 /// Prints a summary line per corrupted entry and exits with code 1 when any
 /// entry fails verification, so scripts can treat a corrupt cache as an
@@ -1531,6 +1591,27 @@ fn cmd_cache_query(
         ]);
     }
     println!("{table}");
+
+    Ok(())
+}
+
+/// `cache export` command: print or save every cached estimate as a JSON array.
+fn cmd_cache_export(out_path: Option<&str>) -> error::AppResult<()> {
+    let estimates = cache::export_cached_estimates()?;
+    let json = serde_json::to_string_pretty(&estimates)?;
+
+    if let Some(out_path) = out_path {
+        std::fs::write(out_path, json)?;
+        println!(
+            "Exported {} cache entr{} to {}.",
+            estimates.len(),
+            if estimates.len() == 1 { "y" } else { "ies" },
+            out_path
+        );
+    } else {
+        println!("{json}");
+    }
+
     Ok(())
 }
 
