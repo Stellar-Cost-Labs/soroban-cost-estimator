@@ -214,6 +214,10 @@ pub enum ConfigAction {
         #[arg(long, default_value = "testnet")]
         network: String,
 
+        /// Explicit RPC URL (overrides network-based resolution).
+        #[arg(long)]
+        rpc_url: Option<String>,
+
         /// Explicit snapshot path to compare against (defaults to latest).
         #[arg(long)]
         against: Option<String>,
@@ -222,6 +226,10 @@ pub enum ConfigAction {
         /// instead of the full diff. Useful for CI status lines.
         #[arg(long)]
         summary: bool,
+
+        /// Run a one-shot diff that exits 1 if ANY changes are detected, matching watch mode output.
+        #[arg(long)]
+        watch: bool,
     },
 
     /// Show the full chronological change log across all stored snapshots.

@@ -193,6 +193,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             }
             cli::ConfigAction::Diff {
                 network,
+                rpc_url,
                 against,
                 summary,
             } => cmd_config_diff(&network, against.as_deref(), summary, rps, timeout).await,
@@ -989,6 +990,7 @@ fn wasm_info_json(
 /// Makes one batched `getLedgerEntries` RPC call.
 async fn fetch_config_snapshot(
     network: &str,
+    rpc_url: Option<&str>,
     rps: Option<u64>,
     timeout: u64,
 ) -> error::AppResult<config_snapshot::model::ConfigSnapshot> {
@@ -1095,6 +1097,7 @@ fn upgrade_detected(diff: &config_snapshot::diff::ConfigDiff) -> bool {
 /// `config diff` command: compare current config against a snapshot.
 async fn cmd_config_diff(
     network: &str,
+    rpc_url: Option<&str>,
     against_path: Option<&str>,
     summary: bool,
     rps: Option<u64>,
@@ -1316,6 +1319,49 @@ async fn shutdown_signal() -> error::AppResult<()> {
     Ok(())
 }
 
+/// Compares a new snapshot against the latest local snapshot, printing
+/// the diff if changes exist, and always printing stale estimates.
+/// Returns `true` if changes were detected.
+fn check_and_print_diff(
+    network: &str,
+    against_path: Option<&str>,
+    snapshot: &config_snapshot::model::ConfigSnapshot,
+) -> bool {
+    use tracing::debug;
+    let old_snapshot_result = match against_path {
+        Some(path) => config_snapshot::store::load_snapshot_from_path(path),
+        None => config_snapshot::store::load_latest_snapshot(network),
+    };
+
+    if let Ok(old_snapshot) = old_snapshot_result {
+        let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, snapshot);
+        if !diff.changes.is_empty() {
+            debug!(change_count = diff.changes.len(), "config changes detected");
+            println!("{}", config_snapshot::diff::format_diff(&diff));
+        }
+        print_stale_estimates(network, snapshot.ledger);
+        return !diff.changes.is_empty();
+    }
+    false
+}
+
+/// `config diff --watch` command: compute the diff exactly once,
+/// print changes, and exit 1 if ANY changes were detected.
+async fn cmd_config_diff_once(
+    network: &str,
+    against_path: Option<&str>,
+    rpc_url: Option<&str>,
+    rps: Option<u64>,
+) -> error::AppResult<()> {
+    let snapshot = fetch_config_snapshot(network, rpc_url, rps).await?;
+    let has_changes = check_and_print_diff(network, against_path, &snapshot);
+    if has_changes {
+        std::process::exit(1);
+    }
+    println!("No config changes detected.");
+    Ok(())
+}
+
 /// Runs one `watch` poll cycle: fetch the network config, diff it against
 /// the previous snapshot, print changes and stale-estimate info, then save
 /// the new snapshot.
@@ -1328,20 +1374,12 @@ async fn watch_poll_once(
     rps: Option<u64>,
     timeout: u64,
 ) -> error::AppResult<()> {
-    use tracing::{debug, warn};
+    use tracing::warn;
 
     match fetch_config_snapshot(network, rps, timeout).await {
         Ok(snapshot) => {
             if !*first {
-                if let Ok(old_snapshot) = config_snapshot::store::load_latest_snapshot(network) {
-                    let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &snapshot);
-                    if !diff.changes.is_empty() {
-                        debug!(change_count = diff.changes.len(), "config changes detected");
-                        println!("{}", config_snapshot::diff::format_diff(&diff));
-                    }
-
-                    print_stale_estimates(network, snapshot.ledger);
-                }
+                check_and_print_diff(network, None, &snapshot);
             }
 
             let _ = config_snapshot::store::save_snapshot(&snapshot, None);
