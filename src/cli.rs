@@ -146,8 +146,12 @@ pub enum Command {
 
 #[derive(Subcommand, Debug)]
 pub enum CacheAction {
-    /// Show cache health: total entries, disk usage, age, per-network breakdown.
-    Stats,
+    /// Export every cached estimate as a JSON array.
+    Export {
+        /// Write the JSON array to a file instead of standard output.
+        #[arg(long, short)]
+        out: Option<String>,
+    },
 
     /// Check that every cached estimate is valid JSON and not corrupted.
     Verify,

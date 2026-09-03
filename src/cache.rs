@@ -548,7 +548,36 @@ pub fn query_estimates(network: &str, filter: &QueryFilter) -> AppResult<Vec<Cac
     Ok(filtered)
 }
 
-/// Integrity status of a single cache entry.
+/// Export every cached estimate as a deterministic, JSON-serializable list.
+///
+/// All rows are read from the SQLite cache, migrated to the current schema,
+/// and sorted by (wasm_hash, function, args_hash) so repeated exports are
+/// stable. A malformed or unsupported entry returns an error rather than
+/// producing an incomplete backup.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+pub fn export_cached_estimates() -> AppResult<Vec<CachedEstimate>> {
+    let conn = open_db()?;
+    let mut stmt = conn.prepare(
+        "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
+         cpu_instructions, memory_bytes, timestamp \
+         FROM estimates ORDER BY wasm_hash, function, args_hash",
+    )?;
+
+    let rows = stmt.query_map([], estimate_from_row)?;
+
+    let mut estimates = Vec::new();
+    for row in rows {
+        let cached = row?;
+        estimates.push(migrate_to_latest(cached)?);
+    }
+
+    debug!(count = estimates.len(), "exported cached estimates");
+    Ok(estimates)
+}
+
+/// Integrity status of a single cache entry file.
 #[derive(Debug, Clone)]
 pub struct CacheEntryStatus {
     /// Synthesized identity of the cache entry

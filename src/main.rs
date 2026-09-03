@@ -201,7 +201,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::Validate { network } => cmd_config_validate(&network),
         },
         cli::Command::Cache { action } => match action {
-            cli::CacheAction::Stats => cmd_cache_stats(),
+            cli::CacheAction::Export { out } => cmd_cache_export(out.as_deref()),
             cli::CacheAction::Warm {
                 wasm,
                 network,
@@ -1556,6 +1556,27 @@ fn cmd_cache_query(
         ]);
     }
     println!("{table}");
+
+    Ok(())
+}
+
+/// `cache export` command: print or save every cached estimate as a JSON array.
+fn cmd_cache_export(out_path: Option<&str>) -> error::AppResult<()> {
+    let estimates = cache::export_cached_estimates()?;
+    let json = serde_json::to_string_pretty(&estimates)?;
+
+    if let Some(out_path) = out_path {
+        std::fs::write(out_path, json)?;
+        println!(
+            "Exported {} cache entr{} to {}.",
+            estimates.len(),
+            if estimates.len() == 1 { "y" } else { "ies" },
+            out_path
+        );
+    } else {
+        println!("{json}");
+    }
+
     Ok(())
 }
 
