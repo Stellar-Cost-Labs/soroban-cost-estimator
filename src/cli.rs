@@ -80,6 +80,10 @@ pub enum Command {
         /// Number of decimal places for XLM fee values (0..=18, default 7).
         #[arg(long, default_value_t = 7)]
         precision: u32,
+
+        /// Print simulation execution plan without calling network RPC endpoints.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Enumerate all public contract functions and estimate each one.

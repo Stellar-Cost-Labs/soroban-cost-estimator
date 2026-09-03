@@ -147,6 +147,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             json,
             format,
             precision,
+            dry_run,
         } => {
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
@@ -163,6 +164,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 rps,
                 timeout,
                 precision,
+                dry_run,
             )
             .await
         }
@@ -396,6 +398,7 @@ async fn cmd_estimate(
     rps: Option<u64>,
     timeout: u64,
     precision: u32,
+    dry_run: bool,
 ) -> error::AppResult<()> {
     let json_flag = format == "json";
     let table_mode = format == "table";
