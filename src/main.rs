@@ -132,6 +132,7 @@ async fn main() {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run(args: cli::Cli) -> error::AppResult<()> {
     let rps = args.rps;
     let timeout = args.timeout;

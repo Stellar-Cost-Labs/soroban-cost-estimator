@@ -277,4 +277,3 @@ pub fn delete_snapshots_older_than(network: &str, days: u64) -> AppResult<Vec<Pa
 
     Ok(deleted)
 }
-
