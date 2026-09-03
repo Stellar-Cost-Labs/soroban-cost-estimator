@@ -146,6 +146,13 @@ pub enum Command {
 
 #[derive(Subcommand, Debug)]
 pub enum CacheAction {
+    /// Export every cached estimate as a JSON array.
+    Export {
+        /// Write the JSON array to a file instead of standard output.
+        #[arg(long, short)]
+        out: Option<String>,
+    },
+
     /// Check that every cached estimate is valid JSON and not corrupted.
     Verify,
 
