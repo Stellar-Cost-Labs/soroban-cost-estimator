@@ -63,6 +63,10 @@ pub enum Command {
         /// Overrides `--json` when both are supplied.
         #[arg(long, value_parser = ["table", "json", "csv", "markdown"])]
         format: Option<String>,
+
+        /// Number of decimal places for XLM fee values (0..=18, default 7).
+        #[arg(long, default_value_t = 7)]
+        precision: u32,
     },
 
     /// Enumerate all public contract functions and estimate each one.
@@ -87,6 +91,10 @@ pub enum Command {
         /// Overrides `--json` when both are supplied.
         #[arg(long, value_parser = ["table", "json", "csv", "markdown"])]
         format: Option<String>,
+
+        /// Number of decimal places for XLM fee values (0..=18, default 7).
+        #[arg(long, default_value_t = 7)]
+        precision: u32,
     },
 
     /// Print WASM metadata (functions, contract spec, size, hash) without any RPC calls.
