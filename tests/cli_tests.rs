@@ -92,6 +92,10 @@ fn test_help_output() {
     assert!(stdout.contains("config"), "help should list config command");
     assert!(stdout.contains("cache"), "help should list cache command");
     assert!(stdout.contains("watch"), "help should list watch command");
+    assert!(
+        stdout.contains("completions"),
+        "help should list completions command"
+    );
 }
 
 #[test]
@@ -1465,4 +1469,106 @@ fn test_estimate_minimal_wasm_upload_zero_footprint() {
     assert_eq!(parsed["write_entries"], 0);
     assert_eq!(parsed["read_bytes"], 0);
     assert_eq!(parsed["write_bytes"], 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Shell completions
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_completions_help() {
+    let (stdout, stderr, code) = run_cli(&["completions", "--help"]);
+    assert_eq!(
+        code, 0,
+        "completions --help should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("bash"),
+        "completions help should list bash option"
+    );
+    assert!(
+        stdout.contains("zsh"),
+        "completions help should list zsh option"
+    );
+    assert!(
+        stdout.contains("fish"),
+        "completions help should list fish option"
+    );
+    assert!(
+        stdout.contains("powershell"),
+        "completions help should list powershell option"
+    );
+}
+
+#[test]
+fn test_completions_bash() {
+    let (stdout, stderr, code) = run_cli(&["completions", "bash"]);
+    assert_eq!(code, 0, "completions bash should exit 0; stderr: {stderr}");
+    assert!(!stdout.is_empty(), "completion script should not be empty");
+    assert!(
+        stdout.contains("soroban-cost-estimator"),
+        "bash completion script should contain binary name"
+    );
+    assert!(
+        stdout.contains("estimate"),
+        "bash completion script should contain subcommand names"
+    );
+}
+
+#[test]
+fn test_completions_zsh() {
+    let (stdout, stderr, code) = run_cli(&["completions", "zsh"]);
+    assert_eq!(code, 0, "completions zsh should exit 0; stderr: {stderr}");
+    assert!(!stdout.is_empty(), "completion script should not be empty");
+    assert!(
+        stdout.contains("soroban-cost-estimator"),
+        "zsh completion script should contain binary name"
+    );
+    assert!(
+        stdout.contains("estimate"),
+        "zsh completion script should contain subcommand names"
+    );
+}
+
+#[test]
+fn test_completions_fish() {
+    let (stdout, stderr, code) = run_cli(&["completions", "fish"]);
+    assert_eq!(code, 0, "completions fish should exit 0; stderr: {stderr}");
+    assert!(!stdout.is_empty(), "completion script should not be empty");
+    assert!(
+        stdout.contains("soroban-cost-estimator"),
+        "fish completion script should contain binary name"
+    );
+    assert!(
+        stdout.contains("estimate"),
+        "fish completion script should contain subcommand names"
+    );
+}
+
+#[test]
+fn test_completions_powershell() {
+    let (stdout, stderr, code) = run_cli(&["completions", "powershell"]);
+    assert_eq!(
+        code, 0,
+        "completions powershell should exit 0; stderr: {stderr}"
+    );
+    assert!(!stdout.is_empty(), "completion script should not be empty");
+    assert!(
+        stdout.contains("soroban-cost-estimator"),
+        "powershell completion script should contain binary name"
+    );
+    assert!(
+        stdout.contains("estimate"),
+        "powershell completion script should contain subcommand names"
+    );
+}
+
+#[test]
+fn test_completions_unsupported_shell() {
+    let (_stdout, stderr, code) = run_cli(&["completions", "invalid_shell"]);
+    assert_ne!(code, 0, "unsupported shell should exit non-zero");
+    assert!(
+        stderr.contains("invalid value 'invalid_shell'") || stderr.contains("unexpected argument"),
+        "stderr should state invalid shell value; got: {stderr}"
+    );
 }

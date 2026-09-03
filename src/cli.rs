@@ -142,6 +142,13 @@ pub enum Command {
         #[arg(long, default_value = "1h")]
         interval: String,
     },
+
+    /// Generate shell completion scripts for Bash, Zsh, Fish, and PowerShell.
+    Completions {
+        /// Target shell for completion script generation.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Subcommand, Debug)]
