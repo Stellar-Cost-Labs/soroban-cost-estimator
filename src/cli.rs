@@ -1,11 +1,24 @@
 use clap::{Parser, Subcommand};
 
+/// Build version string with metadata from build.rs
+fn build_version() -> &'static str {
+    concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (",
+        env!("GIT_HASH"),
+        " ",
+        env!("BUILD_DATE"),
+        ")"
+    )
+}
+
 /// Estimate Soroban contract resource costs with network config-drift tracking.
 ///
 /// Wraps Stellar's `simulateTransaction` RPC and adds awareness of how the
 /// network's resource-pricing configuration changes over time.
 #[derive(Parser, Debug)]
 #[command(name = "soroban-cost-estimator")]
+#[command(version = build_version())]
 #[command(about = "Estimate Soroban contract costs & track network pricing changes", long_about = None)]
 pub struct Cli {
     /// Cap RPC requests at N per second (fixed-rate spacing; applies to
@@ -63,6 +76,10 @@ pub enum Command {
         /// Overrides `--json` when both are supplied.
         #[arg(long, value_parser = ["table", "json", "csv", "markdown"])]
         format: Option<String>,
+
+        /// Number of decimal places for XLM fee values (0..=18, default 7).
+        #[arg(long, default_value_t = 7)]
+        precision: u32,
     },
 
     /// Enumerate all public contract functions and estimate each one.
@@ -82,6 +99,15 @@ pub enum Command {
         /// Output as JSON instead of a human-readable list.
         #[arg(long)]
         json: bool,
+
+        /// Output format: table (default), json, csv, or markdown.
+        /// Overrides `--json` when both are supplied.
+        #[arg(long, value_parser = ["table", "json", "csv", "markdown"])]
+        format: Option<String>,
+
+        /// Number of decimal places for XLM fee values (0..=18, default 7).
+        #[arg(long, default_value_t = 7)]
+        precision: u32,
     },
 
     /// Print WASM metadata (functions, contract spec, size, hash) without any RPC calls.
