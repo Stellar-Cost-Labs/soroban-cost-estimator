@@ -102,20 +102,27 @@ impl RpcClient {
     /// and TCP keep-alive so that HTTP connections are reused across multiple
     /// RPC calls within a single run, reducing handshake overhead.
     pub fn with_rate_limit(url: &str, rps: Option<u64>) -> Self {
-        Self::with_options(url, rps, DEFAULT_TIMEOUT)
+        Self::with_options(url, rps, DEFAULT_TIMEOUT, DEFAULT_MAX_RETRIES)
     }
 
     /// Create a new RPC client pointing at the given URL, optionally capping
-    /// outbound requests to `rps` requests per second and bounding each HTTP
-    /// request with `timeout`.
+    /// outbound requests to `rps` requests per second, bounding each HTTP
+    /// request with `timeout`, and retrying transient failures up to
+    /// `max_retries` times with exponential backoff.
     ///
     /// The limiter spaces consecutive outbound calls at least `1/rps` seconds
     /// apart (a fixed-rate limiter with a burst of 1). `None` or `Some(0)`
     /// disables rate limiting entirely. Values larger than `u32::MAX` are
     /// clamped. `timeout` applies to the whole request (connect through
-    /// response body) and is passed straight to reqwest.
-    pub fn with_options(url: &str, rps: Option<u64>, timeout: Duration) -> Self {
-        debug!(url, rps, ?timeout, "creating RPC client");
+    /// response body) and is passed straight to reqwest. A `max_retries` of
+    /// `0` disables retries.
+    pub fn with_options(
+        url: &str,
+        rps: Option<u64>,
+        timeout: Duration,
+        max_retries: usize,
+    ) -> Self {
+        debug!(url, rps, ?timeout, max_retries, "creating RPC client");
         Self {
             url: url.to_string(),
             // `ClientBuilder::build` only fails on invalid configuration (a
@@ -598,7 +605,7 @@ mod tests {
     #[tokio::test]
     async fn test_request_timeout_applies() {
         let url = spawn_hanging_stub().await;
-        let client = RpcClient::with_options(&url, None, Duration::from_millis(100));
+        let client = RpcClient::with_options(&url, None, Duration::from_millis(100), 0);
 
         let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
 
