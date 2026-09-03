@@ -139,7 +139,7 @@ fn test_estimate_all_help() {
         code, 0,
         "estimate-all --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--wasm", "--network", "--id", "--json"] {
+    for flag in ["--wasm", "--network", "--id", "--json", "--format"] {
         assert!(
             stdout.contains(flag),
             "estimate-all help should mention {flag}; got: {stdout}"
@@ -419,6 +419,49 @@ fn test_help_lists_global_flags() {
     assert!(
         stdout.contains("--rps"),
         "help should list --rps; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_estimate_all_format_flag_accepted() {
+    // Verify --format is a recognized argument for estimate-all.
+    let (_, stderr, code) = run_cli(&["estimate-all", "--wasm", "test.wasm", "--format", "csv"]);
+    // Should fail because the file doesn't exist, NOT because --format is unknown.
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--format should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_all_format_wins_over_json() {
+    // --format should take precedence over the legacy --json flag.
+    // Both flags are accepted; the combination fails only because
+    // test.wasm doesn't exist, NOT because of an argument conflict.
+    let (_, stderr, code) = run_cli(&[
+        "estimate-all",
+        "--wasm",
+        "test.wasm",
+        "--format",
+        "csv",
+        "--json",
+    ]);
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("cannot") && !stderr.contains("conflicts"),
+        "--format and --json should NOT conflict; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_all_format_invalid_value_rejected() {
+    // clap's value_parser must reject unknown formats before the command runs.
+    let (_, stderr, code) = run_cli(&["estimate-all", "--wasm", "test.wasm", "--format", "xml"]);
+    assert_ne!(code, 0, "invalid --format value should error");
+    assert!(
+        stderr.contains("invalid value") || stderr.contains("possible values"),
+        "clap should reject unknown format; stderr: {stderr}"
     );
 }
 
@@ -1187,4 +1230,239 @@ fn test_cache_query_json_flag_accepted() {
         serde_json::from_str::<serde_json::Value>(trimmed).is_ok(),
         "output should be valid JSON; got: {stdout}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Simulation footprint metrics tests (Issue #2)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Spawns a lightweight local HTTP mock JSON-RPC server on loopback to test
+/// simulation response parsing end-to-end without touching external networks.
+fn start_mock_rpc_server(
+    live_tx_data: &'static str,
+    min_fee: &'static str,
+    ledger: u64,
+) -> (String, std::sync::mpsc::Sender<()>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+    let addr = listener.local_addr().expect("local addr");
+    let (tx_stop, rx_stop) = std::sync::mpsc::channel::<()>();
+
+    let live_tx_data = live_tx_data.to_string();
+    let min_fee = min_fee.to_string();
+
+    std::thread::spawn(move || {
+        listener.set_nonblocking(true).expect("set nonblocking");
+        loop {
+            if rx_stop.try_recv().is_ok() {
+                break;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buf = [0u8; 4096];
+                    let mut req_str = String::new();
+                    loop {
+                        match stream.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                req_str.push_str(&String::from_utf8_lossy(&buf[..n]));
+                                if req_str.contains("\r\n\r\n") {
+                                    if let Some(pos) = req_str.find("Content-Length: ") {
+                                        let cl_str = &req_str[pos + 16..];
+                                        let end = cl_str.find("\r\n").unwrap_or(cl_str.len());
+                                        if let Ok(cl) = cl_str[..end].trim().parse::<usize>() {
+                                            let body_start = req_str.find("\r\n\r\n").unwrap() + 4;
+                                            if req_str.len() - body_start >= cl {
+                                                break;
+                                            }
+                                        } else {
+                                            break;
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+
+                    let resp_body = if req_str.contains("simulateTransaction") {
+                        if live_tx_data.is_empty() {
+                            format!(
+                                r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":"{ledger}","minResourceFee":"{min_fee}"}}}}"#
+                            )
+                        } else {
+                            format!(
+                                r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":"{ledger}","minResourceFee":"{min_fee}","transactionData":"{live_tx_data}"}}}}"#
+                            )
+                        }
+                    } else if req_str.contains("getLedgerEntries") {
+                        format!(
+                            r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":{ledger},"entries":[]}}}}"#
+                        )
+                    } else {
+                        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#.to_string()
+                    };
+
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        resp_body.len(),
+                        resp_body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    (format!("http://127.0.0.1:{}", addr.port()), tx_stop)
+}
+
+const LIVE_INCREMENT_TX_DATA: &str = "AAAAAAAAAAEAAAAH6hS8qZjpjw3bM46OXO9uGfBzeKO3HotPiGjO3IV+Ts0AAAABAAAABgAAAAEmU1Fc+h02S4iEBnpjdCESXpKHG/bOUxC3DeRWUy9+mQAAABQAAAABAAggFgAAAAAAAACIAAAAAAAAPEM=";
+
+#[test]
+fn test_estimate_fn_contract_fixture_populates_footprint_json() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-footprint-json");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+            "--json",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate should succeed; stderr: {stderr}"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+
+    // Footprint metrics verification (Acceptance Criteria)
+    assert_eq!(parsed["read_entries"], 1, "expected 1 read entry");
+    assert!(
+        parsed["write_entries"].as_u64().unwrap_or(0) >= 1,
+        "expected write_entries >= 1"
+    );
+    assert_eq!(parsed["write_entries"], 1, "expected 1 write entry");
+    assert_eq!(parsed["read_bytes"], 0, "expected 0 read bytes");
+    assert_eq!(parsed["write_bytes"], 136, "expected 136 write bytes");
+    assert_eq!(parsed["cpu_instructions"], 532_502);
+    assert_eq!(parsed["fee"]["total_stroops"], 15_427);
+}
+
+#[test]
+fn test_estimate_fn_contract_fixture_populates_footprint_table() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-footprint-table");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate should succeed; stderr: {stderr}"
+    );
+
+    // Verify table output contains the same resource metrics
+    assert!(stdout.contains("Read Entries"));
+    assert!(stdout.contains("Write Entries"));
+    assert!(stdout.contains("Read Bytes"));
+    assert!(stdout.contains("Write Bytes"));
+    assert!(
+        stdout.contains("136"),
+        "table should display 136 write bytes"
+    );
+    assert!(
+        stdout.contains("15427"),
+        "table should display total fee 15427"
+    );
+}
+
+#[test]
+fn test_estimate_minimal_wasm_upload_zero_footprint() {
+    // minimal.wasm (upload path, no footprint) still reports zeros without error
+    let (rpc_url, _stop) = start_mock_rpc_server("", "1000", 100);
+    let home = temp_home("estimate-minimal-upload");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--rpc-url",
+            &rpc_url,
+            "--json",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate should succeed; stderr: {stderr}"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+
+    assert_eq!(parsed["read_entries"], 0);
+    assert_eq!(parsed["write_entries"], 0);
+    assert_eq!(parsed["read_bytes"], 0);
+    assert_eq!(parsed["write_bytes"], 0);
 }
