@@ -1287,3 +1287,119 @@ fn test_load_fresh_estimate_expired_returns_none() {
         assert!(fresh.is_none(), "an expired entry must yield None");
     });
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Cache import
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Write a JSON export file into `tmp` containing the given estimates.
+fn write_export_file(tmp: &Path, entries: &[cache::CachedEstimate]) -> PathBuf {
+    let path = tmp.join("export.json");
+    let json = serde_json::to_string_pretty(entries).expect("serialize export");
+    std::fs::write(&path, json).expect("write export file");
+    path
+}
+
+fn sample_estimate(wasm_hash: &str, function: &str, network: &str) -> cache::CachedEstimate {
+    cache::CachedEstimate {
+        version: cache::CACHE_SCHEMA_VERSION,
+        wasm_hash: wasm_hash.to_string(),
+        function: function.to_string(),
+        args_hash: hex::encode(sha2::Sha256::digest(b"")),
+        network: network.to_string(),
+        ledger: 42,
+        total_stroops: 1_000,
+        cpu_instructions: 500,
+        memory_bytes: 250,
+        timestamp: "2026-01-01T00:00:00Z".to_string(),
+    }
+}
+
+#[test]
+fn test_import_estimates_populates_cache() {
+    with_temp_home(|tmp| {
+        let entries = vec![
+            sample_estimate("hash1", "f1", "testnet"),
+            sample_estimate("hash2", "f2", "mainnet"),
+        ];
+        let path = write_export_file(tmp, &entries);
+
+        let result = cache::import_estimates(&path).expect("import");
+        assert_eq!(result.imported, 2);
+        assert_eq!(result.skipped, 0);
+        assert_eq!(result.failed, 0);
+
+        let estimates = cache::list_cached_estimates("testnet").expect("list");
+        assert_eq!(estimates.len(), 1);
+        assert_eq!(estimates[0].wasm_hash, "hash1");
+        assert_eq!(estimates[0].total_stroops, 1_000);
+    });
+}
+
+#[test]
+fn test_import_estimates_overwrites_existing_entry() {
+    with_temp_home(|tmp| {
+        cache::save_estimate("hash", "f", &[], "testnet", 10, 100, 10, 5).expect("save");
+
+        let entry = sample_estimate("hash", "f", "testnet");
+        let path = write_export_file(tmp, &[entry]);
+
+        let result = cache::import_estimates(&path).expect("import");
+        assert_eq!(result.imported, 1);
+
+        let loaded = cache::load_estimate("hash", "f", &[])
+            .expect("load")
+            .expect("should exist");
+        assert_eq!(
+            loaded.ledger, 42,
+            "import should overwrite the existing entry"
+        );
+        assert_eq!(loaded.total_stroops, 1_000);
+    });
+}
+
+#[test]
+fn test_import_estimates_skips_future_version() {
+    with_temp_home(|tmp| {
+        let mut future = sample_estimate("hash", "f", "testnet");
+        future.version = cache::CACHE_SCHEMA_VERSION + 1;
+        let path = write_export_file(tmp, &[future]);
+
+        let result = cache::import_estimates(&path).expect("import");
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.skipped, 1, "future-version entry should be skipped");
+        assert_eq!(result.failed, 0);
+
+        let estimates = cache::list_cached_estimates("testnet").expect("list");
+        assert!(estimates.is_empty(), "skipped entry must not be stored");
+    });
+}
+
+#[test]
+fn test_import_estimates_missing_file_errors() {
+    with_temp_home(|tmp| {
+        let result = cache::import_estimates(&tmp.join("nope.json"));
+        assert!(result.is_err(), "a missing file should error");
+    });
+}
+
+#[test]
+fn test_import_estimates_malformed_json_errors() {
+    with_temp_home(|tmp| {
+        let path = tmp.join("bad.json");
+        std::fs::write(&path, b"{ not valid json").expect("write");
+        let result = cache::import_estimates(&path);
+        assert!(result.is_err(), "malformed JSON should error");
+    });
+}
+
+#[test]
+fn test_import_estimates_empty_array() {
+    with_temp_home(|tmp| {
+        let path = write_export_file(tmp, &[]);
+        let result = cache::import_estimates(&path).expect("import");
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.skipped, 0);
+        assert_eq!(result.failed, 0);
+    });
+}

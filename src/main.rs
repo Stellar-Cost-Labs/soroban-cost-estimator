@@ -227,6 +227,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 to.as_deref(),
                 json,
             ),
+            cli::CacheAction::Import { file } => cmd_cache_import(&file),
         },
         cli::Command::Watch { network, interval } => {
             cmd_watch(&network, &interval, rps, timeout).await
@@ -1510,6 +1511,36 @@ async fn cmd_cache_warm(
 ) -> error::AppResult<()> {
     let fmt = if json_flag { "json" } else { "table" };
     cmd_estimate_all(wasm_path, network, contract_id, fmt, rps, timeout, 7).await
+}
+
+/// `cache import` command: restore cached estimates from a JSON file.
+///
+/// Reads a JSON array of [`cache::CachedEstimate`] objects and upserts each
+/// one into the SQLite cache database. Prints a summary of how many entries
+/// were imported, skipped (schema newer than supported), or failed to load.
+///
+/// # Network calls
+/// None — pure file I/O + SQLite.
+fn cmd_cache_import(file: &str) -> error::AppResult<()> {
+    let path = std::path::Path::new(file);
+    if !path.exists() {
+        return Err(error::AppError::FileNotFound(file.to_string()));
+    }
+
+    let result = cache::import_estimates(path)?;
+    if result.failed > 0 || result.skipped > 0 {
+        eprintln!(
+            "Warning: {skipped} skipped (unsupported schema), {failed} failed to import.",
+            skipped = result.skipped,
+            failed = result.failed
+        );
+    }
+    println!(
+        "Imported {} cached estimate(s) from {}.",
+        result.imported,
+        path.display()
+    );
+    Ok(())
 }
 
 #[cfg(test)]

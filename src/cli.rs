@@ -189,6 +189,13 @@ pub enum CacheAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Restore cached estimates from a JSON export file.
+    Import {
+        /// Path to the JSON file containing the estimates to import.
+        #[arg(long, short, value_name = "PATH")]
+        file: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]

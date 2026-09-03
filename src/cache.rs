@@ -12,6 +12,7 @@ use rusqlite::Connection;
 use serde::Deserialize;
 use serde::Serialize;
 use tracing::debug;
+use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
@@ -574,6 +575,99 @@ pub fn verify_cache() -> AppResult<Vec<CacheEntryStatus>> {
     statuses.sort_by(|a, b| a.filename.cmp(&b.filename));
     debug!(total = statuses.len(), "cache verification complete");
     Ok(statuses)
+}
+
+/// Result of a cache import operation.
+#[derive(Debug, Clone)]
+pub struct ImportResult {
+    /// Number of estimates successfully imported (inserted or updated).
+    pub imported: usize,
+    /// Number of entries that were skipped because they have a schema version
+    /// newer than the current tool can handle.
+    pub skipped: usize,
+    /// Number of entries that failed validation (e.g. missing required fields).
+    pub failed: usize,
+}
+
+/// Import cached estimates from a JSON file into the SQLite database.
+///
+/// The file must contain a JSON array of objects matching the
+/// [`CachedEstimate`] shape. Each entry is inserted or updated using the
+/// same upsert logic as [`save_estimate`], so re-importing an existing
+/// entry overwrites the previous version.
+///
+/// Entries with a schema version newer than [`CACHE_SCHEMA_VERSION`] are
+/// skipped rather than silently misread. Entries that fail to parse or
+/// validate are counted as failures and do not abort the operation.
+///
+/// # Network calls
+/// None — pure file I/O + SQLite.
+pub fn import_estimates(path: &Path) -> AppResult<ImportResult> {
+    let content = std::fs::read_to_string(path)?;
+    let entries: Vec<CachedEstimate> = serde_json::from_str(&content).map_err(|e| {
+        AppError::General(format!(
+            "failed to parse import file {}: {e}",
+            path.display()
+        ))
+    })?;
+
+    let conn = open_db()?;
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+
+    for entry in entries {
+        match migrate_to_latest(entry.clone()) {
+            Ok(migrated) => {
+                conn.execute(
+                    "INSERT INTO estimates \
+                     (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                     ON CONFLICT(wasm_hash, function, args_hash) DO UPDATE SET \
+                        version = excluded.version, \
+                        network = excluded.network, \
+                        ledger = excluded.ledger, \
+                        total_stroops = excluded.total_stroops, \
+                        cpu_instructions = excluded.cpu_instructions, \
+                        memory_bytes = excluded.memory_bytes, \
+                        timestamp = excluded.timestamp",
+                    rusqlite::params![
+                        migrated.version as i64,
+                        migrated.wasm_hash,
+                        migrated.function,
+                        migrated.args_hash,
+                        migrated.network,
+                        migrated.ledger as i64,
+                        migrated.total_stroops,
+                        migrated.cpu_instructions as i64,
+                        migrated.memory_bytes as i64,
+                        migrated.timestamp,
+                    ],
+                )?;
+                imported += 1;
+            }
+            Err(_) => {
+                if entry.version > CACHE_SCHEMA_VERSION {
+                    skipped += 1;
+                } else {
+                    failed += 1;
+                }
+            }
+        }
+    }
+
+    info!(
+        imported,
+        skipped,
+        failed,
+        path = %path.display(),
+        "cache import complete"
+    );
+    Ok(ImportResult {
+        imported,
+        skipped,
+        failed,
+    })
 }
 
 /// Check which cached estimates are now stale (simulated at an earlier ledger).

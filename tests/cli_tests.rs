@@ -1231,3 +1231,120 @@ fn test_cache_query_json_flag_accepted() {
         "output should be valid JSON; got: {stdout}"
     );
 }
+
+// ── cache import tests ───────────────────────────────────────────────
+
+/// Write a JSON export file containing one `CachedEstimate`.
+fn write_import_file(home: &Path, entries_json: &str) -> PathBuf {
+    let path = home.join("cache-export.json");
+    std::fs::write(&path, entries_json).expect("write import file");
+    path
+}
+
+#[test]
+fn test_cache_import_help() {
+    let (stdout, stderr, code) = run_cli(&["cache", "import", "--help"]);
+    assert_eq!(
+        code, 0,
+        "cache import --help should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("--file"),
+        "cache import help should mention --file; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_import_missing_file_errors() {
+    let home = temp_home("cache-import-missing");
+    let (_, stderr, code) = run_cli_in_home(
+        &["cache", "import", "--file", "no/such/export.json"],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 1,
+        "a missing import file should exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("File not found"),
+        "a missing import file should surface as File not found; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_cache_import_malformed_file_errors() {
+    let home = temp_home("cache-import-malformed");
+    let path = write_import_file(&home, "{ not valid json");
+    let (_, stderr, code) = run_cli_in_home(
+        &["cache", "import", "--file", path.to_str().unwrap()],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 1,
+        "a malformed import file should exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stderr.to_lowercase().contains("parse") || stderr.to_lowercase().contains("error"),
+        "a malformed import file should surface as a parse error; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_cache_import_restores_estimates() {
+    let home = temp_home("cache-import-restore");
+    let entry = serde_json::json!([{
+        "version": cache::CACHE_SCHEMA_VERSION,
+        "wasm_hash": "hashA",
+        "function": "funcA",
+        "args_hash": hex::encode(sha2::Sha256::digest(b"")),
+        "network": "testnet",
+        "ledger": 12,
+        "total_stroops": 2000,
+        "cpu_instructions": 1000,
+        "memory_bytes": 500,
+        "timestamp": "2026-01-01T00:00:00Z",
+    }]);
+    let path = write_import_file(&home, &entry.to_string());
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &["cache", "import", "--file", path.to_str().unwrap()],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "import should succeed; stderr: {stderr}");
+    assert!(
+        stdout.contains("Imported 1 cached estimate(s)"),
+        "stdout should report 1 imported estimate; got: {stdout}"
+    );
+
+    // Verify the estimate can now be queried back from the cache.
+    let query = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(["cache", "query", "--network", "testnet"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .output()
+        .expect("failed to run cache query");
+    let q_stdout = String::from_utf8_lossy(&query.stdout);
+    assert!(
+        q_stdout.contains("funcA") && q_stdout.contains("2000"),
+        "imported estimate should appear in query; got: {q_stdout}"
+    );
+}
+
+#[test]
+fn test_cache_import_empty_array_is_noop() {
+    let home = temp_home("cache-import-empty");
+    let path = write_import_file(&home, "[]");
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &["cache", "import", "--file", path.to_str().unwrap()],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 0,
+        "importing an empty array should succeed; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Imported 0 cached estimate(s)"),
+        "stdout should report 0 imported; got: {stdout}"
+    );
+}
