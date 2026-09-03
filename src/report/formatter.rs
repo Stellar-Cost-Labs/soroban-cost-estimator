@@ -148,7 +148,7 @@ pub struct CsvFormatter;
 impl ReportFormatter for CsvFormatter {
     fn format(&self, report: &CostReport) -> String {
         let mut output = String::from(
-            "function,network,ledger,wasm_hash,cpu_instructions,memory_bytes,\
+            "function,network,ledger,ledger_age,wasm_hash,cpu_instructions,memory_bytes,\
              read_entries,write_entries,read_bytes,write_bytes,tx_size,\
              non_refundable_stroops,refundable_stroops,total_stroops,total_xlm,\
              rpc_latency_ms\n",
@@ -158,6 +158,7 @@ impl ReportFormatter for CsvFormatter {
             &report.function,
             &report.network,
             &report.ledger.to_string(),
+            &report.ledger_age.map(|a| a.to_string()).unwrap_or_default(),
             &report.wasm_hash,
             &report.cpu_instructions.to_string(),
             &report.memory_bytes.to_string(),
