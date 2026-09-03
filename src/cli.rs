@@ -1,11 +1,24 @@
 use clap::{Parser, Subcommand};
 
+/// Build version string with metadata from build.rs
+fn build_version() -> &'static str {
+    concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (",
+        env!("GIT_HASH"),
+        " ",
+        env!("BUILD_DATE"),
+        ")"
+    )
+}
+
 /// Estimate Soroban contract resource costs with network config-drift tracking.
 ///
 /// Wraps Stellar's `simulateTransaction` RPC and adds awareness of how the
 /// network's resource-pricing configuration changes over time.
 #[derive(Parser, Debug)]
 #[command(name = "soroban-cost-estimator")]
+#[command(version = build_version())]
 #[command(about = "Estimate Soroban contract costs & track network pricing changes", long_about = None)]
 pub struct Cli {
     /// Cap RPC requests at N per second (fixed-rate spacing; applies to
