@@ -124,6 +124,7 @@ fn test_estimate_help() {
         "--arg",
         "--cache-ttl",
         "--json",
+        "--dry-run",
     ] {
         assert!(
             stdout.contains(flag),
@@ -602,6 +603,89 @@ fn test_estimate_rpc_url_overrides_unknown_network() {
         !stderr.contains("RPC endpoint not configured"),
         "--rpc-url should override network resolution; got: {stderr}"
     );
+}
+
+#[test]
+fn test_estimate_dry_run_text_output() {
+    let (stdout, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "tests/fixtures/minimal.wasm",
+        "--rpc-url",
+        DEAD_RPC,
+        "--dry-run",
+    ]);
+    assert_eq!(
+        code, 0,
+        "estimate --dry-run should succeed offline without touching RPC; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Dry-run simulation plan"),
+        "stdout should contain dry-run header; got: {stdout}"
+    );
+    assert!(
+        stdout.contains(DEAD_RPC),
+        "stdout should contain RPC endpoint; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Tx Size:"),
+        "stdout should contain tx size; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_estimate_dry_run_json_output() {
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--dry-run",
+            "--json",
+        ])
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run CLI");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let code = output.status.code().unwrap_or(-1);
+
+    assert_eq!(
+        code, 0,
+        "estimate --dry-run --json should exit 0; stderr: {stderr}"
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("output should be valid JSON");
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["wasm_path"], "tests/fixtures/minimal.wasm");
+    assert!(v["tx_size"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(v["network"], "testnet");
+}
+
+#[test]
+fn test_estimate_dry_run_with_fn_and_args() {
+    let (stdout, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "tests/fixtures/minimal.wasm",
+        "--fn",
+        "hello",
+        "--id",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "--arg",
+        "user=alice",
+        "--dry-run",
+    ]);
+    assert_eq!(
+        code, 0,
+        "dry-run with fn & args should exit 0; stderr: {stderr}"
+    );
+    assert!(stdout.contains("Function:      hello"));
+    assert!(stdout.contains(
+        "Contract ID:   0000000000000000000000000000000000000000000000000000000000000000"
+    ));
+    assert!(stdout.contains("Arguments:     user=alice"));
 }
 
 /// Seed a cache entry for `tests/fixtures/minimal.wasm` (default `(wasm

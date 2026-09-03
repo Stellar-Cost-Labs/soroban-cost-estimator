@@ -131,6 +131,29 @@ fn db_path() -> AppResult<PathBuf> {
     Ok(data_dir()?.join("cache.db"))
 }
 
+/// Helper to determine whether a SQLite error represents database locking or busy contention.
+fn is_sqlite_busy_or_locked(err: &rusqlite::Error) -> bool {
+    match err {
+        rusqlite::Error::SqliteFailure(e, _) => {
+            e.code == rusqlite::ErrorCode::DatabaseBusy
+                || e.code == rusqlite::ErrorCode::DatabaseLocked
+                || e.extended_code == 5
+                || e.extended_code == 6
+                || e.extended_code == 261
+                || e.extended_code == 517
+        }
+        _ => false,
+    }
+}
+
+/// Helper to determine whether an AppError wraps a SQLite busy or locked error.
+fn is_app_error_busy_or_locked(err: &AppError) -> bool {
+    match err {
+        AppError::Sqlite(e) => is_sqlite_busy_or_locked(e),
+        _ => false,
+    }
+}
+
 /// Create the `estimates` table (and tune journal mode) on an already-open
 /// connection if it does not exist yet.
 ///
@@ -197,9 +220,25 @@ fn enable_wal_if_possible(conn: &Connection) {
 /// Open a connection to the cache database and ensure the schema exists.
 fn open_db() -> AppResult<Connection> {
     let path = db_path()?;
-    let conn = Connection::open(&path)?;
-    ensure_cache_schema(&conn)?;
-    Ok(conn)
+    let mut retries = 0;
+    loop {
+        let open_res = Connection::open(&path)
+            .map_err(AppError::Sqlite)
+            .and_then(|conn| {
+                let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+                ensure_cache_schema(&conn)?;
+                Ok(conn)
+            });
+
+        match open_res {
+            Ok(conn) => return Ok(conn),
+            Err(ref e) if is_app_error_busy_or_locked(e) && retries < 30 => {
+                retries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Retry limit and base delay for `SQLITE_BUSY` backoff.
