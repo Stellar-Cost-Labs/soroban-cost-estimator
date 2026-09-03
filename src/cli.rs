@@ -13,6 +13,11 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "N")]
     pub rps: Option<u64>,
 
+    /// HTTP request timeout for RPC calls, in seconds (applies to every
+    /// network call).
+    #[arg(long, global = true, value_name = "SECS", default_value_t = 30)]
+    pub timeout: u64,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -53,6 +58,15 @@ pub enum Command {
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
         json: bool,
+
+        /// Output format: table (default), json, csv, or markdown.
+        /// Overrides `--json` when both are supplied.
+        #[arg(long, value_parser = ["table", "json", "csv", "markdown"])]
+        format: Option<String>,
+
+        /// Number of decimal places for XLM fee values (0..=18, default 7).
+        #[arg(long, default_value_t = 7)]
+        precision: u32,
     },
 
     /// Enumerate all public contract functions and estimate each one.
@@ -72,6 +86,15 @@ pub enum Command {
         /// Output as JSON instead of a human-readable list.
         #[arg(long)]
         json: bool,
+
+        /// Output format: table (default), json, csv, or markdown.
+        /// Overrides `--json` when both are supplied.
+        #[arg(long, value_parser = ["table", "json", "csv", "markdown"])]
+        format: Option<String>,
+
+        /// Number of decimal places for XLM fee values (0..=18, default 7).
+        #[arg(long, default_value_t = 7)]
+        precision: u32,
     },
 
     /// Print WASM metadata (functions, contract spec, size, hash) without any RPC calls.

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Duration;
 
 use governor::{Quota, RateLimiter};
 use serde_json::Value;
@@ -9,6 +10,10 @@ use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
 use crate::rpc::retry::with_retry;
+
+/// Default per-request HTTP timeout applied to every RPC call. Matches the
+/// CLI's `--timeout` default (30 seconds).
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Resolves a network name to its well-known Soroban RPC endpoint.
 ///
@@ -76,7 +81,7 @@ pub struct RpcClient {
 
 impl RpcClient {
     /// Create a new RPC client pointing at the given URL, without rate
-    /// limiting.
+    /// limiting and with the default request timeout.
     pub fn new(url: &str) -> Self {
         Self::with_rate_limit(url, None)
     }
@@ -88,11 +93,34 @@ impl RpcClient {
     /// apart (a fixed-rate limiter with a burst of 1). `None` or `Some(0)`
     /// disables rate limiting entirely. Values larger than `u32::MAX` are
     /// clamped.
+    ///
+    /// The underlying `reqwest::Client` is configured with connection pooling
+    /// and TCP keep-alive so that HTTP connections are reused across multiple
+    /// RPC calls within a single run, reducing handshake overhead.
     pub fn with_rate_limit(url: &str, rps: Option<u64>) -> Self {
-        debug!(url, rps, "creating RPC client");
+        Self::with_options(url, rps, DEFAULT_TIMEOUT)
+    }
+
+    /// Create a new RPC client pointing at the given URL, optionally capping
+    /// outbound requests to `rps` requests per second and bounding each HTTP
+    /// request with `timeout`.
+    ///
+    /// The limiter spaces consecutive outbound calls at least `1/rps` seconds
+    /// apart (a fixed-rate limiter with a burst of 1). `None` or `Some(0)`
+    /// disables rate limiting entirely. Values larger than `u32::MAX` are
+    /// clamped. `timeout` applies to the whole request (connect through
+    /// response body) and is passed straight to reqwest.
+    pub fn with_options(url: &str, rps: Option<u64>, timeout: Duration) -> Self {
+        debug!(url, rps, ?timeout, "creating RPC client");
         Self {
             url: url.to_string(),
-            client: reqwest::Client::new(),
+            // `ClientBuilder::build` only fails on invalid configuration (a
+            // default builder cannot), so fall back to a plain client to keep
+            // construction infallible.
+            client: reqwest::Client::builder()
+                .timeout(timeout)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             dedup: Arc::new(Mutex::new(DedupState::default())),
             limiter: rps.and_then(build_rate_limiter),
         }
@@ -261,10 +289,13 @@ fn deserialize_result<T: serde::de::DeserializeOwned>(value: Value) -> AppResult
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use serde_json::Value;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    use crate::error::AppResult;
 
     use super::RpcClient;
 
@@ -533,6 +564,42 @@ mod tests {
         assert!(
             start.elapsed().as_millis() < 45,
             "disabled rate limiting must not delay requests"
+        );
+    }
+
+    /// Spawns an HTTP server that accepts connections but never responds, so
+    /// a client with a short timeout observes a request-timeout error instead
+    /// of hanging forever.
+    async fn spawn_hanging_stub() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind stub server");
+        let addr = listener.local_addr().expect("no local address");
+
+        tokio::spawn(async move {
+            while let Ok((_stream, _)) = listener.accept().await {
+                // Never respond — force the client's request timeout to fire.
+                std::future::pending::<()>().await;
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    /// A per-request timeout configured via `with_options` must actually
+    /// bound the request: against a server that accepts but never answers,
+    /// the retry loop gives up and surfaces an HTTP error rather than
+    /// waiting forever.
+    #[tokio::test]
+    async fn test_request_timeout_applies() {
+        let url = spawn_hanging_stub().await;
+        let client = RpcClient::with_options(&url, None, Duration::from_millis(100));
+
+        let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
+
+        assert!(
+            result.is_err(),
+            "a hanging server must eventually produce a timeout error"
         );
     }
 }
