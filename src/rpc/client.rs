@@ -93,6 +93,10 @@ impl RpcClient {
     /// apart (a fixed-rate limiter with a burst of 1). `None` or `Some(0)`
     /// disables rate limiting entirely. Values larger than `u32::MAX` are
     /// clamped.
+    ///
+    /// The underlying `reqwest::Client` is configured with connection pooling
+    /// and TCP keep-alive so that HTTP connections are reused across multiple
+    /// RPC calls within a single run, reducing handshake overhead.
     pub fn with_rate_limit(url: &str, rps: Option<u64>) -> Self {
         Self::with_options(url, rps, DEFAULT_TIMEOUT)
     }
