@@ -14,7 +14,7 @@
 use proptest::prelude::*;
 
 use soroban_cost_estimator::report::fee_calc::{
-    FeeRates, compute_fee_breakdown, stroops_to_xlm, xlm_to_stroops,
+    DEFAULT_PRECISION, FeeRates, compute_fee_breakdown, stroops_to_xlm, xlm_to_stroops,
 };
 
 /// Strategy for fee rates in a realistic range (all non-negative).
@@ -110,6 +110,7 @@ proptest! {
             read_bytes,
             tx_size,
             rates,
+            DEFAULT_PRECISION,
         );
 
         prop_assert!(
@@ -119,7 +120,7 @@ proptest! {
         );
         // The authoritative total is always reported verbatim.
         prop_assert_eq!(breakdown.total_stroops, total_resource_fee);
-        prop_assert_eq!(breakdown.total_xlm, stroops_to_xlm(total_resource_fee));
+        prop_assert_eq!(breakdown.total_xlm, stroops_to_xlm(total_resource_fee, DEFAULT_PRECISION));
     }
 
     /// The reported totals are internally consistent for any realistic
@@ -142,6 +143,7 @@ proptest! {
             read_bytes,
             tx_size,
             rates,
+            DEFAULT_PRECISION,
         );
         let non_refundable = breakdown.non_refundable_stroops;
 
@@ -160,7 +162,7 @@ proptest! {
             total_resource_fee.max(non_refundable)
         );
         prop_assert_eq!(breakdown.total_stroops, total_resource_fee);
-        prop_assert_eq!(&breakdown.total_xlm, &stroops_to_xlm(total_resource_fee));
+        prop_assert_eq!(&breakdown.total_xlm, &stroops_to_xlm(total_resource_fee, DEFAULT_PRECISION));
         // The XLM string representation round-trips back to the exact
         // stroop count.
         prop_assert_eq!(
@@ -203,6 +205,7 @@ proptest! {
             read_bytes,
             tx_size,
             rates,
+            DEFAULT_PRECISION,
         );
         let swapped = compute_fee_breakdown(
             total_resource_fee,
@@ -212,6 +215,7 @@ proptest! {
             tx_size,
             read_bytes,
             swapped_rates,
+            DEFAULT_PRECISION,
         );
 
         prop_assert_eq!(
