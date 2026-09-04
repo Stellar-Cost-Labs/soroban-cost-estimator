@@ -662,6 +662,8 @@ All commands accept:
 
 | Flag | Description |
 |------|-------------|
+| `--rps <N>` | Cap RPC requests at N per second (0 disables) |
+| `--timeout <SECS>` | HTTP request timeout for RPC calls in seconds (default `30`) |
 | `--help` / `-h` | Print command-specific help |
 
 ## Network Resolution

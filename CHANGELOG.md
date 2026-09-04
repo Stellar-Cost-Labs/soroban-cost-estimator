@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `--timeout` global flag — configurable HTTP request timeout for RPC calls
+  in seconds (default 30).
 - `config diff --summary` — print a single-line summary
   (`X pricing changes, Y non-pricing changes`) instead of the full diff, for CI
   status lines. Exit code and auto-save side effects are unchanged.
@@ -17,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stellar contract invoke --cost`.
 - End-to-end integration tests in `tests/cli_tests.rs` covering every CLI
   command, its flags, and its offline error paths.
+- CI build matrix running fmt, clippy, build, and tests on Linux, macOS, and
+  Windows for cross-platform compatibility.
+
+### Fixed
+
+- Restore the WebSocket RPC client (`rpc::ws`) after the merge of `main`
+  dropped its `AppError` variants and `resolve_ws_endpoint`, which broke
+  compilation and red-flagged every CI job.
 
 ## [0.1.0] - 2026-08-13
 
