@@ -223,6 +223,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 json,
             } => cmd_cache_warm(&wasm, &network, fallback, id.as_deref(), json, rps, timeout).await,
             cli::CacheAction::Verify => cmd_cache_verify(),
+            cli::CacheAction::Import { file } => cmd_cache_import(&file),
             cli::CacheAction::Query {
                 network,
                 function,
@@ -1514,6 +1515,25 @@ fn cmd_cache_verify() -> error::AppResult<()> {
         std::process::exit(1);
     }
 
+    Ok(())
+}
+
+/// `cache import` command: restore cached estimates from a JSON export file.
+///
+/// Reads a JSON file containing an array of cached estimates and inserts each
+/// entry into the local SQLite cache database. Entries with a newer schema
+/// version than the tool supports are skipped with a warning; duplicate keys
+/// are overwritten.
+///
+/// # Network calls
+/// None — pure file I/O + SQLite.
+fn cmd_cache_import(file: &str) -> error::AppResult<()> {
+    let path = std::path::Path::new(file);
+    if !path.exists() {
+        return Err(error::AppError::FileNotFound(file.to_string()));
+    }
+    let imported = cache::import_estimates(path)?;
+    println!("Imported {imported} cached estimate(s) from {file}.");
     Ok(())
 }
 

@@ -179,6 +179,13 @@ pub enum CacheAction {
         json: bool,
     },
 
+    /// Restore cached estimates from a JSON export file.
+    Import {
+        /// Path to the JSON file containing an array of cached estimates.
+        #[arg(long, short)]
+        file: String,
+    },
+
     /// Query cached estimates with optional filters.
     Query {
         /// Network to filter by.

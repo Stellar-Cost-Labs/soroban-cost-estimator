@@ -1287,3 +1287,221 @@ fn test_load_fresh_estimate_expired_returns_none() {
         assert!(fresh.is_none(), "an expired entry must yield None");
     });
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// import_estimates
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Build a JSON string containing a valid array of `CachedEstimate` objects.
+fn sample_export_json() -> String {
+    serde_json::json!([
+        {
+            "version": cache::CACHE_SCHEMA_VERSION,
+            "wasm_hash": "aaa111",
+            "function": "deploy",
+            "args_hash": "bbb222",
+            "network": "testnet",
+            "ledger": 100,
+            "total_stroops": 5_000,
+            "cpu_instructions": 1_000,
+            "memory_bytes": 512,
+            "timestamp": "2025-06-15T12:00:00Z"
+        },
+        {
+            "version": cache::CACHE_SCHEMA_VERSION,
+            "wasm_hash": "ccc333",
+            "function": "transfer",
+            "args_hash": "ddd444",
+            "network": "mainnet",
+            "ledger": 200,
+            "total_stroops": 10_000,
+            "cpu_instructions": 2_000,
+            "memory_bytes": 1_024,
+            "timestamp": "2025-06-16T12:00:00Z"
+        }
+    ])
+    .to_string()
+}
+
+/// A valid JSON file with two estimates is imported successfully.
+#[test]
+fn test_import_estimates_basic() {
+    with_temp_home(|tmp| {
+        let json = sample_export_json();
+        let path = tmp.join("export.json");
+        std::fs::write(&path, &json).expect("write export file");
+
+        let imported = cache::import_estimates(&path).expect("import");
+        assert_eq!(imported, 2, "should import both entries");
+
+        // Verify they are queryable.
+        let tn = cache::list_cached_estimates("testnet").expect("list testnet");
+        assert_eq!(tn.len(), 1);
+        assert_eq!(tn[0].function, "deploy");
+        assert_eq!(tn[0].total_stroops, 5_000);
+
+        let mn = cache::list_cached_estimates("mainnet").expect("list mainnet");
+        assert_eq!(mn.len(), 1);
+        assert_eq!(mn[0].function, "transfer");
+        assert_eq!(mn[0].total_stroops, 10_000);
+    });
+}
+
+/// An empty JSON array imports zero entries without error.
+#[test]
+fn test_import_estimates_empty_array() {
+    with_temp_home(|tmp| {
+        let path = tmp.join("empty.json");
+        std::fs::write(&path, "[]").expect("write empty file");
+
+        let imported = cache::import_estimates(&path).expect("import empty");
+        assert_eq!(imported, 0, "empty array should import nothing");
+    });
+}
+
+/// Entries with a future schema version are skipped (not rejected outright).
+#[test]
+fn test_import_estimates_skips_future_version() {
+    with_temp_home(|tmp| {
+        let json = serde_json::json!([
+            {
+                "version": cache::CACHE_SCHEMA_VERSION,
+                "wasm_hash": "ok1",
+                "function": "f_ok",
+                "args_hash": "a1",
+                "network": "testnet",
+                "ledger": 1,
+                "total_stroops": 100,
+                "cpu_instructions": 10,
+                "memory_bytes": 5,
+                "timestamp": "2025-01-01T00:00:00Z"
+            },
+            {
+                "version": cache::CACHE_SCHEMA_VERSION + 1,
+                "wasm_hash": "future",
+                "function": "f_future",
+                "args_hash": "a2",
+                "network": "testnet",
+                "ledger": 2,
+                "total_stroops": 200,
+                "cpu_instructions": 20,
+                "memory_bytes": 10,
+                "timestamp": "2025-01-02T00:00:00Z"
+            }
+        ])
+        .to_string();
+        let path = tmp.join("mixed.json");
+        std::fs::write(&path, &json).expect("write mixed file");
+
+        let imported = cache::import_estimates(&path).expect("import");
+        assert_eq!(
+            imported, 1,
+            "only the current-version entry should be imported"
+        );
+
+        let estimates = cache::list_cached_estimates("testnet").expect("list");
+        assert_eq!(estimates.len(), 1);
+        assert_eq!(estimates[0].wasm_hash, "ok1");
+    });
+}
+
+/// Duplicate keys (same wasm_hash + function + args_hash) are upserted.
+#[test]
+fn test_import_estimates_upserts_duplicates() {
+    with_temp_home(|tmp| {
+        let json = serde_json::json!([
+            {
+                "version": cache::CACHE_SCHEMA_VERSION,
+                "wasm_hash": "dup",
+                "function": "f",
+                "args_hash": "a",
+                "network": "testnet",
+                "ledger": 10,
+                "total_stroops": 100,
+                "cpu_instructions": 10,
+                "memory_bytes": 5,
+                "timestamp": "2025-01-01T00:00:00Z"
+            },
+            {
+                "version": cache::CACHE_SCHEMA_VERSION,
+                "wasm_hash": "dup",
+                "function": "f",
+                "args_hash": "a",
+                "network": "testnet",
+                "ledger": 20,
+                "total_stroops": 200,
+                "cpu_instructions": 20,
+                "memory_bytes": 10,
+                "timestamp": "2025-02-01T00:00:00Z"
+            }
+        ])
+        .to_string();
+        let path = tmp.join("dup.json");
+        std::fs::write(&path, &json).expect("write dup file");
+
+        let imported = cache::import_estimates(&path).expect("import");
+        assert_eq!(imported, 2, "both entries processed");
+
+        // The second entry should have won via upsert.
+        let estimates = cache::list_cached_estimates("testnet").expect("list");
+        assert_eq!(estimates.len(), 1, "duplicates should collapse to one");
+        assert_eq!(estimates[0].ledger, 20, "later entry wins");
+        assert_eq!(estimates[0].total_stroops, 200);
+    });
+}
+
+/// Malformed JSON file results in an error.
+#[test]
+fn test_import_estimates_malformed_json() {
+    with_temp_home(|tmp| {
+        let path = tmp.join("bad.json");
+        std::fs::write(&path, "{ not valid json }").expect("write bad file");
+
+        let err = cache::import_estimates(&path).expect_err("malformed JSON should fail");
+        assert!(
+            err.to_string().contains("JSON") || err.to_string().contains("expected"),
+            "error should mention JSON parsing: {err}"
+        );
+    });
+}
+
+/// Non-existent file results in an I/O error.
+#[test]
+fn test_import_estimates_missing_file() {
+    with_temp_home(|_tmp| {
+        let path = std::path::PathBuf::from("/no/such/file.json");
+        let err = cache::import_estimates(&path).expect_err("missing file should fail");
+        assert!(
+            matches!(err, soroban_cost_estimator::error::AppError::Io(_)),
+            "missing file should be an I/O error: {err}"
+        );
+    });
+}
+
+/// A JSON file containing a single object (not an array) fails with a parse error.
+#[test]
+fn test_import_estimates_object_not_array() {
+    with_temp_home(|tmp| {
+        let json = serde_json::json!({
+            "version": cache::CACHE_SCHEMA_VERSION,
+            "wasm_hash": "h",
+            "function": "f",
+            "args_hash": "a",
+            "network": "testnet",
+            "ledger": 1,
+            "total_stroops": 100,
+            "cpu_instructions": 10,
+            "memory_bytes": 5,
+            "timestamp": "2025-01-01T00:00:00Z"
+        })
+        .to_string();
+        let path = tmp.join("object.json");
+        std::fs::write(&path, &json).expect("write object file");
+
+        let err = cache::import_estimates(&path).expect_err("object not array should fail");
+        assert!(
+            err.to_string().contains("JSON") || err.to_string().contains("expected"),
+            "error should mention parsing: {err}"
+        );
+    });
+}
