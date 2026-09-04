@@ -6,7 +6,7 @@ use std::time::Duration;
 use governor::{Quota, RateLimiter};
 use serde_json::Value;
 use tokio::sync::Mutex;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::error::{AppError, AppResult};
 use crate::rpc::retry::with_retry;
@@ -73,6 +73,7 @@ struct DedupState {
 #[derive(Debug)]
 pub struct RpcClient {
     url: String,
+    fallback_url: Option<String>,
     client: reqwest::Client,
     dedup: Arc<Mutex<DedupState>>,
     /// Fixed-rate limiter shared by every network call, when enabled.
@@ -111,9 +112,32 @@ impl RpcClient {
     /// clamped. `timeout` applies to the whole request (connect through
     /// response body) and is passed straight to reqwest.
     pub fn with_options(url: &str, rps: Option<u64>, timeout: Duration) -> Self {
-        debug!(url, rps, ?timeout, "creating RPC client");
+        Self::with_fallback(url, None, rps, timeout)
+    }
+
+    /// Create a new RPC client pointing at the given URL, with an optional
+    /// secondary URL used for failover, optionally capping outbound requests
+    /// to `rps` requests per second and bounding each HTTP request with
+    /// `timeout`.
+    ///
+    /// When a request to the primary endpoint fails with a network-level
+    /// error (connection refused, timeout, DNS failure, etc.) and a fallback
+    /// URL is configured, the request is retried against the fallback before
+    /// the error is propagated. RPC-level errors (e.g. bad method, invalid
+    /// params) are not retried against the fallback — they would fail there
+    /// too.
+    ///
+    /// The limiter and timeout behave exactly as in [`Self::with_options`].
+    pub fn with_fallback(
+        url: &str,
+        fallback_url: Option<&str>,
+        rps: Option<u64>,
+        timeout: Duration,
+    ) -> Self {
+        debug!(url, ?fallback_url, rps, ?timeout, "creating RPC client");
         Self {
             url: url.to_string(),
+            fallback_url: fallback_url.map(String::from),
             // `ClientBuilder::build` only fails on invalid configuration (a
             // default builder cannot), so fall back to a plain client to keep
             // construction infallible.
@@ -190,8 +214,16 @@ impl RpcClient {
 
     /// Performs the actual HTTP POST and extracts the raw `result` value.
     ///
+    /// Tries the primary endpoint first. If the primary fails with a
+    /// network-level error (connection refused, timeout, DNS failure, etc.)
+    /// and a fallback URL is configured, retries against the fallback.
+    ///
+    /// RPC-level errors (e.g. bad method, invalid params) are **not** retried
+    /// against the fallback — they would fail there too.
+    ///
     /// # Network calls
-    /// Makes an HTTP POST to the configured RPC endpoint.
+    /// Makes an HTTP POST to the configured RPC endpoint (and optionally the
+    /// fallback).
     async fn perform_call(&self, method: &str, params: Value) -> AppResult<Value> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -201,9 +233,44 @@ impl RpcClient {
         });
 
         trace!(method, "sending RPC request");
+        match self.post_and_parse(method, &body, &self.url).await {
+            Ok(result) => Ok(result),
+            Err(e) if Self::is_network_error(&e) => {
+                if let Some(ref fallback) = self.fallback_url {
+                    warn!(
+                        method,
+                        primary = %self.url,
+                        fallback = %fallback,
+                        error = %e,
+                        "primary RPC endpoint failed — trying fallback"
+                    );
+                    self.post_and_parse(method, &body, fallback).await
+                } else {
+                    Err(e)
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
 
+    /// Check whether an error is a network-level failure (as opposed to an
+    /// RPC-level error returned inside a successful HTTP response).
+    fn is_network_error(error: &AppError) -> bool {
+        match error {
+            AppError::Http(e) => {
+                // reqwest errors that indicate connectivity problems — these
+                // are the cases where a fallback endpoint might succeed.
+                e.is_connect() || e.is_timeout() || e.is_request()
+            }
+            _ => false,
+        }
+    }
+
+    /// POST `body` to `url` (with retries), parse the JSON-RPC response, and
+    /// extract the raw `result` value.
+    async fn post_and_parse(&self, method: &str, body: &Value, url: &str) -> AppResult<Value> {
         let client = self.client.clone();
-        let url = self.url.clone();
+        let url = url.to_string();
         let request_body = body.clone();
         let limiter = self.limiter.clone();
 
@@ -600,6 +667,68 @@ mod tests {
         assert!(
             result.is_err(),
             "a hanging server must eventually produce a timeout error"
+        );
+    }
+
+    /// Reserves a port and immediately closes it, so connecting to it yields
+    /// a network-level connection-refused error (rather than a timeout).
+    async fn refused_port_url() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind stub server");
+        let addr = listener.local_addr().expect("no local address");
+        drop(listener);
+        format!("http://{addr}")
+    }
+
+    /// When the primary endpoint is unreachable (connection refused) and a
+    /// fallback URL is configured, the request must fail over to the fallback
+    /// instead of propagating the network error.
+    #[tokio::test]
+    async fn test_failover_uses_fallback_when_primary_unreachable() {
+        let dead_url = refused_port_url().await;
+        let (fallback_url, fallback_counter) = spawn_json_rpc_stub(0).await;
+        let client = RpcClient::with_fallback(
+            &dead_url,
+            Some(&fallback_url),
+            None,
+            Duration::from_secs(30),
+        );
+
+        let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
+
+        assert!(
+            result.is_ok(),
+            "request should fail over to the fallback endpoint"
+        );
+        assert_eq!(
+            fallback_counter.load(Ordering::SeqCst),
+            1,
+            "fallback endpoint should have served exactly one request"
+        );
+    }
+
+    /// RPC-level errors (a JSON-RPC error body inside a successful HTTP
+    /// response) mean the primary is reachable, so they must **not** trigger
+    /// a failover attempt against the fallback.
+    #[tokio::test]
+    async fn test_no_failover_on_rpc_error() {
+        let (primary_url, _) = spawn_json_rpc_stub(1).await;
+        let (fallback_url, fallback_counter) = spawn_json_rpc_stub(0).await;
+        let client = RpcClient::with_fallback(
+            &primary_url,
+            Some(&fallback_url),
+            None,
+            Duration::from_secs(30),
+        );
+
+        let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
+
+        assert!(result.is_err(), "RPC-level errors must be propagated");
+        assert_eq!(
+            fallback_counter.load(Ordering::SeqCst),
+            0,
+            "fallback must not be contacted for RPC-level errors"
         );
     }
 }
