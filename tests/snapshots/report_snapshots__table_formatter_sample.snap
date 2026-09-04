@@ -1,9 +1,11 @@
 ---
 source: tests/report_snapshots.rs
+assertion_line: 64
 expression: TableFormatter.format(&report)
 ---
 Function: increment
 Network: testnet (ledger 3894195)
+RPC round-trip: 87 ms
 WASM hash: abc123def456
 
 +------------------+----------+---------------+
@@ -25,6 +27,15 @@ WASM hash: abc123def456
 +------------------+----------+---------------+
 
 Fee Breakdown:
-  Non-refundable: 4496 stroops
-  Refundable:     10931 stroops
+  Non-refundable: 4496 stroops (29.1%)
+  Refundable:     10931 stroops (70.9%)
+
+  Components (of non-refundable):
+    CPU:        372 stroops (2.4%)
+    Storage:    4063 stroops (26.3%)
+    Bandwidth:  61 stroops (0.4%)
+
   Total:          15427 stroops (0.0015427)
+
+Optimization Suggestions:
+  No cost optimizations identified (fee rates unavailable or no reducible resources).
