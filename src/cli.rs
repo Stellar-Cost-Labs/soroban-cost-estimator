@@ -76,6 +76,10 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
+        /// Run the simulation twice and print a side-by-side diff.
+        #[arg(long)]
+        diff: bool,
+
         /// Output format: table (default), json, csv, or markdown.
         /// Overrides `--json` when both are supplied.
         #[arg(long, value_parser = ["table", "json", "csv", "markdown"])]
