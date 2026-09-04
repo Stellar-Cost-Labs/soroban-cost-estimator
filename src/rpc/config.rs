@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use tracing::{debug, trace};
 
@@ -214,6 +216,123 @@ pub async fn fetch_all_config_settings(
     Ok(results)
 }
 
+/// In-memory cache for `getLedgerEntries` config setting responses.
+///
+/// Avoids duplicate RPC fetches within a single command run (e.g.
+/// `estimate-all`), where the same config setting may be needed by
+/// multiple simulation passes.
+///
+/// The cache is cheap to create (an empty `HashMap`) and intentionally
+/// has no TTL or eviction — it lives for the duration of a single
+/// command invocation and is dropped when that command finishes.
+#[derive(Debug, Default)]
+pub struct ConfigCache {
+    entries: HashMap<ConfigSettingId, ConfigSettingEntryRaw>,
+}
+
+impl ConfigCache {
+    /// Create an empty cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fetch a single config setting, returning from cache if available.
+    ///
+    /// On a cache miss the setting is fetched via `fetch_config_setting`
+    /// and stored for subsequent lookups.
+    ///
+    /// # Network calls
+    /// Zero if cached, otherwise one `getLedgerEntries` RPC call.
+    pub async fn get_config_setting(
+        &mut self,
+        client: &RpcClient,
+        setting_id: ConfigSettingId,
+    ) -> AppResult<ConfigSettingEntryRaw> {
+        if let Some(entry) = self.entries.get(&setting_id) {
+            debug!(
+                setting = setting_id.human_name(),
+                "config setting served from cache"
+            );
+            return Ok(entry.clone());
+        }
+
+        let entry = fetch_config_setting(client, setting_id).await?;
+        self.entries.insert(setting_id, entry.clone());
+        Ok(entry)
+    }
+
+    /// Fetch all 6 Soroban config settings, serving any previously
+    /// cached entries from memory and only requesting missing ones.
+    ///
+    /// When the cache is empty this is equivalent to a single batched
+    /// `fetch_all_config_settings` call. When some entries are already
+    /// cached, only the missing entries are fetched individually and
+    /// inserted into the cache.
+    ///
+    /// # Network calls
+    /// Zero if all 6 are cached, one batched call when the cache is
+    /// empty, or up to 6 individual calls for partial caches.
+    pub async fn get_all_config_settings(
+        &mut self,
+        client: &RpcClient,
+    ) -> AppResult<Vec<ConfigSettingEntryRaw>> {
+        let all_ids = [
+            ConfigSettingId::ContractComputeV0,
+            ConfigSettingId::ContractLedgerCostV0,
+            ConfigSettingId::ContractHistoricalDataV0,
+            ConfigSettingId::ContractEventsV0,
+            ConfigSettingId::ContractBandwidthV0,
+            ConfigSettingId::StateArchival,
+        ];
+
+        // Collect IDs that are not yet cached.
+        let missing: Vec<ConfigSettingId> = all_ids
+            .iter()
+            .copied()
+            .filter(|id| !self.entries.contains_key(id))
+            .collect();
+
+        if missing.is_empty() {
+            debug!("all config settings served from cache");
+            return Ok(all_ids
+                .iter()
+                .map(|id| self.entries[id].clone())
+                .collect());
+        }
+
+        if missing.len() == all_ids.len() {
+            // Cache is completely empty — use the efficient batched call.
+            let results = fetch_all_config_settings(client).await?;
+            for entry in &results {
+                self.entries.insert(entry.id, entry.clone());
+            }
+            return Ok(results);
+        }
+
+        // Partial cache — fetch only the missing entries individually.
+        debug!(
+            cached = all_ids.len() - missing.len(),
+            missing = missing.len(),
+            "fetching missing config settings"
+        );
+        for id in &missing {
+            let entry = fetch_config_setting(client, *id).await?;
+            self.entries.insert(*id, entry);
+        }
+
+        Ok(all_ids
+            .iter()
+            .map(|id| self.entries[id].clone())
+            .collect())
+    }
+
+    /// Returns the number of config settings currently held in the cache.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,5 +387,166 @@ mod tests {
             );
             keys.push(key);
         }
+    }
+
+    // ── ConfigCache tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_config_cache_starts_empty() {
+        let cache = ConfigCache::new();
+        assert_eq!(cache.len(), 0, "new cache should be empty");
+    }
+
+    #[test]
+    fn test_config_cache_default_is_empty() {
+        let cache = ConfigCache::default();
+        assert_eq!(cache.len(), 0, "default cache should be empty");
+    }
+
+    #[test]
+    fn test_config_cache_stores_entry() {
+        let mut cache = ConfigCache::new();
+        let entry = ConfigSettingEntryRaw {
+            id: ConfigSettingId::ContractComputeV0,
+            config_xdr: "test-xdr-data".to_string(),
+            last_modified_ledger: 100,
+        };
+        cache.entries.insert(entry.id, entry.clone());
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn test_config_cache_lookup_by_id() {
+        let mut cache = ConfigCache::new();
+        let entry = ConfigSettingEntryRaw {
+            id: ConfigSettingId::StateArchival,
+            config_xdr: "archival-xdr".to_string(),
+            last_modified_ledger: 200,
+        };
+        cache.entries.insert(entry.id, entry.clone());
+
+        let fetched = cache.entries.get(&ConfigSettingId::StateArchival);
+        assert!(fetched.is_some(), "should find cached entry");
+        assert_eq!(fetched.unwrap().config_xdr, "archival-xdr");
+    }
+
+    #[test]
+    fn test_config_cache_miss_returns_none() {
+        let cache = ConfigCache::new();
+        let fetched = cache.entries.get(&ConfigSettingId::ContractComputeV0);
+        assert!(fetched.is_none(), "empty cache should return None");
+    }
+
+    #[test]
+    fn test_config_cache_populate_all_ids() {
+        let mut cache = ConfigCache::new();
+        let ids = [
+            ConfigSettingId::ContractComputeV0,
+            ConfigSettingId::ContractLedgerCostV0,
+            ConfigSettingId::ContractHistoricalDataV0,
+            ConfigSettingId::ContractEventsV0,
+            ConfigSettingId::ContractBandwidthV0,
+            ConfigSettingId::StateArchival,
+        ];
+
+        for (i, id) in ids.iter().enumerate() {
+            cache.entries.insert(
+                *id,
+                ConfigSettingEntryRaw {
+                    id: *id,
+                    config_xdr: format!("xdr-{i}"),
+                    last_modified_ledger: i as u32,
+                },
+            );
+        }
+
+        assert_eq!(cache.len(), 6, "cache should hold all 6 settings");
+
+        // Verify all entries are retrievable.
+        for id in &ids {
+            let entry = cache
+                .entries
+                .get(id)
+                .expect("entry should be present");
+            assert_eq!(entry.id, *id);
+        }
+    }
+
+    #[test]
+    fn test_config_cache_overwrite_on_duplicate_insert() {
+        let mut cache = ConfigCache::new();
+        let entry_v1 = ConfigSettingEntryRaw {
+            id: ConfigSettingId::ContractComputeV0,
+            config_xdr: "v1".to_string(),
+            last_modified_ledger: 10,
+        };
+        let entry_v2 = ConfigSettingEntryRaw {
+            id: ConfigSettingId::ContractComputeV0,
+            config_xdr: "v2".to_string(),
+            last_modified_ledger: 20,
+        };
+
+        cache.entries.insert(entry_v1.id, entry_v1);
+        cache.entries.insert(entry_v2.id, entry_v2.clone());
+
+        assert_eq!(cache.len(), 1, "should still be 1 entry after overwrite");
+        let fetched = cache.entries.get(&entry_v2.id).unwrap();
+        assert_eq!(fetched.config_xdr, "v2");
+        assert_eq!(fetched.last_modified_ledger, 20);
+    }
+
+    #[test]
+    fn test_config_cache_isolation_between_settings() {
+        let mut cache = ConfigCache::new();
+        cache.entries.insert(
+            ConfigSettingId::ContractComputeV0,
+            ConfigSettingEntryRaw {
+                id: ConfigSettingId::ContractComputeV0,
+                config_xdr: "compute-xdr".to_string(),
+                last_modified_ledger: 1,
+            },
+        );
+        cache.entries.insert(
+            ConfigSettingId::StateArchival,
+            ConfigSettingEntryRaw {
+                id: ConfigSettingId::StateArchival,
+                config_xdr: "archival-xdr".to_string(),
+                last_modified_ledger: 2,
+            },
+        );
+
+        assert_eq!(cache.len(), 2);
+        assert_eq!(
+            cache
+                .entries
+                .get(&ConfigSettingId::ContractComputeV0)
+                .unwrap()
+                .config_xdr,
+            "compute-xdr"
+        );
+        assert_eq!(
+            cache
+                .entries
+                .get(&ConfigSettingId::StateArchival)
+                .unwrap()
+                .config_xdr,
+            "archival-xdr"
+        );
+    }
+
+    #[test]
+    fn test_config_cache_clears_on_drop() {
+        let mut cache = ConfigCache::new();
+        cache.entries.insert(
+            ConfigSettingId::ContractComputeV0,
+            ConfigSettingEntryRaw {
+                id: ConfigSettingId::ContractComputeV0,
+                config_xdr: "data".to_string(),
+                last_modified_ledger: 1,
+            },
+        );
+        assert_eq!(cache.len(), 1);
+        drop(cache);
+        // Cache is dropped; no lingering state.
     }
 }

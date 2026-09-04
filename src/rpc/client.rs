@@ -106,6 +106,8 @@ pub struct RpcClient {
     dedup: Arc<Mutex<DedupState>>,
     /// Fixed-rate limiter shared by every network call, when enabled.
     limiter: Option<Arc<governor::DefaultDirectRateLimiter>>,
+    /// Total request timeout override from `--rpc-timeout`, if any.
+    request_timeout: Option<Duration>,
 }
 
 impl RpcClient {
@@ -175,6 +177,7 @@ impl RpcClient {
                 .unwrap_or_else(|_| reqwest::Client::new()),
             dedup: Arc::new(Mutex::new(DedupState::default())),
             limiter: rps.and_then(build_rate_limiter),
+            request_timeout,
         }
     }
 
