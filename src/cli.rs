@@ -96,6 +96,10 @@ pub enum Command {
         #[arg(long, default_value = "testnet")]
         network: String,
 
+        /// Explicit RPC URL (overrides network-based resolution).
+        #[arg(long)]
+        rpc_url: Option<String>,
+
         /// Deployed contract ID (64 hex chars) to invoke each function against.
         #[arg(long)]
         id: Option<String>,
@@ -253,6 +257,10 @@ pub enum ConfigAction {
         /// instead of the full diff. Useful for CI status lines.
         #[arg(long)]
         summary: bool,
+
+        /// Output as JSON instead of a human-readable diff.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Show the full chronological change log across all stored snapshots.

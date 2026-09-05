@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, trace, warn};
 
 use crate::error::{AppError, AppResult};
-use crate::rpc::retry::with_retry;
+use crate::rpc::retry::{DEFAULT_MAX_RETRIES, with_retry};
 
 /// Default per-request HTTP timeout applied to every RPC call. Matches the
 /// CLI's `--timeout` default (30 seconds).
@@ -106,6 +106,9 @@ pub struct RpcClient {
     dedup: Arc<Mutex<DedupState>>,
     /// Fixed-rate limiter shared by every network call, when enabled.
     limiter: Option<Arc<governor::DefaultDirectRateLimiter>>,
+    /// Maximum number of retries on transient (HTTP) failures, with
+    /// exponential backoff.
+    max_retries: usize,
 }
 
 impl RpcClient {
@@ -116,7 +119,8 @@ impl RpcClient {
     }
 
     /// Create a new RPC client pointing at the given URL, optionally capping
-    /// outbound requests to `rps` requests per second.
+    /// outbound requests to `rps` requests per second. Retries use the
+    /// [`DEFAULT_MAX_RETRIES`] default.
     ///
     /// The limiter spaces consecutive outbound calls at least `1/rps` seconds
     /// apart (a fixed-rate limiter with a burst of 1). `None` or `Some(0)`
@@ -175,6 +179,7 @@ impl RpcClient {
                 .unwrap_or_else(|_| reqwest::Client::new()),
             dedup: Arc::new(Mutex::new(DedupState::default())),
             limiter: rps.and_then(build_rate_limiter),
+            max_retries,
         }
     }
 
@@ -302,7 +307,7 @@ impl RpcClient {
         let request_body = body.clone();
         let limiter = self.limiter.clone();
 
-        let response = with_retry(|| {
+        let response = with_retry(self.max_retries, || {
             let client = client.clone();
             let url = url.clone();
             let request_body = request_body.clone();

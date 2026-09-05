@@ -172,6 +172,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
         cli::Command::EstimateAll {
             wasm,
             network,
+            rpc_url,
             id,
             json,
             format,
@@ -1142,6 +1143,7 @@ async fn cmd_config_diff(
     rpc_fallback_url: Option<&str>,
     against_path: Option<&str>,
     summary: bool,
+    json_flag: bool,
     rps: Option<u64>,
     timeout: u64,
 ) -> error::AppResult<()> {
@@ -1169,7 +1171,23 @@ async fn cmd_config_diff(
             has_pricing = diff.has_pricing_changes,
             "diff computed"
         );
-        if summary {
+
+        if json_flag {
+            // Collect stale estimates for inclusion in JSON output.
+            let stale: Vec<cache::CachedEstimate> = cache::list_cached_estimates(network)
+                .map(|estimates| {
+                    cache::find_stale_estimates(&estimates, new_snapshot.ledger)
+                        .into_iter()
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let json_output = serde_json::json!({
+                "diff": diff,
+                "stale_estimates": stale,
+            });
+            println!("{}", serde_json::to_string_pretty(&json_output)?);
+        } else if summary {
             println!("{}", config_snapshot::diff::format_diff_summary(&diff));
         } else {
             println!("{}", config_snapshot::diff::format_diff(&diff));
@@ -1179,7 +1197,7 @@ async fn cmd_config_diff(
             match config_snapshot::store::save_snapshot(&new_snapshot, None) {
                 Ok(path) => {
                     info!(path = %path.display(), "auto-saved post-upgrade snapshot");
-                    if !summary {
+                    if !json_flag && !summary {
                         println!(
                             "  Protocol upgrade detected — new config auto-saved to {}",
                             path.display()
@@ -1188,14 +1206,14 @@ async fn cmd_config_diff(
                 }
                 Err(e) => {
                     warn!(error = %e, "could not auto-save post-upgrade snapshot");
-                    if !summary {
+                    if !json_flag && !summary {
                         eprintln!("  Warning: could not auto-save post-upgrade snapshot: {e}");
                     }
                 }
             }
         }
 
-        if !summary {
+        if !json_flag && !summary {
             print_stale_estimates(network, new_snapshot.ledger);
         }
 
