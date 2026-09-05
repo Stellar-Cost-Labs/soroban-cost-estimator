@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use governor::{Quota, RateLimiter};
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{debug, trace, warn};
@@ -87,6 +88,17 @@ struct DedupState {
     /// observe no cached result and simply become the next leader, so a
     /// retry only costs the request itself.
     in_flight: HashMap<RequestKey, Arc<Mutex<()>>>,
+}
+
+/// Response envelope for the `getHealth` JSON-RPC method.
+///
+/// Stellar RPC returns a `status` of `healthy`, `degraded`, or `unhealthy`
+/// plus ledger-window information; the health check only needs `status`.
+/// Extra fields in the response are ignored by serde.
+#[derive(Debug, Deserialize)]
+struct HealthResponse {
+    /// Node health status: `healthy`, `degraded`, or `unhealthy`.
+    status: String,
 }
 
 /// A minimal JSON-RPC 2.0 client for Soroban RPC endpoints.
@@ -197,6 +209,46 @@ impl RpcClient {
             dedup: Arc::new(Mutex::new(DedupState::default())),
             limiter: rps.and_then(build_rate_limiter),
             max_retries,
+        }
+    }
+
+    /// Validate that the RPC endpoint is reachable and healthy before any
+    /// simulation is run.
+    ///
+    /// Issues a lightweight `getHealth` JSON-RPC call and fails fast with a
+    /// clear, actionable error when the endpoint cannot be reached or reports
+    /// a status other than `healthy` — so a misconfigured `--rpc-url` (or a
+    /// down RPC node) is surfaced up front instead of surfacing midway through
+    /// an expensive batch of simulations.
+    ///
+    /// # Network calls
+    /// Makes at most one `getHealth` RPC call to the configured endpoint.
+    pub async fn health_check(&self) -> AppResult<()> {
+        let health: HealthResponse = self
+            .call("getHealth", serde_json::json!({}))
+            .await
+            .map_err(|e| {
+                AppError::Rpc {
+                    status: -1,
+                    message: format!(
+                        "unable to reach RPC endpoint {url}: {e}. Check --rpc-url / --network and that the node is reachable.",
+                        url = self.url
+                    ),
+                }
+            })?;
+
+        if health.status == "healthy" {
+            debug!(url = self.url, "RPC endpoint health check passed");
+            Ok(())
+        } else {
+            Err(AppError::Rpc {
+                status: -1,
+                message: format!(
+                    "RPC endpoint {url} reported unhealthy status: {status}. Check --rpc-url / --network.",
+                    url = self.url,
+                    status = health.status,
+                ),
+            })
         }
     }
 
@@ -417,10 +469,21 @@ mod tests {
 
     use super::{RpcClient, resolve_ws_endpoint};
 
-    /// Spawns a tiny HTTP server that answers JSON-RPC `simulateTransaction`
-    /// calls, counting how many were received. The first `fail_times` calls
-    /// return a JSON-RPC error body instead of a result.
+    /// Spawns a tiny HTTP server that answers JSON-RPC
+    /// `simulateTransaction`-style calls with `{"result":{"pong":true}}`,
+    /// counting how many were received. The first `fail_times` calls return
+    /// a JSON-RPC error body instead of a result.
     async fn spawn_json_rpc_stub(fail_times: u32) -> (String, Arc<AtomicUsize>) {
+        spawn_json_rpc_stub_with_result(fail_times, r#"{"pong":true}"#).await
+    }
+
+    /// Like [`spawn_json_rpc_stub`], but successful responses embed `result_body`
+    /// verbatim as the JSON-RPC `result` value — for stubbing methods with a
+    /// specific response shape (e.g. `getHealth`).
+    async fn spawn_json_rpc_stub_with_result(
+        fail_times: u32,
+        result_body: &'static str,
+    ) -> (String, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("failed to bind stub server");
@@ -435,7 +498,7 @@ mod tests {
                 };
                 let counter = Arc::clone(&server_counter);
                 tokio::spawn(async move {
-                    let _ = handle_conn(stream, counter, fail_times).await;
+                    let _ = handle_conn(stream, counter, fail_times, result_body).await;
                 });
             }
         });
@@ -447,6 +510,7 @@ mod tests {
         mut stream: TcpStream,
         counter: Arc<AtomicUsize>,
         fail_times: u32,
+        result_body: &'static str,
     ) -> std::io::Result<()> {
         let mut buf = Vec::new();
         let mut tmp = [0u8; 1024];
@@ -486,8 +550,9 @@ mod tests {
         let call_no = counter.fetch_add(1, Ordering::SeqCst);
         let body = if (call_no as u32) < fail_times {
             r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure"}}"#
+                .to_string()
         } else {
-            r#"{"jsonrpc":"2.0","id":1,"result":{"pong":true}}"#
+            format!(r#"{{"jsonrpc":"2.0","id":1,"result":{result_body}}}"#)
         };
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -782,6 +847,56 @@ mod tests {
             fallback_counter.load(Ordering::SeqCst),
             0,
             "fallback must not be contacted for RPC-level errors"
+        );
+    }
+
+    /// A reachable endpoint reporting `healthy` must pass the health check.
+    #[tokio::test]
+    async fn test_health_check_ok_when_healthy() {
+        let (url, _) =
+            spawn_json_rpc_stub_with_result(0, r#"{"status":"healthy","latestLedger":42}"#).await;
+        let client = RpcClient::new(&url);
+
+        client
+            .health_check()
+            .await
+            .expect("healthy endpoint passes");
+    }
+
+    /// A reachable endpoint reporting anything other than `healthy` (e.g.
+    /// `degraded`) must fail the health check with an actionable error.
+    #[tokio::test]
+    async fn test_health_check_errs_on_non_healthy_status() {
+        let (url, _) = spawn_json_rpc_stub_with_result(0, r#"{"status":"degraded"}"#).await;
+        let client = RpcClient::new(&url);
+
+        let err = client
+            .health_check()
+            .await
+            .expect_err("degraded endpoint fails");
+        let message = err.to_string();
+        assert!(
+            message.contains("reported unhealthy status: degraded"),
+            "unexpected error: {message}"
+        );
+    }
+
+    /// An unreachable endpoint must fail the health check fast with a message
+    /// pointing at `--rpc-url` / `--network` rather than surfacing later mid-
+    /// simulation.
+    #[tokio::test]
+    async fn test_health_check_errs_when_endpoint_unreachable() {
+        let dead_url = refused_port_url().await;
+        let client = RpcClient::with_options(&dead_url, None, Duration::from_millis(500));
+
+        let err = client
+            .health_check()
+            .await
+            .expect_err("dead endpoint fails");
+        let message = err.to_string();
+        assert!(
+            message.contains("unable to reach RPC endpoint") && message.contains("--rpc-url"),
+            "unexpected error: {message}"
         );
     }
 
