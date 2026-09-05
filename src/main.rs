@@ -122,11 +122,7 @@ async fn main() {
         )
         .init();
 
-    let args = cli::Cli::parse();
-    info!(command = ?args.command, "starting soroban-cost-estimator");
-
-    if let Err(err) = run(args).await {
-        error!(error = %err, "command failed");
+    if let Err(err) = cli::run().await {
         eprintln!("Error: {err}");
         std::process::exit(1);
     }

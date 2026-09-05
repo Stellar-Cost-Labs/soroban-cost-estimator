@@ -9,8 +9,10 @@
 // config_snapshot::store::list_snapshots).
 #![allow(dead_code)]
 
+pub mod args;
 pub mod cache;
 pub mod cli;
+pub mod commands;
 pub mod config_snapshot;
 pub mod error;
 pub mod paths;
