@@ -2,6 +2,100 @@ use comfy_table::Table;
 
 use crate::report::fee_calc::{FeeBreakdown, FeeRates};
 
+/// Resource limits fetched from the network config.
+#[derive(Debug, Clone)]
+pub struct ResourceLimits {
+    pub tx_max_instructions: u64,
+    pub tx_memory_limit: u32,
+    pub tx_max_disk_read_entries: u32,
+    pub tx_max_write_ledger_entries: u32,
+    pub tx_max_disk_read_bytes: u32,
+    pub tx_max_write_bytes: u32,
+    pub tx_max_size_bytes: u32,
+}
+
+/// A single resource warning when usage approaches a network limit.
+#[derive(Debug, Clone)]
+pub struct ResourceWarning {
+    pub resource: &'static str,
+    pub used: u64,
+    pub limit: u64,
+    pub percentage: f64,
+}
+
+impl std::fmt::Display for ResourceWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "  ⚠️  {} at {:.0}% ({}/{})",
+            self.resource, self.percentage, self.used, self.limit
+        )
+    }
+}
+
+/// Default warning threshold: warn when usage exceeds 80% of the limit.
+const WARNING_THRESHOLD: f64 = 0.80;
+
+/// Checks resource usage against network limits and returns warnings for
+/// resources that exceed the threshold.
+///
+/// Returns an empty `Vec` when all resources are below the threshold,
+/// or when limits are not available (e.g. config fetch failed).
+pub fn check_resource_limits(
+    cpu_instructions: u64,
+    memory_bytes: u64,
+    read_entries: u32,
+    write_entries: u32,
+    read_bytes: u32,
+    write_bytes: u32,
+    tx_size: u32,
+    limits: &ResourceLimits,
+) -> Vec<ResourceWarning> {
+    let mut warnings = Vec::new();
+
+    let check = |
+        warnings: &mut Vec<ResourceWarning>,
+        resource: &'static str,
+        used: u64,
+        limit: u64,
+    | {
+        if limit > 0 {
+            let percentage = (used as f64 / limit as f64) * 100.0;
+            if percentage >= WARNING_THRESHOLD * 100.0 {
+                warnings.push(ResourceWarning {
+                    resource,
+                    used,
+                    limit,
+                    percentage,
+                });
+            }
+        }
+    };
+
+    check(&mut warnings, "CPU instructions", cpu_instructions, limits.tx_max_instructions);
+    check(&mut warnings, "Memory bytes", memory_bytes, limits.tx_memory_limit as u64);
+    check(&mut warnings, "Read entries", read_entries as u64, limits.tx_max_disk_read_entries as u64);
+    check(&mut warnings, "Write entries", write_entries as u64, limits.tx_max_write_ledger_entries as u64);
+    check(&mut warnings, "Read bytes", read_bytes as u64, limits.tx_max_disk_read_bytes as u64);
+    check(&mut warnings, "Write bytes", write_bytes as u64, limits.tx_max_write_bytes as u64);
+    check(&mut warnings, "Transaction size", tx_size as u64, limits.tx_max_size_bytes as u64);
+
+    warnings
+}
+
+/// Formats resource warnings for display.
+pub fn format_resource_warnings(warnings: &[ResourceWarning]) -> String {
+    if warnings.is_empty() {
+        return String::new();
+    }
+    let mut output = String::from("\n⚠️  Resource limit warnings:\n");
+    for w in warnings {
+        output.push_str(&format!("{w}\n"));
+    }
+    output.push('\n');
+    output
+}
+
 /// Compute what percentage `part` is of `total`.
 ///
 /// Returns a formatted string like `"29.3%"`. Returns `"0.0%"` when the
@@ -238,6 +332,92 @@ pub fn format_report_json(report: &CostReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_limits() -> ResourceLimits {
+        ResourceLimits {
+            tx_max_instructions: 1_000_000,
+            tx_memory_limit: 41_943_040,
+            tx_max_disk_read_entries: 100,
+            tx_max_write_ledger_entries: 100,
+            tx_max_disk_read_bytes: 1_000_000,
+            tx_max_write_bytes: 1_000_000,
+            tx_max_size_bytes: 100_000,
+        }
+    }
+
+    #[test]
+    fn test_no_warnings_when_below_threshold() {
+        let limits = sample_limits();
+        let warnings = check_resource_limits(100, 100, 10, 10, 1000, 1000, 100, &limits);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_cpu_warning_when_above_threshold() {
+        let limits = sample_limits();
+        // 90% of 1_000_000 = 900_000
+        let warnings = check_resource_limits(900_000, 100, 10, 10, 1000, 1000, 100, &limits);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].resource, "CPU instructions");
+        assert!(warnings[0].percentage >= 80.0);
+    }
+
+    #[test]
+    fn test_memory_warning_when_above_threshold() {
+        let limits = sample_limits();
+        // 90% of 41_943_040
+        let used = (41_943_040.0 * 0.90) as u64;
+        let warnings = check_resource_limits(100, used, 10, 10, 1000, 1000, 100, &limits);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].resource, "Memory bytes");
+    }
+
+    #[test]
+    fn test_multiple_warnings() {
+        let limits = sample_limits();
+        // CPU at 90%, write entries at 90%
+        let warnings = check_resource_limits(900_000, 100, 10, 90, 1000, 1000, 100, &limits);
+        assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn test_zero_limit_skips_check() {
+        let limits = ResourceLimits {
+            tx_max_instructions: 0,
+            tx_memory_limit: 41_943_040,
+            ..sample_limits()
+        };
+        // CPU limit is 0, so no warning even at high usage
+        let warnings = check_resource_limits(999_999, 100, 10, 10, 1000, 1000, 100, &limits);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_exactly_at_threshold_warns() {
+        let limits = sample_limits();
+        // Exactly 80% of 1_000_000
+        let warnings = check_resource_limits(800_000, 100, 10, 10, 1000, 1000, 100, &limits);
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn test_format_warnings_empty() {
+        let output = format_resource_warnings(&[]);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn test_format_warnings_contains_resource() {
+        let warnings = vec![ResourceWarning {
+            resource: "CPU instructions",
+            used: 900_000,
+            limit: 1_000_000,
+            percentage: 90.0,
+        }];
+        let output = format_resource_warnings(&warnings);
+        assert!(output.contains("CPU instructions"));
+        assert!(output.contains("90%"));
+    }
 
     #[test]
     fn test_fee_percentage_normal() {

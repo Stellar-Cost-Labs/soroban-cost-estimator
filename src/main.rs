@@ -418,6 +418,62 @@ async fn fetch_fee_rates(client: &rpc::client::RpcClient) -> report::fee_calc::F
     rates
 }
 
+/// Fetches resource limits from the network config.
+///
+/// Returns `Some(ResourceLimits)` when all three config entries are available,
+/// or `None` if any fetch fails (the caller silently skips warnings).
+async fn fetch_resource_limits(
+    client: &rpc::client::RpcClient,
+) -> Option<report::cost_report::ResourceLimits> {
+    let raw_compute =
+        rpc::config::fetch_config_setting(client, rpc::config::ConfigSettingId::ContractComputeV0)
+            .await;
+    let raw_ledger_cost = rpc::config::fetch_config_setting(
+        client,
+        rpc::config::ConfigSettingId::ContractLedgerCostV0,
+    )
+    .await;
+    let raw_bandwidth = rpc::config::fetch_config_setting(
+        client,
+        rpc::config::ConfigSettingId::ContractBandwidthV0,
+    )
+    .await;
+
+    let compute = match raw_compute {
+        Ok(raw) => match xdr_helper::decode_config_entry_xdr(&raw.config_xdr) {
+            Ok(stellar_xdr::ConfigSettingEntry::ContractComputeV0(s)) => s,
+            _ => return None,
+        },
+        Err(_) => return None,
+    };
+
+    let ledger_cost = match raw_ledger_cost {
+        Ok(raw) => match xdr_helper::decode_config_entry_xdr(&raw.config_xdr) {
+            Ok(stellar_xdr::ConfigSettingEntry::ContractLedgerCostV0(s)) => s,
+            _ => return None,
+        },
+        Err(_) => return None,
+    };
+
+    let bandwidth = match raw_bandwidth {
+        Ok(raw) => match xdr_helper::decode_config_entry_xdr(&raw.config_xdr) {
+            Ok(stellar_xdr::ConfigSettingEntry::ContractBandwidthV0(s)) => s,
+            _ => return None,
+        },
+        Err(_) => return None,
+    };
+
+    Some(report::cost_report::ResourceLimits {
+        tx_max_instructions: compute.tx_max_instructions as u64,
+        tx_memory_limit: compute.tx_memory_limit,
+        tx_max_disk_read_entries: ledger_cost.tx_max_disk_read_entries,
+        tx_max_write_ledger_entries: ledger_cost.tx_max_write_ledger_entries,
+        tx_max_disk_read_bytes: ledger_cost.tx_max_disk_read_bytes,
+        tx_max_write_bytes: ledger_cost.tx_max_write_bytes,
+        tx_max_size_bytes: bandwidth.tx_max_size_bytes,
+    })
+}
+
 /// `estimate` command: simulate a single invocation and print cost report.
 ///
 /// All RPC traffic (simulation and fee-rate fetches) goes through one
@@ -580,6 +636,25 @@ async fn cmd_estimate(
         match formatter_by_name(format) {
             Some(formatter) => println!("{}", formatter.format(&report)),
             None => println!("{}", TableFormatter.format(&report)),
+        }
+
+        // Check resource limits and print warnings
+        let limits = fetch_resource_limits(&client).await;
+        if let Some(limits) = limits {
+            let warnings = report::cost_report::check_resource_limits(
+                cpu_instructions,
+                memory_bytes,
+                read_entries,
+                write_entries,
+                read_bytes,
+                write_bytes,
+                tx_xdr.len() as u32,
+                &limits,
+            );
+            if !warnings.is_empty() {
+                let warning_text = report::cost_report::format_resource_warnings(&warnings);
+                print!("{warning_text}");
+            }
         }
 
         Ok(())
