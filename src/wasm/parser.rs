@@ -1,7 +1,7 @@
 use std::io::Cursor;
 use std::path::Path;
 
-use stellar_xdr::ReadXdr;
+use stellar_xdr::{ReadXdr, ScVal};
 use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
@@ -264,7 +264,7 @@ pub fn parse_contract_spec(bytes: &[u8]) -> AppResult<(SpecFunctions, bool)> {
             let mut cursor = Cursor::new(data);
             while (cursor.position() as usize) < data.len() {
                 let mut limited =
-                    stellar_xdr::Limited::new(&mut cursor, stellar_xdr::Limits::none());
+                    stellar_xdr::Limited::new(&mut cursor, stellar_xdr::Limits::unlimited());
                 // Break (not `?`) on a decode error: a trailing byte or a
                 // truncated final entry should not discard the entries already
                 // decoded. If nothing decoded, the caller's `unwrap_or_default`
@@ -503,6 +503,88 @@ pub fn validate_arg_value(type_def: &stellar_xdr::ScSpecTypeDef, arg: &str) -> A
     Ok(())
 }
 
+/// Coerces a single `--arg` `key=value` pair to an `ScVal` using a
+/// contract-spec type.
+///
+/// The spec type is authoritative when it has a text form that maps directly
+/// onto an `ScVal` (bool, common fixed-width integers, string, symbol). For
+/// those types a value that cannot represent the spec type is rejected early
+/// with the parameter's `key=value` text and the expected type name. Spec
+/// types that require a bespoke parser (vec, map, udt, ...) return `Ok(None)`
+/// so callers can fall back to the legacy type-inference path.
+pub fn coerce_arg_scval(
+    type_def: &stellar_xdr::ScSpecTypeDef,
+    arg: &str,
+) -> AppResult<Option<stellar_xdr::ScVal>> {
+    let value = arg.split_once('=').map(|(_, v)| v).unwrap_or(arg);
+    let expected = spec_type_name(type_def);
+    let invalid = || {
+        AppError::TypeValidation(format!(
+            "arg '{arg}' cannot be used as '{expected}'"
+        ))
+    };
+
+    let coerced = match type_def {
+        stellar_xdr::ScSpecTypeDef::Bool => {
+            if value == "true" {
+                Some(ScVal::Bool(true))
+            } else if value == "false" {
+                Some(ScVal::Bool(false))
+            } else {
+                return Err(invalid());
+            }
+        }
+        stellar_xdr::ScSpecTypeDef::U32 => Some(ScVal::U32(
+            value.parse::<u32>().map_err(|_| invalid())?,
+        )),
+        stellar_xdr::ScSpecTypeDef::I32 => Some(ScVal::I32(
+            value.parse::<i32>().map_err(|_| invalid())?,
+        )),
+        stellar_xdr::ScSpecTypeDef::U64 => Some(ScVal::U64(
+            value.parse::<u64>().map_err(|_| invalid())?,
+        )),
+        stellar_xdr::ScSpecTypeDef::I64 => Some(ScVal::I64(
+            value.parse::<i64>().map_err(|_| invalid())?,
+        )),
+        stellar_xdr::ScSpecTypeDef::Timepoint => Some(ScVal::Timepoint(
+            value.parse::<u64>().map_err(|_| invalid())?,
+        )),
+        stellar_xdr::ScSpecTypeDef::Duration => Some(ScVal::Duration(
+            value.parse::<u64>().map_err(|_| invalid())?,
+        )),
+        stellar_xdr::ScSpecTypeDef::U128 => {
+            let n = value.parse::<u128>().map_err(|_| invalid())?;
+            Some(ScVal::U128(stellar_xdr::UInt128Parts {
+                hi: (n >> 64) as u64,
+                lo: n as u64,
+            }))
+        }
+        stellar_xdr::ScSpecTypeDef::I128 => {
+            let n = value.parse::<i128>().map_err(|_| invalid())?;
+            Some(ScVal::I128(stellar_xdr::Int128Parts {
+                hi: (n >> 64) as i64,
+                lo: n as u64,
+            }))
+        }
+        stellar_xdr::ScSpecTypeDef::Symbol => {
+            if !is_valid_symbol(value) {
+                return Err(invalid());
+            }
+            Some(ScVal::Symbol(stellar_xdr::ScSymbol(
+                value.as_bytes().to_vec(),
+            )))
+        }
+        stellar_xdr::ScSpecTypeDef::String => Some(ScVal::String(stellar_xdr::ScString(
+            value.as_bytes().to_vec(),
+        ))),
+        // Types with no trivial text->ScVal mapping are left to the caller's
+        // inference fallback.
+        _ => None,
+    };
+
+    Ok(coerced)
+}
+
 /// True when `value` is a plausible u256/i256 integer: optional `0x` hex or a
 /// plain decimal without sign-ambiguity issues. A full 256-bit parse is out of
 /// scope, so this is a conservative syntax check.
@@ -696,5 +778,54 @@ fn push_entries_generic<T>(
     }
     if entries.len() > max_listed {
         lines.push(format!("  - ... and {} more", entries.len() - max_listed));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::{ScSpecTypeDef, ScVal};
+
+    fn coerce(type_def: ScSpecTypeDef, arg: &str) -> Option<ScVal> {
+        coerce_arg_scval(&type_def, arg).expect("coercion should be valid")
+    }
+
+    #[test]
+    fn coerces_i64_args() {
+        assert_eq!(coerce(ScSpecTypeDef::I64, "step=5"), Some(ScVal::I64(5)));
+    }
+
+    #[test]
+    fn coerces_u64_args() {
+        assert_eq!(
+            coerce(ScSpecTypeDef::U64, "amount=10"),
+            Some(ScVal::U64(10))
+        );
+    }
+
+    #[test]
+    fn coerces_bool_args() {
+        assert_eq!(
+            coerce(ScSpecTypeDef::Bool, "flag=true"),
+            Some(ScVal::Bool(true))
+        );
+    }
+
+    #[test]
+    fn coerces_string_args() {
+        assert_eq!(
+            coerce(ScSpecTypeDef::String, "name=hello"),
+            Some(ScVal::String(stellar_xdr::ScString(b"hello".to_vec())))
+        );
+    }
+
+    #[test]
+    fn coerces_symbol_args() {
+        assert_eq!(
+            coerce(ScSpecTypeDef::Symbol, "symbol=hello_world"),
+            Some(ScVal::Symbol(stellar_xdr::ScSymbol(
+                b"hello_world".to_vec()
+            )))
+        );
     }
 }
