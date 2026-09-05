@@ -49,6 +49,7 @@ too_many_arguments = { level = "allow", priority = 1 }
 [dependencies]
 # CLI
 clap = { version = "4.6.4", features = ["derive"] }
+clap_complete = "4.5"
 
 # Async runtime
 tokio = { version = "1.53.1", features = ["full"] }
