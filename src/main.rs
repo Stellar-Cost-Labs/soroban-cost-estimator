@@ -182,6 +182,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cmd_estimate_all(
                 &wasm,
                 &network,
+                rpc_url.as_deref(),
                 fallback,
                 id.as_deref(),
                 &format,
@@ -598,6 +599,7 @@ fn csv_row(r: &EstimateAllResult) -> String {
 async fn cmd_estimate_all(
     wasm_path: &str,
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     contract_id: Option<&str>,
     format: &str,
@@ -649,7 +651,7 @@ async fn cmd_estimate_all(
             }
         }
 
-        let endpoint = rpc::client::resolve_endpoint(network, None)?;
+        let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
         let client = rpc::client::RpcClient::with_fallback(
             &endpoint,
             rpc_fallback_url,
