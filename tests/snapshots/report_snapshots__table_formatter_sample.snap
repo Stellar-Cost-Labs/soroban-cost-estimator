@@ -1,9 +1,11 @@
 ---
 source: tests/report_snapshots.rs
+assertion_line: 64
 expression: TableFormatter.format(&report)
 ---
 Function: increment
 Network: testnet (ledger 3894195)
+RPC round-trip: 87 ms
 WASM hash: abc123def456
 
 +------------------+----------+---------------+
@@ -34,3 +36,6 @@ Fee Breakdown:
     Bandwidth:  61 stroops (0.4%)
 
   Total:          15427 stroops (0.0015427)
+
+Optimization Suggestions:
+  No cost optimizations identified (fee rates unavailable or no reducible resources).
