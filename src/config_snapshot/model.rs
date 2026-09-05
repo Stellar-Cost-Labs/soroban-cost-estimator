@@ -1,4 +1,19 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
+
+macro_rules! display_as_debug {
+    ($($type:ty),+ $(,)?) => {
+        $(
+            impl fmt::Display for $type {
+                fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    formatter.write_str(
+                        &serde_json::to_string(self).map_err(|_| fmt::Error)?,
+                    )
+                }
+            }
+        )+
+    };
+}
 
 /// A complete snapshot of the network's Soroban resource-pricing configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,3 +93,13 @@ pub struct StateArchivalV0 {
     pub eviction_scan_size: u32,
     pub starting_eviction_scan_level: u32,
 }
+
+display_as_debug!(
+    ConfigSnapshot,
+    ContractComputeV0,
+    ContractLedgerCostV0,
+    ContractHistoricalDataV0,
+    ContractEventsV0,
+    ContractBandwidthV0,
+    StateArchivalV0,
+);

@@ -1,4 +1,11 @@
 use clap::{Parser, Subcommand};
+use std::fmt;
+
+impl fmt::Display for Cli {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.command)
+    }
+}
 
 /// Build version string with metadata from build.rs
 fn build_version() -> &'static str {
@@ -281,4 +288,26 @@ pub enum ConfigAction {
         #[arg(long, default_value = "testnet")]
         network: String,
     },
+}
+
+impl fmt::Display for Command {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Estimate { .. } => "estimate",
+            Self::EstimateAll { .. } => "estimate-all",
+            Self::Config { .. } => "config",
+            Self::Watch { .. } => "watch",
+        };
+        formatter.write_str(name)
+    }
+}
+
+impl fmt::Display for ConfigAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Snapshot { .. } => "snapshot",
+            Self::Diff { .. } => "diff",
+        };
+        formatter.write_str(name)
+    }
 }
