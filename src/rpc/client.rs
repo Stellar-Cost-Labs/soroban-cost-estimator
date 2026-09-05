@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, trace, warn};
 
 use crate::error::{AppError, AppResult};
-use crate::rpc::retry::with_retry;
+use crate::rpc::retry::{DEFAULT_MAX_RETRIES, with_retry};
 
 /// Default per-request HTTP timeout applied to every RPC call. Matches the
 /// CLI's `--timeout` default (30 seconds).
@@ -106,6 +106,9 @@ pub struct RpcClient {
     dedup: Arc<Mutex<DedupState>>,
     /// Fixed-rate limiter shared by every network call, when enabled.
     limiter: Option<Arc<governor::DefaultDirectRateLimiter>>,
+    /// Maximum number of retries on transient (HTTP) failures, with
+    /// exponential backoff.
+    max_retries: usize,
 }
 
 impl RpcClient {
@@ -116,7 +119,8 @@ impl RpcClient {
     }
 
     /// Create a new RPC client pointing at the given URL, optionally capping
-    /// outbound requests to `rps` requests per second.
+    /// outbound requests to `rps` requests per second. Retries use the
+    /// [`DEFAULT_MAX_RETRIES`] default.
     ///
     /// The limiter spaces consecutive outbound calls at least `1/rps` seconds
     /// apart (a fixed-rate limiter with a burst of 1). `None` or `Some(0)`
@@ -127,26 +131,34 @@ impl RpcClient {
     /// and TCP keep-alive so that HTTP connections are reused across multiple
     /// RPC calls within a single run, reducing handshake overhead.
     pub fn with_rate_limit(url: &str, rps: Option<u64>) -> Self {
-        Self::with_options(url, rps, DEFAULT_TIMEOUT)
+        Self::with_options(url, rps, DEFAULT_TIMEOUT, DEFAULT_MAX_RETRIES)
     }
 
     /// Create a new RPC client pointing at the given URL, optionally capping
-    /// outbound requests to `rps` requests per second and bounding each HTTP
-    /// request with `timeout`.
+    /// outbound requests to `rps` requests per second, bounding each HTTP
+    /// request with `timeout`, and retrying transient failures up to
+    /// `max_retries` times with exponential backoff.
     ///
     /// The limiter spaces consecutive outbound calls at least `1/rps` seconds
     /// apart (a fixed-rate limiter with a burst of 1). `None` or `Some(0)`
     /// disables rate limiting entirely. Values larger than `u32::MAX` are
     /// clamped. `timeout` applies to the whole request (connect through
-    /// response body) and is passed straight to reqwest.
-    pub fn with_options(url: &str, rps: Option<u64>, timeout: Duration) -> Self {
-        Self::with_fallback(url, None, rps, timeout)
+    /// response body) and is passed straight to reqwest. A `max_retries` of
+    /// `0` disables retries.
+    pub fn with_options(
+        url: &str,
+        rps: Option<u64>,
+        timeout: Duration,
+        max_retries: usize,
+    ) -> Self {
+        Self::with_fallback(url, None, rps, timeout, max_retries)
     }
 
     /// Create a new RPC client pointing at the given URL, with an optional
     /// secondary URL used for failover, optionally capping outbound requests
-    /// to `rps` requests per second and bounding each HTTP request with
-    /// `timeout`.
+    /// to `rps` requests per second, bounding each HTTP request with
+    /// `timeout`, and retrying transient failures up to `max_retries` times
+    /// with exponential backoff.
     ///
     /// When a request to the primary endpoint fails with a network-level
     /// error (connection refused, timeout, DNS failure, etc.) and a fallback
@@ -155,14 +167,23 @@ impl RpcClient {
     /// params) are not retried against the fallback — they would fail there
     /// too.
     ///
-    /// The limiter and timeout behave exactly as in [`Self::with_options`].
+    /// The limiter, timeout, and retry behavior behave exactly as in
+    /// [`Self::with_options`].
     pub fn with_fallback(
         url: &str,
         fallback_url: Option<&str>,
         rps: Option<u64>,
         timeout: Duration,
+        max_retries: usize,
     ) -> Self {
-        debug!(url, ?fallback_url, rps, ?timeout, "creating RPC client");
+        debug!(
+            url,
+            ?fallback_url,
+            rps,
+            ?timeout,
+            max_retries,
+            "creating RPC client"
+        );
         Self {
             url: url.to_string(),
             fallback_url: fallback_url.map(String::from),
@@ -175,6 +196,7 @@ impl RpcClient {
                 .unwrap_or_else(|_| reqwest::Client::new()),
             dedup: Arc::new(Mutex::new(DedupState::default())),
             limiter: rps.and_then(build_rate_limiter),
+            max_retries,
         }
     }
 
@@ -302,7 +324,7 @@ impl RpcClient {
         let request_body = body.clone();
         let limiter = self.limiter.clone();
 
-        let response = with_retry(|| {
+        let response = with_retry(self.max_retries, || {
             let client = client.clone();
             let url = url.clone();
             let request_body = request_body.clone();
@@ -391,6 +413,7 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     use crate::error::{AppError, AppResult};
+    use crate::rpc::retry::DEFAULT_MAX_RETRIES;
 
     use super::{RpcClient, resolve_ws_endpoint};
 
@@ -688,7 +711,7 @@ mod tests {
     #[tokio::test]
     async fn test_request_timeout_applies() {
         let url = spawn_hanging_stub().await;
-        let client = RpcClient::with_options(&url, None, Duration::from_millis(100));
+        let client = RpcClient::with_options(&url, None, Duration::from_millis(100), 0);
 
         let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
 
@@ -721,6 +744,7 @@ mod tests {
             Some(&fallback_url),
             None,
             Duration::from_secs(30),
+            DEFAULT_MAX_RETRIES,
         );
 
         let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
@@ -748,6 +772,7 @@ mod tests {
             Some(&fallback_url),
             None,
             Duration::from_secs(30),
+            DEFAULT_MAX_RETRIES,
         );
 
         let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
