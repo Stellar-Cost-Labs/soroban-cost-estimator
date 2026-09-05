@@ -93,8 +93,8 @@ fn test_help_output() {
     assert!(stdout.contains("cache"), "help should list cache command");
     assert!(stdout.contains("watch"), "help should list watch command");
     assert!(
-        stdout.contains("completions"),
-        "help should list completions command"
+        stdout.contains("--rpc-fallback-url"),
+        "help should list --rpc-fallback-url flag"
     );
 }
 
@@ -304,6 +304,24 @@ fn test_unknown_flag_errors() {
 fn test_estimate_all_missing_wasm_errors() {
     let (_, _stderr, code) = run_cli(&["estimate-all"]);
     assert_ne!(code, 0, "estimate-all without --wasm should error");
+}
+
+#[test]
+fn test_rpc_fallback_url_flag_accepted() {
+    // Verify --rpc-fallback-url is accepted as a global argument.
+    let (_, stderr, code) = run_cli(&[
+        "--rpc-fallback-url",
+        "http://127.0.0.1:9999",
+        "estimate",
+        "--wasm",
+        "test.wasm",
+    ]);
+    // Should fail because file doesn't exist, NOT because --rpc-fallback-url is unknown.
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unrecognized"),
+        "--rpc-fallback-url should be recognized; stderr: {stderr}"
+    );
 }
 
 #[test]

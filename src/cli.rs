@@ -31,6 +31,10 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "SECS", default_value_t = 30)]
     pub timeout: u64,
 
+    /// Fallback RPC URL used when the primary endpoint is unreachable.
+    #[arg(long, global = true, value_name = "URL")]
+    pub rpc_fallback_url: Option<String>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -233,6 +237,13 @@ pub enum ConfigAction {
         /// Print the snapshot as JSON instead of the summary lines.
         #[arg(long)]
         json: bool,
+    },
+
+    /// List all saved config snapshots with their timestamp and ledger.
+    List {
+        /// Network whose snapshots to list.
+        #[arg(long, default_value = "testnet")]
+        network: String,
     },
 
     /// Diff the current network config against the most recent snapshot.
