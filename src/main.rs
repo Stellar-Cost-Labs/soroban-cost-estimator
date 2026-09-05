@@ -154,6 +154,9 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
             let format = format.unwrap_or_else(|| if json { "json" } else { "table" }.to_string());
+            if auto_snapshot {
+                take_auto_snapshot(&network, format != "table", rps, timeout).await?;
+            }
             cmd_estimate(
                 &wasm,
                 &network,
@@ -1099,6 +1102,51 @@ fn print_stale_estimates(network: &str, ledger: u32) {
         }
         Err(e) => {
             println!("  Warning: could not check cache: {e}");
+        }
+    }
+}
+
+/// Take a config snapshot automatically before an estimate command.
+///
+/// Errors are treated as non-fatal: a warning is printed and the estimate
+/// proceeds anyway.  This keeps the auto-snapshot from blocking the user's
+/// primary workflow while still surfacing the drift-detection intent.
+///
+/// `quiet` suppresses the human-readable stdout lines for machine formats
+/// (json/csv/markdown) so the estimate's own output stays self-contained;
+/// warnings still go to stderr.
+async fn take_auto_snapshot(
+    network: &str,
+    quiet: bool,
+    rps: Option<u64>,
+    timeout: u64,
+) -> error::AppResult<()> {
+    if !quiet {
+        println!("auto-snapshot: taking config snapshot before estimate…");
+    }
+    match fetch_config_snapshot(network, rps, timeout).await {
+        Ok(snapshot) => match config_snapshot::store::save_snapshot(&snapshot, None) {
+            Ok(path) => {
+                if !quiet {
+                    println!(
+                        "auto-snapshot: saved to {} (network: {}, ledger: {})",
+                        path.display(),
+                        snapshot.network,
+                        snapshot.ledger
+                    );
+                }
+                Ok(())
+            }
+            Err(e) => {
+                warn!(error = %e, "auto-snapshot: could not save snapshot");
+                eprintln!("Warning: auto-snapshot failed to save: {e}");
+                Ok(())
+            }
+        },
+        Err(e) => {
+            warn!(error = %e, "auto-snapshot: could not fetch config");
+            eprintln!("Warning: auto-snapshot failed: {e}");
+            Ok(())
         }
     }
 }

@@ -128,6 +128,7 @@ fn test_estimate_help() {
         "--arg",
         "--cache-ttl",
         "--json",
+        "--auto-snapshot",
     ] {
         assert!(
             stdout.contains(flag),
@@ -143,7 +144,14 @@ fn test_estimate_all_help() {
         code, 0,
         "estimate-all --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--wasm", "--network", "--id", "--json", "--format"] {
+    for flag in [
+        "--wasm",
+        "--network",
+        "--id",
+        "--json",
+        "--format",
+        "--auto-snapshot",
+    ] {
         assert!(
             stdout.contains(flag),
             "estimate-all help should mention {flag}; got: {stdout}"
@@ -484,6 +492,152 @@ fn test_estimate_all_format_invalid_value_rejected() {
     assert!(
         stderr.contains("invalid value") || stderr.contains("possible values"),
         "clap should reject unknown format; stderr: {stderr}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `--auto-snapshot` (implicit drift detection)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_estimate_auto_snapshot_flag_accepted() {
+    // Verify --auto-snapshot is a recognized argument for estimate.
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--auto-snapshot"]);
+    // Should fail because the file doesn't exist, NOT because the flag is unknown.
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--auto-snapshot should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_all_auto_snapshot_flag_accepted() {
+    // Verify --auto-snapshot is a recognized argument for estimate-all.
+    let (_, stderr, code) = run_cli(&["estimate-all", "--wasm", "test.wasm", "--auto-snapshot"]);
+    // Should fail because the file doesn't exist, NOT because the flag is unknown.
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--auto-snapshot should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_auto_snapshot_unknown_network_is_non_fatal() {
+    // With --auto-snapshot the snapshot is attempted *first*; when it fails
+    // (here: unknown network) the estimate must still run and fail on its
+    // own error — the snapshot must never block the primary workflow.
+    let home = temp_home("auto-snapshot-non-fatal");
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--network",
+            "not-a-network",
+            "--auto-snapshot",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 1,
+        "the unknown network should exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("auto-snapshot: taking config snapshot before estimate"),
+        "the snapshot step should announce itself before the estimate; got: {stdout}"
+    );
+    assert!(
+        stderr.contains("Warning: auto-snapshot failed"),
+        "the snapshot failure should surface as a warning; got: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
+        "the estimate should proceed and fail on its own error; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_all_auto_snapshot_unknown_network_is_non_fatal() {
+    let home = temp_home("auto-snapshot-all-non-fatal");
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "estimate-all",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--network",
+            "not-a-network",
+            "--auto-snapshot",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 1,
+        "the unknown network should exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("auto-snapshot: taking config snapshot before estimate"),
+        "the snapshot step should announce itself before the estimate; got: {stdout}"
+    );
+    assert!(
+        stderr.contains("Warning: auto-snapshot failed"),
+        "the snapshot failure should surface as a warning; got: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
+        "the estimate should proceed and fail on its own error; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_auto_snapshot_json_keeps_stdout_machine_clean() {
+    // A fresh cache hit plus --auto-snapshot --json: the snapshot attempt
+    // fails (unknown network) but must be non-fatal, and the human-readable
+    // auto-snapshot chatter must NOT leak into the machine-readable stdout —
+    // warnings belong on stderr only.
+    let home = temp_home("auto-snapshot-json-clean");
+    seed_cache_entry(&home, &chrono::Utc::now().to_rfc3339());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--cache-ttl",
+            "1h",
+            "--network",
+            "not-a-network",
+            "--auto-snapshot",
+            "--json",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run CLI");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a fresh cache hit should exit 0 despite the failed snapshot; stderr: {stderr}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    assert_eq!(parsed["cache"], "hit");
+    assert!(
+        !stdout.contains("auto-snapshot"),
+        "auto-snapshot chatter must not pollute machine output; got: {stdout}"
+    );
+    assert!(
+        stderr.contains("Warning: auto-snapshot failed"),
+        "the snapshot warning should still reach stderr; got: {stderr}"
     );
 }
 

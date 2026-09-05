@@ -11,6 +11,7 @@ Options:
   -w, --wasm <WASM>        Path to the compiled Soroban contract `.wasm` file
       --network <NETWORK>  Network to simulate against [default: testnet]
       --id <ID>            Deployed contract ID (64 hex chars) to invoke each function against
+      --auto-snapshot      Automatically snapshot network config before estimating
       --json               Output as JSON instead of a human-readable list
   -h, --help               Print help
 ```
@@ -28,6 +29,9 @@ Options:
 - Without `--id`, simulations run against a zeroed contract ID and will
   almost certainly fail the "no cost data / no latest ledger" guard; the tool
   prints a note telling you to pass `--id` for real numbers.
+- **`--auto-snapshot`** takes a config snapshot before the batch runs, so a
+  batch estimate doubles as a drift-detection checkpoint. A snapshot failure
+  is a warning, never fatal — the batch proceeds regardless.
 
 ## Example
 

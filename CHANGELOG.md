@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `estimate --auto-snapshot` / `estimate-all --auto-snapshot` — take a config
+  snapshot before estimating, enabling implicit drift detection. Snapshot
+  failures are non-fatal warnings; human-readable progress lines are
+  suppressed in machine formats (`--json`, `--format csv|markdown`).
 - `--timeout` global flag — configurable HTTP request timeout for RPC calls
   in seconds (default 30).
 - `config diff --summary` — print a single-line summary
