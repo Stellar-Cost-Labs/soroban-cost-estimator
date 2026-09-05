@@ -3,6 +3,107 @@ use crate::config_snapshot::model::{
     ContractHistoricalDataV0, ContractLedgerCostV0, StateArchivalV0,
 };
 
+/// Returns a human-readable explanation for a given config setting field path.
+///
+/// Each explanation describes what the setting controls and the unit of
+/// its value (stroops, bytes, instructions, etc.).
+pub fn setting_explanation(field_path: &str) -> Option<&'static str> {
+    match field_path {
+        "contract_compute.ledger_max_instructions" => {
+            Some("Maximum CPU instructions a single ledger can execute across all transactions")
+        }
+        "contract_compute.tx_max_instructions" => {
+            Some("Maximum CPU instructions a single transaction can execute")
+        }
+        "contract_compute.fee_rate_per_instructions_increment" => {
+            Some("Stroops charged per 10,000 CPU instructions (non-refundable fee)")
+        }
+        "contract_compute.tx_memory_limit" => {
+            Some("Maximum memory (in bytes) a single transaction can allocate")
+        }
+        "contract_ledger_cost.ledger_max_disk_read_entries" => {
+            Some("Maximum ledger entries readable per ledger")
+        }
+        "contract_ledger_cost.ledger_max_disk_read_bytes" => {
+            Some("Maximum bytes readable from disk per ledger")
+        }
+        "contract_ledger_cost.ledger_max_write_ledger_entries" => {
+            Some("Maximum ledger entries writable per ledger")
+        }
+        "contract_ledger_cost.ledger_max_write_bytes" => {
+            Some("Maximum bytes writable to disk per ledger")
+        }
+        "contract_ledger_cost.fee_disk_read_ledger_entry" => {
+            Some("Stroops charged per ledger entry read (non-refundable fee)")
+        }
+        "contract_ledger_cost.fee_write_ledger_entry" => {
+            Some("Stroops charged per ledger entry written (non-refundable fee)")
+        }
+        "contract_ledger_cost.fee_disk_read1_kb" => {
+            Some("Stroops charged per 1 KB read from disk (non-refundable fee)")
+        }
+        "contract_ledger_cost.soroban_state_target_size_bytes" => {
+            Some("Target total Soroban state size in bytes for rent fee calculation")
+        }
+        "contract_ledger_cost.rent_fee1_kb_soroban_state_size_low" => {
+            Some("Rent fee per 1 KB when Soroban state is below the target size")
+        }
+        "contract_ledger_cost.rent_fee1_kb_soroban_state_size_high" => {
+            Some("Rent fee per 1 KB when Soroban state is above the target size")
+        }
+        "contract_ledger_cost.soroban_state_rent_fee_growth_factor" => {
+            Some("Growth factor applied to rent fees as state grows")
+        }
+        "contract_historical_data.fee_historical1_kb" => {
+            Some("Stroops charged per 1 KB of historical (archive) data")
+        }
+        "contract_events.tx_max_contract_events_size_bytes" => {
+            Some("Maximum total size of events (in bytes) per transaction")
+        }
+        "contract_events.fee_contract_events1_kb" => {
+            Some("Stroops charged per 1 KB of events (refundable fee)")
+        }
+        "contract_bandwidth.ledger_max_txs_size_bytes" => {
+            Some("Maximum total transaction size (in bytes) per ledger")
+        }
+        "contract_bandwidth.tx_max_size_bytes" => {
+            Some("Maximum size (in bytes) of a single transaction")
+        }
+        "contract_bandwidth.fee_tx_size1_kb" => {
+            Some("Stroops charged per 1 KB of transaction size (non-refundable fee)")
+        }
+        "state_archival.max_entry_ttl" => {
+            Some("Maximum time-to-live (in ledgers) for a contract data entry")
+        }
+        "state_archival.min_temporary_ttl" => {
+            Some("Minimum TTL (in ledgers) for temporary contract data entries")
+        }
+        "state_archival.min_persistent_ttl" => {
+            Some("Minimum TTL (in ledgers) for persistent contract data entries")
+        }
+        "state_archival.persistent_rent_rate_denominator" => {
+            Some("Denominator for the persistent entry rent rate formula")
+        }
+        "state_archival.temp_rent_rate_denominator" => {
+            Some("Denominator for the temporary entry rent rate formula")
+        }
+        "state_archival.max_entries_to_archive" => {
+            Some("Maximum entries archived in a single archival sweep")
+        }
+        "state_archival.live_soroban_state_size_window_sample_size" => {
+            Some("Number of samples in the live Soroban state size window")
+        }
+        "state_archival.live_soroban_state_size_window_sample_period" => {
+            Some("Period (in ledgers) between Soroban state size samples")
+        }
+        "state_archival.eviction_scan_size" => Some("Number of entries scanned per eviction sweep"),
+        "state_archival.starting_eviction_scan_level" => {
+            Some("B-tree level at which eviction scanning begins")
+        }
+        _ => None,
+    }
+}
+
 /// Maps a config setting prefix to its human-readable name.
 ///
 /// Matches the XDR enum variant names from `ConfigSettingId`.
@@ -603,6 +704,9 @@ pub fn format_diff(diff: &ConfigDiff) -> String {
         if change.is_pricing_change {
             let color = pricing_change_color(&change.old_value, &change.new_value);
             output.push_str(&format!("  {color}{icon} {display}{ANSI_RESET}\n"));
+            if let Some(explanation) = change.explanation {
+                output.push_str(&format!("      ℹ️  {explanation}\n"));
+            }
             output.push_str(&format!("      Old: {}\n", change.old_value));
             output.push_str(&format!(
                 "      New: {color}{}{ANSI_RESET}\n",
@@ -610,6 +714,9 @@ pub fn format_diff(diff: &ConfigDiff) -> String {
             ));
         } else {
             output.push_str(&format!("  {icon} {display}\n"));
+            if let Some(explanation) = change.explanation {
+                output.push_str(&format!("      ℹ️  {explanation}\n"));
+            }
             output.push_str(&format!("      Old: {}\n", change.old_value));
             output.push_str(&format!("      New: {}\n", change.new_value));
         }

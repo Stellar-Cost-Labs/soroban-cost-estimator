@@ -297,6 +297,8 @@ fn test_diff_change_has_explanation() {
     let change = &diff.changes[0];
     assert!(change.explanation.is_some());
     assert!(change.explanation.unwrap().contains("CPU instructions"));
+}
+
 // ── Identity: same snapshot should produce no changes (all-present) ────────
 
 #[test]
