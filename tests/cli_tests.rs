@@ -128,6 +128,7 @@ fn test_estimate_help() {
         "--arg",
         "--cache-ttl",
         "--json",
+        "--diff",
     ] {
         assert!(
             stdout.contains(flag),
@@ -1174,6 +1175,26 @@ fn test_watch_interval_suffixes_are_parsed() {
     );
 }
 
+#[test]
+fn test_estimate_diff_nonexistent_file() {
+    let (_stdout, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "tests/fixtures/minimal.wasm",
+        "--diff",
+        "tests/fixtures/does_not_exist.wasm",
+        "--rpc-url",
+        DEAD_RPC,
+    ]);
+    assert_ne!(code, 0, "nonexistent diff file should exit non-zero");
+    assert!(
+        stderr.contains("WASM parse failed")
+            || stderr.contains("No such file")
+            || stderr.contains("File not found"),
+        "stderr should mention failure; got: {stderr}"
+    );
+}
+
 // ── cache query tests ────────────────────────────────────────────────
 
 #[test]
@@ -1214,6 +1235,27 @@ fn test_cache_query_empty_cache() {
     assert!(
         stdout.contains("No cached estimates match the query."),
         "empty cache should report no results; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_estimate_diff_unreachable_rpc() {
+    let (_stdout, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "tests/fixtures/minimal.wasm",
+        "--diff",
+        "tests/fixtures/contract.wasm",
+        "--rpc-url",
+        DEAD_RPC,
+    ]);
+    assert_ne!(code, 0, "unreachable RPC should exit non-zero");
+    assert!(
+        stderr.contains("RPC request failed")
+            || stderr.contains("connect")
+            || stderr.contains("failed to send HTTP request")
+            || stderr.contains("error sending request"),
+        "stderr should mention RPC failure; got: {stderr}"
     );
 }
 
