@@ -22,6 +22,12 @@ pub struct CostReport {
     pub function: String,
     /// WASM bytes SHA-256 hash (hex).
     pub wasm_hash: String,
+    /// WASM binary size in bytes.
+    pub wasm_size: u64,
+    /// Total number of sections in the WASM module.
+    pub section_count: u32,
+    /// Names of the WASM custom sections (e.g. `contractspecv0`, `name`).
+    pub custom_sections: Vec<String>,
     /// CPU instructions consumed.
     pub cpu_instructions: u64,
     /// Memory bytes used.
@@ -163,6 +169,23 @@ pub fn format_suggestions(suggestions: &[OptimizationSuggestion]) -> String {
     out
 }
 
+/// Formats the WASM section summary for a report.
+///
+/// Shows the total section count and, when present, the names of the custom
+/// sections (e.g. `contractspecv0`, `name`).
+#[must_use]
+pub fn format_section_summary(report: &CostReport) -> String {
+    if report.custom_sections.is_empty() {
+        format!("{} (custom: none)", report.section_count)
+    } else {
+        format!(
+            "{} (custom: {})",
+            report.section_count,
+            report.custom_sections.join(", ")
+        )
+    }
+}
+
 /// Formats a cost report as a human-readable table.
 pub fn format_report_table(report: &CostReport) -> String {
     let mut output = String::new();
@@ -173,7 +196,12 @@ pub fn format_report_table(report: &CostReport) -> String {
         report.network, report.ledger
     ));
     output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
-    output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
+    output.push_str(&format!("WASM hash: {}\n", report.wasm_hash));
+    output.push_str(&format!("WASM size:  {} bytes\n", report.wasm_size));
+    output.push_str(&format!(
+        "Sections:   {}\n\n",
+        format_section_summary(report)
+    ));
 
     let mut table = Table::new();
 
@@ -259,10 +287,29 @@ mod tests {
         assert_eq!(fee_percentage(2, 3), "66.7%");
     }
 
+    #[test]
+    fn test_format_section_summary_with_custom() {
+        let report = report_with_rates(sample_rates());
+        assert_eq!(
+            format_section_summary(&report),
+            "9 (custom: contractspecv0, name)"
+        );
+    }
+
+    #[test]
+    fn test_format_section_summary_none() {
+        let mut report = report_with_rates(sample_rates());
+        report.custom_sections = vec![];
+        assert_eq!(format_section_summary(&report), "9 (custom: none)");
+    }
+
     fn report_with_rates(rates: FeeRates) -> CostReport {
         CostReport {
             function: "increment".to_string(),
             wasm_hash: "abc".to_string(),
+            wasm_size: 7_312,
+            section_count: 9,
+            custom_sections: vec!["contractspecv0".to_string(), "name".to_string()],
             cpu_instructions: 532_502,
             memory_bytes: 0,
             tx_size: 156,

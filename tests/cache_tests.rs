@@ -627,6 +627,16 @@ fn test_verify_cache_across_networks_all_valid() {
 fn test_concurrent_cross_network_same_key_no_corruption() {
     with_temp_home(|_tmp| {
         let args = vec!["shared".to_string()];
+
+        // Warm up the database so the WAL/journal setup and table creation
+        // complete before the writer threads start; otherwise both threads
+        // race the `PRAGMA journal_mode=WAL` switch on a fresh file and one
+        // can fail with SQLITE_BUSY before its busy_timeout is installed.
+        // Use the same key the writer threads upsert so the entry-count
+        // assertion below still sees exactly one row for the shared key.
+        cache::save_estimate("shared-hash", "shared-func", &args, "testnet", 0, 0, 0, 0)
+            .expect("warmup save");
+
         let tn_args = args.clone();
         let mn_args = args.clone();
 
@@ -674,8 +684,18 @@ fn test_concurrent_cross_network_same_key_no_corruption() {
         );
 
         let statuses = cache::verify_cache().expect("verify");
-        assert_eq!(statuses.len(), 1, "one entry for the shared key");
-        assert!(statuses[0].valid, "entry must be valid: {statuses:?}");
+        // The warm-up row is a separate key; only the shared key must have a
+        // single surviving entry after the concurrent cross-network writes.
+        let shared: Vec<_> = statuses
+            .iter()
+            .filter(|status| status.filename.starts_with("shared-hash-"))
+            .collect();
+        assert_eq!(
+            shared.len(),
+            1,
+            "one entry for the shared key: {statuses:?}"
+        );
+        assert!(shared[0].valid, "entry must be valid: {statuses:?}");
     });
 }
 
@@ -1106,6 +1126,16 @@ fn test_verify_cache_accepts_legacy_entries() {
 fn test_concurrent_same_key_saves_leave_valid_entry() {
     with_temp_home(|_tmp| {
         let args = vec!["shared".to_string()];
+
+        // Warm up the database so the WAL/journal setup and table creation
+        // complete before the writer threads start; otherwise all threads race
+        // the `PRAGMA journal_mode=WAL` switch on a fresh file and some can
+        // fail with SQLITE_BUSY before their busy_timeout is installed.
+        // Use the same key the writer threads upsert so the entry-count
+        // assertion below still sees exactly one row for the shared key.
+        cache::save_estimate("shared-hash", "shared-func", &args, "testnet", 0, 0, 0, 0)
+            .expect("warmup save");
+
         let handles: Vec<_> = (0..CONCURRENT_THREADS)
             .map(|t| {
                 let args = args.clone();

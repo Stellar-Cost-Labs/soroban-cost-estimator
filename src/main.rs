@@ -522,6 +522,9 @@ async fn cmd_estimate(
         let report = report::cost_report::CostReport {
             function: function_name.to_string(),
             wasm_hash: wasm_hash.clone(),
+            wasm_size: wasm_info.size as u64,
+            section_count: u32::try_from(wasm_info.sections.count).unwrap_or(u32::MAX),
+            custom_sections: wasm_info.sections.custom_names.clone(),
             cpu_instructions,
             memory_bytes,
             tx_size: tx_xdr.len() as u32,
@@ -1661,7 +1664,9 @@ mod tests {
     use soroban_cost_estimator::config_snapshot::model::{
         ConfigSnapshot, ContractComputeV0, ContractLedgerCostV0,
     };
-    use soroban_cost_estimator::wasm::parser::{ContractMeta, FunctionInfo, ParamInfo, WasmInfo};
+    use soroban_cost_estimator::wasm::parser::{
+        ContractMeta, FunctionInfo, ParamInfo, SectionInfo, WasmInfo,
+    };
 
     fn snapshot_with_compute_fee(fee: i64) -> ConfigSnapshot {
         ConfigSnapshot {
@@ -1777,6 +1782,11 @@ mod tests {
     fn test_wasm_info_json_structure() {
         let info = WasmInfo {
             bytes: vec![0u8; 44],
+            size: 44,
+            sections: SectionInfo {
+                count: 0,
+                custom_names: Vec::new(),
+            },
             has_spec: true,
             contract_meta: ContractMeta::default(),
             functions: vec![FunctionInfo {

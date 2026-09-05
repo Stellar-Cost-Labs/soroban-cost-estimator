@@ -1,10 +1,13 @@
 ---
 source: tests/report_snapshots.rs
-assertion_line: 75
 expression: JsonFormatter.format(&report)
 ---
 {
   "cpu_instructions": 532502,
+  "custom_sections": [
+    "contractspecv0",
+    "name"
+  ],
   "fee": {
     "bandwidth_fee_stroops": 61,
     "cpu_fee_stroops": 372,
@@ -21,9 +24,11 @@ expression: JsonFormatter.format(&report)
   "read_bytes": 0,
   "read_entries": 1,
   "rpc_latency_ms": 87,
+  "section_count": 9,
   "suggestions": [],
   "tx_size": 156,
   "wasm_hash": "abc123def456",
+  "wasm_size": 7312,
   "write_bytes": 136,
   "write_entries": 1
 }
