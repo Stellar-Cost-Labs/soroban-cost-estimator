@@ -136,6 +136,7 @@ async fn main() {
 async fn run(args: cli::Cli) -> error::AppResult<()> {
     let rps = args.rps;
     let timeout = args.timeout;
+    let max_retries = args.max_retries;
     let fallback = args.rpc_fallback_url.as_deref();
     match args.command {
         cli::Command::Estimate {
@@ -165,6 +166,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 &format,
                 rps,
                 timeout,
+                max_retries,
                 precision,
             )
             .await
@@ -188,6 +190,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 &format,
                 rps,
                 timeout,
+                max_retries,
                 precision,
             )
             .await
@@ -195,7 +198,16 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
         cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(&wasm, json),
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot { network, out, json } => {
-                cmd_config_snapshot(&network, fallback, out.as_deref(), json, rps, timeout).await
+                cmd_config_snapshot(
+                    &network,
+                    fallback,
+                    out.as_deref(),
+                    json,
+                    rps,
+                    timeout,
+                    max_retries,
+                )
+                .await
             }
             cli::ConfigAction::List { network } => cmd_config_snapshot_list(&network),
             cli::ConfigAction::Diff {
@@ -210,6 +222,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     summary,
                     rps,
                     timeout,
+                    max_retries,
                 )
                 .await
             }
@@ -224,7 +237,19 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 network,
                 id,
                 json,
-            } => cmd_cache_warm(&wasm, &network, fallback, id.as_deref(), json, rps, timeout).await,
+            } => {
+                cmd_cache_warm(
+                    &wasm,
+                    &network,
+                    fallback,
+                    id.as_deref(),
+                    json,
+                    rps,
+                    timeout,
+                    max_retries,
+                )
+                .await
+            }
             cli::CacheAction::Verify => cmd_cache_verify(),
             cli::CacheAction::Query {
                 network,
@@ -247,7 +272,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             ),
         },
         cli::Command::Watch { network, interval } => {
-            cmd_watch(&network, fallback, &interval, rps, timeout).await
+            cmd_watch(&network, fallback, &interval, rps, timeout, max_retries).await
         }
     }
 }
@@ -414,6 +439,7 @@ async fn cmd_estimate(
     format: &str,
     rps: Option<u64>,
     timeout: u64,
+    max_retries: usize,
     precision: u32,
 ) -> error::AppResult<()> {
     let json_flag = format == "json";
@@ -462,6 +488,7 @@ async fn cmd_estimate(
             rpc_fallback_url,
             rps,
             std::time::Duration::from_secs(timeout),
+            max_retries,
         );
 
         let sc_vals: Vec<stellar_xdr::ScVal> = args
@@ -605,6 +632,7 @@ async fn cmd_estimate_all(
     format: &str,
     rps: Option<u64>,
     timeout: u64,
+    max_retries: usize,
     precision: u32,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
@@ -657,6 +685,7 @@ async fn cmd_estimate_all(
             rpc_fallback_url,
             rps,
             std::time::Duration::from_secs(timeout),
+            max_retries,
         );
 
         // Fee rates are only needed to itemize the per-function fee breakdown
@@ -1015,6 +1044,7 @@ async fn fetch_config_snapshot(
     rpc_fallback_url: Option<&str>,
     rps: Option<u64>,
     timeout: u64,
+    max_retries: usize,
 ) -> error::AppResult<config_snapshot::model::ConfigSnapshot> {
     use tracing::Instrument;
     use tracing::{debug, info_span};
@@ -1027,6 +1057,7 @@ async fn fetch_config_snapshot(
             rpc_fallback_url,
             rps,
             std::time::Duration::from_secs(timeout),
+            max_retries,
         );
         debug!("fetching all config settings");
         let raw_entries = rpc::config::fetch_all_config_settings(&client).await?;
@@ -1083,6 +1114,7 @@ async fn cmd_config_snapshot(
     json_flag: bool,
     rps: Option<u64>,
     timeout: u64,
+    max_retries: usize,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -1090,7 +1122,8 @@ async fn cmd_config_snapshot(
     let span = info_span!("cmd_config_snapshot", network);
     async {
         info!("taking config snapshot");
-        let snapshot = fetch_config_snapshot(network, rpc_fallback_url, rps, timeout).await?;
+        let snapshot =
+            fetch_config_snapshot(network, rpc_fallback_url, rps, timeout, max_retries).await?;
 
         let path = config_snapshot::store::save_snapshot(&snapshot, out_path)?;
         info!(path = %path.display(), ledger = snapshot.ledger, "snapshot saved");
@@ -1147,6 +1180,7 @@ async fn cmd_config_diff(
     summary: bool,
     rps: Option<u64>,
     timeout: u64,
+    max_retries: usize,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::{debug, info_span};
@@ -1164,7 +1198,8 @@ async fn cmd_config_diff(
             }
         };
 
-        let new_snapshot = fetch_config_snapshot(network, rpc_fallback_url, rps, timeout).await?;
+        let new_snapshot =
+            fetch_config_snapshot(network, rpc_fallback_url, rps, timeout, max_retries).await?;
 
         let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
         debug!(
@@ -1376,10 +1411,11 @@ async fn watch_poll_once(
     first: &mut bool,
     rps: Option<u64>,
     timeout: u64,
+    max_retries: usize,
 ) -> error::AppResult<()> {
     use tracing::{debug, warn};
 
-    match fetch_config_snapshot(network, rpc_fallback_url, rps, timeout).await {
+    match fetch_config_snapshot(network, rpc_fallback_url, rps, timeout, max_retries).await {
         Ok(snapshot) => {
             if !*first {
                 if let Ok(old_snapshot) = config_snapshot::store::load_latest_snapshot(network) {
@@ -1415,6 +1451,7 @@ async fn cmd_watch(
     interval: &str,
     rps: Option<u64>,
     timeout: u64,
+    max_retries: usize,
 ) -> error::AppResult<()> {
     use tracing::info;
 
@@ -1436,7 +1473,15 @@ async fn cmd_watch(
                 return Ok(());
             }
             () = async {
-                let _ = watch_poll_once(network, rpc_fallback_url, &mut first, rps, timeout).await;
+                let _ = watch_poll_once(
+                    network,
+                    rpc_fallback_url,
+                    &mut first,
+                    rps,
+                    timeout,
+                    max_retries,
+                )
+                .await;
                 tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
             } => {}
         }
@@ -1638,6 +1683,7 @@ async fn cmd_cache_warm(
     json_flag: bool,
     rps: Option<u64>,
     timeout: u64,
+    max_retries: usize,
 ) -> error::AppResult<()> {
     let fmt = if json_flag { "json" } else { "table" };
     cmd_estimate_all(
@@ -1648,6 +1694,7 @@ async fn cmd_cache_warm(
         fmt,
         rps,
         timeout,
+        max_retries,
         7,
     )
     .await
