@@ -1488,3 +1488,200 @@ fn test_estimate_minimal_wasm_upload_zero_footprint() {
     assert_eq!(parsed["read_bytes"], 0);
     assert_eq!(parsed["write_bytes"], 0);
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// cache import
+// ─────────────────────────────────────────────────────────────────────────
+
+/// `cache import --help` exits 0 and mentions the --file flag.
+#[test]
+fn test_cache_import_help() {
+    let (stdout, stderr, code) = run_cli(&["cache", "import", "--help"]);
+    assert_eq!(
+        code, 0,
+        "cache import --help should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("--file") || stdout.contains("-f"),
+        "cache import help should mention --file; got: {stdout}"
+    );
+}
+
+/// `cache import` without arguments should error (--file is required).
+#[test]
+fn test_cache_import_missing_file_errors() {
+    let (_, stderr, code) = run_cli(&["cache", "import"]);
+    assert_ne!(code, 0, "cache import without --file should error");
+    assert!(
+        stderr.contains("error") || stderr.contains("required"),
+        "stderr should indicate missing argument; got: {stderr}"
+    );
+}
+
+/// `cache import` with a non-existent file should exit non-zero and report
+/// a useful error message.
+#[test]
+fn test_cache_import_nonexistent_file_errors() {
+    let home = temp_home("cache-import-nofile");
+    let (_, stderr, code) = run_cli_in_home(
+        &["cache", "import", "--file", "/no/such/export.json"],
+        Some(&home),
+    );
+    assert_ne!(code, 0, "import of missing file should exit non-zero");
+    assert!(
+        stderr.to_lowercase().contains("error") || stderr.contains("failed"),
+        "stderr should mention the error; got: {stderr}"
+    );
+}
+
+/// `cache import` with an invalid (non-JSON) file should exit non-zero.
+#[test]
+fn test_cache_import_invalid_json_errors() {
+    let home = temp_home("cache-import-badjson");
+    let bad_file = home.join("bad.json");
+    std::fs::write(&bad_file, "this is not json").expect("write bad json");
+
+    let (_, stderr, code) = run_cli_in_home(
+        &["cache", "import", "--file", bad_file.to_str().unwrap()],
+        Some(&home),
+    );
+    assert_ne!(code, 0, "import of invalid JSON should exit non-zero");
+    assert!(
+        stderr.to_lowercase().contains("error") || stderr.contains("parse"),
+        "stderr should indicate parse failure; got: {stderr}"
+    );
+}
+
+/// Importing an empty JSON array succeeds and reports 0 imported entries.
+#[test]
+fn test_cache_import_empty_array_succeeds() {
+    let home = temp_home("cache-import-empty");
+    let empty_file = home.join("empty.json");
+    std::fs::write(&empty_file, "[]").expect("write empty json");
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &["cache", "import", "--file", empty_file.to_str().unwrap()],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 0,
+        "import of empty array should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains('0') || stdout.contains("Imported"),
+        "stdout should confirm import; got: {stdout}"
+    );
+}
+
+/// A full round-trip: export the cache, then import it back and verify the
+/// contents are restored.
+#[test]
+fn test_cache_import_round_trip_via_cli() {
+    // Seed a cache entry using the library directly.
+    let home = temp_home("cache-import-roundtrip");
+
+    // Seed the SQLite cache for this home.
+    {
+        let data_dir = home.join(".soroban-cost-estimator");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let db = data_dir.join("cache.db");
+        let conn = rusqlite::Connection::open(&db).expect("open cache db");
+        cache::ensure_cache_schema(&conn).expect("ensure schema");
+        conn.execute(
+            "INSERT INTO estimates \
+             (version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
+              cpu_instructions, memory_bytes, timestamp, duration_ms, success) \
+             VALUES (2, 'roundtrip_hash', 'rt_func', 'rt_args_hash', 'testnet', \
+                     77, 123456, 9876, 5432, '2026-01-01T00:00:00Z', NULL, 1)",
+            [],
+        )
+        .expect("seed cache entry");
+    }
+
+    // Export to a temp file.
+    let export_file = home.join("export.json");
+    let (_, stderr, code) = run_cli_in_home(
+        &["cache", "export", "--out", export_file.to_str().unwrap()],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "cache export should succeed; stderr: {stderr}");
+    assert!(export_file.exists(), "export file should have been created");
+
+    // Now import into a fresh home.
+    let fresh_home = temp_home("cache-import-roundtrip-fresh");
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &["cache", "import", "--file", export_file.to_str().unwrap()],
+        Some(&fresh_home),
+    );
+    assert_eq!(code, 0, "cache import should succeed; stderr: {stderr}");
+    assert!(
+        stdout.contains('1') || stdout.contains("Imported"),
+        "stdout should confirm 1 entry imported; got: {stdout}"
+    );
+
+    // Verify the entry is present in the fresh home's cache via cache query.
+    let (qout, qerr, qcode) = run_cli_in_home(
+        &["cache", "query", "--network", "testnet", "--json"],
+        Some(&fresh_home),
+    );
+    assert_eq!(qcode, 0, "cache query should succeed; stderr: {qerr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(qout.trim()).expect("valid JSON from cache query");
+    let arr = parsed.as_array().expect("expected JSON array");
+    assert_eq!(arr.len(), 1, "imported cache should contain 1 entry");
+    assert_eq!(arr[0]["wasm_hash"], "roundtrip_hash");
+    assert_eq!(arr[0]["function"], "rt_func");
+    assert_eq!(arr[0]["total_stroops"], 123_456);
+}
+
+/// `cache import` with a file containing future schema version entries reports skipped count.
+#[test]
+fn test_cache_import_skipped_future_version() {
+    let home = temp_home("cache-import-skipped");
+    let export_file = home.join("future_export.json");
+    
+    // Write a JSON array with one valid entry and one future entry.
+    let json_content = r#"[
+      {
+        "version": 9999,
+        "wasm_hash": "future_hash",
+        "function": "future_func",
+        "args_hash": "future_args",
+        "network": "testnet",
+        "ledger": 100,
+        "total_stroops": 10,
+        "cpu_instructions": 10,
+        "memory_bytes": 10,
+        "timestamp": "2026-01-01T00:00:00Z",
+        "duration_ms": null,
+        "success": true
+      }
+    ]"#;
+    std::fs::write(&export_file, json_content).expect("write future json");
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &["cache", "import", "--file", export_file.to_str().unwrap()],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "import should succeed even with skipped entries; stderr: {stderr}");
+    assert!(
+        stdout.contains("0 cache entries"),
+        "stdout should report 0 entries imported; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("1 skipped"),
+        "stdout should report 1 skipped entry; got: {stdout}"
+    );
+}
+
+/// `cache --help` lists the `import` subcommand.
+#[test]
+fn test_cache_help_lists_import() {
+    let (stdout, stderr, code) = run_cli(&["cache", "--help"]);
+    assert_eq!(code, 0, "cache --help should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("import"),
+        "cache help should list import subcommand; got: {stdout}"
+    );
+}

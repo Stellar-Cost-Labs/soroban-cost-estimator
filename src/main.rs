@@ -249,6 +249,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 .await
             }
             cli::CacheAction::Verify => cmd_cache_verify(),
+            cli::CacheAction::Import { file } => cmd_cache_import(&file),
             cli::CacheAction::Query {
                 network,
                 function,
@@ -1494,6 +1495,7 @@ async fn cmd_watch(
 ///
 /// # Network calls
 /// None — pure SQLite I/O.
+#[allow(dead_code)]
 fn cmd_cache_stats() -> error::AppResult<()> {
     let stats = cache::cache_stats()?;
 
@@ -1529,6 +1531,7 @@ fn cmd_cache_stats() -> error::AppResult<()> {
 }
 
 /// Format a byte count as a human-readable string (KB, MB, GB).
+#[allow(dead_code)]
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -1666,6 +1669,46 @@ fn cmd_cache_export(out_path: Option<&str>) -> error::AppResult<()> {
         );
     } else {
         println!("{json}");
+    }
+
+    Ok(())
+}
+
+/// `cache import` command: restore cached estimates from a JSON export file.
+///
+/// Reads the file at `file_path`, parses it as a JSON array of
+/// [`cache::CachedEstimate`] entries, migrates each to the current schema,
+/// and upserts them into the local SQLite cache.  Entries from a newer tool
+/// (schema version \u003e current) are skipped and counted in the summary.
+///
+/// # Network calls
+/// None \u2014 pure file I/O.
+fn cmd_cache_import(file_path: &str) -> error::AppResult<()> {
+    let content = std::fs::read_to_string(file_path).map_err(|e| {
+        error::AppError::General(format!("failed to read import file {file_path:?}: {e}"))
+    })?;
+
+    let entries: Vec<cache::CachedEstimate> = serde_json::from_str(&content).map_err(|e| {
+        error::AppError::General(format!("failed to parse import file {file_path:?}: {e}"))
+    })?;
+
+    let stats = cache::import_cached_estimates(entries)?;
+
+    let entry_word = if stats.imported == 1 {
+        "entry"
+    } else {
+        "entries"
+    };
+    if stats.skipped == 0 {
+        println!(
+            "Imported {} cache {} from {}.",
+            stats.imported, entry_word, file_path
+        );
+    } else {
+        println!(
+            "Imported {} cache {} from {} ({} skipped — schema version too new).",
+            stats.imported, entry_word, file_path, stats.skipped
+        );
     }
 
     Ok(())
