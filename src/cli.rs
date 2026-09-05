@@ -275,4 +275,19 @@ pub enum ConfigAction {
         #[arg(long, default_value = "testnet")]
         network: String,
     },
+
+    /// Delete a specific snapshot or all snapshots older than N days.
+    Delete {
+        /// Network whose snapshots to delete.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+
+        /// Timestamp of the snapshot to delete (e.g. "2024-01-01T00:00:00Z").
+        #[arg(long)]
+        timestamp: Option<String>,
+
+        /// Delete all snapshots older than this many days.
+        #[arg(long)]
+        older_than: Option<u64>,
+    },
 }

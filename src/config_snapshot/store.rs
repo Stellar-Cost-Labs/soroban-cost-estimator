@@ -222,3 +222,58 @@ fn validate_single_snapshot(path: &std::path::Path) -> AppResult<()> {
 
     Ok(())
 }
+
+/// Deletes a specific snapshot by network and timestamp.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn delete_snapshot(network: &str, timestamp: &str) -> AppResult<PathBuf> {
+    let dir = snapshots_dir()?;
+    let ts_safe = timestamp.replace(':', "-");
+    let filename = format!("{}-{}.json", network, ts_safe);
+    let path = dir.join(&filename);
+
+    if !path.exists() {
+        return Err(AppError::General(format!(
+            "No snapshot found for network '{}' at timestamp '{}'",
+            network, timestamp
+        )));
+    }
+
+    std::fs::remove_file(&path)?;
+    debug!(path = %path.display(), network, "snapshot deleted");
+    Ok(path)
+}
+
+/// Deletes all snapshots for a network older than `days` days.
+///
+/// Returns the list of deleted snapshot paths.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn delete_snapshots_older_than(network: &str, days: u64) -> AppResult<Vec<PathBuf>> {
+    use std::time::{Duration, SystemTime};
+
+    let dir = snapshots_dir()?;
+    let cutoff = SystemTime::now() - Duration::from_secs(days * 24 * 60 * 60);
+    let mut deleted = Vec::new();
+
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with(&format!("{}-", network)) || !name_str.ends_with(".json") {
+            continue;
+        }
+
+        let modified = entry.metadata()?.modified()?;
+        if modified < cutoff {
+            std::fs::remove_file(&path)?;
+            debug!(path = %path.display(), network, "snapshot deleted (older than {} days)", days);
+            deleted.push(path);
+        }
+    }
+
+    Ok(deleted)
+}
