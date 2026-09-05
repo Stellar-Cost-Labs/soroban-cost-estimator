@@ -31,11 +31,9 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "SECS", default_value_t = 30)]
     pub timeout: u64,
 
-    /// Retry transient RPC failures up to N times (default 3), using
-    /// exponential backoff (500ms, then doubled between attempts). 0
-    /// disables retries entirely.
-    #[arg(long, global = true, value_name = "N", default_value_t = 3)]
-    pub max_retries: usize,
+    /// Fallback RPC URL used when the primary endpoint is unreachable.
+    #[arg(long, global = true, value_name = "URL")]
+    pub rpc_fallback_url: Option<String>,
 
     #[command(subcommand)]
     pub command: Command,
@@ -232,6 +230,13 @@ pub enum ConfigAction {
         /// Print the snapshot as JSON instead of the summary lines.
         #[arg(long)]
         json: bool,
+    },
+
+    /// List all saved config snapshots with their timestamp and ledger.
+    List {
+        /// Network whose snapshots to list.
+        #[arg(long, default_value = "testnet")]
+        network: String,
     },
 
     /// Diff the current network config against the most recent snapshot.
