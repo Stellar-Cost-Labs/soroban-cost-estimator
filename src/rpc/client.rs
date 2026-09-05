@@ -887,7 +887,10 @@ mod tests {
     #[tokio::test]
     async fn test_health_check_errs_when_endpoint_unreachable() {
         let dead_url = refused_port_url().await;
-        let client = RpcClient::with_options(&dead_url, None, Duration::from_millis(500));
+        // `max_retries: 0` keeps this fast: a refused connection is retryable,
+        // and the default backoff (0.5s + 1s + 2s) is irrelevant to the
+        // health check failing fast on an unreachable endpoint.
+        let client = RpcClient::with_options(&dead_url, None, Duration::from_millis(500), 0);
 
         let err = client
             .health_check()
