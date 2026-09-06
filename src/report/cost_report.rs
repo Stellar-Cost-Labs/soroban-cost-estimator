@@ -163,6 +163,20 @@ pub fn format_suggestions(suggestions: &[OptimizationSuggestion]) -> String {
     out
 }
 
+/// Project the total resource fee for `count` invocations of the contract.
+///
+/// Returns the projected stroops and XLM cost for running the same contract
+/// function `count` times. The calculation is a simple multiplication of the
+/// per-invocation costs by the count.
+pub fn project_cost_for_invocations(
+    report: &CostReport,
+    count: u64,
+) -> (i64, String) {
+    let projected_stroops = report.fee.total_stroops.checked_mul(count as i64).unwrap_or(i64::MAX);
+    let projected_xlm = stroops_to_xlm(projected_stroops);
+    (projected_stroops, projected_xlm)
+}
+
 /// Formats a cost report as a human-readable table.
 pub fn format_report_table(report: &CostReport) -> String {
     let mut output = String::new();
