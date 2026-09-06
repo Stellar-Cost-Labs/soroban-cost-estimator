@@ -349,4 +349,64 @@ mod tests {
         assert!(out.contains("- Reduce ledger write entries:"));
         assert!(out.contains("2500 stroops"));
     }
+
+    #[test]
+    fn test_format_report_table_and_json_populated_footprint() {
+        let report = report_with_rates(sample_rates());
+
+        // Table verification
+        let table_out = format_report_table(&report);
+        assert!(table_out.contains("Read Entries"));
+        assert!(table_out.contains("Write Entries"));
+        assert!(table_out.contains("Read Bytes"));
+        assert!(table_out.contains("Write Bytes"));
+        assert!(table_out.contains("136")); // write_bytes
+
+        // JSON verification
+        let json_out = format_report_json(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json_out).expect("valid json");
+        assert_eq!(parsed["read_entries"], 1);
+        assert_eq!(parsed["write_entries"], 1);
+        assert_eq!(parsed["read_bytes"], 0);
+        assert_eq!(parsed["write_bytes"], 136);
+    }
+
+    #[test]
+    fn test_format_report_table_and_json_zero_footprint() {
+        let report = CostReport {
+            function: "(wasm upload)".to_string(),
+            wasm_hash: "0000".to_string(),
+            cpu_instructions: 0,
+            memory_bytes: 0,
+            tx_size: 0,
+            read_entries: 0,
+            write_entries: 0,
+            read_bytes: 0,
+            write_bytes: 0,
+            fee: FeeBreakdown {
+                non_refundable_stroops: 0,
+                refundable_stroops: 0,
+                cpu_fee_stroops: 0,
+                storage_fee_stroops: 0,
+                bandwidth_fee_stroops: 0,
+                total_stroops: 0,
+                total_xlm: "0.0000000".to_string(),
+            },
+            ledger: 0,
+            network: "testnet".to_string(),
+            rpc_latency_ms: 0,
+            rates: None,
+        };
+
+        let table_out = format_report_table(&report);
+        assert!(table_out.contains("Read Entries"));
+        assert!(table_out.contains("Write Entries"));
+
+        let json_out = format_report_json(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json_out).expect("valid json");
+        assert_eq!(parsed["read_entries"], 0);
+        assert_eq!(parsed["write_entries"], 0);
+        assert_eq!(parsed["read_bytes"], 0);
+        assert_eq!(parsed["write_bytes"], 0);
+    }
 }
