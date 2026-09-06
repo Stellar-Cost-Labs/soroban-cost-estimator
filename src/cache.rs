@@ -265,6 +265,16 @@ pub fn save_estimate(
         .lock()
         .map_err(|e| AppError::General(format!("cache write lock poisoned: {e}")))?;
     let conn = open_db()?;
+    // Prune-on-write: drop estimates older than the prune ledger delta so the
+    // cache cannot grow unbounded. Best-effort — a prune failure must not
+    // abort the save.
+    let cutoff = ledger.saturating_sub(DEFAULT_PRUNE_LEDGER_DELTA);
+    if DEFAULT_PRUNE_LEDGER_DELTA > 0 {
+        let _ = conn.execute(
+            "DELETE FROM estimates WHERE network = ?1 AND ledger < ?2",
+            rusqlite::params![network, cutoff as i64],
+        );
+    }
     conn.execute(
         "INSERT INTO estimates \
          (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, duration_ms, success) \
@@ -664,6 +674,10 @@ pub struct CacheStats {
     pub oldest_entry: Option<String>,
     /// Timestamp of the newest entry (ISO-8601), if any.
     pub newest_entry: Option<String>,
+    /// Ledger of the oldest entry, if any.
+    pub oldest_ledger: Option<u32>,
+    /// Ledger of the newest entry, if any.
+    pub newest_ledger: Option<u32>,
     /// Per-network breakdown: (network, count).
     pub per_network: Vec<(String, usize)>,
 }
@@ -694,6 +708,20 @@ pub fn cache_stats() -> AppResult<CacheStats> {
         .query_row("SELECT MAX(timestamp) FROM estimates", [], |row| row.get(0))
         .ok();
 
+    // Oldest and newest ledgers.
+    let oldest_ledger: Option<u32> = conn
+        .query_row("SELECT MIN(ledger) FROM estimates", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .ok()
+        .map(|v| v as u32);
+    let newest_ledger: Option<u32> = conn
+        .query_row("SELECT MAX(ledger) FROM estimates", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .ok()
+        .map(|v| v as u32);
+
     // Per-network breakdown.
     let mut stmt = conn.prepare(
         "SELECT network, COUNT(*) FROM estimates GROUP BY network ORDER BY COUNT(*) DESC",
@@ -708,6 +736,8 @@ pub fn cache_stats() -> AppResult<CacheStats> {
         disk_bytes,
         oldest_entry,
         newest_entry,
+        oldest_ledger,
+        newest_ledger,
         per_network,
     })
 }
@@ -804,6 +834,45 @@ pub fn remove_cached_estimates_for_wasm(wasm_hash: &str) -> AppResult<usize> {
     let removed = execute_with_retry(|| {
         conn.execute("DELETE FROM estimates WHERE wasm_hash = ?1", [wasm_hash])
     })?;
+    Ok(removed)
+}
+
+/// Default ledger delta for automatic pruning on cache write.
+///
+/// With Stellar ledgers advancing roughly every 5 seconds, 1_000_000 ledgers
+/// is about two months of history. `0` disables pruning entirely.
+pub const DEFAULT_PRUNE_LEDGER_DELTA: u32 = 1_000_000;
+
+/// Prune cached estimates for `network` recorded before
+/// `current_ledger - ledger_delta`.
+///
+/// Returns the number of rows removed. A `ledger_delta` of `0` disables
+/// pruning and returns `0` without touching the cache.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+pub fn prune_stale_estimates(
+    network: &str,
+    current_ledger: u32,
+    ledger_delta: u32,
+) -> AppResult<usize> {
+    if ledger_delta == 0 {
+        return Ok(0);
+    }
+    let cutoff = current_ledger.saturating_sub(ledger_delta);
+
+    let _guard = WRITE_LOCK
+        .lock()
+        .map_err(|e| AppError::General(format!("cache write lock poisoned: {e}")))?;
+    let conn = open_db()?;
+    let removed = execute_with_retry(|| {
+        conn.execute(
+            "DELETE FROM estimates WHERE network = ?1 AND ledger < ?2",
+            rusqlite::params![network, cutoff as i64],
+        )
+    })?;
+
+    debug!(network, removed, "pruned stale cache estimates");
     Ok(removed)
 }
 

@@ -1352,3 +1352,58 @@ fn test_load_fresh_estimate_expired_returns_none() {
         assert!(fresh.is_none(), "an expired entry must yield None");
     });
 }
+
+/// Pruning removes entries whose ledger is older than `current_ledger - delta`.
+#[test]
+fn test_prune_stale_estimates_removes_old_entries() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate(
+            "recent",
+            "func",
+            &[],
+            "testnet",
+            1_000,
+            100,
+            100,
+            100,
+            None,
+            true,
+        )
+        .expect("save recent");
+        cache::save_estimate("old", "func", &[], "testnet", 10, 100, 100, 100, None, true)
+            .expect("save old");
+
+        let removed = cache::prune_stale_estimates("testnet", 1_000, 100).expect("prune");
+        assert_eq!(removed, 1, "the entry at ledger 10 should be pruned");
+
+        assert!(
+            cache::load_estimate("recent", "func", &[])
+                .expect("load recent")
+                .is_some()
+        );
+        assert!(
+            cache::load_estimate("old", "func", &[])
+                .expect("load old")
+                .is_none()
+        );
+    });
+}
+
+/// `clear_cache` empties the estimate cache for a network.
+#[test]
+fn test_clear_cache_empties_the_cache() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h", "f", &[], "testnet", 42, 100, 100, 100, None, true)
+            .expect("save");
+        assert_eq!(cache::cache_stats().expect("stats").total_entries, 1);
+
+        let removed = cache::clear_cache("testnet").expect("clear");
+        assert_eq!(removed, 1, "clearing testnet should remove its one entry");
+        assert_eq!(
+            cache::cache_stats()
+                .expect("stats after clear")
+                .total_entries,
+            0
+        );
+    });
+}
