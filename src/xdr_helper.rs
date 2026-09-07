@@ -217,32 +217,35 @@ pub fn build_simulation_tx_envelope(
     Ok(xdr_bytes)
 }
 
-/// Validates `--arg` values against the contract-spec types for the function
+/// Validates and coerces `--arg` values against the contract-spec types for the function
 /// being simulated, before any RPC call is made.
 ///
 /// When the WASM carries a `contractspecv0` and a matching function is found
-/// with typed parameters, each `--arg` value must match the declared type
-/// (e.g. `abc` is rejected for `i64`). Mismatches fail fast so a bad argument
-/// never reaches the network. Only the target function's declared parameters
-/// are checked: extra or missing arguments are a mismatch as well.
+/// with typed parameters, each `--arg` value is parsed according to the
+/// declared type (e.g. `abc` is rejected for `i64`). Mismatches fail fast so a
+/// bad argument never reaches the network. Only the target function's declared
+/// parameters are checked: extra or missing arguments are a mismatch as well.
+///
+/// Returns the parsed `ScVal` arguments in the same order as the function's
+/// parameters, ready for `build_simulation_tx_envelope`.
 ///
 /// * `function_name` - `None` (WASM upload) or a function with no spec params
-///   skips validation entirely.
+///   returns an empty vector.
 /// * `args` - Raw `--arg KEY=VAL` entries as passed on the CLI.
 /// * `functions` - Enumerated functions with spec-derived params.
 pub fn validate_args_against_spec(
     function_name: Option<&str>,
     args: &[String],
     functions: &[FunctionInfo],
-) -> AppResult<()> {
+) -> AppResult<Vec<stellar_xdr::ScVal>> {
     let Some(fn_name) = function_name else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let Some(fn_info) = functions.iter().find(|f| f.name == fn_name) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     if fn_info.params.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     if args.len() != fn_info.params.len() {
@@ -253,16 +256,79 @@ pub fn validate_args_against_spec(
             .collect::<Vec<_>>()
             .join(", ");
         return Err(AppError::TypeValidation(format!(
-            "function '{fn_name}' expects {} argument(s) ({decl}), but {} were provided",
+            "function '{}' expects {} argument(s) ({}), but {} were provided",
+            fn_name,
             fn_info.params.len(),
+            decl,
             args.len()
         )));
     }
 
+    let mut scvals = Vec::with_capacity(args.len());
     for (arg, param) in args.iter().zip(&fn_info.params) {
-        crate::wasm::parser::validate_arg_value(&param.type_def, arg)?;
+        let value = match arg.split_once('=') {
+            Some((_, value)) => value,
+            None => arg.as_str(),
+        };
+        let scval = parse_arg_value_with_type(&param.type_def, value)?;
+        scvals.push(scval);
     }
-    Ok(())
+    Ok(scvals)
+}
+
+/// Parse a single `--arg` value as an `ScVal` using the contract-spec type.
+///
+/// This is the type-directed fallback for `--arg` parsing: when the raw value
+/// could be inferred as multiple types (e.g. `"crypto"` could be plain string
+/// or symbol), the spec type disambiguates.
+fn parse_arg_value_with_type(
+    type_def: &stellar_xdr::ScSpecTypeDef,
+    value: &str,
+) -> AppResult<stellar_xdr::ScVal> {
+    use stellar_xdr::ScSpecTypeDef;
+    match type_def {
+        ScSpecTypeDef::I64 => {
+            let v = value.parse::<i64>().map_err(|_| {
+                AppError::TypeValidation(format!("cannot parse '{}' as i64", value))
+            })?;
+            Ok(stellar_xdr::ScVal::I64(v))
+        }
+        ScSpecTypeDef::U64 => {
+            let v = value.parse::<u64>().map_err(|_| {
+                AppError::TypeValidation(format!("cannot parse '{}' as u64", value))
+            })?;
+            Ok(stellar_xdr::ScVal::U64(v))
+        }
+        ScSpecTypeDef::Bool => {
+            let v = match value {
+                "true" => true,
+                "false" => false,
+                _ => {
+                    return Err(AppError::TypeValidation(format!(
+                        "cannot parse '{}' as bool",
+                        value
+                    )));
+                }
+            };
+            Ok(stellar_xdr::ScVal::Bool(v))
+        }
+        ScSpecTypeDef::String => {
+            let s = stellar_xdr::StringM::try_from(value.as_bytes().to_vec()).map_err(|e| {
+                AppError::TypeValidation(format!("invalid string for '{}': {}", value, e))
+            })?;
+            Ok(stellar_xdr::ScVal::String(s))
+        }
+        ScSpecTypeDef::Symbol => {
+            let s = stellar_xdr::ScSymbol::try_from(value.as_bytes().to_vec()).map_err(|e| {
+                AppError::TypeValidation(format!("invalid symbol for '{}': {}", value, e))
+            })?;
+            Ok(stellar_xdr::ScVal::Symbol(s))
+        }
+        other => Err(AppError::TypeValidation(format!(
+            "unsupported spec type for --arg coercion: {:?}",
+            other
+        ))),
+    }
 }
 
 /// Parse a contract ID into a 32-byte array.
