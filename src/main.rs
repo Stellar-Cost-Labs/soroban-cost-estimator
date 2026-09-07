@@ -174,6 +174,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
         cli::Command::EstimateAll {
             wasm,
             network,
+            rpc_url,
             id,
             json,
             format,
@@ -183,6 +184,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cmd_estimate_all(
                 &wasm,
                 &network,
+                rpc_url.as_deref(),
                 fallback,
                 id.as_deref(),
                 &format,
@@ -241,12 +243,14 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::CacheAction::Warm {
                 wasm,
                 network,
+                rpc_url,
                 id,
                 json,
             } => {
                 cmd_cache_warm(
                     &wasm,
                     &network,
+                    rpc_url.as_deref(),
                     fallback,
                     id.as_deref(),
                     json,
@@ -525,6 +529,12 @@ async fn cmd_estimate(
         let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
         debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
 
+        // Fail fast on a misconfigured --rpc-url or down node (#55): validate
+        // the endpoint is reachable and healthy before running any simulation.
+        // Local argument errors above are reported first; this guards the
+        // (potentially expensive) simulateTransaction call itself.
+        client.health_check().await?;
+
         // Time the simulateTransaction round-trip so the report can flag
         // slow RPC endpoints. Includes any retries performed by the client.
         let rpc_start = std::time::Instant::now();
@@ -645,6 +655,7 @@ fn csv_row(r: &EstimateAllResult) -> String {
 async fn cmd_estimate_all(
     wasm_path: &str,
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     contract_id: Option<&str>,
     format: &str,
@@ -697,7 +708,7 @@ async fn cmd_estimate_all(
             }
         }
 
-        let endpoint = rpc::client::resolve_endpoint(network, None)?;
+        let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
         let client = rpc::client::RpcClient::with_fallback(
             &endpoint,
             rpc_fallback_url,
@@ -705,6 +716,11 @@ async fn cmd_estimate_all(
             std::time::Duration::from_secs(timeout),
             max_retries,
         );
+
+        // Validate the RPC endpoint is reachable before running a full batch
+        // of simulations (#55): fail fast up front rather than after each
+        // function's simulation times out.
+        client.health_check().await?;
 
         // Fee rates are only needed to itemize the per-function fee breakdown
         // in JSON output; skip the extra RPC calls in table mode.
@@ -1725,6 +1741,7 @@ fn cmd_cache_export(out_path: Option<&str>) -> error::AppResult<()> {
 async fn cmd_cache_warm(
     wasm_path: &str,
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     contract_id: Option<&str>,
     json_flag: bool,
@@ -1736,6 +1753,7 @@ async fn cmd_cache_warm(
     cmd_estimate_all(
         wasm_path,
         network,
+        rpc_url,
         rpc_fallback_url,
         contract_id,
         fmt,
