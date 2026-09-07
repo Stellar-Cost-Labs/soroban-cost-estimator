@@ -235,12 +235,14 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::CacheAction::Warm {
                 wasm,
                 network,
+                rpc_url,
                 id,
                 json,
             } => {
                 cmd_cache_warm(
                     &wasm,
                     &network,
+                    rpc_url.as_deref(),
                     fallback,
                     id.as_deref(),
                     json,
@@ -1678,6 +1680,7 @@ fn cmd_cache_export(out_path: Option<&str>) -> error::AppResult<()> {
 async fn cmd_cache_warm(
     wasm_path: &str,
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     contract_id: Option<&str>,
     json_flag: bool,
@@ -1689,6 +1692,7 @@ async fn cmd_cache_warm(
     cmd_estimate_all(
         wasm_path,
         network,
+        rpc_url,
         rpc_fallback_url,
         contract_id,
         fmt,
