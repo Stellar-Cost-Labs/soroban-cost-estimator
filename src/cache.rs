@@ -827,6 +827,70 @@ pub fn invalidate_if_wasm_changed(wasm_path: &Path, current_hash: &str) -> AppRe
     Ok(changed)
 }
 
+/// Import cached estimates from a JSON file into the cache database.
+///
+/// The file must contain a JSON array of [`CachedEstimate`] objects. Each entry
+/// is validated against the current schema before insertion; entries with a
+/// newer schema version are skipped with a warning. Duplicate keys (same
+/// `wasm_hash`, `function`, and `args_hash`) are overwritten via upsert.
+///
+/// Returns the number of entries successfully imported.
+///
+/// # Network calls
+/// None — pure file I/O + SQLite.
+pub fn import_estimates(path: &std::path::Path) -> AppResult<usize> {
+    let content = std::fs::read_to_string(path)?;
+    let entries: Vec<CachedEstimate> = serde_json::from_str(&content)?;
+
+    let conn = open_db()?;
+    let mut imported = 0usize;
+
+    for entry in entries {
+        match migrate_to_latest(entry) {
+            Ok(entry) => {
+                conn.execute(
+                    "INSERT INTO estimates \
+                     (version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
+                      cpu_instructions, memory_bytes, timestamp) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                     ON CONFLICT(wasm_hash, function, args_hash) DO UPDATE SET \
+                        version = excluded.version, \
+                        network = excluded.network, \
+                        ledger = excluded.ledger, \
+                        total_stroops = excluded.total_stroops, \
+                        cpu_instructions = excluded.cpu_instructions, \
+                        memory_bytes = excluded.memory_bytes, \
+                        timestamp = excluded.timestamp",
+                    rusqlite::params![
+                        entry.version as i64,
+                        entry.wasm_hash,
+                        entry.function,
+                        entry.args_hash,
+                        entry.network,
+                        entry.ledger as i64,
+                        entry.total_stroops,
+                        entry.cpu_instructions as i64,
+                        entry.memory_bytes as i64,
+                        entry.timestamp,
+                    ],
+                )?;
+                imported += 1;
+            }
+            Err(e) => {
+                warn!(
+                    wasm_hash = %entry.wasm_hash,
+                    function = %entry.function,
+                    error = %e,
+                    "skipping cache entry during import"
+                );
+            }
+        }
+    }
+
+    debug!(imported, "cache import complete");
+    Ok(imported)
+}
+
 /// Read a file's modification time as nanoseconds since the Unix epoch.
 ///
 /// Falls back to `0` when the platform cannot report a modification time,

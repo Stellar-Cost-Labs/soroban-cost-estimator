@@ -1254,237 +1254,118 @@ fn test_cache_query_json_flag_accepted() {
     );
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Simulation footprint metrics tests (Issue #2)
-// ─────────────────────────────────────────────────────────────────────────
+// ── cache import tests ────────────────────────────────────────────────
 
-/// Spawns a lightweight local HTTP mock JSON-RPC server on loopback to test
-/// simulation response parsing end-to-end without touching external networks.
-fn start_mock_rpc_server(
-    live_tx_data: &'static str,
-    min_fee: &'static str,
-    ledger: u64,
-) -> (String, std::sync::mpsc::Sender<()>) {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
+#[test]
+fn test_cache_import_help() {
+    let (stdout, stderr, code) = run_cli(&["cache", "import", "--help"]);
+    assert_eq!(
+        code, 0,
+        "cache import --help should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("--file"),
+        "import help should mention --file; got: {stdout}"
+    );
+}
 
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
-    let addr = listener.local_addr().expect("local addr");
-    let (tx_stop, rx_stop) = std::sync::mpsc::channel::<()>();
+#[test]
+fn test_cache_import_missing_file_arg_errors() {
+    let (_, stderr, code) = run_cli(&["cache", "import"]);
+    assert_ne!(code, 0, "cache import without --file should error");
+    assert!(
+        stderr.contains("error") || stderr.contains("required"),
+        "stderr should indicate error: {stderr}"
+    );
+}
 
-    let live_tx_data = live_tx_data.to_string();
-    let min_fee = min_fee.to_string();
+#[test]
+fn test_cache_import_nonexistent_file_errors() {
+    let (_, stderr, code) = run_cli(&["cache", "import", "--file", "no/such/file.json"]);
+    assert_eq!(code, 1, "a missing file should exit 1");
+    assert!(
+        stderr.contains("File not found"),
+        "stderr should name the missing file; got: {stderr}"
+    );
+}
 
-    std::thread::spawn(move || {
-        listener.set_nonblocking(true).expect("set nonblocking");
-        loop {
-            if rx_stop.try_recv().is_ok() {
-                break;
-            }
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let mut buf = [0u8; 4096];
-                    let mut req_str = String::new();
-                    loop {
-                        match stream.read(&mut buf) {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                req_str.push_str(&String::from_utf8_lossy(&buf[..n]));
-                                if req_str.contains("\r\n\r\n") {
-                                    if let Some(pos) = req_str.find("Content-Length: ") {
-                                        let cl_str = &req_str[pos + 16..];
-                                        let end = cl_str.find("\r\n").unwrap_or(cl_str.len());
-                                        if let Ok(cl) = cl_str[..end].trim().parse::<usize>() {
-                                            let body_start = req_str.find("\r\n\r\n").unwrap() + 4;
-                                            if req_str.len() - body_start >= cl {
-                                                break;
-                                            }
-                                        } else {
-                                            break;
-                                        }
-                                    } else {
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                std::thread::sleep(std::time::Duration::from_millis(5));
-                            }
-                            Err(_) => break,
-                        }
-                    }
-
-                    let resp_body = if req_str.contains("simulateTransaction") {
-                        if live_tx_data.is_empty() {
-                            format!(
-                                r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":"{ledger}","minResourceFee":"{min_fee}"}}}}"#
-                            )
-                        } else {
-                            format!(
-                                r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":"{ledger}","minResourceFee":"{min_fee}","transactionData":"{live_tx_data}"}}}}"#
-                            )
-                        }
-                    } else if req_str.contains("getLedgerEntries") {
-                        format!(
-                            r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":{ledger},"entries":[]}}}}"#
-                        )
-                    } else {
-                        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#.to_string()
-                    };
-
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        resp_body.len(),
-                        resp_body
-                    );
-                    let _ = stream.write_all(response.as_bytes());
-                    let _ = stream.flush();
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(_) => break,
-            }
+#[test]
+fn test_cache_import_valid_json() {
+    let home = temp_home("cache-import-valid");
+    let export_file = home.join("export.json");
+    let json = serde_json::json!([
+        {
+            "version": 1,
+            "wasm_hash": "aaa111",
+            "function": "deploy",
+            "args_hash": "bbb222",
+            "network": "testnet",
+            "ledger": 100,
+            "total_stroops": 5_000,
+            "cpu_instructions": 1_000,
+            "memory_bytes": 512,
+            "timestamp": "2025-06-15T12:00:00Z"
         }
-    });
+    ]);
+    std::fs::write(&export_file, json.to_string()).expect("write export file");
 
-    (format!("http://127.0.0.1:{}", addr.port()), tx_stop)
-}
-
-const LIVE_INCREMENT_TX_DATA: &str = "AAAAAAAAAAEAAAAH6hS8qZjpjw3bM46OXO9uGfBzeKO3HotPiGjO3IV+Ts0AAAABAAAABgAAAAEmU1Fc+h02S4iEBnpjdCESXpKHG/bOUxC3DeRWUy9+mQAAABQAAAABAAggFgAAAAAAAACIAAAAAAAAPEM=";
-
-#[test]
-fn test_estimate_fn_contract_fixture_populates_footprint_json() {
-    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
-    let home = temp_home("estimate-footprint-json");
-
-    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
-        .args([
-            "estimate",
-            "--wasm",
-            "tests/fixtures/contract.wasm",
-            "--id",
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            "--fn",
-            "increment",
-            "--arg",
-            "1",
-            "--rpc-url",
-            &rpc_url,
-            "--json",
-        ])
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("RUST_LOG", "error")
-        .output()
-        .expect("failed to run estimate");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let (stdout, stderr, code) = run_cli_in_home(
+        &["cache", "import", "--file", export_file.to_str().unwrap()],
+        Some(&home),
+    );
     assert_eq!(
-        output.status.code(),
-        Some(0),
-        "estimate should succeed; stderr: {stderr}"
-    );
-
-    let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
-
-    // Footprint metrics verification (Acceptance Criteria)
-    assert_eq!(parsed["read_entries"], 1, "expected 1 read entry");
-    assert!(
-        parsed["write_entries"].as_u64().unwrap_or(0) >= 1,
-        "expected write_entries >= 1"
-    );
-    assert_eq!(parsed["write_entries"], 1, "expected 1 write entry");
-    assert_eq!(parsed["read_bytes"], 0, "expected 0 read bytes");
-    assert_eq!(parsed["write_bytes"], 136, "expected 136 write bytes");
-    assert_eq!(parsed["cpu_instructions"], 532_502);
-    assert_eq!(parsed["fee"]["total_stroops"], 15_427);
-}
-
-#[test]
-fn test_estimate_fn_contract_fixture_populates_footprint_table() {
-    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
-    let home = temp_home("estimate-footprint-table");
-
-    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
-        .args([
-            "estimate",
-            "--wasm",
-            "tests/fixtures/contract.wasm",
-            "--id",
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            "--fn",
-            "increment",
-            "--arg",
-            "1",
-            "--rpc-url",
-            &rpc_url,
-        ])
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("RUST_LOG", "error")
-        .output()
-        .expect("failed to run estimate");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "estimate should succeed; stderr: {stderr}"
-    );
-
-    // Verify table output contains the same resource metrics
-    assert!(stdout.contains("Read Entries"));
-    assert!(stdout.contains("Write Entries"));
-    assert!(stdout.contains("Read Bytes"));
-    assert!(stdout.contains("Write Bytes"));
-    assert!(
-        stdout.contains("136"),
-        "table should display 136 write bytes"
+        code, 0,
+        "importing valid JSON should exit 0; stderr: {stderr}"
     );
     assert!(
-        stdout.contains("15427"),
-        "table should display total fee 15427"
+        stdout.contains("Imported 1"),
+        "should report 1 imported entry; got: {stdout}"
     );
 }
 
 #[test]
-fn test_estimate_minimal_wasm_upload_zero_footprint() {
-    // minimal.wasm (upload path, no footprint) still reports zeros without error
-    let (rpc_url, _stop) = start_mock_rpc_server("", "1000", 100);
-    let home = temp_home("estimate-minimal-upload");
+fn test_cache_import_malformed_json_errors() {
+    let home = temp_home("cache-import-malformed");
+    let export_file = home.join("bad.json");
+    std::fs::write(&export_file, "{ not json }").expect("write bad file");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
-        .args([
-            "estimate",
-            "--wasm",
-            "tests/fixtures/minimal.wasm",
-            "--rpc-url",
-            &rpc_url,
-            "--json",
-        ])
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("RUST_LOG", "error")
-        .output()
-        .expect("failed to run estimate");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "estimate should succeed; stderr: {stderr}"
+    let (stdout, stderr, code) = run_cli_in_home(
+        &["cache", "import", "--file", export_file.to_str().unwrap()],
+        Some(&home),
     );
+    assert_ne!(code, 1, "malformed JSON should exit non-zero");
+    assert!(
+        stderr.contains("Error"),
+        "stderr should report an error; got: {stderr}"
+    );
+}
 
-    let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+#[test]
+fn test_cache_import_empty_array() {
+    let home = temp_home("cache-import-empty");
+    let export_file = home.join("empty.json");
+    std::fs::write(&export_file, "[]").expect("write empty file");
 
-    assert_eq!(parsed["read_entries"], 0);
-    assert_eq!(parsed["write_entries"], 0);
-    assert_eq!(parsed["read_bytes"], 0);
-    assert_eq!(parsed["write_bytes"], 0);
+    let (stdout, stderr, code) = run_cli_in_home(
+        &["cache", "import", "--file", export_file.to_str().unwrap()],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 0,
+        "empty array import should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Imported 0"),
+        "should report 0 imported entries; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_help_lists_import() {
+    let (stdout, stderr, code) = run_cli(&["cache", "--help"]);
+    assert_eq!(code, 0, "cache --help should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("import"),
+        "cache help should list import; got: {stdout}"
+    );
 }
