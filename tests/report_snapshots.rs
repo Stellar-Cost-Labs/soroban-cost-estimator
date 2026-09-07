@@ -27,6 +27,7 @@ fn sample_report() -> CostReport {
         ledger: 3_894_195,
         network: "testnet".to_string(),
         rpc_latency_ms: 87,
+        delta: None,
         rates: None,
     }
 }
@@ -54,6 +55,7 @@ fn empty_report() -> CostReport {
         ledger: 0,
         network: "mainnet".to_string(),
         rpc_latency_ms: 0,
+        delta: None,
         rates: None,
     }
 }
