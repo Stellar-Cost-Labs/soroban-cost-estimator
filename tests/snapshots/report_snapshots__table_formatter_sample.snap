@@ -37,5 +37,10 @@ Fee Breakdown:
 
   Total:          15427 stroops (0.0015427)
 
+Fee Breakdown Chart:
+
+  Refundable     | ######################################## |  10931 (70.9%)
+  Non-refundable | ################                         |   4496 (29.1%)
+
 Optimization Suggestions:
   No cost optimizations identified (fee rates unavailable or no reducible resources).

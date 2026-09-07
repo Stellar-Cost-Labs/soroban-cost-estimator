@@ -168,7 +168,7 @@ pub fn field_display_name(field_path: &str) -> String {
 }
 
 /// A single changed field between two snapshots.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct FieldDiff {
     pub field_path: String,
     pub old_value: String,
@@ -178,7 +178,7 @@ pub struct FieldDiff {
 }
 
 /// The result of comparing two config snapshots.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ConfigDiff {
     pub old_snapshot: SnapshotInfo,
     pub new_snapshot: SnapshotInfo,
@@ -186,7 +186,7 @@ pub struct ConfigDiff {
     pub has_pricing_changes: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SnapshotInfo {
     pub network: String,
     pub timestamp: String,
