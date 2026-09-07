@@ -221,6 +221,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                         against.as_deref(),
                         rpc_url.as_deref(),
                         rps,
+                        timeout,
+                        max_retries,
                     )
                     .await
                 } else {
@@ -1452,8 +1454,10 @@ async fn cmd_config_diff_once(
     against_path: Option<&str>,
     rpc_url: Option<&str>,
     rps: Option<u64>,
+    timeout: u64,
+    max_retries: usize,
 ) -> error::AppResult<()> {
-    let snapshot = fetch_config_snapshot(network, rpc_url, rps).await?;
+    let snapshot = fetch_config_snapshot(network, rpc_url, rps, timeout, max_retries).await?;
     let has_changes = check_and_print_diff(network, against_path, &snapshot);
     if has_changes {
         std::process::exit(1);
