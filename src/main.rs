@@ -132,9 +132,12 @@ async fn main() {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run(args: cli::Cli) -> error::AppResult<()> {
     let rps = args.rps;
     let timeout = args.timeout;
+    let max_retries = args.max_retries;
+    let fallback = args.rpc_fallback_url.as_deref();
     match args.command {
         cli::Command::Estimate {
             wasm,
@@ -156,6 +159,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 &wasm,
                 &network,
                 rpc_url.as_deref(),
+                fallback,
                 id.as_deref(),
                 r#fn.as_deref(),
                 &args,
@@ -163,6 +167,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 &format,
                 rps,
                 timeout,
+                max_retries,
                 precision,
                 dry_run,
             )
@@ -180,10 +185,12 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cmd_estimate_all(
                 &wasm,
                 &network,
+                fallback,
                 id.as_deref(),
                 &format,
                 rps,
                 timeout,
+                max_retries,
                 precision,
             )
             .await
@@ -191,13 +198,34 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
         cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(&wasm, json),
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot { network, out, json } => {
-                cmd_config_snapshot(&network, out.as_deref(), json, rps, timeout).await
+                cmd_config_snapshot(
+                    &network,
+                    fallback,
+                    out.as_deref(),
+                    json,
+                    rps,
+                    timeout,
+                    max_retries,
+                )
+                .await
             }
+            cli::ConfigAction::List { network } => cmd_config_snapshot_list(&network),
             cli::ConfigAction::Diff {
                 network,
                 against,
                 summary,
-            } => cmd_config_diff(&network, against.as_deref(), summary, rps, timeout).await,
+            } => {
+                cmd_config_diff(
+                    &network,
+                    fallback,
+                    against.as_deref(),
+                    summary,
+                    rps,
+                    timeout,
+                    max_retries,
+                )
+                .await
+            }
             cli::ConfigAction::History { network } => cmd_config_history(&network),
             cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network),
             cli::ConfigAction::Validate { network } => cmd_config_validate(&network),
@@ -209,7 +237,19 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 network,
                 id,
                 json,
-            } => cmd_cache_warm(&wasm, &network, id.as_deref(), json, rps, timeout).await,
+            } => {
+                cmd_cache_warm(
+                    &wasm,
+                    &network,
+                    fallback,
+                    id.as_deref(),
+                    json,
+                    rps,
+                    timeout,
+                    max_retries,
+                )
+                .await
+            }
             cli::CacheAction::Verify => cmd_cache_verify(),
             cli::CacheAction::Query {
                 network,
@@ -232,7 +272,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             ),
         },
         cli::Command::Watch { network, interval } => {
-            cmd_watch(&network, &interval, rps, timeout).await
+            cmd_watch(&network, fallback, &interval, rps, timeout, max_retries).await
         }
     }
 }
@@ -391,6 +431,7 @@ async fn cmd_estimate(
     wasm_path: &str,
     network: &str,
     rpc_url: Option<&str>,
+    rpc_fallback_url: Option<&str>,
     contract_id: Option<&str>,
     fn_name: Option<&str>,
     args: &[String],
@@ -398,6 +439,7 @@ async fn cmd_estimate(
     format: &str,
     rps: Option<u64>,
     timeout: u64,
+    max_retries: usize,
     precision: u32,
     dry_run: bool,
 ) -> error::AppResult<()> {
@@ -443,10 +485,12 @@ async fn cmd_estimate(
         }
 
         let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
-        let client = rpc::client::RpcClient::with_options(
+        let client = rpc::client::RpcClient::with_fallback(
             &endpoint,
+            rpc_fallback_url,
             rps,
             std::time::Duration::from_secs(timeout),
+            max_retries,
         );
 
         let sc_vals: Vec<stellar_xdr::ScVal> = args
@@ -603,10 +647,12 @@ fn csv_row(r: &EstimateAllResult) -> String {
 async fn cmd_estimate_all(
     wasm_path: &str,
     network: &str,
+    rpc_fallback_url: Option<&str>,
     contract_id: Option<&str>,
     format: &str,
     rps: Option<u64>,
     timeout: u64,
+    max_retries: usize,
     precision: u32,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
@@ -654,10 +700,12 @@ async fn cmd_estimate_all(
         }
 
         let endpoint = rpc::client::resolve_endpoint(network, None)?;
-        let client = rpc::client::RpcClient::with_options(
+        let client = rpc::client::RpcClient::with_fallback(
             &endpoint,
+            rpc_fallback_url,
             rps,
             std::time::Duration::from_secs(timeout),
+            max_retries,
         );
 
         // Fee rates are only needed to itemize the per-function fee breakdown
@@ -1013,8 +1061,10 @@ fn wasm_info_json(
 /// Makes one batched `getLedgerEntries` RPC call.
 async fn fetch_config_snapshot(
     network: &str,
+    rpc_fallback_url: Option<&str>,
     rps: Option<u64>,
     timeout: u64,
+    max_retries: usize,
 ) -> error::AppResult<config_snapshot::model::ConfigSnapshot> {
     use tracing::Instrument;
     use tracing::{debug, info_span};
@@ -1022,10 +1072,12 @@ async fn fetch_config_snapshot(
     let span = info_span!("fetch_config_snapshot", network);
     async {
         let endpoint = rpc::client::resolve_endpoint(network, None)?;
-        let client = rpc::client::RpcClient::with_options(
+        let client = rpc::client::RpcClient::with_fallback(
             &endpoint,
+            rpc_fallback_url,
             rps,
             std::time::Duration::from_secs(timeout),
+            max_retries,
         );
         debug!("fetching all config settings");
         let raw_entries = rpc::config::fetch_all_config_settings(&client).await?;
@@ -1077,10 +1129,12 @@ fn print_stale_estimates(network: &str, ledger: u32) {
 /// `config snapshot` command: fetch config settings and save snapshot.
 async fn cmd_config_snapshot(
     network: &str,
+    rpc_fallback_url: Option<&str>,
     out_path: Option<&str>,
     json_flag: bool,
     rps: Option<u64>,
     timeout: u64,
+    max_retries: usize,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -1088,7 +1142,8 @@ async fn cmd_config_snapshot(
     let span = info_span!("cmd_config_snapshot", network);
     async {
         info!("taking config snapshot");
-        let snapshot = fetch_config_snapshot(network, rps, timeout).await?;
+        let snapshot =
+            fetch_config_snapshot(network, rpc_fallback_url, rps, timeout, max_retries).await?;
 
         let path = config_snapshot::store::save_snapshot(&snapshot, out_path)?;
         info!(path = %path.display(), ledger = snapshot.ledger, "snapshot saved");
@@ -1107,6 +1162,27 @@ async fn cmd_config_snapshot(
     .await
 }
 
+/// `config snapshot list` command: list all saved snapshots for a network.
+fn cmd_config_snapshot_list(network: &str) -> error::AppResult<()> {
+    let snapshots = config_snapshot::store::list_snapshots(network)?;
+
+    if snapshots.is_empty() {
+        println!("No snapshots found for network '{network}'.");
+        return Ok(());
+    }
+
+    println!("Config snapshots for network '{network}':");
+    for path in snapshots {
+        let path_str = path.to_string_lossy();
+        let snapshot = config_snapshot::store::load_snapshot_from_path(&path_str)?;
+        println!(
+            "  {}  ledger {}  {}",
+            snapshot.timestamp, snapshot.ledger, path_str
+        );
+    }
+    Ok(())
+}
+
 /// True when a config diff signals a network protocol/config upgrade.
 ///
 /// Pricing changes are the tool's proxy for "the network changed its
@@ -1119,10 +1195,12 @@ fn upgrade_detected(diff: &config_snapshot::diff::ConfigDiff) -> bool {
 /// `config diff` command: compare current config against a snapshot.
 async fn cmd_config_diff(
     network: &str,
+    rpc_fallback_url: Option<&str>,
     against_path: Option<&str>,
     summary: bool,
     rps: Option<u64>,
     timeout: u64,
+    max_retries: usize,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::{debug, info_span};
@@ -1140,7 +1218,8 @@ async fn cmd_config_diff(
             }
         };
 
-        let new_snapshot = fetch_config_snapshot(network, rps, timeout).await?;
+        let new_snapshot =
+            fetch_config_snapshot(network, rpc_fallback_url, rps, timeout, max_retries).await?;
 
         let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
         debug!(
@@ -1409,13 +1488,15 @@ async fn shutdown_signal() -> error::AppResult<()> {
 /// Makes one batched `getLedgerEntries` RPC call.
 async fn watch_poll_once(
     network: &str,
+    rpc_fallback_url: Option<&str>,
     first: &mut bool,
     rps: Option<u64>,
     timeout: u64,
+    max_retries: usize,
 ) -> error::AppResult<()> {
     use tracing::{debug, warn};
 
-    match fetch_config_snapshot(network, rps, timeout).await {
+    match fetch_config_snapshot(network, rpc_fallback_url, rps, timeout, max_retries).await {
         Ok(snapshot) => {
             if !*first {
                 if let Ok(old_snapshot) = config_snapshot::store::load_latest_snapshot(network) {
@@ -1447,9 +1528,11 @@ async fn watch_poll_once(
 /// cancelled rather than writing a partial snapshot.
 async fn cmd_watch(
     network: &str,
+    rpc_fallback_url: Option<&str>,
     interval: &str,
     rps: Option<u64>,
     timeout: u64,
+    max_retries: usize,
 ) -> error::AppResult<()> {
     use tracing::info;
 
@@ -1471,7 +1554,15 @@ async fn cmd_watch(
                 return Ok(());
             }
             () = async {
-                let _ = watch_poll_once(network, &mut first, rps, timeout).await;
+                let _ = watch_poll_once(
+                    network,
+                    rpc_fallback_url,
+                    &mut first,
+                    rps,
+                    timeout,
+                    max_retries,
+                )
+                .await;
                 tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
             } => {}
         }
@@ -1479,6 +1570,65 @@ async fn cmd_watch(
 }
 
 /// `cache verify` command: check every cache entry parses as valid JSON.
+/// `cache stats` command: show cache health overview.
+///
+/// Prints total entries, disk usage, age (oldest/newest), and per-network
+/// breakdown. Useful for checking whether the cache is being populated and
+/// how much disk space it consumes.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+fn cmd_cache_stats() -> error::AppResult<()> {
+    let stats = cache::cache_stats()?;
+
+    if stats.total_entries == 0 {
+        println!("Cache is empty — no cached estimates.");
+        return Ok(());
+    }
+
+    println!("Cache Statistics");
+    println!("================");
+    println!("  Total entries:  {}", stats.total_entries);
+    println!("  Disk usage:     {}", format_bytes(stats.disk_bytes));
+    println!(
+        "  Oldest entry:   {}",
+        stats.oldest_entry.as_deref().unwrap_or("n/a")
+    );
+    println!(
+        "  Newest entry:   {}",
+        stats.newest_entry.as_deref().unwrap_or("n/a")
+    );
+
+    if !stats.per_network.is_empty() {
+        println!("\nPer-network breakdown:");
+        for (network, count) in &stats.per_network {
+            println!(
+                "  {network}: {count} entr{}",
+                if *count == 1 { "y" } else { "ies" }
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Format a byte count as a human-readable string (KB, MB, GB).
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 ///
 /// Prints a summary line per corrupted entry and exits with code 1 when any
 /// entry fails verification, so scripts can treat a corrupt cache as an
@@ -1609,13 +1759,26 @@ fn cmd_cache_export(out_path: Option<&str>) -> error::AppResult<()> {
 async fn cmd_cache_warm(
     wasm_path: &str,
     network: &str,
+    rpc_fallback_url: Option<&str>,
     contract_id: Option<&str>,
     json_flag: bool,
     rps: Option<u64>,
     timeout: u64,
+    max_retries: usize,
 ) -> error::AppResult<()> {
     let fmt = if json_flag { "json" } else { "table" };
-    cmd_estimate_all(wasm_path, network, contract_id, fmt, rps, timeout, 7).await
+    cmd_estimate_all(
+        wasm_path,
+        network,
+        rpc_fallback_url,
+        contract_id,
+        fmt,
+        rps,
+        timeout,
+        max_retries,
+        7,
+    )
+    .await
 }
 
 #[cfg(test)]
