@@ -97,7 +97,13 @@ pub fn load_snapshot_from_path(path: &str) -> AppResult<ConfigSnapshot> {
     Ok(snapshot)
 }
 
-
+/// Lists all snapshots for a given network.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn list_snapshots(network: &str) -> AppResult<Vec<PathBuf>> {
+    let dir = snapshots_dir()?;
+    let mut snapshots = Vec::new();
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
         let name = entry.file_name();
