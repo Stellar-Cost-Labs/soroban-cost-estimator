@@ -7,6 +7,7 @@
 
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use rusqlite::Connection;
 use serde::Deserialize;
@@ -17,6 +18,11 @@ use tracing::warn;
 
 use crate::error::AppError;
 use crate::error::AppResult;
+
+/// Check whether a rusqlite error is `SQLITE_BUSY`.
+fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
+    err.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
+}
 
 /// Current cache-entry schema version.
 ///
@@ -104,6 +110,14 @@ pub struct QueryFilter {
     pub to: Option<String>,
 }
 
+/// Global lock for serializing cache writes.
+///
+/// SQLite WAL mode allows concurrent readers, but only one writer at a time.
+/// Under heavy contention (e.g. multiple threads writing the same key),
+/// `busy_timeout` alone may not prevent `SQLITE_BUSY`. This mutex ensures
+/// writes are serialized at the application level.
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
+
 /// Returns the base data directory path: `~/.soroban-cost-estimator`,
 /// creating it if needed.
 fn data_dir() -> AppResult<PathBuf> {
@@ -128,9 +142,9 @@ pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
     // any statement that can take a lock. The WAL journal-mode switch is the
     // one exception the busy handler does not cover (it needs exclusive
     // access), so it is handled separately below.
+    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
     conn.execute_batch(
-        "PRAGMA busy_timeout=5000; \
-         CREATE TABLE IF NOT EXISTS estimates (
+        "CREATE TABLE IF NOT EXISTS estimates (
             version          INTEGER NOT NULL,
             wasm_hash        TEXT NOT NULL,
             function         TEXT NOT NULL,
@@ -166,14 +180,16 @@ fn enable_wal_if_possible(conn: &Connection) {
         return;
     };
     if mode == "wal" {
+        let _ = conn.execute_batch("PRAGMA synchronous=NORMAL;");
         return;
     }
-    for attempt in 0..5u32 {
+    for attempt in 0..10u32 {
         if conn.execute_batch("PRAGMA journal_mode=WAL;").is_ok() {
+            let _ = conn.execute_batch("PRAGMA synchronous=NORMAL;");
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(
-            u64::from(attempt + 1) * 25,
+            u64::from(attempt + 1) * 50,
         ));
     }
 }
@@ -184,6 +200,35 @@ fn open_db() -> AppResult<Connection> {
     let conn = Connection::open(&path)?;
     ensure_cache_schema(&conn)?;
     Ok(conn)
+}
+
+/// Retry limit and base delay for `SQLITE_BUSY` backoff.
+const MAX_RETRIES: u32 = 5;
+const BASE_RETRY_DELAY_MS: u64 = 10;
+
+/// Execute a SQLite write operation, retrying on `SQLITE_BUSY` with
+/// exponential backoff.
+fn execute_with_retry<F, T>(mut operation: F) -> AppResult<T>
+where
+    F: FnMut() -> Result<T, rusqlite::Error>,
+{
+    let mut delay = BASE_RETRY_DELAY_MS;
+    for attempt in 0..MAX_RETRIES {
+        match operation() {
+            Ok(val) => return Ok(val),
+            Err(e) if is_sqlite_busy(&e) && attempt < MAX_RETRIES - 1 => {
+                warn!(
+                    attempt,
+                    delay_ms = delay,
+                    "SQLITE_BUSY, retrying after backoff"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+                delay *= 2;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    unreachable!()
 }
 
 /// Save an estimate result to the cache.
@@ -216,6 +261,9 @@ pub fn save_estimate(
 ) -> AppResult<()> {
     let args_hash = hash_args(args);
 
+    let _guard = WRITE_LOCK
+        .lock()
+        .map_err(|e| AppError::General(format!("cache write lock poisoned: {e}")))?;
     let conn = open_db()?;
     conn.execute(
         "INSERT INTO estimates \
@@ -500,7 +548,36 @@ pub fn query_estimates(network: &str, filter: &QueryFilter) -> AppResult<Vec<Cac
     Ok(filtered)
 }
 
-/// Integrity status of a single cache entry.
+/// Export every cached estimate as a deterministic, JSON-serializable list.
+///
+/// All rows are read from the SQLite cache, migrated to the current schema,
+/// and sorted by (wasm_hash, function, args_hash) so repeated exports are
+/// stable. A malformed or unsupported entry returns an error rather than
+/// producing an incomplete backup.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+pub fn export_cached_estimates() -> AppResult<Vec<CachedEstimate>> {
+    let conn = open_db()?;
+    let mut stmt = conn.prepare(
+        "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
+         cpu_instructions, memory_bytes, timestamp \
+         FROM estimates ORDER BY wasm_hash, function, args_hash",
+    )?;
+
+    let rows = stmt.query_map([], estimate_from_row)?;
+
+    let mut estimates = Vec::new();
+    for row in rows {
+        let cached = row?;
+        estimates.push(migrate_to_latest(cached)?);
+    }
+
+    debug!(count = estimates.len(), "exported cached estimates");
+    Ok(estimates)
+}
+
+/// Integrity status of a single cache entry file.
 #[derive(Debug, Clone)]
 pub struct CacheEntryStatus {
     /// Synthesized identity of the cache entry
@@ -576,6 +653,65 @@ pub fn verify_cache() -> AppResult<Vec<CacheEntryStatus>> {
     Ok(statuses)
 }
 
+/// Aggregate statistics for the estimate cache.
+#[derive(Debug, Clone)]
+pub struct CacheStats {
+    /// Total number of cached estimates across all networks.
+    pub total_entries: usize,
+    /// Disk usage of the SQLite database file in bytes.
+    pub disk_bytes: u64,
+    /// Timestamp of the oldest entry (ISO-8601), if any.
+    pub oldest_entry: Option<String>,
+    /// Timestamp of the newest entry (ISO-8601), if any.
+    pub newest_entry: Option<String>,
+    /// Per-network breakdown: (network, count).
+    pub per_network: Vec<(String, usize)>,
+}
+
+/// Compute aggregate cache statistics.
+///
+/// Reads the SQLite database metadata (file size) and queries the
+/// `estimates` table for total count, timestamp bounds, and a
+/// `GROUP BY network` breakdown.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+pub fn cache_stats() -> AppResult<CacheStats> {
+    let path = db_path()?;
+    let disk_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+    let conn = open_db()?;
+
+    // Total count.
+    let total_entries: usize =
+        conn.query_row("SELECT COUNT(*) FROM estimates", [], |row| row.get(0))?;
+
+    // Oldest and newest timestamps.
+    let oldest_entry: Option<String> = conn
+        .query_row("SELECT MIN(timestamp) FROM estimates", [], |row| row.get(0))
+        .ok();
+    let newest_entry: Option<String> = conn
+        .query_row("SELECT MAX(timestamp) FROM estimates", [], |row| row.get(0))
+        .ok();
+
+    // Per-network breakdown.
+    let mut stmt = conn.prepare(
+        "SELECT network, COUNT(*) FROM estimates GROUP BY network ORDER BY COUNT(*) DESC",
+    )?;
+    let per_network: Vec<(String, usize)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    debug!(total_entries, disk_bytes, "cache stats computed");
+    Ok(CacheStats {
+        total_entries,
+        disk_bytes,
+        oldest_entry,
+        newest_entry,
+        per_network,
+    })
+}
+
 /// Check which cached estimates are now stale (simulated at an earlier ledger).
 ///
 /// Returns a list of cached estimates that were made before `current_ledger`.
@@ -641,8 +777,13 @@ fn save_registry(registry: &WasmRegistry) -> AppResult<()> {
 /// # Network calls
 /// None — pure SQLite I/O.
 pub fn remove_cached_estimates_for_wasm(wasm_hash: &str) -> AppResult<usize> {
+    let _guard = WRITE_LOCK
+        .lock()
+        .map_err(|e| AppError::General(format!("cache write lock poisoned: {e}")))?;
     let conn = open_db()?;
-    let removed = conn.execute("DELETE FROM estimates WHERE wasm_hash = ?1", [wasm_hash])?;
+    let removed = execute_with_retry(|| {
+        conn.execute("DELETE FROM estimates WHERE wasm_hash = ?1", [wasm_hash])
+    })?;
     Ok(removed)
 }
 

@@ -1,11 +1,24 @@
 use clap::{Parser, Subcommand};
 
+/// Build version string with metadata from build.rs
+fn build_version() -> &'static str {
+    concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (",
+        env!("GIT_HASH"),
+        " ",
+        env!("BUILD_DATE"),
+        ")"
+    )
+}
+
 /// Estimate Soroban contract resource costs with network config-drift tracking.
 ///
 /// Wraps Stellar's `simulateTransaction` RPC and adds awareness of how the
 /// network's resource-pricing configuration changes over time.
 #[derive(Parser, Debug)]
 #[command(name = "soroban-cost-estimator")]
+#[command(version = build_version())]
 #[command(about = "Estimate Soroban contract costs & track network pricing changes", long_about = None)]
 pub struct Cli {
     /// Cap RPC requests at N per second (fixed-rate spacing; applies to
@@ -17,6 +30,16 @@ pub struct Cli {
     /// network call).
     #[arg(long, global = true, value_name = "SECS", default_value_t = 30)]
     pub timeout: u64,
+
+    /// Fallback RPC URL used when the primary endpoint is unreachable.
+    #[arg(long, global = true, value_name = "URL")]
+    pub rpc_fallback_url: Option<String>,
+
+    /// Retry transient RPC failures up to N times (default 3), using
+    /// exponential backoff (500ms, then doubled between attempts). 0
+    /// disables retries entirely.
+    #[arg(long, global = true, value_name = "N", default_value_t = 3)]
+    pub max_retries: usize,
 
     #[command(subcommand)]
     pub command: Command,
@@ -133,6 +156,13 @@ pub enum Command {
 
 #[derive(Subcommand, Debug)]
 pub enum CacheAction {
+    /// Export every cached estimate as a JSON array.
+    Export {
+        /// Write the JSON array to a file instead of standard output.
+        #[arg(long, short)]
+        out: Option<String>,
+    },
+
     /// Check that every cached estimate is valid JSON and not corrupted.
     Verify,
 
@@ -206,6 +236,13 @@ pub enum ConfigAction {
         /// Print the snapshot as JSON instead of the summary lines.
         #[arg(long)]
         json: bool,
+    },
+
+    /// List all saved config snapshots with their timestamp and ledger.
+    List {
+        /// Network whose snapshots to list.
+        #[arg(long, default_value = "testnet")]
+        network: String,
     },
 
     /// Diff the current network config against the most recent snapshot.
