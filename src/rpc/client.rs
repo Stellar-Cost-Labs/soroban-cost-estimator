@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use governor::{Quota, RateLimiter};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{debug, trace, warn};
@@ -89,6 +91,17 @@ struct DedupState {
     in_flight: HashMap<RequestKey, Arc<Mutex<()>>>,
 }
 
+/// Response envelope for the `getHealth` JSON-RPC method.
+///
+/// Stellar RPC returns a `status` of `healthy`, `degraded`, or `unhealthy`
+/// plus ledger-window information; the health check only needs `status`.
+/// Extra fields in the response are ignored by serde.
+#[derive(Debug, Deserialize)]
+struct HealthResponse {
+    /// Node health status: `healthy`, `degraded`, or `unhealthy`.
+    status: String,
+}
+
 /// A minimal JSON-RPC 2.0 client for Soroban RPC endpoints.
 ///
 /// Identical in-flight or completed requests (same method + params) are
@@ -109,6 +122,8 @@ pub struct RpcClient {
     /// Maximum number of retries on transient (HTTP) failures, with
     /// exponential backoff.
     max_retries: usize,
+    /// Custom HTTP headers attached to every outbound request.
+    headers: HeaderMap,
 }
 
 impl RpcClient {
@@ -176,6 +191,39 @@ impl RpcClient {
         timeout: Duration,
         max_retries: usize,
     ) -> Self {
+        Self::with_fallback_headers(url, fallback_url, rps, timeout, max_retries, &[])
+    }
+
+    /// Create a new RPC client that attaches custom HTTP headers (each a
+    /// `"Key: Value"` string) to every request, without rate limiting, with
+    /// the default request timeout and the default retry policy. Entries
+    /// that cannot be parsed (or that carry an empty value) are skipped.
+    pub fn with_headers(url: &str, headers: &[String]) -> Self {
+        Self::with_fallback_headers(
+            url,
+            None,
+            None,
+            DEFAULT_TIMEOUT,
+            DEFAULT_MAX_RETRIES,
+            headers,
+        )
+    }
+
+    /// Create a new RPC client with an optional fallback URL, optional rate
+    /// limit, request timeout, retry policy, and custom HTTP headers attached
+    /// to every request.
+    ///
+    /// Behaves exactly like [`Self::with_fallback`] and additionally attaches
+    /// the parsed `"Key: Value"` headers (skipping any entry that cannot be
+    /// parsed or that has an empty value) to every outbound request.
+    pub fn with_fallback_headers(
+        url: &str,
+        fallback_url: Option<&str>,
+        rps: Option<u64>,
+        timeout: Duration,
+        max_retries: usize,
+        headers: &[String],
+    ) -> Self {
         debug!(
             url,
             ?fallback_url,
@@ -184,6 +232,7 @@ impl RpcClient {
             max_retries,
             "creating RPC client"
         );
+        let headers = parse_headers(headers);
         Self {
             url: url.to_string(),
             fallback_url: fallback_url.map(String::from),
@@ -192,11 +241,53 @@ impl RpcClient {
             // construction infallible.
             client: reqwest::Client::builder()
                 .timeout(timeout)
+                .default_headers(headers.clone())
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             dedup: Arc::new(Mutex::new(DedupState::default())),
             limiter: rps.and_then(build_rate_limiter),
             max_retries,
+            headers,
+        }
+    }
+
+    /// Validate that the RPC endpoint is reachable and healthy before any
+    /// simulation is run.
+    ///
+    /// Issues a lightweight `getHealth` JSON-RPC call and fails fast with a
+    /// clear, actionable error when the endpoint cannot be reached or reports
+    /// a status other than `healthy` — so a misconfigured `--rpc-url` (or a
+    /// down RPC node) is surfaced up front instead of surfacing midway through
+    /// an expensive batch of simulations.
+    ///
+    /// # Network calls
+    /// Makes at most one `getHealth` RPC call to the configured endpoint.
+    pub async fn health_check(&self) -> AppResult<()> {
+        let health: HealthResponse = self
+            .call("getHealth", serde_json::json!({}))
+            .await
+            .map_err(|e| {
+                AppError::Rpc {
+                    status: -1,
+                    message: format!(
+                        "unable to reach RPC endpoint {url}: {e}. Check --rpc-url / --network and that the node is reachable.",
+                        url = self.url
+                    ),
+                }
+            })?;
+
+        if health.status == "healthy" {
+            debug!(url = self.url, "RPC endpoint health check passed");
+            Ok(())
+        } else {
+            Err(AppError::Rpc {
+                status: -1,
+                message: format!(
+                    "RPC endpoint {url} reported unhealthy status: {status}. Check --rpc-url / --network.",
+                    url = self.url,
+                    status = health.status,
+                ),
+            })
         }
     }
 
@@ -348,13 +439,6 @@ impl RpcClient {
         .await?;
         let status = response.status();
         let response_body: Value = response.json().await?;
-        if std::env::var("SCE_DEBUG_RPC").is_ok() {
-            debug!(
-                method,
-                response = %serde_json::to_string(&response_body).unwrap_or_default(),
-                "RPC response"
-            );
-        }
 
         if let Some(error) = response_body.get("error") {
             let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
@@ -363,7 +447,7 @@ impl RpcClient {
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown error")
                 .to_string();
-            debug!(method, code, message, "RPC error");
+            debug!(method, code, message, "RPC error response");
             return Err(AppError::Rpc {
                 status: code,
                 message,
@@ -375,6 +459,12 @@ impl RpcClient {
             message: "response missing 'result' field".to_string(),
         })?;
 
+        debug!(
+            method,
+            status = %status,
+            result = %serde_json::to_string(result).unwrap_or_default(),
+            "RPC response received"
+        );
         trace!(method, "RPC call succeeded");
         Ok(result.clone())
     }
@@ -402,6 +492,41 @@ fn deserialize_result<T: serde::de::DeserializeOwned>(value: Value) -> AppResult
         .map_err(|e| AppError::General(format!("failed to deserialize RPC response: {e}")))
 }
 
+/// Parse a `"Key: Value"` string into an HTTP header name and value.
+///
+/// Returns an error if the format is invalid (missing colon, empty key,
+/// or non-ASCII characters in the header name).
+fn parse_header(raw: &str) -> Result<(HeaderName, HeaderValue), String> {
+    let colon_pos = raw.find(':').ok_or("missing ':' separator")?;
+    let name_str = raw[..colon_pos].trim();
+    let value_str = raw[colon_pos + 1..].trim();
+
+    if name_str.is_empty() {
+        return Err("empty header name".to_string());
+    }
+
+    let name = HeaderName::from_bytes(name_str.as_bytes())
+        .map_err(|e| format!("invalid header name: {e}"))?;
+    let value =
+        HeaderValue::from_str(value_str).map_err(|e| format!("invalid header value: {e}"))?;
+
+    Ok((name, value))
+}
+
+/// Parse a list of `"Key: Value"` strings into a [`HeaderMap`], skipping any
+/// entry that cannot be parsed or that has an empty value.
+fn parse_headers(raw_headers: &[String]) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for raw in raw_headers {
+        if let Ok((name, value)) = parse_header(raw) {
+            if !value.as_bytes().is_empty() {
+                headers.insert(name, value);
+            }
+        }
+    }
+    headers
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -417,10 +542,21 @@ mod tests {
 
     use super::{RpcClient, resolve_ws_endpoint};
 
-    /// Spawns a tiny HTTP server that answers JSON-RPC `simulateTransaction`
-    /// calls, counting how many were received. The first `fail_times` calls
-    /// return a JSON-RPC error body instead of a result.
+    /// Spawns a tiny HTTP server that answers JSON-RPC
+    /// `simulateTransaction`-style calls with `{"result":{"pong":true}}`,
+    /// counting how many were received. The first `fail_times` calls return
+    /// a JSON-RPC error body instead of a result.
     async fn spawn_json_rpc_stub(fail_times: u32) -> (String, Arc<AtomicUsize>) {
+        spawn_json_rpc_stub_with_result(fail_times, r#"{"pong":true}"#).await
+    }
+
+    /// Like [`spawn_json_rpc_stub`], but successful responses embed `result_body`
+    /// verbatim as the JSON-RPC `result` value — for stubbing methods with a
+    /// specific response shape (e.g. `getHealth`).
+    async fn spawn_json_rpc_stub_with_result(
+        fail_times: u32,
+        result_body: &'static str,
+    ) -> (String, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("failed to bind stub server");
@@ -435,7 +571,7 @@ mod tests {
                 };
                 let counter = Arc::clone(&server_counter);
                 tokio::spawn(async move {
-                    let _ = handle_conn(stream, counter, fail_times).await;
+                    let _ = handle_conn(stream, counter, fail_times, result_body).await;
                 });
             }
         });
@@ -447,6 +583,7 @@ mod tests {
         mut stream: TcpStream,
         counter: Arc<AtomicUsize>,
         fail_times: u32,
+        result_body: &'static str,
     ) -> std::io::Result<()> {
         let mut buf = Vec::new();
         let mut tmp = [0u8; 1024];
@@ -486,8 +623,9 @@ mod tests {
         let call_no = counter.fetch_add(1, Ordering::SeqCst);
         let body = if (call_no as u32) < fail_times {
             r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure"}}"#
+                .to_string()
         } else {
-            r#"{"jsonrpc":"2.0","id":1,"result":{"pong":true}}"#
+            format!(r#"{{"jsonrpc":"2.0","id":1,"result":{result_body}}}"#)
         };
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -785,6 +923,59 @@ mod tests {
         );
     }
 
+    /// A reachable endpoint reporting `healthy` must pass the health check.
+    #[tokio::test]
+    async fn test_health_check_ok_when_healthy() {
+        let (url, _) =
+            spawn_json_rpc_stub_with_result(0, r#"{"status":"healthy","latestLedger":42}"#).await;
+        let client = RpcClient::new(&url);
+
+        client
+            .health_check()
+            .await
+            .expect("healthy endpoint passes");
+    }
+
+    /// A reachable endpoint reporting anything other than `healthy` (e.g.
+    /// `degraded`) must fail the health check with an actionable error.
+    #[tokio::test]
+    async fn test_health_check_errs_on_non_healthy_status() {
+        let (url, _) = spawn_json_rpc_stub_with_result(0, r#"{"status":"degraded"}"#).await;
+        let client = RpcClient::new(&url);
+
+        let err = client
+            .health_check()
+            .await
+            .expect_err("degraded endpoint fails");
+        let message = err.to_string();
+        assert!(
+            message.contains("reported unhealthy status: degraded"),
+            "unexpected error: {message}"
+        );
+    }
+
+    /// An unreachable endpoint must fail the health check fast with a message
+    /// pointing at `--rpc-url` / `--network` rather than surfacing later mid-
+    /// simulation.
+    #[tokio::test]
+    async fn test_health_check_errs_when_endpoint_unreachable() {
+        let dead_url = refused_port_url().await;
+        // `max_retries: 0` keeps this fast: a refused connection is retryable,
+        // and the default backoff (0.5s + 1s + 2s) is irrelevant to the
+        // health check failing fast on an unreachable endpoint.
+        let client = RpcClient::with_options(&dead_url, None, Duration::from_millis(500), 0);
+
+        let err = client
+            .health_check()
+            .await
+            .expect_err("dead endpoint fails");
+        let message = err.to_string();
+        assert!(
+            message.contains("unable to reach RPC endpoint") && message.contains("--rpc-url"),
+            "unexpected error: {message}"
+        );
+    }
+
     #[test]
     fn test_resolve_ws_endpoint_derives_well_known_urls() {
         assert_eq!(
@@ -815,5 +1006,100 @@ mod tests {
             resolve_ws_endpoint("testnet", Some("ws://localhost:8000/ws")).unwrap(),
             "ws://localhost:8000/ws"
         );
+    }
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_header_valid() {
+        let (name, value) = parse_header("X-API-Key: secret123").unwrap();
+        assert_eq!(name.as_str(), "x-api-key");
+        assert_eq!(value.to_str().unwrap(), "secret123");
+    }
+
+    #[test]
+    fn test_parse_header_with_spaces() {
+        let (name, value) = parse_header(" Authorization : Bearer tok ").unwrap();
+        assert_eq!(name.as_str(), "authorization");
+        assert_eq!(value.to_str().unwrap(), "Bearer tok");
+    }
+
+    #[test]
+    fn test_parse_header_missing_colon() {
+        assert!(parse_header("NoColon").is_err());
+    }
+
+    #[test]
+    fn test_parse_header_empty_name() {
+        assert!(parse_header(": value").is_err());
+    }
+
+    #[test]
+    fn test_parse_header_empty_value() {
+        let (name, value) = parse_header("X-Custom:").unwrap();
+        assert_eq!(name.as_str(), "x-custom");
+        assert_eq!(value.to_str().unwrap(), "");
+    }
+
+    #[test]
+    fn test_parse_header_value_with_colons() {
+        let (name, value) = parse_header("X-Auth: token:with:colons").unwrap();
+        assert_eq!(name.as_str(), "x-auth");
+        assert_eq!(value.to_str().unwrap(), "token:with:colons");
+    }
+
+    #[test]
+    fn test_with_headers_empty() {
+        let client = RpcClient::with_headers("http://localhost", &[]);
+        assert!(client.headers.is_empty());
+    }
+
+    #[test]
+    fn test_with_headers_stores_parsed() {
+        let client = RpcClient::with_headers(
+            "http://localhost",
+            &[
+                "X-API-Key: secret".to_string(),
+                "Authorization: Bearer tok".to_string(),
+            ],
+        );
+        assert_eq!(client.headers.len(), 2);
+        assert_eq!(
+            client.headers.get("x-api-key").unwrap().to_str().unwrap(),
+            "secret"
+        );
+        assert_eq!(
+            client
+                .headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer tok"
+        );
+    }
+
+    #[test]
+    fn test_with_headers_skips_malformed() {
+        let client = RpcClient::with_headers(
+            "http://localhost",
+            &[
+                "Good: ok".to_string(),
+                "NoColonHere".to_string(),
+                "Also-Bad:".to_string(),
+            ],
+        );
+        // Only the valid header should be stored.
+        assert_eq!(client.headers.len(), 1);
+        assert!(client.headers.contains_key("good"));
+    }
+
+    #[test]
+    fn test_rpc_client_new_has_no_custom_headers() {
+        let client = RpcClient::new("http://localhost");
+        assert!(client.headers.is_empty());
     }
 }
