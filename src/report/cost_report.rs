@@ -112,7 +112,7 @@ pub fn build_chart_entries(
     }
 
     // Sort by descending stroops so the largest component is first.
-    entries.sort_by(|a, b| b.stroops.cmp(&a.stroops));
+    entries.sort_by_key(|a| std::cmp::Reverse(a.stroops));
     entries
 }
 
