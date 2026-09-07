@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use governor::{Quota, RateLimiter};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -122,6 +123,8 @@ pub struct RpcClient {
     /// Maximum number of retries on transient (HTTP) failures, with
     /// exponential backoff.
     max_retries: usize,
+    /// Custom HTTP headers attached to every outbound request.
+    headers: HeaderMap,
 }
 
 impl RpcClient {
@@ -189,6 +192,32 @@ impl RpcClient {
         timeout: Duration,
         max_retries: usize,
     ) -> Self {
+        Self::with_fallback_headers(url, fallback_url, rps, timeout, max_retries, &[])
+    }
+
+    /// Create a new RPC client that attaches custom HTTP headers (each a
+    /// `"Key: Value"` string) to every request, without rate limiting, with
+    /// the default request timeout and the default retry policy. Entries
+    /// that cannot be parsed (or that carry an empty value) are skipped.
+    pub fn with_headers(url: &str, headers: &[String]) -> Self {
+        Self::with_fallback_headers(url, None, None, DEFAULT_TIMEOUT, DEFAULT_MAX_RETRIES, headers)
+    }
+
+    /// Create a new RPC client with an optional fallback URL, optional rate
+    /// limit, request timeout, retry policy, and custom HTTP headers attached
+    /// to every request.
+    ///
+    /// Behaves exactly like [`Self::with_fallback`] and additionally attaches
+    /// the parsed `"Key: Value"` headers (skipping any entry that cannot be
+    /// parsed or that has an empty value) to every outbound request.
+    pub fn with_fallback_headers(
+        url: &str,
+        fallback_url: Option<&str>,
+        rps: Option<u64>,
+        timeout: Duration,
+        max_retries: usize,
+        headers: &[String],
+    ) -> Self {
         debug!(
             url,
             ?fallback_url,
@@ -197,6 +226,7 @@ impl RpcClient {
             max_retries,
             "creating RPC client"
         );
+        let headers = parse_headers(headers);
         Self {
             url: url.to_string(),
             fallback_url: fallback_url.map(String::from),
@@ -211,6 +241,7 @@ impl RpcClient {
             dedup: Arc::new(Mutex::new(DedupState::default())),
             limiter: rps.and_then(build_rate_limiter),
             max_retries,
+            headers,
         }
     }
 
@@ -402,6 +433,13 @@ impl RpcClient {
         .await?;
         let status = response.status();
         let response_body: Value = response.json().await?;
+        if std::env::var("SCE_DEBUG_RPC").is_ok() {
+            debug!(
+                method,
+                response = %serde_json::to_string(&response_body).unwrap_or_default(),
+                "RPC response"
+            );
+        }
 
         if let Some(error) = response_body.get("error") {
             let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
@@ -410,7 +448,7 @@ impl RpcClient {
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown error")
                 .to_string();
-            debug!(method, code, message, "RPC error response");
+            debug!(method, code, message, "RPC error");
             return Err(AppError::Rpc {
                 status: code,
                 message,
@@ -422,12 +460,6 @@ impl RpcClient {
             message: "response missing 'result' field".to_string(),
         })?;
 
-        debug!(
-            method,
-            status = %status,
-            result = %serde_json::to_string(result).unwrap_or_default(),
-            "RPC response received"
-        );
         trace!(method, "RPC call succeeded");
         Ok(result.clone())
     }
@@ -453,6 +485,41 @@ fn build_rate_limiter(rps: u64) -> Option<Arc<governor::DefaultDirectRateLimiter
 fn deserialize_result<T: serde::de::DeserializeOwned>(value: Value) -> AppResult<T> {
     serde_json::from_value(value)
         .map_err(|e| AppError::General(format!("failed to deserialize RPC response: {e}")))
+}
+
+/// Parse a `"Key: Value"` string into an HTTP header name and value.
+///
+/// Returns an error if the format is invalid (missing colon, empty key,
+/// or non-ASCII characters in the header name).
+fn parse_header(raw: &str) -> Result<(HeaderName, HeaderValue), String> {
+    let colon_pos = raw.find(':').ok_or("missing ':' separator")?;
+    let name_str = raw[..colon_pos].trim();
+    let value_str = raw[colon_pos + 1..].trim();
+
+    if name_str.is_empty() {
+        return Err("empty header name".to_string());
+    }
+
+    let name = HeaderName::from_bytes(name_str.as_bytes())
+        .map_err(|e| format!("invalid header name: {e}"))?;
+    let value = HeaderValue::from_str(value_str)
+        .map_err(|e| format!("invalid header value: {e}"))?;
+
+    Ok((name, value))
+}
+
+/// Parse a list of `"Key: Value"` strings into a [`HeaderMap`], skipping any
+/// entry that cannot be parsed or that has an empty value.
+fn parse_headers(raw_headers: &[String]) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for raw in raw_headers {
+        if let Ok((name, value)) = parse_header(raw) {
+            if !value.as_bytes().is_empty() {
+                headers.insert(name, value);
+            }
+        }
+    }
+    headers
 }
 
 #[cfg(test)]
@@ -935,41 +1002,6 @@ mod tests {
             "ws://localhost:8000/ws"
         );
     }
-}
-
-/// Parse a `"Key: Value"` string into an HTTP header name and value.
-///
-/// Returns an error if the format is invalid (missing colon, empty key,
-/// or non-ASCII characters in the header name).
-fn parse_header(raw: &str) -> Result<(HeaderName, HeaderValue), String> {
-    let colon_pos = raw.find(':').ok_or("missing ':' separator")?;
-    let name_str = raw[..colon_pos].trim();
-    let value_str = raw[colon_pos + 1..].trim();
-
-    if name_str.is_empty() {
-        return Err("empty header name".to_string());
-    }
-
-    let name = HeaderName::from_bytes(name_str.as_bytes())
-        .map_err(|e| format!("invalid header name: {e}"))?;
-    let value = HeaderValue::from_str(value_str)
-        .map_err(|e| format!("invalid header value: {e}"))?;
-
-    Ok((name, value))
-}
-
-/// Parse a list of `"Key: Value"` strings into a [`HeaderMap`], skipping any
-/// entry that cannot be parsed or that has an empty value.
-fn parse_headers(raw_headers: &[String]) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    for raw in raw_headers {
-        if let Ok((name, value)) = parse_header(raw) {
-            if !value.as_bytes().is_empty() {
-                headers.insert(name, value);
-            }
-        }
-    }
-    headers
 }
 
 #[cfg(test)]
