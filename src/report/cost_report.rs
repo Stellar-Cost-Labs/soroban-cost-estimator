@@ -78,7 +78,10 @@ pub fn build_chart_entries(
     if non_refundable > 0 {
         let bar = render_bar(non_refundable, max_stroops);
         let pct = if has_total {
-            format!(" ({:.1}%)", non_refundable as f64 / total_stroops as f64 * 100.0)
+            format!(
+                " ({:.1}%)",
+                non_refundable as f64 / total_stroops as f64 * 100.0
+            )
         } else {
             String::new()
         };
@@ -93,7 +96,10 @@ pub fn build_chart_entries(
     if refundable > 0 {
         let bar = render_bar(refundable, max_stroops);
         let pct = if has_total {
-            format!(" ({:.1}%)", refundable as f64 / total_stroops as f64 * 100.0)
+            format!(
+                " ({:.1}%)",
+                refundable as f64 / total_stroops as f64 * 100.0
+            )
         } else {
             String::new()
         };
@@ -145,7 +151,11 @@ fn render_bar(value: i64, max: i64) -> String {
     }
     let filled = ((value as f64 / max as f64) * CHART_BAR_WIDTH as f64).round() as usize;
     let filled = filled.min(CHART_BAR_WIDTH);
-    format!("{}{}", "#".repeat(filled), " ".repeat(CHART_BAR_WIDTH - filled))
+    format!(
+        "{}{}",
+        "#".repeat(filled),
+        " ".repeat(CHART_BAR_WIDTH - filled)
+    )
 }
 
 /// Format a stroops value with right-alignment for column display.

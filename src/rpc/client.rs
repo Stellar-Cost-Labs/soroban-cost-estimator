@@ -200,7 +200,14 @@ impl RpcClient {
     /// the default request timeout and the default retry policy. Entries
     /// that cannot be parsed (or that carry an empty value) are skipped.
     pub fn with_headers(url: &str, headers: &[String]) -> Self {
-        Self::with_fallback_headers(url, None, None, DEFAULT_TIMEOUT, DEFAULT_MAX_RETRIES, headers)
+        Self::with_fallback_headers(
+            url,
+            None,
+            None,
+            DEFAULT_TIMEOUT,
+            DEFAULT_MAX_RETRIES,
+            headers,
+        )
     }
 
     /// Create a new RPC client with an optional fallback URL, optional rate
@@ -502,8 +509,8 @@ fn parse_header(raw: &str) -> Result<(HeaderName, HeaderValue), String> {
 
     let name = HeaderName::from_bytes(name_str.as_bytes())
         .map_err(|e| format!("invalid header name: {e}"))?;
-    let value = HeaderValue::from_str(value_str)
-        .map_err(|e| format!("invalid header value: {e}"))?;
+    let value =
+        HeaderValue::from_str(value_str).map_err(|e| format!("invalid header value: {e}"))?;
 
     Ok((name, value))
 }
@@ -1067,7 +1074,8 @@ mod header_tests {
             "secret"
         );
         assert_eq!(
-            client.headers
+            client
+                .headers
                 .get("authorization")
                 .unwrap()
                 .to_str()
