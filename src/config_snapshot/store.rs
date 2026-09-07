@@ -17,13 +17,6 @@ fn snapshots_dir() -> AppResult<PathBuf> {
     Ok(dir)
 }
 
-/// Returns the cache directory, creating it if needed.
-pub fn cache_dir() -> AppResult<PathBuf> {
-    let dir = data_dir()?.join("cache");
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
 /// Saves a config snapshot to disk as a JSON file.
 ///
 /// The filename is `{network}-{timestamp}.json` within the snapshots directory,
@@ -102,32 +95,13 @@ pub fn load_snapshot_from_path(path: &str) -> AppResult<ConfigSnapshot> {
     Ok(snapshot)
 }
 
-/// Exports a snapshot to an explicit JSON file after validating its contents.
-///
-/// This is intentionally an ordinary pretty-printed JSON copy so snapshots
-/// can be shared between machines without a custom archive format.
-pub fn export_snapshot(snapshot_path: &str, out_path: &str) -> AppResult<PathBuf> {
-    let snapshot = load_snapshot_from_path(snapshot_path)?;
-    save_snapshot(&snapshot, Some(out_path))
-}
-
-/// Imports and validates a snapshot into the local snapshots directory.
-///
-/// The imported file receives the same network/timestamp-based filename as a
-/// locally-created snapshot, avoiding collisions with unrelated filenames.
-pub fn import_snapshot(path: &str) -> AppResult<PathBuf> {
-    let snapshot = load_snapshot_from_path(path)?;
-    save_snapshot(&snapshot, None)
-}
-
-/// Lists all available snapshots for a given network.
+/// Lists all snapshots for a given network.
 ///
 /// # Network calls
 /// None — pure file I/O.
 pub fn list_snapshots(network: &str) -> AppResult<Vec<PathBuf>> {
     let dir = snapshots_dir()?;
     let mut snapshots = Vec::new();
-
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
         let name = entry.file_name();
