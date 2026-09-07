@@ -184,6 +184,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cmd_estimate_all(
                 &wasm,
                 &network,
+                rpc_url.as_deref(),
                 fallback,
                 id.as_deref(),
                 &format,
@@ -213,12 +214,14 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 network,
                 against,
                 summary,
+                json,
             } => {
                 cmd_config_diff(
                     &network,
                     fallback,
                     against.as_deref(),
                     summary,
+                    json,
                     rps,
                     timeout,
                     max_retries,
@@ -625,6 +628,7 @@ fn csv_row(r: &EstimateAllResult) -> String {
 async fn cmd_estimate_all(
     wasm_path: &str,
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     contract_id: Option<&str>,
     format: &str,
@@ -677,7 +681,7 @@ async fn cmd_estimate_all(
             }
         }
 
-        let endpoint = rpc::client::resolve_endpoint(network, None)?;
+        let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
         let client = rpc::client::RpcClient::with_fallback(
             &endpoint,
             rpc_fallback_url,
@@ -1704,6 +1708,7 @@ async fn cmd_cache_warm(
     cmd_estimate_all(
         wasm_path,
         network,
+        None,
         rpc_fallback_url,
         contract_id,
         fmt,
