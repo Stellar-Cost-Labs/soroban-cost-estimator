@@ -1,4 +1,5 @@
 use comfy_table::Table;
+use std::fmt;
 
 use crate::report::fee_calc::{FeeBreakdown, FeeRates};
 
@@ -161,6 +162,12 @@ pub fn format_suggestions(suggestions: &[OptimizationSuggestion]) -> String {
         }
     }
     out
+}
+
+impl fmt::Display for CostReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&format_report_table(self))
+    }
 }
 
 /// Formats a cost report as a human-readable table.

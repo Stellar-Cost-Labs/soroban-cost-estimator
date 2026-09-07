@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 use crate::error::{AppError, AppResult};
 
@@ -27,6 +28,19 @@ pub struct FeeBreakdown {
     pub total_xlm: String,
 }
 
+impl fmt::Display for FeeBreakdown {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Non-refundable: {} stroops\nRefundable: {} stroops\nTotal: {} stroops ({})",
+            self.non_refundable_stroops,
+            self.refundable_stroops,
+            self.total_stroops,
+            self.total_xlm
+        )
+    }
+}
+
 /// Fee rates sourced from the network's `ConfigSettingContract*` entries.
 ///
 /// All rates are raw config values: stroops per 10,000 instructions
@@ -45,6 +59,20 @@ pub struct FeeRates {
     pub fee_per_read_1kb: i64,
     /// Stroops per 1KB of transaction size.
     pub fee_per_1kb: i64,
+}
+
+impl fmt::Display for FeeRates {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "CPU: {} stroops/10k, read: {} stroops/entry, write: {} stroops/entry, read bytes: {} stroops/KB, transaction: {} stroops/KB",
+            self.fee_per_10k_insns,
+            self.fee_per_read_entry,
+            self.fee_per_write_entry,
+            self.fee_per_read_1kb,
+            self.fee_per_1kb
+        )
+    }
 }
 
 /// Compute the fee breakdown from a simulation result.
