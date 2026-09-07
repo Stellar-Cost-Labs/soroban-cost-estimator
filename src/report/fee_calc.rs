@@ -190,6 +190,35 @@ pub fn stroops_to_xlm(stroops: i64, precision: u32) -> String {
     format!("{sign}{whole_part}.{frac_part:0width$}")
 }
 
+/// Parse an XLM string to stroops (i64).
+pub fn xlm_to_stroops(xlm: &str) -> AppResult<i64> {
+    let parts: Vec<&str> = xlm.split('.').collect();
+    match parts.len() {
+        1 => {
+            let whole: i64 = parts[0]
+                .parse()
+                .map_err(|_| AppError::FeeCalc(format!("invalid XLM value: {xlm}")))?;
+            whole
+                .checked_mul(10_000_000)
+                .ok_or_else(|| AppError::FeeCalc("XLM value overflow".to_string()))
+        }
+        2 => {
+            let whole: i64 = parts[0]
+                .parse()
+                .map_err(|_| AppError::FeeCalc(format!("invalid XLM value: {xlm}")))?;
+            let fraction_str = format!("{:0<7}", parts[1]);
+            let fraction: i64 = fraction_str[..7.min(fraction_str.len())]
+                .parse()
+                .map_err(|_| AppError::FeeCalc(format!("invalid XLM value: {xlm}")))?;
+            whole
+                .checked_mul(10_000_000)
+                .and_then(|w| w.checked_add(fraction))
+                .ok_or_else(|| AppError::FeeCalc("XLM value overflow".to_string()))
+        }
+        _ => Err(AppError::FeeCalc(format!("invalid XLM value: {xlm}"))),
+    }
+}
+
 /// Min/max/average fee summary across a set of estimates.
 ///
 /// All values are in stroops. The average uses integer division — stroops
@@ -239,8 +268,6 @@ pub fn fee_range(fees: &[i64]) -> Option<FeeRange> {
         avg_stroops,
     })
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -371,8 +398,6 @@ mod tests {
         // Negative values keep their sign.
         assert_eq!(stroops_to_xlm(-1_234_567, 3), "-0.123");
     }
-
-
 
     #[test]
     fn test_compute_fee_breakdown() {

@@ -17,8 +17,6 @@ fn snapshots_dir() -> AppResult<PathBuf> {
     Ok(dir)
 }
 
-
-
 /// Saves a config snapshot to disk as a JSON file.
 ///
 /// The filename is `{network}-{timestamp}.json` within the snapshots directory,
