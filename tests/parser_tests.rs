@@ -232,3 +232,149 @@ fn test_validate_arg_value_bytes_n() {
         "2-byte type needs 2 bytes"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// contractmeta custom-section parsing helpers
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Encodes an XDR string: 4-byte big-endian length + UTF-8 bytes, padded to a
+/// 4-byte boundary (XDR strings are padded, `pad_len` in stellar-xdr).
+fn xdr_string(s: &str) -> Vec<u8> {
+    let mut out = (s.len() as u32).to_be_bytes().to_vec();
+    out.extend_from_slice(s.as_bytes());
+    let padding = (4 - s.len() % 4) % 4;
+    out.extend_from_slice(&[0u8; 4][..padding]);
+    out
+}
+
+/// Encodes one `ScMetaEntry::ScMetaV0` union value: 4-byte discriminant 0,
+/// then the `{ key, val }` XDR struct.
+fn xdr_meta_entry(key: &str, val: &str) -> Vec<u8> {
+    let mut out = 0u32.to_be_bytes().to_vec();
+    out.extend_from_slice(&xdr_string(key));
+    out.extend_from_slice(&xdr_string(val));
+    out
+}
+
+/// Wraps `payload` in a WASM custom section (id 0) named `name`.
+/// Short ASCII names only (a single length byte).
+fn custom_section(name: &str, payload: &[u8]) -> Vec<u8> {
+    let mut content = Vec::new();
+    content.push(name.len() as u8);
+    content.extend_from_slice(name.as_bytes());
+    content.extend_from_slice(payload);
+
+    let mut section = vec![0u8]; // custom section id
+    let mut size = content.len() as u32;
+    loop {
+        let mut byte = (size & 0x7f) as u8;
+        size >>= 7;
+        if size != 0 {
+            byte |= 0x80;
+        }
+        section.push(byte);
+        if size == 0 {
+            break;
+        }
+    }
+    section.extend_from_slice(&content);
+    section
+}
+
+/// The bare fixture extended with a `contractmetav0` section carrying
+/// name/version/description plus one custom key.
+fn wasm_with_contract_meta() -> Vec<u8> {
+    let mut bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&xdr_meta_entry("name", "MetaContract"));
+    payload.extend_from_slice(&xdr_meta_entry("version", "9.9.9"));
+    payload.extend_from_slice(&xdr_meta_entry("description", "A meta description"));
+    payload.extend_from_slice(&xdr_meta_entry("custom_key", "custom_value"));
+    bytes.extend_from_slice(&custom_section("contractmetav0", &payload));
+    bytes
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// contractmeta custom-section parsing
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_parse_contract_meta_extracts_name_version_description() {
+    let bytes = wasm_with_contract_meta();
+    let meta = soroban_cost_estimator::wasm::parser::parse_contract_meta(&bytes)
+        .expect("meta should parse");
+
+    assert_eq!(meta.name.as_deref(), Some("MetaContract"));
+    assert_eq!(meta.version.as_deref(), Some("9.9.9"));
+    assert_eq!(meta.description.as_deref(), Some("A meta description"));
+    assert_eq!(meta.entries.len(), 4);
+    assert!(
+        meta.entries
+            .contains(&("custom_key".to_string(), "custom_value".to_string()))
+    );
+}
+
+#[test]
+fn test_load_wasm_populates_contract_meta() {
+    let bytes = wasm_with_contract_meta();
+    let temp = std::env::temp_dir().join(format!("sce-meta-{}.wasm", std::process::id()));
+    std::fs::write(&temp, &bytes).expect("write fixture");
+
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(&temp)
+        .expect("wasm with appended custom section should load");
+    assert_eq!(
+        wasm_info.contract_meta.name.as_deref(),
+        Some("MetaContract")
+    );
+    assert_eq!(wasm_info.contract_meta.version.as_deref(), Some("9.9.9"));
+
+    let formatted =
+        soroban_cost_estimator::wasm::parser::format_contract_meta(&wasm_info.contract_meta);
+    assert!(formatted.contains("Contract meta: present"));
+    assert!(formatted.contains("name: MetaContract"));
+    assert!(formatted.contains("version: 9.9.9"));
+    assert!(formatted.contains("description: A meta description"));
+    assert!(formatted.contains("custom_key: custom_value"));
+
+    let _ = std::fs::remove_file(&temp);
+}
+
+#[test]
+fn test_parse_contract_meta_absent_without_section() {
+    let bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
+    let meta = soroban_cost_estimator::wasm::parser::parse_contract_meta(&bytes)
+        .expect("absent section is not an error");
+    assert!(meta.is_empty());
+    assert_eq!(
+        soroban_cost_estimator::wasm::parser::format_contract_meta(&meta),
+        "Contract meta: absent"
+    );
+}
+
+/// The soroban-sdk-built fixture carries a real `contractmetav0` section with
+/// build metadata (rustc / sdk versions); the parser must surface it.
+#[test]
+fn test_parse_contract_meta_real_fixture() {
+    let path = Path::new("tests/fixtures/contract.wasm");
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(path)
+        .expect("failed to load contract fixture");
+
+    let meta = &wasm_info.contract_meta;
+    assert!(
+        !meta.is_empty(),
+        "soroban-sdk-built fixture should carry a contractmeta section"
+    );
+    assert!(
+        meta.entries.iter().any(|(k, _)| k == "rsver"),
+        "fixture meta should include the rustc version entry"
+    );
+    assert!(
+        meta.entries.iter().any(|(k, _)| k == "rssdkver"),
+        "fixture meta should include the sdk version entry"
+    );
+
+    let formatted = soroban_cost_estimator::wasm::parser::format_contract_meta(meta);
+    assert!(formatted.contains("Contract meta: present"));
+    assert!(formatted.contains("rsver:"));
+    assert!(formatted.contains("rssdkver:"));
+}

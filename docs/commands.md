@@ -344,6 +344,7 @@ soroban-cost-estimator config diff [OPTIONS]
 |------|----------|---------|-------------|
 | `--network <NETWORK>` | | `testnet` | Network to compare against |
 | `--against <AGAINST>` | | latest snapshot | Explicit snapshot path to compare against |
+| `--summary` | | `false` | Print a single-line count summary instead of the full diff (for CI status lines) |
 | `--help` `-h` | | | Print help |
 
 **Behavior**
@@ -661,6 +662,8 @@ All commands accept:
 
 | Flag | Description |
 |------|-------------|
+| `--rps <N>` | Cap RPC requests at N per second (0 disables) |
+| `--timeout <SECS>` | HTTP request timeout for RPC calls in seconds (default `30`) |
 | `--help` / `-h` | Print command-specific help |
 
 ## Network Resolution
