@@ -148,6 +148,11 @@ pub enum Command {
         /// Network to watch.
         #[arg(long, default_value = "testnet")]
         network: String,
+
+        /// Explicit RPC URL (overrides network-based resolution).
+        #[arg(long)]
+        rpc_url: Option<String>,
+
         /// Polling interval (e.g. "30m", "1h").
         #[arg(long, default_value = "1h")]
         interval: String,
@@ -229,6 +234,10 @@ pub enum ConfigAction {
         #[arg(long, default_value = "testnet")]
         network: String,
 
+        /// Explicit RPC URL (overrides network-based resolution).
+        #[arg(long)]
+        rpc_url: Option<String>,
+
         /// Explicit output path (defaults to ~/.soroban-cost-estimator/snapshots/).
         #[arg(long)]
         out: Option<String>,
@@ -250,6 +259,10 @@ pub enum ConfigAction {
         /// Network to compare against.
         #[arg(long, default_value = "testnet")]
         network: String,
+
+        /// Explicit RPC URL (overrides network-based resolution).
+        #[arg(long)]
+        rpc_url: Option<String>,
 
         /// Explicit snapshot path to compare against (defaults to latest).
         #[arg(long)]
