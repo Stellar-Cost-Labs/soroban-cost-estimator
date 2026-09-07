@@ -92,6 +92,10 @@ fn test_help_output() {
     assert!(stdout.contains("config"), "help should list config command");
     assert!(stdout.contains("cache"), "help should list cache command");
     assert!(stdout.contains("watch"), "help should list watch command");
+    assert!(
+        stdout.contains("--rpc-fallback-url"),
+        "help should list --rpc-fallback-url flag"
+    );
 }
 
 #[test]
@@ -123,6 +127,7 @@ fn test_estimate_help() {
         "--id",
         "--arg",
         "--cache-ttl",
+        "--clear-cache",
         "--json",
     ] {
         assert!(
@@ -139,7 +144,7 @@ fn test_estimate_all_help() {
         code, 0,
         "estimate-all --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--wasm", "--network", "--id", "--json"] {
+    for flag in ["--wasm", "--network", "--id", "--json", "--format"] {
         assert!(
             stdout.contains(flag),
             "estimate-all help should mention {flag}; got: {stdout}"
@@ -217,6 +222,7 @@ fn test_cache_help() {
     assert_eq!(code, 0, "cache --help should exit 0; stderr: {stderr}");
     assert!(stdout.contains("verify"), "cache help should list verify");
     assert!(stdout.contains("query"), "cache help should list query");
+    assert!(stdout.contains("clear"), "cache help should list clear");
 }
 
 #[test]
@@ -300,6 +306,24 @@ fn test_unknown_flag_errors() {
 fn test_estimate_all_missing_wasm_errors() {
     let (_, _stderr, code) = run_cli(&["estimate-all"]);
     assert_ne!(code, 0, "estimate-all without --wasm should error");
+}
+
+#[test]
+fn test_rpc_fallback_url_flag_accepted() {
+    // Verify --rpc-fallback-url is accepted as a global argument.
+    let (_, stderr, code) = run_cli(&[
+        "--rpc-fallback-url",
+        "http://127.0.0.1:9999",
+        "estimate",
+        "--wasm",
+        "test.wasm",
+    ]);
+    // Should fail because file doesn't exist, NOT because --rpc-fallback-url is unknown.
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unrecognized"),
+        "--rpc-fallback-url should be recognized; stderr: {stderr}"
+    );
 }
 
 #[test]
@@ -419,6 +443,49 @@ fn test_help_lists_global_flags() {
     assert!(
         stdout.contains("--rps"),
         "help should list --rps; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_estimate_all_format_flag_accepted() {
+    // Verify --format is a recognized argument for estimate-all.
+    let (_, stderr, code) = run_cli(&["estimate-all", "--wasm", "test.wasm", "--format", "csv"]);
+    // Should fail because the file doesn't exist, NOT because --format is unknown.
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--format should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_all_format_wins_over_json() {
+    // --format should take precedence over the legacy --json flag.
+    // Both flags are accepted; the combination fails only because
+    // test.wasm doesn't exist, NOT because of an argument conflict.
+    let (_, stderr, code) = run_cli(&[
+        "estimate-all",
+        "--wasm",
+        "test.wasm",
+        "--format",
+        "csv",
+        "--json",
+    ]);
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("cannot") && !stderr.contains("conflicts"),
+        "--format and --json should NOT conflict; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_all_format_invalid_value_rejected() {
+    // clap's value_parser must reject unknown formats before the command runs.
+    let (_, stderr, code) = run_cli(&["estimate-all", "--wasm", "test.wasm", "--format", "xml"]);
+    assert_ne!(code, 0, "invalid --format value should error");
+    assert!(
+        stderr.contains("invalid value") || stderr.contains("possible values"),
+        "clap should reject unknown format; stderr: {stderr}"
     );
 }
 
@@ -569,6 +636,16 @@ fn test_estimate_rpc_url_overrides_unknown_network() {
 /// (empty for no args). The entry is written directly into the SQLite cache
 /// database so the `estimate` command's cache-hit path can find it.
 fn seed_cache_entry(home: &Path, timestamp: &str) {
+    seed_cache_entry_for(home, "testnet", "(wasm upload)", 42, timestamp);
+}
+
+/// Seed a cache entry on the given network/function, in `home`.
+///
+/// A thin generalization of [`seed_cache_entry`] so tests can populate more
+/// than one network (or several functions) and exercise per-network
+/// cache-clear isolation. The row targets `tests/fixtures/minimal.wasm` with
+/// no args, exactly like [`seed_cache_entry`].
+fn seed_cache_entry_for(home: &Path, network: &str, function: &str, ledger: i64, timestamp: &str) {
     let wasm_bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
     let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_bytes));
     let args_hash = hex::encode(sha2::Sha256::digest(b""));
@@ -588,10 +665,10 @@ fn seed_cache_entry(home: &Path, timestamp: &str) {
         rusqlite::params![
             1i64,
             wasm_hash,
-            "(wasm upload)",
+            function,
             args_hash,
-            "testnet",
-            42i64,
+            network,
+            ledger,
             1_000i64,
             500i64,
             250i64,
@@ -1187,4 +1264,393 @@ fn test_cache_query_json_flag_accepted() {
         serde_json::from_str::<serde_json::Value>(trimmed).is_ok(),
         "output should be valid JSON; got: {stdout}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `cache clear` / `estimate --clear-cache` (Issue #24)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_cache_clear_help() {
+    let (stdout, stderr, code) = run_cli(&["cache", "clear", "--help"]);
+    assert_eq!(
+        code, 0,
+        "cache clear --help should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("--network"),
+        "cache clear help should mention --network; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_clear_on_empty_cache_succeeds() {
+    // Default network is testnet; a pristine cache reports zero cleared.
+    let home = temp_home("cache-clear-empty");
+    let (stdout, stderr, code) = run_cli_in_home(&["cache", "clear"], Some(&home));
+    assert_eq!(
+        code, 0,
+        "cache clear on empty cache should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Cleared 0 cached estimate(s) for testnet."),
+        "should report zero cleared for testnet; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_clear_removes_only_requested_network() {
+    let home = temp_home("cache-clear-network");
+    let now = chrono::Utc::now().to_rfc3339();
+    // Distinct function names per row: the cache key is (wasm_hash, function,
+    // args_hash) and does not include the network, so reusing "(wasm upload)"
+    // on mainnet would overwrite the testnet row.
+    seed_cache_entry_for(&home, "testnet", "(wasm upload)", 42, &now);
+    seed_cache_entry_for(&home, "testnet", "increment", 42, &now);
+    seed_cache_entry_for(&home, "mainnet", "mainnet_fn", 77, &now);
+
+    // Default `cache clear` targets testnet only.
+    let (stdout, stderr, code) = run_cli_in_home(&["cache", "clear"], Some(&home));
+    assert_eq!(code, 0, "cache clear should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("Cleared 2 cached estimate(s) for testnet."),
+        "should report both testnet entries cleared; got: {stdout}"
+    );
+
+    // testnet is empty now; mainnet is untouched.
+    let (stdout, _, code) =
+        run_cli_in_home(&["cache", "query", "--network", "testnet"], Some(&home));
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("No cached estimates match the query."),
+        "testnet should have no entries left; got: {stdout}"
+    );
+    let (stdout, _, _) = run_cli_in_home(&["cache", "query", "--network", "mainnet"], Some(&home));
+    assert!(
+        !stdout.contains("No cached estimates match the query.") && stdout.contains("mainnet_fn"),
+        "mainnet entry should survive the testnet clear; got: {stdout}"
+    );
+
+    // An explicit --network clears only that network.
+    let (stdout, stderr, code) =
+        run_cli_in_home(&["cache", "clear", "--network", "mainnet"], Some(&home));
+    assert_eq!(
+        code, 0,
+        "cache clear mainnet should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Cleared 1 cached estimate(s) for mainnet."),
+        "should report the mainnet entry cleared; got: {stdout}"
+    );
+    let (stdout, _, _) = run_cli_in_home(&["cache", "query", "--network", "mainnet"], Some(&home));
+    assert!(
+        stdout.contains("No cached estimates match the query."),
+        "mainnet should be empty after its own clear; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_estimate_clear_cache_flag_accepted() {
+    // --clear-cache must be a recognized estimate flag (the run fails on the
+    // missing WASM file, not on the argument).
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--clear-cache"]);
+    assert_ne!(code, 0, "missing WASM file should still error");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--clear-cache should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_clear_cache_wipes_network_before_simulation() {
+    // A fresh testnet entry plus --cache-ttl would otherwise short-circuit on
+    // a cache hit. With --clear-cache the entry is wiped first, so the run
+    // falls through to the (dead) RPC endpoint — proving the clear ran before
+    // the simulation. The mainnet entry must survive untouched.
+    let home = temp_home("estimate-clear-cache");
+    let now = chrono::Utc::now().to_rfc3339();
+    // The testnet row must use the exact key `estimate` looks up for
+    // minimal.wasm (function "(wasm upload)", no args); the mainnet row uses
+    // a distinct function name so the two networks' rows coexist.
+    seed_cache_entry_for(&home, "testnet", "(wasm upload)", 42, &now);
+    seed_cache_entry_for(&home, "mainnet", "mainnet_fn", 77, &now);
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--cache-ttl",
+            "1h",
+            "--clear-cache",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            DEAD_RPC,
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 1,
+        "cleared cache should fall through to the dead RPC endpoint; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Cleared 1 cached estimate(s) for testnet."),
+        "stdout should announce the clear; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Cache hit"),
+        "--clear-cache must prevent a cache hit; got: {stdout}"
+    );
+
+    // testnet is empty; mainnet is untouched.
+    let (stdout, _, _) = run_cli_in_home(&["cache", "query", "--network", "testnet"], Some(&home));
+    assert!(
+        stdout.contains("No cached estimates match the query."),
+        "testnet should have no entries left; got: {stdout}"
+    );
+    let (stdout, _, _) = run_cli_in_home(&["cache", "query", "--network", "mainnet"], Some(&home));
+    assert!(
+        stdout.contains("mainnet_fn"),
+        "mainnet entries should survive the testnet clear; got: {stdout}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Simulation footprint metrics tests (Issue #2)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Spawns a lightweight local HTTP mock JSON-RPC server on loopback to test
+/// simulation response parsing end-to-end without touching external networks.
+fn start_mock_rpc_server(
+    live_tx_data: &'static str,
+    min_fee: &'static str,
+    ledger: u64,
+) -> (String, std::sync::mpsc::Sender<()>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+    let addr = listener.local_addr().expect("local addr");
+    let (tx_stop, rx_stop) = std::sync::mpsc::channel::<()>();
+
+    let live_tx_data = live_tx_data.to_string();
+    let min_fee = min_fee.to_string();
+
+    std::thread::spawn(move || {
+        listener.set_nonblocking(true).expect("set nonblocking");
+        loop {
+            if rx_stop.try_recv().is_ok() {
+                break;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buf = [0u8; 4096];
+                    let mut req_str = String::new();
+                    loop {
+                        match stream.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                req_str.push_str(&String::from_utf8_lossy(&buf[..n]));
+                                if req_str.contains("\r\n\r\n") {
+                                    if let Some(pos) = req_str.find("Content-Length: ") {
+                                        let cl_str = &req_str[pos + 16..];
+                                        let end = cl_str.find("\r\n").unwrap_or(cl_str.len());
+                                        if let Ok(cl) = cl_str[..end].trim().parse::<usize>() {
+                                            let body_start = req_str.find("\r\n\r\n").unwrap() + 4;
+                                            if req_str.len() - body_start >= cl {
+                                                break;
+                                            }
+                                        } else {
+                                            break;
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+
+                    let resp_body = if req_str.contains("simulateTransaction") {
+                        if live_tx_data.is_empty() {
+                            format!(
+                                r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":"{ledger}","minResourceFee":"{min_fee}"}}}}"#
+                            )
+                        } else {
+                            format!(
+                                r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":"{ledger}","minResourceFee":"{min_fee}","transactionData":"{live_tx_data}"}}}}"#
+                            )
+                        }
+                    } else if req_str.contains("getHealth") {
+                        format!(
+                            r#"{{"jsonrpc":"2.0","id":1,"result":{{"status":"healthy","latestLedger":{ledger}}}}}"#
+                        )
+                    } else if req_str.contains("getLedgerEntries") {
+                        format!(
+                            r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":{ledger},"entries":[]}}}}"#
+                        )
+                    } else {
+                        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#.to_string()
+                    };
+
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        resp_body.len(),
+                        resp_body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    (format!("http://127.0.0.1:{}", addr.port()), tx_stop)
+}
+
+const LIVE_INCREMENT_TX_DATA: &str = "AAAAAAAAAAEAAAAH6hS8qZjpjw3bM46OXO9uGfBzeKO3HotPiGjO3IV+Ts0AAAABAAAABgAAAAEmU1Fc+h02S4iEBnpjdCESXpKHG/bOUxC3DeRWUy9+mQAAABQAAAABAAggFgAAAAAAAACIAAAAAAAAPEM=";
+
+#[test]
+fn test_estimate_fn_contract_fixture_populates_footprint_json() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-footprint-json");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+            "--json",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate should succeed; stderr: {stderr}"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+
+    // Footprint metrics verification (Acceptance Criteria)
+    assert_eq!(parsed["read_entries"], 1, "expected 1 read entry");
+    assert!(
+        parsed["write_entries"].as_u64().unwrap_or(0) >= 1,
+        "expected write_entries >= 1"
+    );
+    assert_eq!(parsed["write_entries"], 1, "expected 1 write entry");
+    assert_eq!(parsed["read_bytes"], 0, "expected 0 read bytes");
+    assert_eq!(parsed["write_bytes"], 136, "expected 136 write bytes");
+    assert_eq!(parsed["cpu_instructions"], 532_502);
+    assert_eq!(parsed["fee"]["total_stroops"], 15_427);
+}
+
+#[test]
+fn test_estimate_fn_contract_fixture_populates_footprint_table() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-footprint-table");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate should succeed; stderr: {stderr}"
+    );
+
+    // Verify table output contains the same resource metrics
+    assert!(stdout.contains("Read Entries"));
+    assert!(stdout.contains("Write Entries"));
+    assert!(stdout.contains("Read Bytes"));
+    assert!(stdout.contains("Write Bytes"));
+    assert!(
+        stdout.contains("136"),
+        "table should display 136 write bytes"
+    );
+    assert!(
+        stdout.contains("15427"),
+        "table should display total fee 15427"
+    );
+}
+
+#[test]
+fn test_estimate_minimal_wasm_upload_zero_footprint() {
+    // minimal.wasm (upload path, no footprint) still reports zeros without error
+    let (rpc_url, _stop) = start_mock_rpc_server("", "1000", 100);
+    let home = temp_home("estimate-minimal-upload");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--rpc-url",
+            &rpc_url,
+            "--json",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate should succeed; stderr: {stderr}"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+
+    assert_eq!(parsed["read_entries"], 0);
+    assert_eq!(parsed["write_entries"], 0);
+    assert_eq!(parsed["read_bytes"], 0);
+    assert_eq!(parsed["write_bytes"], 0);
 }

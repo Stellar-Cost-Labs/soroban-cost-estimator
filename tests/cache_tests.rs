@@ -943,6 +943,71 @@ fn current_schema_version() -> u32 {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// clear_cache (issue #24)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// `clear_cache` deletes every entry recorded for the requested network and
+/// returns the number of rows removed, leaving other networks untouched.
+#[test]
+fn test_clear_cache_removes_requested_network_only() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true)
+            .expect("save testnet f1");
+        cache::save_estimate("h2", "f2", &[], "testnet", 2, 200, 20, 10, None, true)
+            .expect("save testnet f2");
+        cache::save_estimate("h3", "f3", &[], "mainnet", 3, 300, 30, 15, None, true)
+            .expect("save mainnet f3");
+
+        let removed = cache::clear_cache("testnet").expect("clear testnet");
+        assert_eq!(
+            removed, 2,
+            "clearing testnet should delete its two entries, got {removed}"
+        );
+
+        let testnet = cache::list_cached_estimates("testnet").expect("list testnet");
+        assert!(testnet.is_empty(), "testnet should be empty after clearing");
+        let mainnet = cache::list_cached_estimates("mainnet").expect("list mainnet");
+        assert_eq!(mainnet.len(), 1, "mainnet entries must be untouched");
+        assert_eq!(mainnet[0].function, "f3");
+        assert_eq!(mainnet[0].network, "mainnet");
+
+        // A second clear on the already-empty network deletes nothing.
+        let removed = cache::clear_cache("testnet").expect("clear testnet again");
+        assert_eq!(removed, 0, "second clear should delete nothing");
+    });
+}
+
+/// Clearing a network with no entries (or a brand-new cache) is a no-op that
+/// reports zero and does not error.
+#[test]
+fn test_clear_cache_on_empty_cache_returns_zero() {
+    with_temp_home(|_tmp| {
+        let removed = cache::clear_cache("futurenet").expect("clear empty cache");
+        assert_eq!(removed, 0, "an empty cache should report zero cleared");
+    });
+}
+
+/// Clearing one network must never leak into a different network's entries.
+#[test]
+fn test_clear_cache_never_touches_other_networks() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("hA", "fA", &[], "testnet", 1, 100, 10, 5, None, true)
+            .expect("save testnet");
+        cache::save_estimate("hB", "fB", &[], "mainnet", 2, 200, 20, 10, None, true)
+            .expect("save mainnet");
+        cache::save_estimate("hC", "fC", &[], "futurenet", 3, 300, 30, 15, None, true)
+            .expect("save futurenet");
+
+        let removed = cache::clear_cache("mainnet").expect("clear mainnet");
+        assert_eq!(removed, 1, "only the mainnet entry should be deleted");
+
+        assert_eq!(cache::list_cached_estimates("testnet").unwrap().len(), 1);
+        assert_eq!(cache::list_cached_estimates("mainnet").unwrap().len(), 0);
+        assert_eq!(cache::list_cached_estimates("futurenet").unwrap().len(), 1);
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Schema versioning & migration
 // ─────────────────────────────────────────────────────────────────────────
 
