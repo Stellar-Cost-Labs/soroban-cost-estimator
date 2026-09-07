@@ -213,17 +213,28 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 rpc_url,
                 against,
                 summary,
+                watch,
             } => {
-                cmd_config_diff(
-                    &network,
-                    fallback,
-                    against.as_deref(),
-                    summary,
-                    rps,
-                    timeout,
-                    max_retries,
-                )
-                .await
+                if watch {
+                    cmd_config_diff_once(
+                        &network,
+                        against.as_deref(),
+                        rpc_url.as_deref(),
+                        rps,
+                    )
+                    .await
+                } else {
+                    cmd_config_diff(
+                        &network,
+                        fallback,
+                        against.as_deref(),
+                        summary,
+                        rps,
+                        timeout,
+                        max_retries,
+                    )
+                    .await
+                }
             }
             cli::ConfigAction::History { network } => cmd_config_history(&network),
             cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network),
