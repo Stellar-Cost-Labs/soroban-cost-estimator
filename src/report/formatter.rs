@@ -94,6 +94,13 @@ impl ReportFormatter for TableFormatter {
             report.fee.total_stroops, report.fee.total_xlm,
         ));
 
+        // ASCII bar chart for a quick visual summary of where the fee goes.
+        output.push_str(&crate::report::cost_report::format_cost_breakdown_chart(
+            report.fee.total_stroops,
+            report.fee.non_refundable_stroops,
+            report.fee.refundable_stroops,
+        ));
+
         output.push('\n');
         output.push_str(&crate::report::cost_report::format_suggestions(
             &report.suggest_optimizations(),
@@ -445,14 +452,20 @@ mod tests {
         assert!(output.contains("Fee Breakdown Chart:"));
         assert!(output.contains("Non-refundable"));
         assert!(output.contains("Refundable"));
-        // Bars should contain # characters
-        let lines: Vec<&str> = output.lines().collect();
-        let chart_lines: Vec<&str> = lines
-            .iter()
+        // Only rows after the chart header belong to the chart — the fee
+        // breakdown section above also names both components.
+        let chart_start = output
+            .find("Fee Breakdown Chart:")
+            .expect("table output should contain the fee breakdown chart");
+        let chart_lines: Vec<&str> = output[chart_start..]
+            .lines()
             .filter(|l| l.contains("Non-refundable") || l.contains("Refundable"))
-            .copied()
             .collect();
-        assert_eq!(chart_lines.len(), 2);
+        assert_eq!(
+            chart_lines.len(),
+            2,
+            "chart should render one row per non-zero fee component"
+        );
         for line in &chart_lines {
             assert!(line.contains('#'), "chart line should contain '#': {line}");
         }

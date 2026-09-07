@@ -18,6 +18,16 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "SECS", default_value_t = 30)]
     pub timeout: u64,
 
+    /// Enable debug-level logging, including full RPC request payloads and
+    /// response summaries.
+    #[arg(long, short, global = true)]
+    pub verbose: bool,
+
+    /// Custom HTTP header to send with every RPC request, e.g.
+    /// `--header "X-API-Key: secret"`. Repeatable for multiple headers.
+    #[arg(long = "header", value_name = "KEY: VALUE", global = true)]
+    pub headers: Vec<String>,
+
     #[command(subcommand)]
     pub command: Command,
 }

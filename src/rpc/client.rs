@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use governor::{Quota, RateLimiter};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{debug, trace};
@@ -77,6 +79,8 @@ pub struct RpcClient {
     dedup: Arc<Mutex<DedupState>>,
     /// Fixed-rate limiter shared by every network call, when enabled.
     limiter: Option<Arc<governor::DefaultDirectRateLimiter>>,
+    /// Custom HTTP headers attached to every outbound request.
+    headers: HeaderMap,
 }
 
 impl RpcClient {
@@ -107,7 +111,36 @@ impl RpcClient {
     /// clamped. `timeout` applies to the whole request (connect through
     /// response body) and is passed straight to reqwest.
     pub fn with_options(url: &str, rps: Option<u64>, timeout: Duration) -> Self {
+        Self::with_options_headers(url, rps, timeout, &[])
+    }
+
+    /// Create a new RPC client that attaches custom HTTP headers (each a
+    /// `"Key: Value"` string) to every request, without rate limiting and
+    /// with the default request timeout. Entries that cannot be parsed are
+    /// skipped.
+    pub fn with_headers(url: &str, headers: &[String]) -> Self {
+        Self::with_options_headers(url, None, DEFAULT_TIMEOUT, headers)
+    }
+
+    /// Create a new RPC client pointing at the given URL, optionally capping
+    /// outbound requests to `rps` requests per second, bounding each HTTP
+    /// request with `timeout`, and attaching custom HTTP headers (each a
+    /// `"Key: Value"` string) to every request.
+    ///
+    /// The limiter spaces consecutive outbound calls at least `1/rps` seconds
+    /// apart (a fixed-rate limiter with a burst of 1). `None` or `Some(0)`
+    /// disables rate limiting entirely. Values larger than `u32::MAX` are
+    /// clamped. `timeout` applies to the whole request (connect through
+    /// response body) and is passed straight to reqwest. Headers that cannot
+    /// be parsed (or that carry an empty value) are skipped.
+    pub fn with_options_headers(
+        url: &str,
+        rps: Option<u64>,
+        timeout: Duration,
+        headers: &[String],
+    ) -> Self {
         debug!(url, rps, ?timeout, "creating RPC client");
+        let headers = parse_headers(headers);
         Self {
             url: url.to_string(),
             // `ClientBuilder::build` only fails on invalid configuration (a
@@ -115,10 +148,12 @@ impl RpcClient {
             // construction infallible.
             client: reqwest::Client::builder()
                 .timeout(timeout)
+                .default_headers(headers.clone())
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             dedup: Arc::new(Mutex::new(DedupState::default())),
             limiter: rps.and_then(build_rate_limiter),
+            headers,
         }
     }
 
@@ -620,8 +655,22 @@ fn parse_header(raw: &str) -> Result<(HeaderName, HeaderValue), String> {
     Ok((name, value))
 }
 
+/// Parse a list of `"Key: Value"` strings into a [`HeaderMap`], skipping any
+/// entry that cannot be parsed or that has an empty value.
+fn parse_headers(raw_headers: &[String]) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for raw in raw_headers {
+        if let Ok((name, value)) = parse_header(raw) {
+            if !value.as_bytes().is_empty() {
+                headers.insert(name, value);
+            }
+        }
+    }
+    headers
+}
+
 #[cfg(test)]
-mod tests {
+mod header_tests {
     use super::*;
 
     #[test]
