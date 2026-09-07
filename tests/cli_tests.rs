@@ -1324,6 +1324,10 @@ fn start_mock_rpc_server(
                                 r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":"{ledger}","minResourceFee":"{min_fee}","transactionData":"{live_tx_data}"}}}}"#
                             )
                         }
+                    } else if req_str.contains("getHealth") {
+                        format!(
+                            r#"{{"jsonrpc":"2.0","id":1,"result":{{"status":"healthy","latestLedger":{ledger}}}}}"#
+                        )
                     } else if req_str.contains("getLedgerEntries") {
                         format!(
                             r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":{ledger},"entries":[]}}}}"#

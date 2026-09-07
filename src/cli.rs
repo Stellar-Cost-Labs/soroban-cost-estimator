@@ -31,9 +31,25 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "SECS", default_value_t = 30)]
     pub timeout: u64,
 
+    /// Enable debug-level logging, including full RPC request payloads and
+    /// response summaries.
+    #[arg(long, short, global = true)]
+    pub verbose: bool,
+
+    /// Custom HTTP header to send with every RPC request, e.g.
+    /// `--header "X-API-Key: secret"`. Repeatable for multiple headers.
+    #[arg(long = "header", value_name = "KEY: VALUE", global = true)]
+    pub headers: Vec<String>,
+
     /// Fallback RPC URL used when the primary endpoint is unreachable.
     #[arg(long, global = true, value_name = "URL")]
     pub rpc_fallback_url: Option<String>,
+
+    /// Retry transient RPC failures up to N times (default 3), using
+    /// exponential backoff (500ms, then doubled between attempts). 0
+    /// disables retries entirely.
+    #[arg(long, global = true, value_name = "N", default_value_t = 3)]
+    pub max_retries: usize,
 
     #[command(subcommand)]
     pub command: Command,
@@ -95,6 +111,10 @@ pub enum Command {
         /// Network to simulate against.
         #[arg(long, default_value = "testnet")]
         network: String,
+
+        /// Explicit RPC URL (overrides network-based resolution).
+        #[arg(long)]
+        rpc_url: Option<String>,
 
         /// Deployed contract ID (64 hex chars) to invoke each function against.
         #[arg(long)]
@@ -176,6 +196,10 @@ pub enum CacheAction {
         /// Network to simulate against.
         #[arg(long, default_value = "testnet")]
         network: String,
+
+        /// Explicit RPC URL (overrides network-based resolution).
+        #[arg(long)]
+        rpc_url: Option<String>,
 
         /// Deployed contract ID (64 hex chars) to invoke each function against.
         #[arg(long)]
@@ -260,6 +284,10 @@ pub enum ConfigAction {
         /// instead of the full diff. Useful for CI status lines.
         #[arg(long)]
         summary: bool,
+
+        /// Output as JSON instead of a human-readable diff.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Show the full chronological change log across all stored snapshots.
