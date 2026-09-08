@@ -285,6 +285,10 @@ pub enum ConfigAction {
         #[arg(long)]
         against: Option<String>,
 
+        /// Explicit snapshot path for the newer config when diffing offline.
+        #[arg(long)]
+        new: Option<String>,
+
         /// Print a single-line summary (counts of pricing/non-pricing changes)
         /// instead of the full diff. Useful for CI status lines.
         #[arg(long)]

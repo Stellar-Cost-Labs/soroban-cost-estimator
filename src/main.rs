@@ -221,6 +221,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::Diff {
                 network,
                 against,
+                new,
                 summary,
                 json,
             } => {
@@ -1242,6 +1243,7 @@ async fn cmd_config_diff(
     network: &str,
     rpc_fallback_url: Option<&str>,
     against_path: Option<&str>,
+    new_path: Option<&str>,
     summary: bool,
     json_flag: bool,
     rps: Option<u64>,
@@ -1303,7 +1305,7 @@ async fn cmd_config_diff(
             println!("{}", config_snapshot::diff::format_diff(&diff));
         }
 
-        if upgrade_detected(&diff) {
+        if new_path.is_none() && upgrade_detected(&diff) {
             match config_snapshot::store::save_snapshot(&new_snapshot, None) {
                 Ok(path) => {
                     info!(path = %path.display(), "auto-saved post-upgrade snapshot");
