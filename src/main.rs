@@ -150,6 +150,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             id,
             args,
             cache_ttl,
+            clear_cache,
             json,
             format,
             precision,
@@ -166,6 +167,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 r#fn.as_deref(),
                 &args,
                 cache_ttl.as_deref(),
+                clear_cache,
                 &format,
                 rps,
                 timeout,
@@ -264,6 +266,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 .await
             }
             cli::CacheAction::Verify => cmd_cache_verify(),
+            cli::CacheAction::Clear { network } => cmd_cache_clear(&network),
             cli::CacheAction::Query {
                 network,
                 function,
@@ -458,6 +461,7 @@ async fn cmd_estimate(
     fn_name: Option<&str>,
     args: &[String],
     cache_ttl: Option<&str>,
+    clear_cache: bool,
     format: &str,
     rps: Option<u64>,
     timeout: u64,
@@ -478,6 +482,21 @@ async fn cmd_estimate(
         has_contract_id = contract_id.is_some(),
     );
     async {
+        // With `--clear-cache`, wipe every cached estimate for this network
+        // before anything else runs, so the `--cache-ttl` lookup and the
+        // simulation below both start from an empty slate. Human-readable
+        // table output gets the announcement on stdout; machine formats
+        // (json/csv/markdown) keep their stdout clean and use stderr.
+        if clear_cache {
+            let cleared = cache::clear_cache(network)?;
+            let message = format!("Cleared {cleared} cached estimate(s) for {network}.");
+            if table_mode {
+                println!("{message}");
+            } else {
+                eprintln!("{message}");
+            }
+        }
+
         info!("loading WASM");
         let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
         debug!(functions = wasm_info.functions.len(), has_spec = wasm_info.has_spec, "WASM loaded");
@@ -1706,6 +1725,20 @@ fn cmd_cache_verify() -> error::AppResult<()> {
         std::process::exit(1);
     }
 
+    Ok(())
+}
+
+/// `cache clear` command: delete every cached estimate for a network.
+///
+/// Defaults to `testnet`; pass `--network` to target another network. Only
+/// entries recorded for that network are removed — other networks' entries
+/// are untouched.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+fn cmd_cache_clear(network: &str) -> error::AppResult<()> {
+    let cleared = cache::clear_cache(network)?;
+    println!("Cleared {cleared} cached estimate(s) for {network}.");
     Ok(())
 }
 

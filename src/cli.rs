@@ -88,6 +88,11 @@ pub enum Command {
         #[arg(long, value_name = "DURATION")]
         cache_ttl: Option<String>,
 
+        /// Wipe this network's cached estimates before running the
+        /// simulation (e.g. after upgrading the tool or a network upgrade).
+        #[arg(long)]
+        clear_cache: bool,
+
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
         json: bool,
@@ -179,6 +184,13 @@ pub enum CacheAction {
 
     /// Check that every cached estimate is valid JSON and not corrupted.
     Verify,
+
+    /// Delete every cached estimate recorded for a network.
+    Clear {
+        /// Network whose cached estimates to delete.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+    },
 
     /// Pre-populate the cache by estimating every exported function.
     Warm {
