@@ -184,8 +184,14 @@ fn test_config_snapshot_help() {
 fn test_config_export_import_help() {
     for command in ["export", "import"] {
         let (stdout, stderr, code) = run_cli(&["config", command, "--help"]);
-        assert_eq!(code, 0, "config {command} --help should exit 0; stderr: {stderr}");
-        assert!(stdout.contains("--snapshot"), "{command} help should mention --snapshot");
+        assert_eq!(
+            code, 0,
+            "config {command} --help should exit 0; stderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("--snapshot"),
+            "{command} help should mention --snapshot"
+        );
     }
 }
 
@@ -193,11 +199,18 @@ fn test_config_export_import_help() {
 fn test_config_export_missing_snapshot_errors() {
     let home = temp_home("export-missing");
     let (_, stderr, code) = run_cli_in_home(
-        &["config", "export", "--snapshot", "missing.json", "--out", "out.json"],
+        &[
+            "config",
+            "export",
+            "--snapshot",
+            "missing.json",
+            "--out",
+            "out.json",
+        ],
         Some(&home),
     );
     assert_eq!(code, 1);
-    assert!(stderr.contains("I/O error"), "got: {stderr}");
+    assert!(stderr.contains("failed to perform I/O"), "got: {stderr}");
 }
 
 #[test]
@@ -210,7 +223,7 @@ fn test_config_import_malformed_snapshot_errors() {
         Some(&home),
     );
     assert_eq!(code, 1);
-    assert!(stderr.contains("Snapshot parse error"), "got: {stderr}");
+    assert!(stderr.contains("failed to parse snapshot"), "got: {stderr}");
 }
 
 #[test]

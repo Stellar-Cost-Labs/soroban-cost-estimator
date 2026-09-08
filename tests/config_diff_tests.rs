@@ -222,8 +222,11 @@ fn test_snapshot_export_import_round_trip() {
         let source = tmp.join("source.json");
         let exported = tmp.join("shared.json");
         let snapshot = make_snapshot(100, 5);
-        std::fs::write(&source, serde_json::to_string(&snapshot).expect("serialize snapshot"))
-            .expect("write source");
+        std::fs::write(
+            &source,
+            serde_json::to_string(&snapshot).expect("serialize snapshot"),
+        )
+        .expect("write source");
 
         let export_path = store::export_snapshot(
             source.to_str().expect("source path"),
@@ -231,10 +234,9 @@ fn test_snapshot_export_import_round_trip() {
         )
         .expect("export snapshot");
         assert_eq!(export_path, exported);
-        let exported_snapshot = store::load_snapshot_from_path(
-            exported.to_str().expect("export path"),
-        )
-        .expect("load export");
+        let exported_snapshot =
+            store::load_snapshot_from_path(exported.to_str().expect("export path"))
+                .expect("load export");
         assert_eq!(exported_snapshot.network, "testnet");
 
         let imported = store::import_snapshot(exported.to_str().expect("export path"))
