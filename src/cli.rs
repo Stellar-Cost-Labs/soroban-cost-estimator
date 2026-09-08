@@ -263,6 +263,14 @@ pub enum ConfigAction {
         #[arg(long)]
         out: Option<String>,
 
+        /// Automatically delete snapshots older than N days.
+        #[arg(
+            long,
+            value_name = "N",
+            value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..)
+        )]
+        retain: Option<u64>,
+
         /// Print the snapshot as JSON instead of the summary lines.
         #[arg(long)]
         json: bool,
