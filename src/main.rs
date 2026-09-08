@@ -204,11 +204,17 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
         }
         cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(&wasm, json),
         cli::Command::Config { action } => match action {
-            cli::ConfigAction::Snapshot { network, out, json } => {
+            cli::ConfigAction::Snapshot {
+                network,
+                out,
+                retain,
+                json,
+            } => {
                 cmd_config_snapshot(
                     &network,
                     fallback,
                     out.as_deref(),
+                    retain,
                     json,
                     rps,
                     timeout,
@@ -1168,6 +1174,7 @@ async fn cmd_config_snapshot(
     network: &str,
     rpc_fallback_url: Option<&str>,
     out_path: Option<&str>,
+    retain_days: Option<u64>,
     json_flag: bool,
     rps: Option<u64>,
     timeout: u64,
@@ -1192,6 +1199,25 @@ async fn cmd_config_snapshot(
 
         let path = config_snapshot::store::save_snapshot(&snapshot, out_path)?;
         info!(path = %path.display(), ledger = snapshot.ledger, "snapshot saved");
+
+        // With `--retain N`, delete this network's snapshots whose files are
+        // older than N days (by modification time). Runs after the save, so
+        // the just-written snapshot is never at risk.
+        if let Some(retain_days) = retain_days {
+            let cleaned = config_snapshot::store::clean_old_snapshots(network, retain_days)?;
+            info!(cleaned, retain_days, "cleaned old snapshots");
+            if cleaned > 0 {
+                let message = format!(
+                    "Deleted {cleaned} snapshot(s) older than {retain_days} day(s) for {network}."
+                );
+                if json_flag {
+                    // Keep stdout machine-readable; announce on stderr.
+                    eprintln!("{message}");
+                } else {
+                    println!("{message}");
+                }
+            }
+        }
 
         if json_flag {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);

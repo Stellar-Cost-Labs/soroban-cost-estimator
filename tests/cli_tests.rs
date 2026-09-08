@@ -170,7 +170,7 @@ fn test_config_snapshot_help() {
         code, 0,
         "config snapshot --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--network", "--out", "--json"] {
+    for flag in ["--network", "--out", "--json", "--retain"] {
         assert!(
             stdout.contains(flag),
             "snapshot help should mention {flag}; got: {stdout}"
@@ -838,6 +838,50 @@ fn test_config_snapshot_unknown_network() {
             "Error: failed to locate RPC endpoint: not configured for network not-a-network"
         ),
         "the error should name the unknown network; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_retain_flag_accepted() {
+    // `--retain` must be a recognized argument: the run fails on the unknown
+    // network (before any RPC), not on the flag itself.
+    let (_, stderr, code) = run_cli(&[
+        "config",
+        "snapshot",
+        "--network",
+        "not-a-network",
+        "--retain",
+        "5",
+    ]);
+    assert_eq!(code, 1, "an unknown network should exit 1");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--retain should be a recognized argument; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
+        "the failure should come from the network, not the flag; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_retain_zero_rejected() {
+    // `--retain 0` would delete every snapshot, so clap must reject it before
+    // anything runs.
+    let (_, stderr, code) = run_cli(&[
+        "config",
+        "snapshot",
+        "--network",
+        "not-a-network",
+        "--retain",
+        "0",
+    ]);
+    assert_ne!(code, 0, "--retain 0 should be rejected");
+    assert!(
+        stderr.contains("is not in"),
+        "clap should explain the valid range; stderr: {stderr}"
     );
 }
 

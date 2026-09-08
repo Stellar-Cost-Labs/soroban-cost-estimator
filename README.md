@@ -156,11 +156,14 @@ Fetch all 6 `ConfigSetting` ledger entries, decode them via XDR, timestamp,
 and save to disk.
 
 ```bash
-soroban-cost-estimator config snapshot --network testnet [--out /custom/path.json] [--json]
+soroban-cost-estimator config snapshot --network testnet [--out /custom/path.json] [--json] [--retain N]
 ```
 
 Saved to `~/.soroban-cost-estimator/snapshots/<network>-<timestamp>.json`.
 `--json` also prints the snapshot as JSON (and still saves it).
+`--retain N` is a retention policy: snapshots for the network whose files are
+older than N days are deleted after saving, so the snapshots directory doesn't
+grow without bound.
 
 ### `config diff`
 
