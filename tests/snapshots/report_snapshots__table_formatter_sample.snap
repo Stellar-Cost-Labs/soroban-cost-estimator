@@ -1,12 +1,13 @@
 ---
 source: tests/report_snapshots.rs
-assertion_line: 64
 expression: TableFormatter.format(&report)
 ---
 Function: increment
 Network: testnet (ledger 3894195)
 RPC round-trip: 87 ms
-WASM hash: abc123def456
+WASM hash:  abc123def456
+WASM size:  7312 bytes
+Sections:   9 (custom: contractspecv0, name)
 
 +------------------+----------+---------------+
 | Resource         | Consumed | Fee (stroops) |

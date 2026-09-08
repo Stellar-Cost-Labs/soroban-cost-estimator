@@ -8,6 +8,9 @@ fn sample_report() -> CostReport {
     CostReport {
         function: "increment".to_string(),
         wasm_hash: "abc123def456".to_string(),
+        wasm_size: 7_312,
+        section_count: 9,
+        custom_sections: vec!["contractspecv0".to_string(), "name".to_string()],
         cpu_instructions: 532_502,
         memory_bytes: 0,
         tx_size: 156,
@@ -35,6 +38,9 @@ fn empty_report() -> CostReport {
     CostReport {
         function: "(wasm upload)".to_string(),
         wasm_hash: "0000000000000000".to_string(),
+        wasm_size: 0,
+        section_count: 0,
+        custom_sections: vec![],
         cpu_instructions: 0,
         memory_bytes: 0,
         tx_size: 0,

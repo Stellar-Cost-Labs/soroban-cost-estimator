@@ -37,7 +37,7 @@ This guide covers common errors, their causes, and solutions when using the soro
 
 #### Error: `HTTP request failed: <details>`
 **Cause**: Network-level failure connecting to the RPC endpoint (DNS resolution, connection timeout, TLS error, etc.).
-**Solution**: 
+**Solution**:
 - Verify internet connectivity
 - Check the RPC URL is correct (use `--rpc-url` to override)
 - Ensure the RPC node is operational (check status page)
@@ -53,7 +53,7 @@ This guide covers common errors, their causes, and solutions when using the soro
 - The function name (`--fn`) doesn't exist on the contract
 - The RPC endpoint is for a different network than where the contract is deployed
 - The RPC schema has changed and the tool needs updating
-**Solution**: 
+**Solution**:
 - Verify the contract ID is correct (64 hex chars or `C...` strkey)
 - Ensure the contract is deployed on the target network
 - Check the function name matches exactly (case-sensitive)
@@ -105,7 +105,7 @@ This guide covers common errors, their causes, and solutions when using the soro
 
 #### Error: `Snapshot not found: <path>`
 **Cause**: The specified config snapshot file does not exist.
-**Solution**: 
+**Solution**:
 - Run `soroban-cost-estimator config snapshot` first to create a baseline
 - Check the snapshot directory (`~/.soroban-cost-estimator/snapshots/`)
 - Use `--against` to specify an explicit snapshot path for `config diff`
