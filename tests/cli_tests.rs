@@ -170,7 +170,7 @@ fn test_config_snapshot_help() {
         code, 0,
         "config snapshot --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--network", "--out", "--json"] {
+    for flag in ["--network", "--rpc-url", "--out", "--json"] {
         assert!(
             stdout.contains(flag),
             "snapshot help should mention {flag}; got: {stdout}"
@@ -185,7 +185,7 @@ fn test_config_diff_help() {
         code, 0,
         "config diff --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--network", "--against", "--summary"] {
+    for flag in ["--network", "--rpc-url", "--against", "--summary"] {
         assert!(
             stdout.contains(flag),
             "diff help should mention {flag}; got: {stdout}"
@@ -197,7 +197,7 @@ fn test_config_diff_help() {
 fn test_watch_help() {
     let (stdout, stderr, code) = run_cli(&["watch", "--help"]);
     assert_eq!(code, 0, "watch --help should exit 0; stderr: {stderr}");
-    for flag in ["--network", "--interval"] {
+    for flag in ["--network", "--rpc-url", "--interval"] {
         assert!(
             stdout.contains(flag),
             "watch help should mention {flag}; got: {stdout}"
@@ -841,6 +841,36 @@ fn test_config_snapshot_unknown_network() {
     );
 }
 
+#[test]
+fn test_config_snapshot_rpc_url_overrides_unknown_network() {
+    // `--rpc-url` must bypass network-name resolution: with an otherwise
+    // unknown network name, the failure has to come from the RPC call itself
+    // (the dead endpoint), not from endpoint resolution.
+    let home = temp_home("snapshot-rpc-url-override");
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "--max-retries",
+            "0",
+            "config",
+            "snapshot",
+            "--network",
+            "not-a-network",
+            "--rpc-url",
+            DEAD_RPC,
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "the dead endpoint should still fail");
+    assert!(
+        !stderr.contains("not configured for network"),
+        "--rpc-url should override network resolution; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("failed to send HTTP request"),
+        "the failure should come from the HTTP call; got: {stderr}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // `config diff`
 // ─────────────────────────────────────────────────────────────────────────
@@ -1032,6 +1062,41 @@ fn test_config_diff_loads_valid_snapshot_before_network() {
     );
 }
 
+#[test]
+fn test_config_diff_rpc_url_overrides_unknown_network() {
+    // `--rpc-url` must bypass network-name resolution for the live fetch: an
+    // otherwise unknown network name combined with --rpc-url fails on the RPC
+    // call itself (the dead endpoint), not on endpoint resolution.
+    let home = temp_home("diff-rpc-url-override");
+    let path = home.join("snapshot.json");
+    std::fs::write(&path, snapshot_json("not-a-network", 1000)).expect("write fixture");
+
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "--max-retries",
+            "0",
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against",
+            path.to_str().unwrap(),
+            "--rpc-url",
+            DEAD_RPC,
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "the dead endpoint should still fail");
+    assert!(
+        !stderr.contains("not configured for network"),
+        "--rpc-url should override network resolution; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("failed to send HTTP request"),
+        "the failure should come from the HTTP call; got: {stderr}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // `watch`
 // ─────────────────────────────────────────────────────────────────────────
@@ -1183,6 +1248,55 @@ fn test_watch_interval_suffixes_are_parsed() {
     assert!(
         stdout.contains("every 1800s"),
         "`30m` should resolve to 1800s; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_watch_rpc_url_used_for_polls() {
+    // `--rpc-url` must be honored by watch's poller: an otherwise unknown
+    // network name combined with --rpc-url reaches the HTTP layer (fails on
+    // the dead endpoint) instead of failing network resolution, and watch
+    // keeps running and retrying.
+    let home = temp_home("watch-rpc-url");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "--max-retries",
+            "0",
+            "watch",
+            "--network",
+            "not-a-network",
+            "--rpc-url",
+            DEAD_RPC,
+            "--interval",
+            "1h",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn watch");
+
+    // Give the first poll time to fail against the dead endpoint.
+    std::thread::sleep(std::time::Duration::from_millis(750));
+    let status = child.try_wait().expect("failed to poll watch process");
+    assert!(
+        status.is_none(),
+        "watch should still be running after a failed poll, got: {status:?}"
+    );
+
+    let _ = child.kill();
+    let output = child.wait_with_output().expect("failed to reap watch");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        !combined.contains("not configured for network"),
+        "--rpc-url should override network resolution; got: {combined}"
+    );
+    assert!(
+        combined.contains("failed to send HTTP request"),
+        "the poll failure should come from the HTTP call; got: {combined}"
     );
 }
 
