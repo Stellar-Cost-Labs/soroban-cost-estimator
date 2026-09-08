@@ -121,6 +121,9 @@ static WRITE_LOCK: Mutex<()> = Mutex::new(());
 /// Returns the base data directory path: `~/.soroban-cost-estimator`,
 /// creating it if needed.
 fn data_dir() -> AppResult<PathBuf> {
+    let home = crate::home_dir()
+        .ok_or_else(|| AppError::General("could not determine home directory".to_string()))?;
+    let dir = home.join(".soroban-cost-estimator");
     let dir = crate::paths::data_dir()?;
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
@@ -131,12 +134,44 @@ fn db_path() -> AppResult<PathBuf> {
     Ok(data_dir()?.join("cache.db"))
 }
 
+/// SQLite permits only one writer at a time. In WAL mode a second writer
+/// briefly contends for the write lock; `busy_timeout` makes it wait, but
+/// racing DDL/schema setup on fresh connections can still surface
+/// `SQLITE_BUSY`. Retry a bounded number of times so concurrent cache writes
+/// succeed instead of failing non-deterministically.
+fn retry_on_busy<F>(mut f: F) -> AppResult<()>
+where
+    F: FnMut() -> AppResult<()>,
+{
+    const MAX_ATTEMPTS: u32 = 20;
+    for _ in 0..MAX_ATTEMPTS {
+        match f() {
+            Err(AppError::Sqlite(rusqlite::Error::SqliteFailure(failure, _)))
+                if failure.code == rusqlite::ErrorCode::DatabaseBusy =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            other => return other,
+        }
+    }
+    f()
+}
+
 /// Create the `estimates` table (and tune journal mode) on an already-open
 /// connection if it does not exist yet.
 ///
 /// Centralized so both the normal cache path and callers that open the
 /// database directly (e.g. test helpers) create an identical schema.
 pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
+    // WAL lets concurrent readers and writers coexist, and a per-connection
+    // busy timeout makes contending writers wait instead of failing with
+    // SQLITE_BUSY. Set the busy handler BEFORE switching journal mode and
+    // creating the table: those operations take locks, so the handler must be
+    // active first. (`PRAGMA busy_timeout` interleaved inside the same batch
+    // as `journal_mode=WAL` is unreliable for racing writers.)
+    conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; \
     // busy_timeout makes contending writers wait instead of failing with
     // SQLITE_BUSY. It is set first so the busy handler is installed before
     // any statement that can take a lock. The WAL journal-mode switch is the
@@ -261,6 +296,35 @@ pub fn save_estimate(
 ) -> AppResult<()> {
     let args_hash = hash_args(args);
 
+    retry_on_busy(|| {
+        let conn = open_db()?;
+        conn.execute(
+            "INSERT INTO estimates \
+             (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+             ON CONFLICT(wasm_hash, function, args_hash) DO UPDATE SET \
+                version = excluded.version, \
+                network = excluded.network, \
+                ledger = excluded.ledger, \
+                total_stroops = excluded.total_stroops, \
+                cpu_instructions = excluded.cpu_instructions, \
+                memory_bytes = excluded.memory_bytes, \
+                timestamp = excluded.timestamp",
+            rusqlite::params![
+                CACHE_SCHEMA_VERSION as i64,
+                wasm_hash,
+                function,
+                args_hash.as_str(),
+                network,
+                ledger as i64,
+                total_stroops,
+                cpu_instructions as i64,
+                memory_bytes as i64,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    })?;
     let _guard = WRITE_LOCK
         .lock()
         .map_err(|e| AppError::General(format!("cache write lock poisoned: {e}")))?;

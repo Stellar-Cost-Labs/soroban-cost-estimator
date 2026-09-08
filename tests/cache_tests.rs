@@ -38,6 +38,9 @@ where
 
     let old_home = std::env::var_os("HOME");
     let old_userprofile = std::env::var_os("USERPROFILE");
+    // SAFETY: serialized by HOME_MUTEX, no other thread reads these vars during this block
+    unsafe {
+        std::env::set_var("HOME", &tmp);
     // SAFETY: serialized by HOME_MUTEX, no other thread reads these env vars
     // during this block.
     unsafe {
@@ -51,6 +54,7 @@ where
     // Run the test; catch panics so we can clean up regardless
     let result = std::panic::catch_unwind(|| {
         // Verify the cache dir resolves inside the temp dir
+        let home = soroban_cost_estimator::home_dir().expect("home dir");
         let data_dir = soroban_cost_estimator::paths::data_dir().expect("data dir");
         assert!(
             data_dir.starts_with(&tmp),
@@ -61,6 +65,9 @@ where
         test(&tmp);
     });
 
+    // SAFETY: serialized by HOME_MUTEX, no other thread reads these vars during this block
+    restore_env("HOME", old_home);
+    restore_env("USERPROFILE", old_userprofile);
     // SAFETY: serialized by HOME_MUTEX, no other thread reads these env vars
     // during this block.
     unsafe {
@@ -84,6 +91,17 @@ where
 
     if let Err(e) = result {
         std::panic::resume_unwind(e);
+    }
+}
+
+/// Restore an environment variable to its prior value (or remove it).
+fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
+    // SAFETY: called under HOME_MUTEX, no other thread reads these vars concurrently
+    unsafe {
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 }
 
