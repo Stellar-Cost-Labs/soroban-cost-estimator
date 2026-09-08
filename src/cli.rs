@@ -31,9 +31,25 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "SECS", default_value_t = 30)]
     pub timeout: u64,
 
+    /// Enable debug-level logging, including full RPC request payloads and
+    /// response summaries.
+    #[arg(long, short, global = true)]
+    pub verbose: bool,
+
+    /// Custom HTTP header to send with every RPC request, e.g.
+    /// `--header "X-API-Key: secret"`. Repeatable for multiple headers.
+    #[arg(long = "header", value_name = "KEY: VALUE", global = true)]
+    pub headers: Vec<String>,
+
     /// Fallback RPC URL used when the primary endpoint is unreachable.
     #[arg(long, global = true, value_name = "URL")]
     pub rpc_fallback_url: Option<String>,
+
+    /// Retry transient RPC failures up to N times (default 3), using
+    /// exponential backoff (500ms, then doubled between attempts). 0
+    /// disables retries entirely.
+    #[arg(long, global = true, value_name = "N", default_value_t = 3)]
+    pub max_retries: usize,
 
     #[command(subcommand)]
     pub command: Command,
@@ -72,6 +88,11 @@ pub enum Command {
         #[arg(long, value_name = "DURATION")]
         cache_ttl: Option<String>,
 
+        /// Wipe this network's cached estimates before running the
+        /// simulation (e.g. after upgrading the tool or a network upgrade).
+        #[arg(long)]
+        clear_cache: bool,
+
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
         json: bool,
@@ -99,6 +120,10 @@ pub enum Command {
         /// Network to simulate against.
         #[arg(long, default_value = "testnet")]
         network: String,
+
+        /// Explicit RPC URL (overrides network-based resolution).
+        #[arg(long)]
+        rpc_url: Option<String>,
 
         /// Deployed contract ID (64 hex chars) to invoke each function against.
         #[arg(long)]
@@ -164,6 +189,13 @@ pub enum CacheAction {
     /// Check that every cached estimate is valid JSON and not corrupted.
     Verify,
 
+    /// Delete every cached estimate recorded for a network.
+    Clear {
+        /// Network whose cached estimates to delete.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+    },
+
     /// Pre-populate the cache by estimating every exported function.
     Warm {
         /// Path to the compiled Soroban contract `.wasm` file.
@@ -173,6 +205,10 @@ pub enum CacheAction {
         /// Network to simulate against.
         #[arg(long, default_value = "testnet")]
         network: String,
+
+        /// Explicit RPC URL (overrides network-based resolution).
+        #[arg(long)]
+        rpc_url: Option<String>,
 
         /// Deployed contract ID (64 hex chars) to invoke each function against.
         #[arg(long)]
@@ -236,6 +272,13 @@ pub enum ConfigAction {
         json: bool,
     },
 
+    /// List all saved config snapshots with their timestamp and ledger.
+    List {
+        /// Network whose snapshots to list.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+    },
+
     /// Diff the current network config against the most recent snapshot.
     Diff {
         /// Network to compare against.
@@ -250,6 +293,10 @@ pub enum ConfigAction {
         /// instead of the full diff. Useful for CI status lines.
         #[arg(long)]
         summary: bool,
+
+        /// Output as JSON instead of a human-readable diff.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Show the full chronological change log across all stored snapshots.

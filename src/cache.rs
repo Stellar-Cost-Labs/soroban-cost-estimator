@@ -768,6 +768,26 @@ fn save_registry(registry: &WasmRegistry) -> AppResult<()> {
     Ok(())
 }
 
+/// Delete every cached estimate recorded for the given network.
+///
+/// Returns the number of rows deleted. Entries for other networks are left
+/// untouched. This is the single shared implementation behind both the
+/// `cache clear` subcommand and the `estimate --clear-cache` flag, so the
+/// two paths behave identically.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+pub fn clear_cache(network: &str) -> AppResult<usize> {
+    let _guard = WRITE_LOCK
+        .lock()
+        .map_err(|e| AppError::General(format!("cache write lock poisoned: {e}")))?;
+    let conn = open_db()?;
+    let removed =
+        execute_with_retry(|| conn.execute("DELETE FROM estimates WHERE network = ?1", [network]))?;
+    debug!(network, removed, "cache cleared");
+    Ok(removed)
+}
+
 /// Remove every cached estimate produced from the given WASM hash.
 ///
 /// Returns the number of cache rows removed. Used by
