@@ -14,6 +14,7 @@ Options:
       --fn <FN>            Contract function name to invoke
       --id <ID>            Deployed contract ID (64 hex chars) to invoke. Required when --fn is used
       --arg <KEY=VAL>      Function arguments as key=value pairs (value is type-inferred)
+      --auto-snapshot      Automatically snapshot network config before estimating
       --json               Output as JSON instead of a human-readable table
   -h, --help               Print help
 ```
@@ -39,6 +40,27 @@ Options:
 - A simulation that returns no cost data and no latest ledger fails loudly
   with an error naming `--id`, `--fn`, and the RPC endpoint — it is treated
   as a misconfigured request, not a free transaction.
+- **`--auto-snapshot`** fetches the network config and saves a snapshot
+  *before* the estimate runs, so every estimate doubles as a drift-detection
+  checkpoint. A snapshot failure is a warning, never fatal — the estimate
+  proceeds regardless. Progress lines are suppressed in machine formats
+  (`--json`, `--format csv|markdown`); warnings go to stderr.
+
+## Example — snapshot before estimating
+
+```bash
+soroban-cost-estimator estimate \
+  --wasm tests/fixtures/contract.wasm \
+  --id CC4WIEYYSCFGDJXMLZ73FKUUJNDEOJRNOOBZHI55QR27NW4RCNTHAQ5T \
+  --network testnet --fn increment --arg step=5 --auto-snapshot
+```
+
+Before the report is printed, the tool takes and saves a config snapshot:
+
+```text
+auto-snapshot: taking config snapshot before estimate…
+auto-snapshot: saved to /home/you/.soroban-cost-estimator/snapshots/testnet-<timestamp>.json (network: testnet, ledger: 3470630)
+```
 
 ## Example — upload simulation
 

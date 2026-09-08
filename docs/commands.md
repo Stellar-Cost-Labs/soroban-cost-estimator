@@ -126,6 +126,18 @@ soroban-cost-estimator estimate \
   --cache-ttl 1h
 ```
 
+Take a config snapshot before estimating (implicit drift detection):
+
+```bash
+soroban-cost-estimator estimate \
+  --wasm tests/fixtures/contract.wasm \
+  --id CC4WIEYYSCFGDJXMLZ73FKUUJNDEOJRNOOBZHI55QR27NW4RCNTHAQ5T \
+  --network testnet \
+  --fn increment \
+  --arg step=5 \
+  --auto-snapshot
+```
+
 **Sample table output**
 
 ```text
@@ -202,6 +214,7 @@ soroban-cost-estimator estimate-all [OPTIONS] --wasm <WASM>
 | `--wasm <WASM>` | `-w` | ✅ | — | Path to the compiled Soroban contract `.wasm` file |
 | `--network <NETWORK>` | | | `testnet` | Network to simulate against |
 | `--id <ID>` | | | — | Deployed contract ID (64 hex chars) to invoke each function against |
+| `--auto-snapshot` | | | `false` | Take a config snapshot before estimating (implicit drift detection) |
 | `--json` | | | `false` | Output as JSON instead of a human-readable list |
 | `--help` | `-h` | | | Print help |
 
@@ -219,6 +232,9 @@ soroban-cost-estimator estimate-all [OPTIONS] --wasm <WASM>
   almost certainly fail; the tool prints a note telling you to pass `--id`
   for real numbers.
 - All zero-argument function results are cached, just like `estimate`.
+- **`--auto-snapshot`**: takes a config snapshot before the batch runs, so a
+  batch estimate doubles as a drift-detection checkpoint. A snapshot failure
+  is a warning, never fatal.
 - **Exit codes**: 0 on success, 1 on error.
 
 **Examples**
