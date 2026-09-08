@@ -281,6 +281,10 @@ pub enum ConfigAction {
         #[arg(long, default_value = "testnet")]
         network: String,
 
+        /// Explicit RPC URL (overrides network-based resolution).
+        #[arg(long)]
+        rpc_url: Option<String>,
+
         /// Explicit snapshot path to compare against (defaults to latest).
         #[arg(long)]
         against: Option<String>,
