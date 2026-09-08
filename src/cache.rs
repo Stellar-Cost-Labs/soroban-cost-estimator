@@ -577,6 +577,88 @@ pub fn export_cached_estimates() -> AppResult<Vec<CachedEstimate>> {
     Ok(estimates)
 }
 
+/// Summary statistics returned by [`import_cached_estimates`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportStats {
+    /// Number of entries successfully written (inserted or updated) to the cache.
+    pub imported: usize,
+    /// Number of entries skipped because their schema version is newer than
+    /// [`CACHE_SCHEMA_VERSION`] and cannot be safely migrated.
+    pub skipped: usize,
+}
+
+/// Restore cached estimates from a previously exported JSON array.
+///
+/// Each entry is migrated to the current schema via [`migrate_to_latest`]
+/// before being upserted into the SQLite cache. Entries whose schema version
+/// is newer than [`CACHE_SCHEMA_VERSION`] are skipped and counted in
+/// [`ImportStats::skipped`] rather than causing a hard error, so a partially
+/// compatible export file still imports as much as possible.
+///
+/// Entries are upserted (INSERT … ON CONFLICT … DO UPDATE), meaning existing
+/// rows for the same `(wasm_hash, function, args_hash)` primary key are
+/// overwritten with the imported values.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+pub fn import_cached_estimates(entries: Vec<CachedEstimate>) -> AppResult<ImportStats> {
+    let mut to_insert: Vec<CachedEstimate> = Vec::with_capacity(entries.len());
+    let mut skipped = 0usize;
+
+    for entry in entries {
+        match migrate_to_latest(entry) {
+            Ok(migrated) => to_insert.push(migrated),
+            Err(_) => {
+                skipped += 1;
+            }
+        }
+    }
+
+    let _guard = WRITE_LOCK
+        .lock()
+        .map_err(|e| AppError::General(format!("cache write lock poisoned: {e}")))?;
+    let conn = open_db()?;
+
+    for entry in &to_insert {
+        execute_with_retry(|| {
+            conn.execute(
+                "INSERT INTO estimates \
+                 (version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
+                  cpu_instructions, memory_bytes, timestamp, duration_ms, success) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+                 ON CONFLICT(wasm_hash, function, args_hash) DO UPDATE SET \
+                    version = excluded.version, \
+                    network = excluded.network, \
+                    ledger = excluded.ledger, \
+                    total_stroops = excluded.total_stroops, \
+                    cpu_instructions = excluded.cpu_instructions, \
+                    memory_bytes = excluded.memory_bytes, \
+                    timestamp = excluded.timestamp, \
+                    duration_ms = excluded.duration_ms, \
+                    success = excluded.success",
+                rusqlite::params![
+                    entry.version as i64,
+                    entry.wasm_hash.as_str(),
+                    entry.function.as_str(),
+                    entry.args_hash.as_str(),
+                    entry.network.as_str(),
+                    entry.ledger as i64,
+                    entry.total_stroops,
+                    entry.cpu_instructions as i64,
+                    entry.memory_bytes as i64,
+                    entry.timestamp.as_str(),
+                    entry.duration_ms.map(|v| v as i64),
+                    entry.success as i64,
+                ],
+            )
+        })?;
+    }
+
+    let imported = to_insert.len();
+    debug!(imported, skipped, "imported cached estimates");
+    Ok(ImportStats { imported, skipped })
+}
+
 /// Integrity status of a single cache entry file.
 #[derive(Debug, Clone)]
 pub struct CacheEntryStatus {
