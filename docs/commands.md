@@ -18,6 +18,7 @@ management**.
 - [Cache Management](#cache-management)
   - [`cache verify`](#cache-verify) — check cache integrity
   - [`cache warm`](#cache-warm) — pre-populate cache
+  - [`cache clear`](#cache-clear) — wipe cached estimates for a network
 - [Monitoring](#monitoring)
   - [`watch`](#watch) — poll and diff on interval
 
@@ -46,6 +47,7 @@ soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
 | `--id <ID>` | | | — | Deployed contract ID (64 hex chars). Required when `--fn` is used |
 | `--arg <KEY=VAL>` | | | — | Function arguments as `key=value` pairs (value is type-inferred; repeatable) |
 | `--cache-ttl <DURATION>` | | | — | Skip re-simulation when a cached estimate is still fresh (e.g. `30m`, `1h`, `7d`) |
+| `--clear-cache` | | | `false` | Wipe every cached estimate for `--network` before running the simulation |
 | `--json` | | | `false` | Output as JSON instead of a human-readable table |
 | `--help` | `-h` | | | Print help |
 
@@ -70,6 +72,12 @@ soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
 - **Caching**: The result is written to the estimate cache, keyed by
   `wasm_hash + function_name + args_hash`. Use `--cache-ttl` to skip
   re-simulation when the cached entry is still fresh.
+- **`--clear-cache`** wipes every cached estimate for `--network` (default
+  `testnet`) *before* the simulation runs, printing
+  `Cleared N cached estimate(s) for <network>.` It can be combined with any
+  other flag — including `--cache-ttl`, which then starts from an empty
+  cache. Useful after upgrading the tool, after a network upgrade, or after
+  debugging a bad estimate.
 - **Exit codes**: 0 on success, 1 on any error (simulation failure, missing
   WASM file, network error, etc.).
 
@@ -596,6 +604,44 @@ soroban-cost-estimator cache warm \
 
 ---
 
+### `cache clear`
+
+Delete every cached estimate recorded for a network.
+
+**Usage**
+
+```
+soroban-cost-estimator cache clear [OPTIONS]
+```
+
+**Flags**
+
+| Flag | Short | Required | Default | Description |
+|------|-------|----------|---------|-------------|
+| `--network <NETWORK>` | | | `testnet` | Network whose cached estimates to delete |
+| `--help` | `-h` | | | Print help |
+
+**Behavior**
+
+- Deletes every cached estimate whose `network` field matches the requested
+  network; entries for other networks are left untouched.
+- Prints `Cleared N cached estimate(s) for <network>.`
+- No network calls are made — this is pure local cache I/O.
+- Backed by the same function as `estimate --clear-cache`, so the two paths
+  behave identically.
+
+**Examples**
+
+```bash
+soroban-cost-estimator cache clear
+# → Cleared 12 cached estimate(s) for testnet.
+
+soroban-cost-estimator cache clear --network mainnet
+# → Cleared 3 cached estimate(s) for mainnet.
+```
+
+---
+
 ## Monitoring
 
 ### `watch`
@@ -662,8 +708,8 @@ All commands accept:
 
 | Flag | Description |
 |------|-------------|
-| `--format <FORMAT>` | Select `table`, `json`, `csv`, or `markdown` output; defaults to `table` |
-| `--rps <N>` | Cap RPC requests per second |
+| `--rps <N>` | Cap RPC requests at N per second (0 disables) |
+| `--timeout <SECS>` | HTTP request timeout for RPC calls in seconds (default `30`) |
 | `--help` / `-h` | Print command-specific help |
 
 `--format` applies to report-producing commands. The legacy `--json` flag remains supported as an alias for `--format json` where it was previously available.

@@ -94,6 +94,7 @@ soroban-cost-estimator estimate \
     [--id <contract-id-hex>] \
     [--fn my_function --arg key=val] \
     [--rpc-url https://custom-rpc.example.com] \
+    [--clear-cache] \
     [--json]
 ```
 
@@ -116,6 +117,12 @@ soroban-cost-estimator estimate \
 ```
 
 Use `--json` for machine-readable output (e.g., for CI pipelines).
+
+Pass `--clear-cache` to wipe every cached estimate for `--network` before the
+simulation runs — handy after upgrading the tool, after a major network
+upgrade, or after debugging a bad estimate. It prints
+`Cleared N cached estimate(s) for <network>.` and can be combined with any
+other `estimate` flags (including `--cache-ttl`).
 
 The read/write entry counts and byte sizes in the report are decoded from the
 simulation response's resource **footprint** — real values from the ledger
@@ -204,6 +211,23 @@ soroban-cost-estimator cache verify
 
 - Exits **0** if the cache is empty or every entry is valid
 - Exits **1** and lists the corrupted filenames if any entry fails
+
+### `cache clear`
+
+Wipe every cached estimate recorded for a network without hunting through
+`~/.soroban-cost-estimator/cache/` by hand.
+
+```bash
+soroban-cost-estimator cache clear              # clears testnet entries
+soroban-cost-estimator cache clear --network mainnet
+```
+
+- Defaults to `testnet`; pass `--network` to target another network
+- Prints `Cleared N cached estimate(s) for <network>.`
+- Only the requested network's entries are removed — other networks are
+  untouched
+- The same clearing logic backs the `estimate --clear-cache` flag, so both
+  paths behave identically
 
 ## Installation
 
