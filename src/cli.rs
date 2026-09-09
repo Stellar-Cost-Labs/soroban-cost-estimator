@@ -185,11 +185,17 @@ pub enum CacheAction {
     /// Check that every cached estimate is valid JSON and not corrupted.
     Verify,
 
+    /// Show cache health overview (count, size, oldest/newest ledger).
+    Info,
+
     /// Delete every cached estimate recorded for a network.
     Clear {
         /// Network whose cached estimates to delete.
         #[arg(long, default_value = "testnet")]
         network: String,
+        /// Confirm removal (required — cache clear is destructive).
+        #[arg(long)]
+        confirm: bool,
     },
 
     /// Pre-populate the cache by estimating every exported function.

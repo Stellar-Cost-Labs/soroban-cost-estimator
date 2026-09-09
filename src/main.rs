@@ -265,7 +265,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 .await
             }
             cli::CacheAction::Verify => cmd_cache_verify(),
-            cli::CacheAction::Clear { network } => cmd_cache_clear(&network),
+            cli::CacheAction::Info => cmd_cache_stats(),
+            cli::CacheAction::Clear { network, confirm } => cmd_cache_clear(&network, confirm),
             cli::CacheAction::Query {
                 network,
                 function,
@@ -1325,6 +1326,7 @@ async fn cmd_config_diff(
 
         if !json_flag && !summary {
             print_stale_estimates(network, new_snapshot.ledger);
+            print_cache_prune_suggestion();
         }
 
         if diff.has_pricing_changes {
@@ -1334,6 +1336,29 @@ async fn cmd_config_diff(
     }
     .instrument(span)
     .await
+}
+
+/// Number of cached entries above which `config diff` suggests pruning.
+const CACHE_PRUNE_SUGGESTION_THRESHOLD: usize = 1_000;
+
+/// Print the cache size and a prune suggestion when the cache is large.
+///
+/// Best-effort: a failure to read the cache is silent (the diff output is the
+/// primary result, and a missing cache is not an error).
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+fn print_cache_prune_suggestion() {
+    let Ok(stats) = cache::cache_stats() else {
+        return;
+    };
+    if stats.total_entries > CACHE_PRUNE_SUGGESTION_THRESHOLD {
+        println!(
+            "  Cache: {} entries ({}). Consider `soroban-cost-estimator cache clear` to prune stale estimates.",
+            stats.total_entries,
+            format_bytes(stats.disk_bytes),
+        );
+    }
 }
 
 /// `config history` command: print the full chronological change log.
@@ -1620,6 +1645,18 @@ fn cmd_cache_stats() -> error::AppResult<()> {
         "  Newest entry:   {}",
         stats.newest_entry.as_deref().unwrap_or("n/a")
     );
+    println!(
+        "  Oldest ledger:  {}",
+        stats
+            .oldest_ledger
+            .map_or_else(|| "n/a".to_string(), |v| v.to_string())
+    );
+    println!(
+        "  Newest ledger:  {}",
+        stats
+            .newest_ledger
+            .map_or_else(|| "n/a".to_string(), |v| v.to_string())
+    );
 
     if !stats.per_network.is_empty() {
         println!("\nPer-network breakdown:");
@@ -1694,11 +1731,15 @@ fn cmd_cache_verify() -> error::AppResult<()> {
 ///
 /// Defaults to `testnet`; pass `--network` to target another network. Only
 /// entries recorded for that network are removed — other networks' entries
-/// are untouched.
+/// are untouched. Requires `--confirm` because the operation is destructive.
 ///
 /// # Network calls
 /// None — pure SQLite I/O.
-fn cmd_cache_clear(network: &str) -> error::AppResult<()> {
+fn cmd_cache_clear(network: &str, confirm: bool) -> error::AppResult<()> {
+    if !confirm {
+        println!("This will remove cached estimates for {network}. Re-run with --confirm to proceed.");
+        return Ok(());
+    }
     let cleared = cache::clear_cache(network)?;
     println!("Cleared {cleared} cached estimate(s) for {network}.");
     Ok(())
