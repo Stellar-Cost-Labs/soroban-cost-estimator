@@ -654,7 +654,7 @@ pub fn verify_cache() -> AppResult<Vec<CacheEntryStatus>> {
 }
 
 /// Aggregate statistics for the estimate cache.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CacheStats {
     /// Total number of cached estimates across all networks.
     pub total_entries: usize,
