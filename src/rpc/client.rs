@@ -251,6 +251,14 @@ impl RpcClient {
         }
     }
 
+    /// Custom HTTP headers attached to every outbound request, as parsed from
+    /// the `"Key: Value"` strings passed to [`Self::with_headers`] or
+    /// [`Self::with_fallback_headers`].
+    #[must_use]
+    pub fn custom_headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
     /// Validate that the RPC endpoint is reachable and healthy before any
     /// simulation is run.
     ///

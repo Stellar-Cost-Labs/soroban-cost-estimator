@@ -401,7 +401,7 @@ pub fn format_contract_meta(meta: &ContractMeta) -> String {
 
 /// Human-readable name for a `ScSpecTypeDef`.
 #[must_use]
-fn spec_type_name(t: &stellar_xdr::ScSpecTypeDef) -> &'static str {
+pub fn spec_type_name(t: &stellar_xdr::ScSpecTypeDef) -> &'static str {
     match t {
         stellar_xdr::ScSpecTypeDef::Val => "val",
         stellar_xdr::ScSpecTypeDef::Bool => "bool",

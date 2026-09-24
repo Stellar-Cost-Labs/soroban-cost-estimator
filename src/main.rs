@@ -533,17 +533,26 @@ async fn cmd_estimate(
             extra_headers,
         );
 
-        let sc_vals: Vec<stellar_xdr::ScVal> = args
-            .iter()
-            .map(|a| xdr_helper::parse_arg_scval(a))
-            .collect();
-        debug!(arg_count = sc_vals.len(), "parsed arguments");
+        // Surface `--id` problems before spec arity errors: invoking a
+        // function requires a parsable contract id, and the CLI tests pin
+        // this precedence (`--fn` without `--id` / malformed `--id` must
+        // report the id, not a missing argument).
+        if fn_name.is_some() {
+            let id = contract_id.ok_or_else(|| {
+                error::AppError::TxConstruction(
+                    "contract id required for function invocation (pass --id <64-hex>)"
+                        .to_string(),
+                )
+            })?;
+            xdr_helper::parse_contract_id(id)?;
+        }
+
+        let sc_vals: Vec<stellar_xdr::ScVal> =
+            xdr_helper::parse_args_with_spec(fn_name, args, &wasm_info.functions)?;
+        debug!(arg_count = sc_vals.len(), "parsed arguments against contract spec");
 
         let tx_xdr =
             xdr_helper::build_simulation_tx_envelope(&wasm_info.bytes, contract_id, fn_name, &sc_vals)?;
-
-        xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
-        debug!(arg_count = args.len(), "validated arguments against contract spec");
 
         let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
         debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
@@ -1592,65 +1601,6 @@ async fn cmd_watch(
 }
 
 /// `cache verify` command: check every cache entry parses as valid JSON.
-/// `cache stats` command: show cache health overview.
-///
-/// Prints total entries, disk usage, age (oldest/newest), and per-network
-/// breakdown. Useful for checking whether the cache is being populated and
-/// how much disk space it consumes.
-///
-/// # Network calls
-/// None — pure SQLite I/O.
-fn cmd_cache_stats() -> error::AppResult<()> {
-    let stats = cache::cache_stats()?;
-
-    if stats.total_entries == 0 {
-        println!("Cache is empty — no cached estimates.");
-        return Ok(());
-    }
-
-    println!("Cache Statistics");
-    println!("================");
-    println!("  Total entries:  {}", stats.total_entries);
-    println!("  Disk usage:     {}", format_bytes(stats.disk_bytes));
-    println!(
-        "  Oldest entry:   {}",
-        stats.oldest_entry.as_deref().unwrap_or("n/a")
-    );
-    println!(
-        "  Newest entry:   {}",
-        stats.newest_entry.as_deref().unwrap_or("n/a")
-    );
-
-    if !stats.per_network.is_empty() {
-        println!("\nPer-network breakdown:");
-        for (network, count) in &stats.per_network {
-            println!(
-                "  {network}: {count} entr{}",
-                if *count == 1 { "y" } else { "ies" }
-            );
-        }
-    }
-
-    Ok(())
-}
-
-/// Format a byte count as a human-readable string (KB, MB, GB).
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
 ///
 /// Prints a summary line per corrupted entry and exits with code 1 when any
 /// entry fails verification, so scripts can treat a corrupt cache as an
