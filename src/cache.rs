@@ -90,6 +90,16 @@ pub struct CachedEstimate {
     pub success: bool,
 }
 
+impl std::fmt::Display for CachedEstimate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} on {} (ledger {}): {} stroops",
+            self.function, self.network, self.ledger, self.total_stroops
+        )
+    }
+}
+
 /// Optional filters for [`query_estimates`].
 ///
 /// Every field is optional; a `None` field means "no filter on this axis".
@@ -859,4 +869,31 @@ fn wasm_file_mtime_nanos(wasm_path: &Path) -> AppResult<u64> {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     Ok(nanos)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cached_estimate_display() {
+        let est = CachedEstimate {
+            version: CACHE_SCHEMA_VERSION,
+            wasm_hash: "abc".to_string(),
+            function: "hello".to_string(),
+            args_hash: "def".to_string(),
+            network: "testnet".to_string(),
+            ledger: 1000,
+            total_stroops: 500,
+            cpu_instructions: 10,
+            memory_bytes: 20,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            duration_ms: None,
+            success: true,
+        };
+        assert_eq!(
+            format!("{}", est),
+            "hello on testnet (ledger 1000): 500 stroops"
+        );
+    }
 }

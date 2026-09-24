@@ -289,6 +289,12 @@ impl CostReport {
     }
 }
 
+impl std::fmt::Display for CostReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", format_report_table(self))
+    }
+}
+
 /// Render optimization suggestions as a human-readable block.
 ///
 /// Always emits a header; when there are no suggestions it explains why, so
@@ -525,6 +531,14 @@ mod tests {
         assert_eq!(parsed["write_entries"], 1);
         assert_eq!(parsed["read_bytes"], 0);
         assert_eq!(parsed["write_bytes"], 136);
+    }
+
+    #[test]
+    fn test_cost_report_display() {
+        let report = report_with_rates(sample_rates());
+        let display_out = format!("{}", report);
+        let expected = format_report_table(&report);
+        assert_eq!(display_out, expected);
     }
 
     #[test]

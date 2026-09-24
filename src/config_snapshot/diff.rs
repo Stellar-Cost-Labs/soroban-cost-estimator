@@ -186,6 +186,12 @@ pub struct ConfigDiff {
     pub has_pricing_changes: bool,
 }
 
+impl std::fmt::Display for ConfigDiff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", format_diff(self))
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SnapshotInfo {
     pub network: String,
@@ -963,5 +969,13 @@ mod tests {
             !output.contains("\u{1b}["),
             "no-change output should have no ANSI codes: {output}"
         );
+    }
+
+    #[test]
+    fn test_config_diff_display() {
+        let old = make_snapshot(100, 10);
+        let new = make_snapshot(120, 10);
+        let diff = diff_snapshots(&old, &new);
+        assert_eq!(format!("{}", diff), format_diff(&diff));
     }
 }

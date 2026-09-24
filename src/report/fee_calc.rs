@@ -27,6 +27,19 @@ pub struct FeeBreakdown {
     pub total_xlm: String,
 }
 
+impl std::fmt::Display for FeeBreakdown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} stroops ({} XLM) [Non-refundable: {}, Refundable: {}]",
+            self.total_stroops,
+            self.total_xlm,
+            self.non_refundable_stroops,
+            self.refundable_stroops
+        )
+    }
+}
+
 /// Fee rates sourced from the network's `ConfigSettingContract*` entries.
 ///
 /// All rates are raw config values: stroops per 10,000 instructions
@@ -450,5 +463,27 @@ mod tests {
         assert_eq!(breakdown.non_refundable_stroops, 4_496);
         assert_eq!(breakdown.refundable_stroops, 15_427 - 4_496);
         assert_eq!(breakdown.total_stroops, 15_427);
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    #[test]
+    fn test_fee_breakdown_display() {
+        let breakdown = FeeBreakdown {
+            non_refundable_stroops: 100,
+            refundable_stroops: 200,
+            cpu_fee_stroops: 10,
+            storage_fee_stroops: 20,
+            bandwidth_fee_stroops: 30,
+            total_stroops: 300,
+            total_xlm: "0.0000300".to_string(),
+        };
+        assert_eq!(
+            format!("{}", breakdown),
+            "300 stroops (0.0000300 XLM) [Non-refundable: 100, Refundable: 200]"
+        );
     }
 }
