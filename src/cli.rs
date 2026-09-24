@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 /// Build version string with metadata from build.rs
@@ -58,10 +60,18 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Simulate a single contract invocation and print the cost report.
+    ///
+    /// Repeat `--wasm` (or pass `--wasm-dir`) to evaluate several contracts
+    /// in one batch run and print a multi-contract cost summary.
     Estimate {
-        /// Path to the compiled Soroban contract `.wasm` file.
-        #[arg(long, short)]
-        wasm: String,
+        /// Path to a compiled Soroban contract `.wasm` file. Repeat the flag
+        /// to evaluate multiple contracts in a single batch run.
+        #[arg(long, short, value_name = "PATH", required_unless_present = "wasm_dir")]
+        wasm: Vec<PathBuf>,
+
+        /// Directory of `.wasm` files to evaluate as a batch (non-recursive).
+        #[arg(long, value_name = "DIR")]
+        wasm_dir: Option<PathBuf>,
 
         /// Network to simulate against.
         #[arg(long, default_value = "testnet")]
@@ -108,10 +118,18 @@ pub enum Command {
     },
 
     /// Enumerate all public contract functions and estimate each one.
+    ///
+    /// Repeat `--wasm` (or pass `--wasm-dir`) to estimate several contracts
+    /// in one batch run and print a multi-contract cost summary.
     EstimateAll {
-        /// Path to the compiled Soroban contract `.wasm` file.
-        #[arg(long, short)]
-        wasm: String,
+        /// Path to a compiled Soroban contract `.wasm` file. Repeat the flag
+        /// to estimate multiple contracts in a single batch run.
+        #[arg(long, short, value_name = "PATH", required_unless_present = "wasm_dir")]
+        wasm: Vec<PathBuf>,
+
+        /// Directory of `.wasm` files to estimate as a batch (non-recursive).
+        #[arg(long, value_name = "DIR")]
+        wasm_dir: Option<PathBuf>,
 
         /// Network to simulate against.
         #[arg(long, default_value = "testnet")]

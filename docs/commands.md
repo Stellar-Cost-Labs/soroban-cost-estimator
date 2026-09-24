@@ -26,6 +26,14 @@ management**.
 
 ## Estimation
 
+> **Batch mode.** Repeating `--wasm` or passing `--wasm-dir <dir>` to `estimate`
+> or `estimate-all` evaluates every resolved contract in one run and prints an
+> aggregated multi-contract summary (function count, upload cost, and min/max
+> invocation fees per contract) instead of per-invocation output. `--json`
+> emits a structured batch report, and a contract that fails is reported in the
+> summary without aborting the rest of the run. In batch mode the `\*` above
+> marks the two WASM sources: supply at least one.
+
 ### `estimate`
 
 Simulate a single contract invocation and print the cost report.
@@ -40,7 +48,8 @@ soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
 
 | Flag | Short | Required | Default | Description |
 |------|-------|----------|---------|-------------|
-| `--wasm <WASM>` | `-w` | ✅ | — | Path to the compiled Soroban contract `.wasm` file |
+| `--wasm <PATH>` | `-w` | ✅* | — | Path to a compiled contract `.wasm` file (repeatable) |
+| `--wasm-dir <DIR>` | | ✅* | — | Directory of `.wasm` files to evaluate as a batch (non-recursive) |
 | `--network <NETWORK>` | | | `testnet` | Network to simulate against (`testnet`, `mainnet`, `futurenet`) |
 | `--rpc-url <RPC_URL>` | | | — | Explicit RPC URL (overrides network-based resolution) |
 | `--fn <FN>` | | | — | Contract function name to invoke |
@@ -199,7 +208,8 @@ soroban-cost-estimator estimate-all [OPTIONS] --wasm <WASM>
 
 | Flag | Short | Required | Default | Description |
 |------|-------|----------|---------|-------------|
-| `--wasm <WASM>` | `-w` | ✅ | — | Path to the compiled Soroban contract `.wasm` file |
+| `--wasm <PATH>` | `-w` | ✅* | — | Path to a compiled contract `.wasm` file (repeatable) |
+| `--wasm-dir <DIR>` | | ✅* | — | Directory of `.wasm` files to estimate as a batch (non-recursive) |
 | `--network <NETWORK>` | | | `testnet` | Network to simulate against |
 | `--id <ID>` | | | — | Deployed contract ID (64 hex chars) to invoke each function against |
 | `--json` | | | `false` | Output as JSON instead of a human-readable list |
