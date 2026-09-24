@@ -1,6 +1,7 @@
 use crate::config_snapshot::model::{
     ConfigSnapshot, ContractBandwidthV0, ContractComputeV0, ContractEventsV0,
-    ContractHistoricalDataV0, ContractLedgerCostV0, StateArchivalV0,
+    ContractHistoricalDataV0, ContractLedgerCostV0, StateArchivalV0, config_setting_human_name,
+    config_setting_id_for_prefix,
 };
 
 /// Returns a human-readable explanation for a given config setting field path.
@@ -106,16 +107,15 @@ pub fn setting_explanation(field_path: &str) -> Option<&'static str> {
 
 /// Maps a config setting prefix to its human-readable name.
 ///
-/// Matches the XDR enum variant names from `ConfigSettingId`.
+/// Names come from [`config_setting_human_name`] (resolved through
+/// [`config_setting_id_for_prefix`]) so diff tables, diff headers, and
+/// `--json` payloads always agree. Unknown prefixes fall back to the raw
+/// field path.
 pub fn setting_display_name(field_path: &str) -> &str {
-    match field_path.split('.').next() {
-        Some("contract_compute") => "Contract Compute V0",
-        Some("contract_ledger_cost") => "Contract Ledger Cost V0",
-        Some("contract_historical_data") => "Contract Historical Data V0",
-        Some("contract_events") => "Contract Events V0",
-        Some("contract_bandwidth") => "Contract Bandwidth V0",
-        Some("state_archival") => "State Archival",
-        _ => field_path,
+    let prefix = field_path.split('.').next().unwrap_or(field_path);
+    match config_setting_id_for_prefix(prefix) {
+        Some(id) => config_setting_human_name(&id),
+        None => field_path,
     }
 }
 
@@ -171,10 +171,45 @@ pub fn field_display_name(field_path: &str) -> String {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct FieldDiff {
     pub field_path: String,
+    /// Raw `ConfigSettingId` number (e.g. `0` for contract compute), or
+    /// `None` when the path's setting prefix is unknown.
+    pub setting_id: Option<u32>,
+    /// Friendly setting name (e.g. `Contract Compute V0`) for `field_path`.
+    pub setting_name: String,
     pub old_value: String,
     pub new_value: String,
     pub is_pricing_change: bool,
     pub explanation: Option<&'static str>,
+}
+
+impl FieldDiff {
+    /// Builds one change entry, deriving the raw setting id and the
+    /// friendly setting name from `field_path` so `--json` output carries
+    /// both alongside the machine path and always matches the table text.
+    fn new(
+        field_path: &str,
+        old_value: String,
+        new_value: String,
+        is_pricing_change: bool,
+        explanation: Option<&'static str>,
+    ) -> Self {
+        let prefix = field_path.split('.').next().unwrap_or(field_path);
+        let id = config_setting_id_for_prefix(prefix);
+        let setting_id = id.map(|id| id as u32);
+        let setting_name = match id {
+            Some(id) => config_setting_human_name(&id).to_string(),
+            None => field_path.to_string(),
+        };
+        Self {
+            field_path: field_path.to_string(),
+            setting_id,
+            setting_name,
+            old_value,
+            new_value,
+            is_pricing_change,
+            explanation,
+        }
+    }
 }
 
 /// The result of comparing two config snapshots.
@@ -270,20 +305,20 @@ fn compare_contract_compute(
                 false,
             );
         }
-        (None, Some(_)) => diffs.push(FieldDiff {
-            field_path: "contract_compute".to_string(),
-            old_value: "(missing)".to_string(),
-            new_value: "(present)".to_string(),
-            is_pricing_change: true,
-            explanation: None,
-        }),
-        (Some(_), None) => diffs.push(FieldDiff {
-            field_path: "contract_compute".to_string(),
-            old_value: "(present)".to_string(),
-            new_value: "(missing)".to_string(),
-            is_pricing_change: true,
-            explanation: None,
-        }),
+        (None, Some(_)) => diffs.push(FieldDiff::new(
+            "contract_compute",
+            "(missing)".to_string(),
+            "(present)".to_string(),
+            true,
+            None,
+        )),
+        (Some(_), None) => diffs.push(FieldDiff::new(
+            "contract_compute",
+            "(present)".to_string(),
+            "(missing)".to_string(),
+            true,
+            None,
+        )),
         _ => {}
     }
 }
@@ -373,20 +408,20 @@ fn compare_ledger_cost(
                 false,
             );
         }
-        (None, Some(_)) => diffs.push(FieldDiff {
-            field_path: "contract_ledger_cost".to_string(),
-            old_value: "(missing)".to_string(),
-            new_value: "(present)".to_string(),
-            is_pricing_change: true,
-            explanation: None,
-        }),
-        (Some(_), None) => diffs.push(FieldDiff {
-            field_path: "contract_ledger_cost".to_string(),
-            old_value: "(present)".to_string(),
-            new_value: "(missing)".to_string(),
-            is_pricing_change: true,
-            explanation: None,
-        }),
+        (None, Some(_)) => diffs.push(FieldDiff::new(
+            "contract_ledger_cost",
+            "(missing)".to_string(),
+            "(present)".to_string(),
+            true,
+            None,
+        )),
+        (Some(_), None) => diffs.push(FieldDiff::new(
+            "contract_ledger_cost",
+            "(present)".to_string(),
+            "(missing)".to_string(),
+            true,
+            None,
+        )),
         _ => {}
     }
 }
@@ -406,20 +441,20 @@ fn compare_historical_data(
                 true,
             );
         }
-        (None, Some(_)) => diffs.push(FieldDiff {
-            field_path: "contract_historical_data".to_string(),
-            old_value: "(missing)".to_string(),
-            new_value: "(present)".to_string(),
-            is_pricing_change: true,
-            explanation: None,
-        }),
-        (Some(_), None) => diffs.push(FieldDiff {
-            field_path: "contract_historical_data".to_string(),
-            old_value: "(present)".to_string(),
-            new_value: "(missing)".to_string(),
-            is_pricing_change: true,
-            explanation: None,
-        }),
+        (None, Some(_)) => diffs.push(FieldDiff::new(
+            "contract_historical_data",
+            "(missing)".to_string(),
+            "(present)".to_string(),
+            true,
+            None,
+        )),
+        (Some(_), None) => diffs.push(FieldDiff::new(
+            "contract_historical_data",
+            "(present)".to_string(),
+            "(missing)".to_string(),
+            true,
+            None,
+        )),
         _ => {}
     }
 }
@@ -446,20 +481,20 @@ fn compare_events(
                 true,
             );
         }
-        (None, Some(_)) => diffs.push(FieldDiff {
-            field_path: "contract_events".to_string(),
-            old_value: "(missing)".to_string(),
-            new_value: "(present)".to_string(),
-            is_pricing_change: true,
-            explanation: None,
-        }),
-        (Some(_), None) => diffs.push(FieldDiff {
-            field_path: "contract_events".to_string(),
-            old_value: "(present)".to_string(),
-            new_value: "(missing)".to_string(),
-            is_pricing_change: true,
-            explanation: None,
-        }),
+        (None, Some(_)) => diffs.push(FieldDiff::new(
+            "contract_events",
+            "(missing)".to_string(),
+            "(present)".to_string(),
+            true,
+            None,
+        )),
+        (Some(_), None) => diffs.push(FieldDiff::new(
+            "contract_events",
+            "(present)".to_string(),
+            "(missing)".to_string(),
+            true,
+            None,
+        )),
         _ => {}
     }
 }
@@ -493,20 +528,20 @@ fn compare_bandwidth(
                 true,
             );
         }
-        (None, Some(_)) => diffs.push(FieldDiff {
-            field_path: "contract_bandwidth".to_string(),
-            old_value: "(missing)".to_string(),
-            new_value: "(present)".to_string(),
-            is_pricing_change: true,
-            explanation: None,
-        }),
-        (Some(_), None) => diffs.push(FieldDiff {
-            field_path: "contract_bandwidth".to_string(),
-            old_value: "(present)".to_string(),
-            new_value: "(missing)".to_string(),
-            is_pricing_change: true,
-            explanation: None,
-        }),
+        (None, Some(_)) => diffs.push(FieldDiff::new(
+            "contract_bandwidth",
+            "(missing)".to_string(),
+            "(present)".to_string(),
+            true,
+            None,
+        )),
+        (Some(_), None) => diffs.push(FieldDiff::new(
+            "contract_bandwidth",
+            "(present)".to_string(),
+            "(missing)".to_string(),
+            true,
+            None,
+        )),
         _ => {}
     }
 }
@@ -589,20 +624,20 @@ fn compare_state_archival(
                 false,
             );
         }
-        (None, Some(_)) => diffs.push(FieldDiff {
-            field_path: "state_archival".to_string(),
-            old_value: "(missing)".to_string(),
-            new_value: "(present)".to_string(),
-            is_pricing_change: true,
-            explanation: None,
-        }),
-        (Some(_), None) => diffs.push(FieldDiff {
-            field_path: "state_archival".to_string(),
-            old_value: "(present)".to_string(),
-            new_value: "(missing)".to_string(),
-            is_pricing_change: true,
-            explanation: None,
-        }),
+        (None, Some(_)) => diffs.push(FieldDiff::new(
+            "state_archival",
+            "(missing)".to_string(),
+            "(present)".to_string(),
+            true,
+            None,
+        )),
+        (Some(_), None) => diffs.push(FieldDiff::new(
+            "state_archival",
+            "(present)".to_string(),
+            "(missing)".to_string(),
+            true,
+            None,
+        )),
         _ => {}
     }
 }
@@ -615,13 +650,13 @@ fn check<T: PartialEq + std::fmt::Display>(
     is_pricing: bool,
 ) {
     if old != new {
-        diffs.push(FieldDiff {
-            field_path: path.to_string(),
-            old_value: old.to_string(),
-            new_value: new.to_string(),
-            is_pricing_change: is_pricing,
-            explanation: setting_explanation(path),
-        });
+        diffs.push(FieldDiff::new(
+            path,
+            old.to_string(),
+            new.to_string(),
+            is_pricing,
+            setting_explanation(path),
+        ));
     }
 }
 
@@ -863,6 +898,68 @@ mod tests {
         let output = format_diff(&diff);
         assert!(output.contains("Contract Compute V0"));
         assert!(output.contains("Contract Bandwidth V0"));
+    }
+
+    /// AC: `--json` carries the friendly setting name alongside the raw
+    /// `ConfigSettingId` number, not just the machine field path.
+    #[test]
+    fn test_json_has_friendly_name_alongside_raw_id() {
+        use crate::rpc::config::ConfigSettingId;
+
+        let old = make_snapshot(100, 5);
+        let new = make_snapshot(200, 5);
+        let diff = diff_snapshots(&old, &new);
+        let json = serde_json::to_value(&diff).expect("diff should serialize to JSON");
+        let change = &json["changes"][0];
+
+        assert_eq!(
+            change["field_path"],
+            "contract_compute.fee_rate_per_instructions_increment"
+        );
+        assert_eq!(change["setting_name"], "Contract Compute V0");
+        assert_eq!(
+            change["setting_name"],
+            config_setting_human_name(&ConfigSettingId::ContractComputeV0)
+        );
+        assert_eq!(change["setting_id"], 0);
+
+        // The in-memory struct exposes the same pair the JSON does.
+        assert_eq!(diff.changes[0].setting_name, "Contract Compute V0");
+        assert_eq!(diff.changes[0].setting_id, Some(0));
+    }
+
+    /// Missing-section entries (bare prefix paths) also carry name + id.
+    #[test]
+    fn test_missing_section_entry_carries_setting_name_and_id() {
+        let mut old = make_snapshot(100, 5);
+        old.contract_bandwidth = None;
+        let new = make_snapshot(100, 5);
+        let diff = diff_snapshots(&old, &new);
+        assert_eq!(diff.changes.len(), 1);
+        assert_eq!(diff.changes[0].field_path, "contract_bandwidth");
+        assert_eq!(diff.changes[0].setting_name, "Contract Bandwidth V0");
+        assert_eq!(diff.changes[0].setting_id, Some(4));
+    }
+
+    /// AC: diff tables render names from the shared helper, so table text,
+    /// header text, and JSON can never drift apart.
+    #[test]
+    fn test_format_diff_uses_config_setting_human_name() {
+        use crate::rpc::config::ConfigSettingId;
+
+        let old = make_snapshot(100, 5);
+        let new = make_snapshot(200, 5);
+        let diff = diff_snapshots(&old, &new);
+        let output = format_diff(&diff);
+        let expected = config_setting_human_name(&ConfigSettingId::ContractComputeV0);
+        assert!(
+            output.contains(expected),
+            "diff table should show `{expected}`: {output}"
+        );
+        assert_eq!(
+            field_display_name("contract_compute.fee_rate_per_instructions_increment"),
+            format!("{expected} > Fee Rate Per Instructions Increment")
+        );
     }
 
     // ── ANSI pricing-change colors (#81) ──────────────────────────────
