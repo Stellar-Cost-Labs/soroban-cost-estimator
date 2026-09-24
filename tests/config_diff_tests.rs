@@ -252,7 +252,7 @@ fn test_format_diff_summary_counts_mixed() {
     let diff = diff::diff_snapshots(&old, &new);
     assert_eq!(
         diff::format_diff_summary(&diff),
-        "2 pricing changes, 1 non-pricing changes"
+        "Config drift detected: 2 pricing changes, 1 non-pricing changes"
     );
 }
 
@@ -262,7 +262,7 @@ fn test_format_diff_summary_no_changes() {
     let diff = diff::diff_snapshots(&snap, &snap);
     assert_eq!(
         diff::format_diff_summary(&diff),
-        "0 pricing changes, 0 non-pricing changes"
+        "Network config up to date (ledger 100)"
     );
 }
 
