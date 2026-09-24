@@ -172,21 +172,15 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 rpc_url,
                 against,
                 summary,
-                watch,
             } => {
-                if watch {
-                    cmd_config_diff_once(&network, against.as_deref(), rpc_url.as_deref(), rps)
-                        .await
-                } else {
-                    cmd_config_diff(
-                        &network,
-                        rpc_url.as_deref(),
-                        against.as_deref(),
-                        summary,
-                        rps,
-                    )
-                    .await
-                }
+                cmd_config_diff(
+                    &network,
+                    rpc_url.as_deref(),
+                    against.as_deref(),
+                    summary,
+                    rps,
+                )
+                .await
             }
             cli::ConfigAction::History { network } => cmd_config_history(&network),
             cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network),
@@ -220,7 +214,6 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 json,
             ),
         },
-        cli::Command::Watch { network, interval } => cmd_watch(&network, &interval, rps).await,
     }
 }
 
@@ -1192,134 +1185,6 @@ fn parse_interval_secs(interval: &str) -> u64 {
         _ => (&trimmed[..], 1u64),
     };
     num_part.parse::<u64>().unwrap_or(3600).saturating_mul(mult)
-}
-
-/// Resolves when the process receives SIGINT (Ctrl-C) or SIGTERM, so a
-/// long-running command can stop gracefully.
-///
-/// # Network calls
-/// None — waits on OS signals.
-async fn shutdown_signal() -> error::AppResult<()> {
-    #[cfg(unix)]
-    {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = sigterm.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
-    Ok(())
-}
-
-/// Compares a new snapshot against the latest local snapshot, printing
-/// the diff if changes exist, and always printing stale estimates.
-/// Returns `true` if changes were detected.
-fn check_and_print_diff(
-    network: &str,
-    against_path: Option<&str>,
-    snapshot: &config_snapshot::model::ConfigSnapshot,
-) -> bool {
-    use tracing::debug;
-    let old_snapshot_result = match against_path {
-        Some(path) => config_snapshot::store::load_snapshot_from_path(path),
-        None => config_snapshot::store::load_latest_snapshot(network),
-    };
-
-    if let Ok(old_snapshot) = old_snapshot_result {
-        let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, snapshot);
-        if !diff.changes.is_empty() {
-            debug!(change_count = diff.changes.len(), "config changes detected");
-            println!("{}", config_snapshot::diff::format_diff(&diff));
-        }
-        print_stale_estimates(network, snapshot.ledger);
-        return !diff.changes.is_empty();
-    }
-    false
-}
-
-/// `config diff --watch` command: compute the diff exactly once,
-/// print changes, and exit 1 if ANY changes were detected.
-async fn cmd_config_diff_once(
-    network: &str,
-    against_path: Option<&str>,
-    rpc_url: Option<&str>,
-    rps: Option<u64>,
-) -> error::AppResult<()> {
-    let snapshot = fetch_config_snapshot(network, rpc_url, rps).await?;
-    let has_changes = check_and_print_diff(network, against_path, &snapshot);
-    if has_changes {
-        std::process::exit(1);
-    }
-    println!("No config changes detected.");
-    Ok(())
-}
-
-/// Runs one `watch` poll cycle: fetch the network config, diff it against
-/// the previous snapshot, print changes and stale-estimate info, then save
-/// the new snapshot.
-///
-/// # Network calls
-/// Makes one batched `getLedgerEntries` RPC call.
-async fn watch_poll_once(
-    network: &str,
-    first: &mut bool,
-    rps: Option<u64>,
-) -> error::AppResult<()> {
-    use tracing::warn;
-
-    match fetch_config_snapshot(network, None, rps).await {
-        Ok(snapshot) => {
-            if !*first {
-                check_and_print_diff(network, None, &snapshot);
-            }
-
-            let _ = config_snapshot::store::save_snapshot(&snapshot, None);
-            *first = false;
-        }
-        Err(e) => {
-            warn!(error = %e, "failed to fetch config");
-            eprintln!("Warning: failed to fetch config: {e}");
-        }
-    }
-    Ok(())
-}
-
-/// `watch` command: poll network config and print diffs.
-///
-/// Polls immediately, then on `interval`, until SIGINT (Ctrl-C) or SIGTERM
-/// is received — then exits cleanly with code 0. The in-flight poll is
-/// cancelled rather than writing a partial snapshot.
-async fn cmd_watch(network: &str, interval: &str, rps: Option<u64>) -> error::AppResult<()> {
-    use tracing::info;
-
-    let interval_secs: u64 = parse_interval_secs(interval);
-
-    info!(interval_secs, "starting watch");
-    println!(
-        "Watching {} for config changes every {}s... (Ctrl-C to stop)",
-        network, interval_secs
-    );
-
-    let mut first = true;
-    loop {
-        tokio::select! {
-            signal = shutdown_signal() => {
-                signal?;
-                info!("received stop signal");
-                println!("Received stop signal — exiting cleanly.");
-                return Ok(());
-            }
-            () = async {
-                let _ = watch_poll_once(network, &mut first, rps).await;
-                tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
-            } => {}
-        }
-    }
 }
 
 /// `cache verify` command: check every cache entry parses as valid JSON.

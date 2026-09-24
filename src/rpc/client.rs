@@ -16,6 +16,20 @@ use crate::rpc::retry::with_retry;
 /// None — returns hardcoded well-known URLs. Custom URLs override network resolution.
 pub fn resolve_endpoint(network: &str, custom_url: Option<&str>) -> AppResult<String> {
     if let Some(url) = custom_url {
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|e| AppError::InvalidRpcUrl(format!("malformed URL: {e}")))?;
+
+        let scheme = parsed.scheme();
+        if scheme != "http" && scheme != "https" {
+            return Err(AppError::InvalidRpcUrl(format!(
+                "invalid scheme '{scheme}', must be http or https"
+            )));
+        }
+
+        if parsed.host().is_none() {
+            return Err(AppError::InvalidRpcUrl("missing host".to_string()));
+        }
+
         debug!(url, "using custom RPC endpoint");
         return Ok(url.to_string());
     }
@@ -534,5 +548,44 @@ mod tests {
             start.elapsed().as_millis() < 45,
             "disabled rate limiting must not delay requests"
         );
+    }
+
+    #[test]
+    fn test_resolve_endpoint_valid_custom_urls() {
+        assert!(super::resolve_endpoint("testnet", Some("http://localhost:8000")).is_ok());
+        assert!(super::resolve_endpoint("testnet", Some("https://example.com/rpc")).is_ok());
+        assert!(super::resolve_endpoint("testnet", Some("http://127.0.0.1")).is_ok());
+    }
+
+    #[test]
+    fn test_resolve_endpoint_invalid_custom_urls() {
+        let malformed = super::resolve_endpoint("testnet", Some("not_a_url"));
+        assert!(matches!(
+            malformed,
+            Err(crate::error::AppError::InvalidRpcUrl(_))
+        ));
+
+        let no_host = super::resolve_endpoint("testnet", Some("http://"));
+        assert!(matches!(
+            no_host,
+            Err(crate::error::AppError::InvalidRpcUrl(_))
+        ));
+
+        let bad_scheme = super::resolve_endpoint("testnet", Some("ftp://localhost"));
+        assert!(
+            matches!(bad_scheme, Err(crate::error::AppError::InvalidRpcUrl(msg)) if msg.contains("must be http or https"))
+        );
+
+        let bad_scheme2 = super::resolve_endpoint("testnet", Some("ws://localhost"));
+        assert!(matches!(
+            bad_scheme2,
+            Err(crate::error::AppError::InvalidRpcUrl(_))
+        ));
+
+        let bad_port = super::resolve_endpoint("testnet", Some("http://localhost:9999999"));
+        assert!(matches!(
+            bad_port,
+            Err(crate::error::AppError::InvalidRpcUrl(_))
+        ));
     }
 }

@@ -96,16 +96,6 @@ pub enum Command {
         #[command(subcommand)]
         action: CacheAction,
     },
-
-    /// Poll network config on an interval and print diffs when they appear.
-    Watch {
-        /// Network to watch.
-        #[arg(long, default_value = "testnet")]
-        network: String,
-        /// Polling interval (e.g. "30m", "1h").
-        #[arg(long, default_value = "1h")]
-        interval: String,
-    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -203,10 +193,6 @@ pub enum ConfigAction {
         /// instead of the full diff. Useful for CI status lines.
         #[arg(long)]
         summary: bool,
-
-        /// Run a one-shot diff that exits 1 if ANY changes are detected, matching watch mode output.
-        #[arg(long)]
-        watch: bool,
     },
 
     /// Show the full chronological change log across all stored snapshots.

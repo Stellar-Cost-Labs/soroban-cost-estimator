@@ -17,6 +17,9 @@ pub enum AppError {
     #[error("failed to execute RPC: status {status} - {message}")]
     Rpc { status: i64, message: String },
 
+    #[error("invalid RPC URL: {0}")]
+    InvalidRpcUrl(String),
+
     #[error("failed to send HTTP request: {0}")]
     Http(#[from] reqwest::Error),
 

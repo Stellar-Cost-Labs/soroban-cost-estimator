@@ -91,7 +91,6 @@ fn test_help_output() {
     );
     assert!(stdout.contains("config"), "help should list config command");
     assert!(stdout.contains("cache"), "help should list cache command");
-    assert!(stdout.contains("watch"), "help should list watch command");
 }
 
 #[test]
@@ -184,18 +183,6 @@ fn test_config_diff_help() {
         assert!(
             stdout.contains(flag),
             "diff help should mention {flag}; got: {stdout}"
-        );
-    }
-}
-
-#[test]
-fn test_watch_help() {
-    let (stdout, stderr, code) = run_cli(&["watch", "--help"]);
-    assert_eq!(code, 0, "watch --help should exit 0; stderr: {stderr}");
-    for flag in ["--network", "--interval"] {
-        assert!(
-            stdout.contains(flag),
-            "watch help should mention {flag}; got: {stdout}"
         );
     }
 }
@@ -873,37 +860,6 @@ fn test_config_diff_loads_valid_snapshot_before_network() {
 // `watch`
 // ─────────────────────────────────────────────────────────────────────────
 
-#[test]
-fn test_watch_unknown_network_is_non_fatal() {
-    // `watch` is a long-running loop: a failing poll warns and retries rather
-    // than exiting. Verify it accepts the args, warns, and keeps running —
-    // then kill it, since it would otherwise never return.
-    let home = temp_home("watch-loop");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
-        .args(["watch", "--network", "not-a-network", "--interval", "1h"])
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("failed to spawn watch");
-
-    // Give the first poll a moment to run, then confirm it has not exited.
-    std::thread::sleep(std::time::Duration::from_millis(750));
-    let status = child.try_wait().expect("failed to poll watch process");
-    assert!(
-        status.is_none(),
-        "watch should still be running after a failed poll, got: {status:?}"
-    );
-
-    let _ = child.kill();
-    let output = child.wait_with_output().expect("failed to reap watch");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("Watching not-a-network for config changes every 3600s"),
-        "watch should announce its network and resolved interval; got: {stdout}"
-    );
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 // `wasm-info` — contractmeta display
 // ─────────────────────────────────────────────────────────────────────────
@@ -1000,29 +956,6 @@ fn test_wasm_info_reports_absent_contract_meta() {
     );
 }
 
-#[test]
-fn test_watch_interval_suffixes_are_parsed() {
-    // `30m` must resolve to 1800s in the banner — the interval parser is unit
-    // tested in-crate, this pins the wiring through the CLI.
-    let home = temp_home("watch-interval");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
-        .args(["watch", "--network", "not-a-network", "--interval", "30m"])
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("failed to spawn watch");
-
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    let _ = child.kill();
-    let output = child.wait_with_output().expect("failed to reap watch");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("every 1800s"),
-        "`30m` should resolve to 1800s; got: {stdout}"
-    );
-}
-
 // ── cache query tests ────────────────────────────────────────────────
 
 #[test]
@@ -1100,125 +1033,5 @@ fn test_cache_query_json_flag_accepted() {
     assert!(
         serde_json::from_str::<serde_json::Value>(trimmed).is_ok(),
         "output should be valid JSON; got: {stdout}"
-    );
-}
-
-#[test]
-fn test_config_diff_watch_once_no_changes() {
-    let home = temp_home("diff-watch-once-no-changes");
-    let snapshot = snapshot_json("testnet", 1000);
-
-    let local_path = home.join("snapshot.json");
-    std::fs::write(&local_path, &snapshot).unwrap();
-
-    let remote_path = home.join("remote.json");
-    std::fs::write(&remote_path, &snapshot).unwrap();
-
-    let (stdout, stderr, code) = run_cli_in_home(
-        &[
-            "config",
-            "diff",
-            "--watch",
-            "--network",
-            "testnet",
-            "--against",
-            local_path.to_str().unwrap(),
-            "--rpc-url",
-            &format!("file://{}", remote_path.display()),
-        ],
-        Some(&home),
-    );
-
-    assert_eq!(code, 0, "no changes should exit 0; stderr: {stderr}");
-    assert!(
-        stdout.contains("No config changes detected"),
-        "should print no diff message; got {stdout}"
-    );
-}
-
-#[test]
-fn test_config_diff_watch_once_with_changes() {
-    let home = temp_home("diff-watch-once-with-changes");
-    let local_snap = snapshot_json("testnet", 1000);
-    let remote_snap = r#"{
-  "network": "testnet",
-  "ledger": 1001,
-  "timestamp": "2026-01-01T00:00:00+00:00",
-  "contract_compute": {
-    "ledger_max_instructions": 1000000,
-    "tx_max_instructions": 100000,
-    "fee_rate_per_instructions_increment": 500,
-    "tx_memory_limit": 41943040
-  },
-  "contract_ledger_cost": null,
-  "contract_historical_data": null,
-  "contract_events": null,
-  "contract_bandwidth": null,
-  "state_archival": null
-}"#;
-
-    let local_path = home.join("snapshot.json");
-    std::fs::write(&local_path, &local_snap).unwrap();
-
-    let remote_path = home.join("remote.json");
-    std::fs::write(&remote_path, remote_snap).unwrap();
-
-    let (stdout, stderr, code) = run_cli_in_home(
-        &[
-            "config",
-            "diff",
-            "--watch",
-            "--network",
-            "testnet",
-            "--against",
-            local_path.to_str().unwrap(),
-            "--rpc-url",
-            &format!("file://{}", remote_path.display()),
-        ],
-        Some(&home),
-    );
-
-    assert_eq!(code, 1, "changes should exit 1; stderr: {stderr}");
-    assert!(
-        !stdout.contains("No config changes detected"),
-        "should NOT print no diff message"
-    );
-    assert!(
-        stdout.contains("Contract Compute V0"),
-        "should print diff format; got {stdout}"
-    );
-}
-
-#[test]
-fn test_config_diff_watch_once_does_not_loop() {
-    let home = temp_home("diff-watch-once-no-loop");
-    let snapshot = snapshot_json("testnet", 1000);
-    let local_path = home.join("snapshot.json");
-    std::fs::write(&local_path, &snapshot).unwrap();
-
-    let start = std::time::Instant::now();
-    let (_, stderr, code) = run_cli_in_home(
-        &[
-            "config",
-            "diff",
-            "--watch",
-            "--network",
-            "testnet",
-            "--against",
-            local_path.to_str().unwrap(),
-            "--rpc-url",
-            "http://127.0.0.1:1",
-        ],
-        Some(&home),
-    );
-    let elapsed = start.elapsed();
-
-    assert!(elapsed.as_secs() < 5, "one-shot mode should not block/loop");
-    assert_eq!(code, 1, "should exit with error code");
-    assert!(
-        stderr.contains("failed to locate RPC endpoint")
-            || stderr.contains("error sending request")
-            || stderr.contains("failed to fetch"),
-        "should report network error; got: {stderr}"
     );
 }
