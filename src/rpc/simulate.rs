@@ -381,6 +381,86 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_transaction_data_resources_synthetic_multiple_footprint_entries() {
+        let key1 = stellar_xdr::LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
+            account_id: stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::Uint256([1u8; 32]),
+            )),
+        });
+        let key2 = stellar_xdr::LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
+            account_id: stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::Uint256([2u8; 32]),
+            )),
+        });
+        let key3 = stellar_xdr::LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
+            account_id: stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::Uint256([3u8; 32]),
+            )),
+        });
+
+        let data = stellar_xdr::SorobanTransactionData {
+            ext: stellar_xdr::SorobanTransactionDataExt::V0,
+            resources: stellar_xdr::SorobanResources {
+                footprint: stellar_xdr::LedgerFootprint {
+                    read_only: vec![key1].try_into().unwrap(),
+                    read_write: vec![key2, key3].try_into().unwrap(),
+                },
+                instructions: 750_000,
+                disk_read_bytes: 512,
+                write_bytes: 1024,
+            },
+            resource_fee: 50_000,
+        };
+
+        let xdr = data
+            .to_xdr(stellar_xdr::Limits::none())
+            .expect("XDR encode");
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &xdr);
+
+        let resources = parse_transaction_data_resources(&Some(b64))
+            .expect("parse should succeed")
+            .expect("resources should be present");
+
+        assert_eq!(resources.cpu_insns, 750_000);
+        assert_eq!(resources.read_entries, 1);
+        assert_eq!(resources.write_entries, 2);
+        assert_eq!(resources.read_bytes, 512);
+        assert_eq!(resources.write_bytes, 1024);
+    }
+
+    #[test]
+    fn test_parse_transaction_data_resources_empty_footprint() {
+        let data = stellar_xdr::SorobanTransactionData {
+            ext: stellar_xdr::SorobanTransactionDataExt::V0,
+            resources: stellar_xdr::SorobanResources {
+                footprint: stellar_xdr::LedgerFootprint {
+                    read_only: stellar_xdr::VecM::default(),
+                    read_write: stellar_xdr::VecM::default(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let xdr = data
+            .to_xdr(stellar_xdr::Limits::none())
+            .expect("XDR encode");
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &xdr);
+
+        let resources = parse_transaction_data_resources(&Some(b64))
+            .expect("parse should succeed")
+            .expect("resources should be present");
+
+        assert_eq!(resources.cpu_insns, 0);
+        assert_eq!(resources.read_entries, 0);
+        assert_eq!(resources.write_entries, 0);
+        assert_eq!(resources.read_bytes, 0);
+        assert_eq!(resources.write_bytes, 0);
+    }
+
+    #[test]
     fn test_parse_transaction_data_resources_absent() {
         assert_eq!(parse_transaction_data_resources(&None).unwrap(), None);
     }
