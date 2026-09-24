@@ -36,9 +36,12 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
     let mut functions = metadata.functions;
     if !spec_functions.is_empty() {
         for fn_info in &mut functions {
-            if let Some((_, params)) = spec_functions.iter().find(|(n, _)| n == &fn_info.name) {
+            if let Some((_, params, doc)) =
+                spec_functions.iter().find(|(n, _, _)| n == &fn_info.name)
+            {
                 fn_info.params = params.clone();
                 fn_info.param_count = params.len() as u32;
+                fn_info.doc = doc.clone();
             }
         }
     }
@@ -136,6 +139,7 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
                             param_count,
                             result_count,
                             params: Vec::new(),
+                            doc: None,
                         });
                     }
                     exports.push(ExportInfo {
@@ -234,8 +238,8 @@ pub fn type_ref_kind_name(ty: &wasmparser::TypeRef) -> &'static str {
     }
 }
 
-/// Decoded spec function entries: (function name, typed parameter list).
-pub type SpecFunctions = Vec<(String, Vec<ParamInfo>)>;
+/// Decoded spec function entries: (function name, typed parameter list, docstring).
+pub type SpecFunctions = Vec<(String, Vec<ParamInfo>, Option<String>)>;
 
 /// Decodes the Soroban contract spec (`contractspecv0` custom section).
 ///
@@ -283,7 +287,15 @@ pub fn parse_contract_spec(bytes: &[u8]) -> AppResult<(SpecFunctions, bool)> {
                             type_def: input.type_.clone(),
                         })
                         .collect();
-                    spec_functions.push((name, params));
+                    let doc = {
+                        let doc_str = String::from_utf8_lossy(f.doc.as_slice()).to_string();
+                        if doc_str.is_empty() {
+                            None
+                        } else {
+                            Some(doc_str)
+                        }
+                    };
+                    spec_functions.push((name, params, doc));
                 }
             }
         }
@@ -593,21 +605,42 @@ pub struct FunctionInfo {
     pub result_count: u32,
     /// Typed parameters from the contract spec, if the WASM has one.
     pub params: Vec<ParamInfo>,
+    /// Docstring from the contract spec, if present.
+    pub doc: Option<String>,
 }
 
 /// Formats a function with its spec-derived signature, e.g. `increment(x: I64)`.
+///
+/// When a docstring is present, it is appended on a new line prefixed with `///`.
 #[must_use]
 pub fn format_function(fn_info: &FunctionInfo) -> String {
-    if fn_info.params.is_empty() {
-        return fn_info.name.clone();
+    let sig = if fn_info.params.is_empty() {
+        fn_info.name.clone()
+    } else {
+        let params = fn_info
+            .params
+            .iter()
+            .map(|p| format!("{}: {}", p.name, p.type_name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{}({params})", fn_info.name)
+    };
+
+    match &fn_info.doc {
+        Some(doc) => {
+            let doc_lines: Vec<&str> = doc.lines().collect();
+            if doc_lines.len() <= 1 {
+                format!("{sig}\n    /// {doc}")
+            } else {
+                let mut result = sig;
+                for line in &doc_lines {
+                    result.push_str(&format!("\n    /// {line}"));
+                }
+                result
+            }
+        }
+        None => sig,
     }
-    let params = fn_info
-        .params
-        .iter()
-        .map(|p| format!("{}: {}", p.name, p.type_name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("{}({params})", fn_info.name)
 }
 
 /// Information extracted from a WASM file.

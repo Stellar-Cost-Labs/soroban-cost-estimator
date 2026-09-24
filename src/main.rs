@@ -1080,6 +1080,7 @@ fn wasm_info_json(
                 "name": f.name,
                 "param_count": f.param_count,
                 "result_count": f.result_count,
+                "doc": f.doc,
                 "params": f.params.iter().map(|p| {
                     serde_json::json!({ "name": p.name, "type": p.type_name })
                 }).collect::<Vec<_>>(),
@@ -1592,66 +1593,6 @@ async fn cmd_watch(
 }
 
 /// `cache verify` command: check every cache entry parses as valid JSON.
-/// `cache stats` command: show cache health overview.
-///
-/// Prints total entries, disk usage, age (oldest/newest), and per-network
-/// breakdown. Useful for checking whether the cache is being populated and
-/// how much disk space it consumes.
-///
-/// # Network calls
-/// None — pure SQLite I/O.
-fn cmd_cache_stats() -> error::AppResult<()> {
-    let stats = cache::cache_stats()?;
-
-    if stats.total_entries == 0 {
-        println!("Cache is empty — no cached estimates.");
-        return Ok(());
-    }
-
-    println!("Cache Statistics");
-    println!("================");
-    println!("  Total entries:  {}", stats.total_entries);
-    println!("  Disk usage:     {}", format_bytes(stats.disk_bytes));
-    println!(
-        "  Oldest entry:   {}",
-        stats.oldest_entry.as_deref().unwrap_or("n/a")
-    );
-    println!(
-        "  Newest entry:   {}",
-        stats.newest_entry.as_deref().unwrap_or("n/a")
-    );
-
-    if !stats.per_network.is_empty() {
-        println!("\nPer-network breakdown:");
-        for (network, count) in &stats.per_network {
-            println!(
-                "  {network}: {count} entr{}",
-                if *count == 1 { "y" } else { "ies" }
-            );
-        }
-    }
-
-    Ok(())
-}
-
-/// Format a byte count as a human-readable string (KB, MB, GB).
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
-///
 /// Prints a summary line per corrupted entry and exits with code 1 when any
 /// entry fails verification, so scripts can treat a corrupt cache as an
 /// error. A healthy (or empty) cache exits 0.
@@ -1959,6 +1900,7 @@ mod tests {
                     type_name: "I64".to_string(),
                     type_def: stellar_xdr::ScSpecTypeDef::I64,
                 }],
+                doc: Some("Increment the counter".to_string()),
             }],
             start_function: None,
             memories: Vec::new(),
@@ -1974,6 +1916,7 @@ mod tests {
         assert_eq!(value["contract_meta"]["name"], serde_json::Value::Null);
         assert_eq!(value["contract_meta"]["entries"], serde_json::json!([]));
         assert_eq!(value["functions"][0]["name"], "increment");
+        assert_eq!(value["functions"][0]["doc"], "Increment the counter");
         assert_eq!(value["functions"][0]["params"][0]["name"], "step");
         assert_eq!(value["functions"][0]["params"][0]["type"], "I64");
     }
