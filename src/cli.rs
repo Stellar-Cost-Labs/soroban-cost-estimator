@@ -45,6 +45,11 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "URL")]
     pub rpc_fallback_url: Option<String>,
 
+    /// Control color output: "auto" (default, TTY-aware), "always", or "never".
+    /// Also respects the NO_COLOR environment variable.
+    #[arg(long, global = true, value_name = "WHEN", default_value = "auto")]
+    pub color: String,
+
     /// Retry transient RPC failures up to N times (default 3), using
     /// exponential backoff (500ms, then doubled between attempts). 0
     /// disables retries entirely.
