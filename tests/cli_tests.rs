@@ -1654,3 +1654,121 @@ fn test_estimate_minimal_wasm_upload_zero_footprint() {
     assert_eq!(parsed["read_bytes"], 0);
     assert_eq!(parsed["write_bytes"], 0);
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Unoptimized-WASM tip
+// ─────────────────────────────────────────────────────────────────────────
+
+/// `contract.wasm` carries a `name` section, so `estimate` must warn on
+/// stderr — never stdout — before the simulation runs.
+#[test]
+fn test_estimate_unoptimized_wasm_prints_tip_to_stderr() {
+    let home = temp_home("optimize-tip");
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--rpc-url",
+            DEAD_RPC,
+        ],
+        Some(&home),
+    );
+
+    // The dead endpoint still fails the run, but the tip is emitted first.
+    assert_eq!(code, 1, "the dead endpoint should fail; stderr: {stderr}");
+    assert!(
+        stderr.contains("Unoptimized WASM detected"),
+        "stderr should carry the optimization tip; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("soroban contract optimize") && stderr.contains("wasm-opt"),
+        "the tip should name both optimizers; got: {stderr}"
+    );
+    assert!(
+        !stdout.contains("Unoptimized WASM detected"),
+        "the tip must not pollute stdout; got: {stdout}"
+    );
+}
+
+/// `--json` promises machine-readable stdout and suppresses the tip entirely.
+#[test]
+fn test_estimate_json_suppresses_optimization_tip() {
+    let home = temp_home("optimize-tip-json");
+    let (_, stderr, _) = run_cli_in_home(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--rpc-url",
+            DEAD_RPC,
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert!(
+        !stderr.contains("Unoptimized WASM detected"),
+        "--json must suppress the tip; stderr: {stderr}"
+    );
+}
+
+/// `--quiet` suppresses non-essential output, including the tip.
+#[test]
+fn test_estimate_quiet_suppresses_optimization_tip() {
+    let home = temp_home("optimize-tip-quiet");
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--rpc-url",
+            DEAD_RPC,
+            "--quiet",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "--quiet should still fail on the dead endpoint");
+    assert!(
+        !stderr.contains("Unoptimized WASM detected"),
+        "--quiet must suppress the tip; stderr: {stderr}"
+    );
+}
+
+/// A binary without debug sections must never trigger the tip.
+#[test]
+fn test_estimate_minimal_wasm_has_no_optimization_tip() {
+    let home = temp_home("optimize-tip-clean");
+    let (_, stderr, _) = run_cli_in_home(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--rpc-url",
+            DEAD_RPC,
+        ],
+        Some(&home),
+    );
+    assert!(
+        !stderr.contains("Unoptimized WASM detected"),
+        "clean WASM must not warn; stderr: {stderr}"
+    );
+}
+
+/// `wasm-info` reports the same detection without any RPC call.
+#[test]
+fn test_wasm_info_reports_debug_symbols() {
+    let home = temp_home("wasm-info-debug");
+    let (stdout, stderr, code) = run_cli_in_home(
+        &["wasm-info", "--wasm", "tests/fixtures/contract.wasm"],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "wasm-info should succeed; stderr: {stderr}");
+    assert!(
+        stdout.contains("Debug symbols: present"),
+        "wasm-info should flag debug symbols; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("reclaimable"),
+        "wasm-info should quantify the reclaimable share; got: {stdout}"
+    );
+}

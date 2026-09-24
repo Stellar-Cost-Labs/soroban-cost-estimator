@@ -1,6 +1,7 @@
 use std::io::Cursor;
 use std::path::Path;
 
+use sha2::Digest;
 use stellar_xdr::ReadXdr;
 use tracing::{debug, trace};
 
@@ -43,9 +44,17 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
         }
     }
 
+    // Soroban identifies a contract on-chain by the SHA-256 hash of its WASM
+    // bytes (the executable hash). Compute it once, here, so every command
+    // reports the same identity for the same file without re-hashing.
+    let wasm_hash = hex::encode(sha2::Sha256::digest(&bytes));
+
     trace!(functions = functions.len(), has_spec, "WASM parsed");
     Ok(WasmInfo {
+        wasm_hash,
         bytes,
+        has_debug_symbols: metadata.has_debug_symbols,
+        debug_symbol_bytes: metadata.debug_symbol_bytes,
         functions,
         has_spec,
         contract_meta,
@@ -80,6 +89,11 @@ pub struct ModuleMetadata {
     pub imports: Vec<ImportInfo>,
     /// Exports declared by the module, including non-function exports.
     pub exports: Vec<ExportInfo>,
+    /// Whether the module carries a `name` or `.debug*` custom section —
+    /// the signature of an unoptimized/debug build.
+    pub has_debug_symbols: bool,
+    /// Combined byte size of the `name` and `.debug*` custom sections.
+    pub debug_symbol_bytes: usize,
 }
 
 /// Enumerates exported functions and captures module entry-point metadata:
@@ -100,6 +114,8 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
     let mut memories = Vec::new();
     let mut imports = Vec::new();
     let mut exports = Vec::new();
+    let mut has_debug_symbols = false;
+    let mut debug_symbol_bytes = 0usize;
 
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
         let payload = payload.map_err(|e| AppError::WasmParse(e.to_string()))?;
@@ -155,6 +171,15 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
                     });
                 }
             }
+            wasmparser::Payload::CustomSection(section) => {
+                // `name` carries the function/local symbol table; `.debug*`
+                // sections carry DWARF info. Both are stripped by
+                // `soroban contract optimize` / `wasm-opt -g`.
+                if is_debug_custom_section(section.name()) {
+                    has_debug_symbols = true;
+                    debug_symbol_bytes += section.data().len();
+                }
+            }
             wasmparser::Payload::StartSection { func, .. } => start_function = Some(func),
             wasmparser::Payload::ImportSection(section) => {
                 for group in section {
@@ -206,6 +231,8 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
         memories,
         imports,
         exports,
+        has_debug_symbols,
+        debug_symbol_bytes,
     })
 }
 
@@ -613,8 +640,16 @@ pub fn format_function(fn_info: &FunctionInfo) -> String {
 /// Information extracted from a WASM file.
 #[derive(Debug, Clone)]
 pub struct WasmInfo {
+    /// SHA-256 hash of the raw WASM bytes (lowercase hex). Soroban uses this
+    /// 32-byte digest as the on-chain executable hash of the contract.
+    pub wasm_hash: String,
     /// Raw WASM bytes.
     pub bytes: Vec<u8>,
+    /// True when the binary carries a `name` or `.debug*` custom section,
+    /// which marks it as an unoptimized/debug build.
+    pub has_debug_symbols: bool,
+    /// Combined byte size of the `name` and `.debug*` custom sections.
+    pub debug_symbol_bytes: usize,
     /// Names and signatures of exported (public) functions.
     pub functions: Vec<FunctionInfo>,
     /// Whether the WASM carries a Soroban contract spec (`contractspecv0`).
@@ -630,6 +665,53 @@ pub struct WasmInfo {
     pub imports: Vec<ImportInfo>,
     /// Exports declared by the module, including non-function exports.
     pub exports: Vec<ExportInfo>,
+}
+
+impl WasmInfo {
+    /// Estimated percentage of the binary that can be reclaimed by stripping
+    /// its `name` / `.debug*` custom sections, rounded to whole percent.
+    ///
+    /// Returns `0` when the binary carries no debug sections. Real-world
+    /// `soroban contract optimize` runs typically shrink a debug build by
+    /// 40–70%; the value here is derived from the actual section sizes rather
+    /// than hard-coded.
+    #[must_use]
+    pub fn estimated_size_reduction_percent(&self) -> u32 {
+        if self.debug_symbol_bytes == 0 || self.bytes.is_empty() {
+            return 0;
+        }
+        let bytes = self.bytes.len() as u64;
+        let debug = self.debug_symbol_bytes as u64;
+        // Round to nearest percent, then floor at 1 so a detected debug
+        // section never reports "~0%".
+        let rounded = (debug * 100 + bytes / 2) / bytes;
+        u32::try_from(rounded.max(1)).unwrap_or(1)
+    }
+}
+
+/// True when a WASM custom section is a debug/optimization artifact: the
+/// `name` symbol section or any DWARF `.debug*` section.
+#[must_use]
+pub fn is_debug_custom_section(name: &str) -> bool {
+    name == "name" || name.starts_with(".debug")
+}
+
+/// Builds the "unoptimized WASM" tip for an unoptimized build, or `None` when
+/// the binary carries no debug symbols.
+///
+/// The returned string is meant for stderr so it never contaminates
+/// machine-readable stdout; callers are responsible for suppressing it in
+/// quiet/JSON modes.
+#[must_use]
+pub fn format_optimization_tip(info: &WasmInfo) -> Option<String> {
+    if !info.has_debug_symbols {
+        return None;
+    }
+    Some(format!(
+        "💡 Tip: Unoptimized WASM detected (contains debug symbols). \
+         Run `soroban contract optimize` or `wasm-opt` to reduce upload cost by ~{}%",
+        info.estimated_size_reduction_percent()
+    ))
 }
 
 /// Formats a human-readable diagnostic summary of a loaded module: the start
