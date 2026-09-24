@@ -38,9 +38,11 @@ where
     std::fs::create_dir_all(&tmp).expect("create temp home");
 
     let old_home = std::env::var_os("HOME");
+    let old_userprofile = std::env::var_os("USERPROFILE");
     // SAFETY: serialized by HOME_MUTEX, no other thread reads HOME during this block
     unsafe {
         std::env::set_var("HOME", &tmp);
+        std::env::set_var("USERPROFILE", &tmp);
     }
 
     // Run the test; catch panics so we can clean up regardless
@@ -64,6 +66,15 @@ where
     } else {
         unsafe {
             std::env::remove_var("HOME");
+        }
+    }
+    if let Some(old) = old_userprofile {
+        unsafe {
+            std::env::set_var("USERPROFILE", old);
+        }
+    } else {
+        unsafe {
+            std::env::remove_var("USERPROFILE");
         }
     }
 
