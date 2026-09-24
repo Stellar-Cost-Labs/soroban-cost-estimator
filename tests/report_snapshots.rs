@@ -3,6 +3,7 @@ use soroban_cost_estimator::report::fee_calc::FeeBreakdown;
 use soroban_cost_estimator::report::formatter::{
     CsvFormatter, JsonFormatter, MarkdownFormatter, ReportFormatter, TableFormatter,
 };
+use soroban_cost_estimator::wasm::parser::ContractMeta;
 
 fn sample_report() -> CostReport {
     CostReport {
@@ -28,6 +29,7 @@ fn sample_report() -> CostReport {
         network: "testnet".to_string(),
         rpc_latency_ms: 87,
         rates: None,
+        contract_meta: ContractMeta::default(),
     }
 }
 
@@ -55,6 +57,7 @@ fn empty_report() -> CostReport {
         network: "mainnet".to_string(),
         rpc_latency_ms: 0,
         rates: None,
+        contract_meta: ContractMeta::default(),
     }
 }
 
