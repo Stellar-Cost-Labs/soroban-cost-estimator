@@ -126,6 +126,130 @@ fn test_watch_help() {
 }
 
 #[test]
+fn test_config_cache_import_help() {
+    let (stdout, stderr, code) = run_cli(&["config", "cache", "import", "--help"]);
+    assert_eq!(
+        code, 0,
+        "config cache import --help should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("--overwrite"),
+        "import help should mention --overwrite"
+    );
+    assert!(
+        stdout.contains("--merge"),
+        "import help should mention --merge"
+    );
+}
+
+#[test]
+fn test_config_cache_help_lists_import() {
+    let (stdout, stderr, code) = run_cli(&["config", "cache", "--help"]);
+    assert_eq!(
+        code, 0,
+        "config cache --help should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("import"),
+        "config cache help should list import"
+    );
+}
+
+#[test]
+fn test_cache_import_prints_summary() {
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp =
+        std::env::temp_dir().join(format!("sce_cli_import_{}_{}", std::process::id(), suffix));
+    std::fs::create_dir_all(&tmp).expect("create temp home");
+
+    let export_path = tmp.join("export.json");
+    let export = serde_json::json!({
+        "schema_version": 1,
+        "exported_at": "2026-01-01T00:00:00+00:00",
+        "entries": [{
+            "wasm_hash": "abc123",
+            "function": "cli_import_fn",
+            "args_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "network": "testnet",
+            "ledger": 42,
+            "total_stroops": 100,
+            "cpu_instructions": 10,
+            "memory_bytes": 5,
+            "timestamp": "2026-01-01T00:00:00+00:00"
+        }]
+    });
+    std::fs::write(
+        &export_path,
+        serde_json::to_string_pretty(&export).expect("ser"),
+    )
+    .expect("write export");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "config",
+            "cache",
+            "import",
+            export_path.to_str().expect("utf8 path"),
+        ])
+        .env("HOME", &tmp)
+        .output()
+        .expect("run CLI import");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let code = output.status.code().unwrap_or(-1);
+    assert_eq!(code, 0, "import should exit 0; stderr: {stderr}");
+    assert_eq!(
+        stdout.trim(),
+        "Imported 1 new entries, skipped 0 existing entries",
+        "summary line should match the acceptance criteria exactly"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_cache_import_corrupted_file_exits_nonzero() {
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = std::env::temp_dir().join(format!(
+        "sce_cli_import_bad_{}_{}",
+        std::process::id(),
+        suffix
+    ));
+    std::fs::create_dir_all(&tmp).expect("create temp home");
+
+    let export_path = tmp.join("corrupt.json");
+    std::fs::write(&export_path, "not json at all").expect("write corrupt");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "config",
+            "cache",
+            "import",
+            export_path.to_str().expect("utf8 path"),
+        ])
+        .env("HOME", &tmp)
+        .output()
+        .expect("run CLI import");
+
+    let code = output.status.code().unwrap_or(-1);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_ne!(code, 0, "corrupt import should exit non-zero");
+    assert!(
+        stderr.contains("corrupted"),
+        "stderr should carry the informative error: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn test_estimate_missing_wasm_errors() {
     let (_, stderr, code) = run_cli(&["estimate"]);
     assert_ne!(code, 0, "estimate without --wasm should error");

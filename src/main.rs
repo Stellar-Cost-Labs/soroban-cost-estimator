@@ -53,6 +53,13 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::Diff { network, against } => {
                 cmd_config_diff(&network, against.as_deref()).await
             }
+            cli::ConfigAction::Cache { action } => match action {
+                cli::CacheAction::Import {
+                    file,
+                    merge: _,
+                    overwrite,
+                } => cmd_cache_import(&file, overwrite),
+            },
         },
         cli::Command::Watch { network, interval } => cmd_watch(&network, &interval).await,
     }
@@ -581,6 +588,22 @@ async fn cmd_config_diff(network: &str, against_path: Option<&str>) -> error::Ap
     if diff.has_pricing_changes {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+/// `config cache import` command: restore cached estimates from an export file.
+///
+/// Merge mode (the default, and `--merge`) keeps the newer of each pair;
+/// `--overwrite` replaces existing entries unconditionally.
+///
+/// # Network calls
+/// None — pure file I/O via `cache::import_cache`.
+fn cmd_cache_import(file: &std::path::Path, overwrite: bool) -> error::AppResult<()> {
+    let summary = cache::import_cache(file, overwrite)?;
+    println!(
+        "Imported {} new entries, skipped {} existing entries",
+        summary.imported, summary.skipped
+    );
     Ok(())
 }
 
