@@ -162,3 +162,44 @@ fn test_json_flag_accepted() {
         "--json should be a recognized argument; stderr: {stderr}"
     );
 }
+
+/// The fixture's only function needs an argument, so `estimate-all --json`
+/// must still print a valid report object and exit non-zero.
+#[test]
+fn test_estimate_all_json_outputs_object_and_exits_nonzero_on_failure() {
+    let (stdout, stderr, code) = run_cli(&[
+        "estimate-all",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--json",
+    ]);
+
+    assert_eq!(
+        code, 1,
+        "any failed function must exit non-zero; stderr: {stderr}"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must be a valid JSON object");
+    assert!(
+        parsed.is_object(),
+        "top-level JSON must be an object, not an array: {stdout}"
+    );
+    assert!(parsed["contract_wasm_hash"].is_string());
+    assert_eq!(parsed["network"], "testnet");
+    assert!(parsed["functions"].is_array());
+    assert!(parsed["total_summary"].is_object());
+
+    let functions = parsed["functions"].as_array().expect("functions array");
+    assert_eq!(functions.len(), 1, "fixture exports one function");
+    let entry = &functions[0];
+    assert_eq!(entry["function_name"], "increment");
+    assert_eq!(entry["status"], "failed");
+    assert!(entry["error_message"].is_string());
+    assert!(entry["resources"].is_null());
+    assert!(entry["fee_breakdown"].is_null());
+
+    assert_eq!(parsed["total_summary"]["total_functions"], 1);
+    assert_eq!(parsed["total_summary"]["failed"], 1);
+    assert_eq!(parsed["total_summary"]["successful"], 0);
+}

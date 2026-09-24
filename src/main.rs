@@ -311,6 +311,12 @@ async fn cmd_estimate(
 }
 
 /// `estimate-all` command: enumerate all functions and estimate each.
+///
+/// Human-readable mode prints progress and per-function results as it goes.
+/// `--json` mode collects everything into an `EstimateAllReport`, prints it
+/// as one pretty-printed JSON object, and exits non-zero when any function
+/// failed — after the JSON has been emitted, so automation always receives
+/// valid output.
 async fn cmd_estimate_all(
     wasm_path: &str,
     network: &str,
@@ -348,37 +354,139 @@ async fn cmd_estimate_all(
     use sha2::Digest;
     let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
 
-    let mut json_results: Vec<serde_json::Value> = Vec::new();
+    if json_flag {
+        return estimate_all_json(&client, &wasm_info, contract_id, &wasm_hash, network).await;
+    }
+
     let total = wasm_info.functions.len();
     for (i, fn_info) in wasm_info.functions.iter().enumerate() {
-        if !json_flag {
-            println!("[{}/{}] {}", i + 1, total, fn_info.name);
-        }
-        let result = estimate_all_function(
+        println!("[{}/{}] {}", i + 1, total, fn_info.name);
+        let _ = estimate_one_function(
             &client,
             &wasm_info,
             fn_info,
             contract_id,
             &wasm_hash,
             network,
-            json_flag,
+            false,
         )
-        .await?;
-        if let Some(value) = result {
-            json_results.push(value);
-        }
-    }
-
-    if json_flag {
-        println!("{}", serde_json::to_string_pretty(&json_results)?);
+        .await;
     }
 
     Ok(())
 }
 
-/// Estimates one exported function against the network, printing its result
-/// (non-JSON mode) or returning its JSON record (JSON mode).
-async fn estimate_all_function(
+/// JSON mode of `estimate-all`: collect per-function results into an
+/// `EstimateAllReport`, print it, and exit non-zero if any function failed.
+///
+/// Fee rates are fetched once (and only when at least one zero-argument
+/// function might actually be simulated) so each success gets a full
+/// fee breakdown.
+async fn estimate_all_json(
+    client: &rpc::client::RpcClient,
+    wasm_info: &wasm::parser::WasmInfo,
+    contract_id: Option<&str>,
+    wasm_hash: &str,
+    network: &str,
+) -> error::AppResult<()> {
+    let fee_rates = if wasm_info.functions.iter().any(|f| f.param_count == 0) {
+        fetch_fee_rates(client).await
+    } else {
+        // No function can reach a simulation, so no breakdown is computed
+        // and no real rates are needed — this keeps the all-skipped path
+        // free of network calls.
+        report::fee_calc::FeeRates {
+            fee_per_10k_insns: 0,
+            fee_per_read_entry: 0,
+            fee_per_write_entry: 0,
+            fee_per_read_1kb: 0,
+            fee_per_1kb: 0,
+        }
+    };
+
+    let mut entries = Vec::with_capacity(wasm_info.functions.len());
+    for fn_info in &wasm_info.functions {
+        let outcome = estimate_one_function(
+            client,
+            wasm_info,
+            fn_info,
+            contract_id,
+            wasm_hash,
+            network,
+            true,
+        )
+        .await;
+        entries.push(function_entry(fn_info, outcome, fee_rates));
+    }
+
+    let report = report::cost_report::EstimateAllReport::new(
+        wasm_hash.to_string(),
+        network.to_string(),
+        entries,
+    );
+    println!("{}", serde_json::to_string_pretty(&report)?);
+
+    if report.total_summary.failed > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Convert a per-function outcome into its `estimate-all --json` entry.
+fn function_entry(
+    fn_info: &wasm::parser::FunctionInfo,
+    outcome: FunctionOutcome,
+    fee_rates: report::fee_calc::FeeRates,
+) -> report::cost_report::EstimateAllFunction {
+    match outcome {
+        FunctionOutcome::Success(success) => {
+            let fee = report::fee_calc::compute_fee_breakdown(
+                success.total_fee_stroops,
+                success.resources.cpu_instructions,
+                success.read_entries,
+                success.write_entries,
+                success.resources.read_bytes,
+                success.tx_size,
+                fee_rates,
+            );
+            report::cost_report::EstimateAllFunction::success(
+                fn_info.name.clone(),
+                success.resources,
+                fee,
+            )
+        }
+        FunctionOutcome::Failed(message) => {
+            report::cost_report::EstimateAllFunction::failed(fn_info.name.clone(), message)
+        }
+    }
+}
+
+/// Successful estimation of one function: resources, footprint counts, and
+/// the authoritative total fee — everything needed to build a fee breakdown.
+struct FunctionSuccess {
+    resources: report::cost_report::FunctionResources,
+    read_entries: u32,
+    write_entries: u32,
+    tx_size: u32,
+    total_fee_stroops: i64,
+}
+
+/// Outcome of estimating a single function in `estimate-all`.
+enum FunctionOutcome {
+    /// The simulation completed with resources and a total fee.
+    Success(FunctionSuccess),
+    /// The function could not be estimated (needs args, or simulation failed).
+    Failed(String),
+}
+
+/// Estimates one exported function against the network.
+///
+/// In human-readable mode (`json_flag == false`) the result is printed as
+/// it was before structured JSON existed; in JSON mode nothing is printed
+/// and the outcome is collected into the report instead. Failures are
+/// returned as [`FunctionOutcome::Failed`] rather than propagated, so one
+/// bad function cannot abort the whole run.
+async fn estimate_one_function(
     client: &rpc::client::RpcClient,
     wasm_info: &wasm::parser::WasmInfo,
     fn_info: &wasm::parser::FunctionInfo,
@@ -386,18 +494,13 @@ async fn estimate_all_function(
     wasm_hash: &str,
     network: &str,
     json_flag: bool,
-) -> error::AppResult<Option<serde_json::Value>> {
+) -> FunctionOutcome {
     if fn_info.param_count > 0 {
         let reason = format!("needs --fn/--arg ({} param(s))", fn_info.param_count);
-        if json_flag {
-            return Ok(Some(serde_json::json!({
-                "function": fn_info.name,
-                "status": "skipped",
-                "reason": reason,
-            })));
+        if !json_flag {
+            println!("── Estimating '{}' ── Skipped: {reason}", fn_info.name);
         }
-        println!("── Estimating '{}' ── Skipped: {reason}", fn_info.name);
-        return Ok(None);
+        return FunctionOutcome::Failed(reason);
     }
 
     let tx_xdr = match xdr_helper::build_simulation_tx_envelope(
@@ -408,17 +511,13 @@ async fn estimate_all_function(
     ) {
         Ok(tx) => tx,
         Err(e) => {
-            if json_flag {
-                return Ok(Some(serde_json::json!({
-                    "function": fn_info.name,
-                    "status": "skipped",
-                    "reason": e.to_string(),
-                })));
+            if !json_flag {
+                eprintln!("── Estimating '{}' ── Skipped: {e}", fn_info.name);
             }
-            eprintln!("── Estimating '{}' ── Skipped: {e}", fn_info.name);
-            return Ok(None);
+            return FunctionOutcome::Failed(e.to_string());
         }
     };
+    let tx_size = u32::try_from(tx_xdr.len()).unwrap_or(u32::MAX);
     let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
 
     match rpc::simulate::simulate_transaction(client, &tx_b64).await {
@@ -427,25 +526,37 @@ async fn estimate_all_function(
             // means a misconfigured request, not a free transaction.
             if missing_simulation_data(&resp) {
                 let msg = "simulation returned no cost data and no latest ledger — check --id and the RPC endpoint";
-                if json_flag {
-                    return Ok(Some(serde_json::json!({
-                        "function": fn_info.name,
-                        "status": "error",
-                        "error": msg,
-                    })));
+                if !json_flag {
+                    eprintln!("── Estimating '{}' ── Error: {msg}", fn_info.name);
                 }
-                eprintln!("── Estimating '{}' ── Error: {msg}", fn_info.name);
-                return Ok(None);
+                return FunctionOutcome::Failed(msg.to_string());
             }
 
-            let (cpu, mem, ..) = response_resources(&resp)?;
-            let fee = rpc::simulate::parse_resource_fee(&resp.min_resource_fee)
-                .unwrap_or(None)
-                .or(rpc::simulate::parse_transaction_data_resource_fee(
-                    &resp.transaction_data,
-                )?)
-                .unwrap_or(0);
-            let xlm = report::fee_calc::stroops_to_xlm(fee);
+            let (cpu, mem, read_entries, write_entries, read_bytes, write_bytes) =
+                match response_resources(&resp) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if !json_flag {
+                            eprintln!("── Estimating '{}' ── Error: {e}", fn_info.name);
+                        }
+                        return FunctionOutcome::Failed(e.to_string());
+                    }
+                };
+
+            let total_fee_stroops =
+                match rpc::simulate::parse_transaction_data_resource_fee(&resp.transaction_data) {
+                    Ok(td_fee) => rpc::simulate::parse_resource_fee(&resp.min_resource_fee)
+                        .unwrap_or(None)
+                        .or(td_fee)
+                        .unwrap_or(0),
+                    Err(e) => {
+                        if !json_flag {
+                            eprintln!("── Estimating '{}' ── Error: {e}", fn_info.name);
+                        }
+                        return FunctionOutcome::Failed(e.to_string());
+                    }
+                };
+
             let ledger: u32 = resp
                 .latest_ledger
                 .and_then(|l| u32::try_from(l).ok())
@@ -457,39 +568,36 @@ async fn estimate_all_function(
                 &[],
                 network,
                 ledger,
-                fee,
+                total_fee_stroops,
                 cpu,
                 mem,
             );
 
-            if json_flag {
-                Ok(Some(serde_json::json!({
-                    "function": fn_info.name,
-                    "status": "ok",
-                    "cpu_instructions": cpu,
-                    "memory_bytes": mem,
-                    "fee_stroops": fee,
-                    "fee_xlm": xlm,
-                    "ledger": ledger,
-                })))
-            } else {
+            if !json_flag {
+                let xlm = report::fee_calc::stroops_to_xlm(total_fee_stroops);
                 println!(
-                    "CPU: {cpu} insns | Mem: {mem} bytes | Fee: {fee} stroops ({xlm} XLM) | Ledger: {ledger}"
+                    "CPU: {cpu} insns | Mem: {mem} bytes | Fee: {total_fee_stroops} stroops ({xlm} XLM) | Ledger: {ledger}"
                 );
-                Ok(None)
             }
+
+            FunctionOutcome::Success(FunctionSuccess {
+                resources: report::cost_report::FunctionResources {
+                    cpu_instructions: cpu,
+                    memory_bytes: mem,
+                    read_bytes,
+                    write_bytes,
+                },
+                read_entries,
+                write_entries,
+                tx_size,
+                total_fee_stroops,
+            })
         }
         Err(e) => {
-            if json_flag {
-                Ok(Some(serde_json::json!({
-                    "function": fn_info.name,
-                    "status": "error",
-                    "error": e.to_string(),
-                })))
-            } else {
+            if !json_flag {
                 eprintln!("Skipped — simulation failed: {e}");
-                Ok(None)
             }
+            FunctionOutcome::Failed(e.to_string())
         }
     }
 }
