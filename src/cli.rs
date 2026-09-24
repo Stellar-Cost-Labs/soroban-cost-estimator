@@ -105,6 +105,12 @@ pub enum Command {
         /// Number of decimal places for XLM fee values (0..=18, default 7).
         #[arg(long, default_value_t = 7)]
         precision: u32,
+
+        /// Number of times to repeat the simulation (1..=100, default 1).
+        /// Collects latency statistics (min, max, mean, stddev) and checks
+        /// fee/CPU consistency across runs.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=100))]
+        repeat: u32,
     },
 
     /// Enumerate all public contract functions and estimate each one.
@@ -181,6 +187,9 @@ pub enum CacheAction {
         #[arg(long, short)]
         out: Option<String>,
     },
+
+    /// Show a cache health overview: entry counts, disk usage, and staleness.
+    Stats,
 
     /// Check that every cached estimate is valid JSON and not corrupted.
     Verify,

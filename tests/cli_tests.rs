@@ -129,10 +129,38 @@ fn test_estimate_help() {
         "--cache-ttl",
         "--clear-cache",
         "--json",
+        "--repeat",
     ] {
         assert!(
             stdout.contains(flag),
             "estimate help should mention {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_estimate_repeat_flag_accepted() {
+    // `--repeat` must be a recognized estimate flag (the run fails on the
+    // missing WASM file, not on the argument).
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--repeat", "3"]);
+    assert_ne!(code, 0, "missing WASM file should still error");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--repeat should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_repeat_out_of_range_rejected() {
+    // The accepted range is 1..=100; clap must reject 0 and 101 up front.
+    for bad in ["0", "101"] {
+        let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--repeat", bad]);
+        assert_ne!(code, 0, "--repeat {bad} should be rejected");
+        assert!(
+            stderr.contains("invalid value")
+                || stderr.contains("not in")
+                || stderr.contains("range"),
+            "clap should reject --repeat {bad}; stderr: {stderr}"
         );
     }
 }
@@ -1653,4 +1681,129 @@ fn test_estimate_minimal_wasm_upload_zero_footprint() {
     assert_eq!(parsed["write_entries"], 0);
     assert_eq!(parsed["read_bytes"], 0);
     assert_eq!(parsed["write_bytes"], 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `estimate --repeat` benchmarking (Issue #289)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Args shared by the `--repeat` tests: a deterministic contract invocation
+/// served by the mock RPC server.
+fn repeat_estimate_args(rpc_url: &str) -> Vec<String> {
+    [
+        "estimate",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--id",
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        "--fn",
+        "increment",
+        "--arg",
+        "1",
+        "--rpc-url",
+        rpc_url,
+        "--repeat",
+        "3",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+#[test]
+fn test_estimate_repeat_table_reports_statistics() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-repeat-table");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(repeat_estimate_args(&rpc_url))
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .output()
+        .expect("failed to run estimate --repeat");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate --repeat should succeed; stderr: {stderr}"
+    );
+
+    for label in [
+        "Iteration count",
+        "Min latency (ms)",
+        "Max latency (ms)",
+        "Mean latency (ms)",
+        "Stddev latency (ms)",
+        "CPU Instructions",
+        "Total Fee (stroops)",
+    ] {
+        assert!(
+            stdout.contains(label),
+            "summary should include '{label}'; got: {stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("532502"),
+        "summary should report CPU instructions; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("15427"),
+        "summary should report total fee; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("identical"),
+        "deterministic runs should be marked identical; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_estimate_repeat_json_reports_latency_array() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-repeat-json");
+
+    let mut args = repeat_estimate_args(&rpc_url);
+    args.push("--json".to_string());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(&args)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate --repeat --json");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate --repeat --json should succeed; stderr: {stderr}"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+
+    assert_eq!(parsed["iterations"], 3);
+    assert_eq!(
+        parsed["latencies_ms"].as_array().map(|a| a.len()),
+        Some(3),
+        "latencies_ms should hold one sample per run; got: {stdout}"
+    );
+    for key in [
+        "min_latency_ms",
+        "max_latency_ms",
+        "mean_latency_ms",
+        "stddev_latency_ms",
+    ] {
+        assert!(
+            parsed.get(key).is_some(),
+            "JSON should include statistical metric {key}; got: {stdout}"
+        );
+    }
+    assert_eq!(parsed["cpu_instructions"], 532_502);
+    assert_eq!(parsed["cpu_identical"], true);
+    assert_eq!(parsed["total_fee_stroops"], 15_427);
+    assert_eq!(parsed["fee_identical"], true);
 }

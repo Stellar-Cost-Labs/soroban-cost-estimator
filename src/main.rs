@@ -154,6 +154,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             json,
             format,
             precision,
+            repeat,
         } => {
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
@@ -173,6 +174,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 timeout,
                 max_retries,
                 precision,
+                repeat,
                 &headers,
             )
             .await
@@ -242,6 +244,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::Validate { network } => cmd_config_validate(&network),
         },
         cli::Command::Cache { action } => match action {
+            cli::CacheAction::Stats => cmd_cache_stats(),
             cli::CacheAction::Export { out } => cmd_cache_export(out.as_deref()),
             cli::CacheAction::Warm {
                 wasm,
@@ -466,6 +469,7 @@ async fn cmd_estimate(
     timeout: u64,
     max_retries: usize,
     precision: u32,
+    repeat: u32,
     extra_headers: &[String],
 ) -> error::AppResult<()> {
     let json_flag = format == "json";
@@ -554,88 +558,234 @@ async fn cmd_estimate(
         // (potentially expensive) simulateTransaction call itself.
         client.health_check().await?;
 
-        // Time the simulateTransaction round-trip so the report can flag
-        // slow RPC endpoints. Includes any retries performed by the client.
-        let rpc_start = std::time::Instant::now();
-        let response = rpc::simulate::simulate_transaction(&client, &tx_b64).await?;
-        let rpc_latency_ms = rpc_start.elapsed().as_millis() as u64;
+        // Run the simulation `repeat` times, collecting per-run latency and
+        // asserting that CPU/fee estimates stay identical. The first run also
+        // produces the cost report and populates the cache.
+        let mut latencies_ms: Vec<u64> = Vec::with_capacity(repeat as usize);
+        let mut first_cpu: Option<u64> = None;
+        let mut first_fee: Option<i64> = None;
+        let mut cpu_identical = true;
+        let mut fee_identical = true;
+        let mut first_report: Option<report::cost_report::CostReport> = None;
 
-        if missing_simulation_data(&response) {
-            return Err(error::AppError::SimulationFailed(
-                "simulation returned no cost data and no latest ledger — check --id, --fn, and the RPC endpoint".to_string(),
-            ));
+        for iteration in 1..=repeat {
+            // Time the simulateTransaction round-trip so the report can flag
+            // slow RPC endpoints. Includes any retries performed by the client.
+            let rpc_start = std::time::Instant::now();
+            // Repeated runs must actually reach the network. The deduplicating
+            // client would serve runs 2..N from cache, so bypass dedup here.
+            let response = if repeat > 1 {
+                rpc::simulate::simulate_transaction_uncached(&client, &tx_b64).await?
+            } else {
+                rpc::simulate::simulate_transaction(&client, &tx_b64).await?
+            };
+            let rpc_latency_ms = rpc_start.elapsed().as_millis() as u64;
+
+            if missing_simulation_data(&response) {
+                return Err(error::AppError::SimulationFailed(
+                    "simulation returned no cost data and no latest ledger — check --id, --fn, and the RPC endpoint".to_string(),
+                ));
+            }
+
+            let (
+                cpu_instructions,
+                memory_bytes,
+                read_entries,
+                write_entries,
+                read_bytes,
+                write_bytes,
+            ) = response_resources(&response)?;
+
+            let latest_ledger: u32 = response
+                .latest_ledger
+                .and_then(|l| u32::try_from(l).ok())
+                .unwrap_or(0);
+
+            let total_fee_stroops = rpc::simulate::parse_resource_fee(&response.min_resource_fee)
+                .unwrap_or(None)
+                .or(rpc::simulate::parse_transaction_data_resource_fee(
+                    &response.transaction_data,
+                )?)
+                .unwrap_or(0);
+
+            latencies_ms.push(rpc_latency_ms);
+
+            // Assert determinism across runs: the first sample is the
+            // reference, and any later divergence flips the matching flag.
+            match first_cpu {
+                Some(prev) if prev != cpu_instructions => cpu_identical = false,
+                None => first_cpu = Some(cpu_instructions),
+                _ => {}
+            }
+            match first_fee {
+                Some(prev) if prev != total_fee_stroops => fee_identical = false,
+                None => first_fee = Some(total_fee_stroops),
+                _ => {}
+            }
+
+            debug!(
+                iteration,
+                cpu_instructions,
+                total_fee_stroops,
+                rpc_latency_ms,
+                "simulation iteration complete"
+            );
+
+            // Fee rates are network config, not per-run state — fetch them and
+            // compute the breakdown exactly once (for the first run).
+            if iteration == 1 {
+                let fee_rates = fetch_fee_rates(&client).await;
+                let fee = report::fee_calc::compute_fee_breakdown(
+                    total_fee_stroops,
+                    cpu_instructions,
+                    read_entries,
+                    write_entries,
+                    read_bytes,
+                    tx_xdr.len() as u32,
+                    fee_rates,
+                    precision,
+                );
+
+                let _ = cache::save_estimate(
+                    &wasm_hash,
+                    function_name,
+                    args,
+                    network,
+                    latest_ledger,
+                    fee.total_stroops,
+                    cpu_instructions,
+                    memory_bytes,
+                    Some(rpc_latency_ms),
+                    true,
+                );
+                info!(total_stroops = fee.total_stroops, total_xlm = %fee.total_xlm, "estimate complete");
+
+                first_report = Some(report::cost_report::CostReport {
+                    function: function_name.to_string(),
+                    wasm_hash: wasm_hash.clone(),
+                    cpu_instructions,
+                    memory_bytes,
+                    tx_size: tx_xdr.len() as u32,
+                    read_entries,
+                    write_entries,
+                    read_bytes,
+                    write_bytes,
+                    fee,
+                    ledger: latest_ledger,
+                    network: network.to_string(),
+                    rpc_latency_ms,
+                    rates: Some(fee_rates),
+                });
+            }
         }
 
-        let (cpu_instructions, memory_bytes, read_entries, write_entries, read_bytes, write_bytes) =
-            response_resources(&response)?;
+        let stats = rpc::simulate::summarize_latencies(&latencies_ms).ok_or_else(|| {
+            error::AppError::General("no simulation samples were collected".to_string())
+        })?;
 
-        let latest_ledger: u32 = response
-            .latest_ledger
-            .and_then(|l| u32::try_from(l).ok())
-            .unwrap_or(0);
-
-        let total_fee_stroops = rpc::simulate::parse_resource_fee(&response.min_resource_fee)
-            .unwrap_or(None)
-            .or(rpc::simulate::parse_transaction_data_resource_fee(
-                &response.transaction_data,
-            )?)
-            .unwrap_or(0);
-
-        debug!(cpu_instructions, memory_bytes, latest_ledger, total_fee_stroops, "simulation complete");
-
-        let fee_rates = fetch_fee_rates(&client).await;
-
-        let fee = report::fee_calc::compute_fee_breakdown(
-            total_fee_stroops,
-            cpu_instructions,
-            read_entries,
-            write_entries,
-            read_bytes,
-            tx_xdr.len() as u32,
-            fee_rates,
-            precision,
-        );
-
-        let report = report::cost_report::CostReport {
-            function: function_name.to_string(),
-            wasm_hash: wasm_hash.clone(),
-            cpu_instructions,
-            memory_bytes,
-            tx_size: tx_xdr.len() as u32,
-            read_entries,
-            write_entries,
-            read_bytes,
-            write_bytes,
-            fee: fee.clone(),
-            ledger: latest_ledger,
-            network: network.to_string(),
-            rpc_latency_ms,
-            rates: Some(fee_rates),
-        };
-
-        let _ = cache::save_estimate(
-            &wasm_hash,
-            function_name,
-            args,
-            network,
-            latest_ledger,
-            fee.total_stroops,
-            cpu_instructions,
-            memory_bytes,
-            Some(rpc_latency_ms),
-            true,
-        );
-        info!(total_stroops = fee.total_stroops, total_xlm = %fee.total_xlm, "estimate complete");
-
-        match formatter_by_name(format) {
-            Some(formatter) => println!("{}", formatter.format(&report)),
-            None => println!("{}", TableFormatter.format(&report)),
+        if repeat > 1 {
+            // Benchmark mode: report cross-run latency statistics and
+            // determinism instead of a single-run cost table.
+            print_repeat_summary(
+                repeat,
+                &latencies_ms,
+                &stats,
+                first_cpu.unwrap_or(0),
+                cpu_identical,
+                first_fee.unwrap_or(0),
+                fee_identical,
+                json_flag,
+            )?;
+            if !cpu_identical || !fee_identical {
+                eprintln!(
+                    "Warning: fee or resource estimates varied across {repeat} runs — simulation may be non-deterministic"
+                );
+            }
+        } else {
+            let report = first_report.ok_or_else(|| {
+                error::AppError::General("simulation produced no report".to_string())
+            })?;
+            match formatter_by_name(format) {
+                Some(formatter) => println!("{}", formatter.format(&report)),
+                None => println!("{}", TableFormatter.format(&report)),
+            }
         }
 
         Ok(())
     }
     .instrument(span)
     .await
+}
+
+/// Prints the `estimate --repeat` benchmarking summary.
+///
+/// With `json_flag` set this emits an object containing every per-run latency
+/// plus the aggregate statistics (min/max/mean/stddev) and the determinism
+/// flags. Otherwise it renders a compact human-readable table with the same
+/// information.
+fn print_repeat_summary(
+    iterations: u32,
+    latencies_ms: &[u64],
+    stats: &rpc::simulate::LatencyStats,
+    cpu_instructions: u64,
+    cpu_identical: bool,
+    total_fee_stroops: i64,
+    fee_identical: bool,
+    json_flag: bool,
+) -> error::AppResult<()> {
+    if json_flag {
+        let output = serde_json::json!({
+            "iterations": iterations,
+            "latencies_ms": latencies_ms,
+            "min_latency_ms": stats.min_ms,
+            "max_latency_ms": stats.max_ms,
+            "mean_latency_ms": stats.mean_ms,
+            "stddev_latency_ms": stats.stddev_ms,
+            "cpu_instructions": cpu_instructions,
+            "cpu_identical": cpu_identical,
+            "total_fee_stroops": total_fee_stroops,
+            "fee_identical": fee_identical,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+
+    let identical = |ok: bool| if ok { "identical" } else { "VARIES" };
+    let mut table = Table::new();
+    table.set_header(vec!["Metric", "Value"]);
+    table.add_row(vec![
+        Cell::new("Iteration count"),
+        Cell::new(iterations.to_string()),
+    ]);
+    table.add_row(vec![
+        Cell::new("Min latency (ms)"),
+        Cell::new(stats.min_ms.to_string()),
+    ]);
+    table.add_row(vec![
+        Cell::new("Max latency (ms)"),
+        Cell::new(stats.max_ms.to_string()),
+    ]);
+    table.add_row(vec![
+        Cell::new("Mean latency (ms)"),
+        Cell::new(stats.mean_ms.to_string()),
+    ]);
+    table.add_row(vec![
+        Cell::new("Stddev latency (ms)"),
+        Cell::new(format!("{:.2}", stats.stddev_ms)),
+    ]);
+    table.add_row(vec![
+        Cell::new("CPU Instructions"),
+        Cell::new(format!("{cpu_instructions} ({})", identical(cpu_identical))),
+    ]);
+    table.add_row(vec![
+        Cell::new("Total Fee (stroops)"),
+        Cell::new(format!(
+            "{total_fee_stroops} ({})",
+            identical(fee_identical)
+        )),
+    ]);
+    println!("{table}");
+    Ok(())
 }
 
 /// Converts an `EstimateAllResult` to a CSV row.
