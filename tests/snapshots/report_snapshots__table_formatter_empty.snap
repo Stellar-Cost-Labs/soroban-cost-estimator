@@ -1,9 +1,11 @@
 ---
 source: tests/report_snapshots.rs
+assertion_line: 65
 expression: TableFormatter.format(&empty)
 ---
 Function: (wasm upload)
 Network: mainnet (ledger 0)
+RPC round-trip: 0 ms
 WASM hash: 0000000000000000
 
 +------------------+----------+---------------+
@@ -25,6 +27,15 @@ WASM hash: 0000000000000000
 +------------------+----------+---------------+
 
 Fee Breakdown:
-  Non-refundable: 0 stroops
-  Refundable:     0 stroops
+  Non-refundable: 0 stroops (0.0%)
+  Refundable:     0 stroops (0.0%)
+
+  Components (of non-refundable):
+    CPU:        0 stroops (0.0%)
+    Storage:    0 stroops (0.0%)
+    Bandwidth:  0 stroops (0.0%)
+
   Total:          0 stroops (0.0000000)
+
+Optimization Suggestions:
+  No cost optimizations identified (fee rates unavailable or no reducible resources).

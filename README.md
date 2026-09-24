@@ -22,9 +22,10 @@
 
 # Soroban Cost Estimator
 
-[📚 Documentation](https://soroban-cost-estimator.gitbook.io/soroban-cost_estimator-docs)
+[📚 Documentation](https://soroban-cost-estimator.gitbook.io/soroban-cost_estimator-docs) · [🔄 Migration Guide](docs/migration.md)
 
 **Estimate Soroban contract resource costs & track network pricing changes over time.**
+
 
 This CLI tool wraps Stellar's `simulateTransaction` RPC to report real resource
 consumption (CPU instructions, memory, read/write entries/bytes, tx size, rent)
@@ -93,6 +94,7 @@ soroban-cost-estimator estimate \
     [--id <contract-id-hex>] \
     [--fn my_function --arg key=val] \
     [--rpc-url https://custom-rpc.example.com] \
+    [--clear-cache] \
     [--json]
 ```
 
@@ -115,6 +117,12 @@ soroban-cost-estimator estimate \
 ```
 
 Use `--json` for machine-readable output (e.g., for CI pipelines).
+
+Pass `--clear-cache` to wipe every cached estimate for `--network` before the
+simulation runs — handy after upgrading the tool, after a major network
+upgrade, or after debugging a bad estimate. It prints
+`Cleared N cached estimate(s) for <network>.` and can be combined with any
+other `estimate` flags (including `--cache-ttl`).
 
 The read/write entry counts and byte sizes in the report are decoded from the
 simulation response's resource **footprint** — real values from the ledger
@@ -162,6 +170,13 @@ Compare the current network config against the most recent (or explicit) snapsho
 soroban-cost-estimator config diff --network testnet [--against /path/to/snapshot.json]
 ```
 
+`--summary` prints a single line — `X pricing changes, Y non-pricing changes` —
+instead of the full diff, handy for CI status lines:
+
+```bash
+soroban-cost-estimator config diff --network testnet --summary
+```
+
 - Exits **0** if no changes detected
 - Exits **1** with a detailed field-by-field diff if pricing changed
 - **Auto-saves a snapshot of the new config** when a protocol upgrade is
@@ -196,6 +211,23 @@ soroban-cost-estimator cache verify
 
 - Exits **0** if the cache is empty or every entry is valid
 - Exits **1** and lists the corrupted filenames if any entry fails
+
+### `cache clear`
+
+Wipe every cached estimate recorded for a network without hunting through
+`~/.soroban-cost-estimator/cache/` by hand.
+
+```bash
+soroban-cost-estimator cache clear              # clears testnet entries
+soroban-cost-estimator cache clear --network mainnet
+```
+
+- Defaults to `testnet`; pass `--network` to target another network
+- Prints `Cleared N cached estimate(s) for <network>.`
+- Only the requested network's entries are removed — other networks are
+  untouched
+- The same clearing logic backs the `estimate --clear-cache` flag, so both
+  paths behave identically
 
 ## Installation
 
@@ -363,3 +395,5 @@ Looking for something to work on? The
 [issue backlog](https://github.com/aigbagbobila/soroban-cost-estimator/issues)
 holds scoped issues with Summary / Acceptance Criteria / Tech Stack — good
 first tasks for the Drips Stellar Wave contributor sprints.
+
+Fixing issue 112
