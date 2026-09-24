@@ -141,6 +141,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
     let max_retries = args.max_retries;
     let fallback = args.rpc_fallback_url.as_deref();
     let headers = args.headers;
+    let use_color = config_snapshot::diff::should_use_color(&args.color);
     match args.command {
         cli::Command::Estimate {
             wasm,
@@ -234,6 +235,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     timeout,
                     max_retries,
                     &headers,
+                    use_color,
                 )
                 .await
             }
@@ -295,6 +297,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 timeout,
                 max_retries,
                 &headers,
+                use_color,
             )
             .await
         }
@@ -1248,6 +1251,7 @@ async fn cmd_config_diff(
     timeout: u64,
     max_retries: usize,
     extra_headers: &[String],
+    use_color: bool,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::{debug, info_span};
@@ -1300,7 +1304,7 @@ async fn cmd_config_diff(
         } else if summary {
             println!("{}", config_snapshot::diff::format_diff_summary(&diff));
         } else {
-            println!("{}", config_snapshot::diff::format_diff(&diff));
+            println!("{}", config_snapshot::diff::format_diff(&diff, use_color));
         }
 
         if upgrade_detected(&diff) {
@@ -1503,6 +1507,7 @@ async fn watch_poll_once(
     timeout: u64,
     max_retries: usize,
     extra_headers: &[String],
+    use_color: bool,
 ) -> error::AppResult<()> {
     use tracing::{debug, warn};
 
@@ -1523,7 +1528,7 @@ async fn watch_poll_once(
                     let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &snapshot);
                     if !diff.changes.is_empty() {
                         debug!(change_count = diff.changes.len(), "config changes detected");
-                        println!("{}", config_snapshot::diff::format_diff(&diff));
+                        println!("{}", config_snapshot::diff::format_diff(&diff, use_color));
                     }
 
                     print_stale_estimates(network, snapshot.ledger);
@@ -1554,6 +1559,7 @@ async fn cmd_watch(
     timeout: u64,
     max_retries: usize,
     extra_headers: &[String],
+    use_color: bool,
 ) -> error::AppResult<()> {
     use tracing::info;
 
@@ -1583,6 +1589,7 @@ async fn cmd_watch(
                     timeout,
                     max_retries,
                     extra_headers,
+                    use_color,
                 )
                 .await;
                 tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
@@ -1592,66 +1599,6 @@ async fn cmd_watch(
 }
 
 /// `cache verify` command: check every cache entry parses as valid JSON.
-/// `cache stats` command: show cache health overview.
-///
-/// Prints total entries, disk usage, age (oldest/newest), and per-network
-/// breakdown. Useful for checking whether the cache is being populated and
-/// how much disk space it consumes.
-///
-/// # Network calls
-/// None — pure SQLite I/O.
-fn cmd_cache_stats() -> error::AppResult<()> {
-    let stats = cache::cache_stats()?;
-
-    if stats.total_entries == 0 {
-        println!("Cache is empty — no cached estimates.");
-        return Ok(());
-    }
-
-    println!("Cache Statistics");
-    println!("================");
-    println!("  Total entries:  {}", stats.total_entries);
-    println!("  Disk usage:     {}", format_bytes(stats.disk_bytes));
-    println!(
-        "  Oldest entry:   {}",
-        stats.oldest_entry.as_deref().unwrap_or("n/a")
-    );
-    println!(
-        "  Newest entry:   {}",
-        stats.newest_entry.as_deref().unwrap_or("n/a")
-    );
-
-    if !stats.per_network.is_empty() {
-        println!("\nPer-network breakdown:");
-        for (network, count) in &stats.per_network {
-            println!(
-                "  {network}: {count} entr{}",
-                if *count == 1 { "y" } else { "ies" }
-            );
-        }
-    }
-
-    Ok(())
-}
-
-/// Format a byte count as a human-readable string (KB, MB, GB).
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
-///
 /// Prints a summary line per corrupted entry and exits with code 1 when any
 /// entry fails verification, so scripts can treat a corrupt cache as an
 /// error. A healthy (or empty) cache exits 0.
