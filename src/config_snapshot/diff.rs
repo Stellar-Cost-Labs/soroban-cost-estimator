@@ -73,6 +73,7 @@ pub struct FieldDiff {
     pub old_value: String,
     pub new_value: String,
     pub is_pricing_change: bool,
+    pub unit_description: Option<String>,
 }
 
 /// The result of comparing two config snapshots.
@@ -82,6 +83,22 @@ pub struct ConfigDiff {
     pub new_snapshot: SnapshotInfo,
     pub changes: Vec<FieldDiff>,
     pub has_pricing_changes: bool,
+}
+
+impl ConfigDiff {
+    pub fn has_significant_pricing_changes(&self, threshold: f64) -> bool {
+        self.changes.iter().any(|c| {
+            if !c.is_pricing_change {
+                return false;
+            }
+            let old: Result<f64, _> = c.old_value.parse();
+            let new: Result<f64, _> = c.new_value.parse();
+            match (old, new) {
+                (Ok(o), Ok(n)) if o != 0.0 => ((n - o).abs() / o.abs() * 100.0) >= threshold,
+                _ => true, // If we can't parse or old is 0, consider it significant
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -173,12 +190,14 @@ fn compare_contract_compute(
             old_value: "(missing)".to_string(),
             new_value: "(present)".to_string(),
             is_pricing_change: true,
+            unit_description: None,
         }),
         (Some(_), None) => diffs.push(FieldDiff {
             field_path: "contract_compute".to_string(),
             old_value: "(present)".to_string(),
             new_value: "(missing)".to_string(),
             is_pricing_change: true,
+            unit_description: None,
         }),
         _ => {}
     }
@@ -274,12 +293,14 @@ fn compare_ledger_cost(
             old_value: "(missing)".to_string(),
             new_value: "(present)".to_string(),
             is_pricing_change: true,
+            unit_description: None,
         }),
         (Some(_), None) => diffs.push(FieldDiff {
             field_path: "contract_ledger_cost".to_string(),
             old_value: "(present)".to_string(),
             new_value: "(missing)".to_string(),
             is_pricing_change: true,
+            unit_description: None,
         }),
         _ => {}
     }
@@ -305,12 +326,14 @@ fn compare_historical_data(
             old_value: "(missing)".to_string(),
             new_value: "(present)".to_string(),
             is_pricing_change: true,
+            unit_description: None,
         }),
         (Some(_), None) => diffs.push(FieldDiff {
             field_path: "contract_historical_data".to_string(),
             old_value: "(present)".to_string(),
             new_value: "(missing)".to_string(),
             is_pricing_change: true,
+            unit_description: None,
         }),
         _ => {}
     }
@@ -343,12 +366,14 @@ fn compare_events(
             old_value: "(missing)".to_string(),
             new_value: "(present)".to_string(),
             is_pricing_change: true,
+            unit_description: None,
         }),
         (Some(_), None) => diffs.push(FieldDiff {
             field_path: "contract_events".to_string(),
             old_value: "(present)".to_string(),
             new_value: "(missing)".to_string(),
             is_pricing_change: true,
+            unit_description: None,
         }),
         _ => {}
     }
@@ -388,12 +413,14 @@ fn compare_bandwidth(
             old_value: "(missing)".to_string(),
             new_value: "(present)".to_string(),
             is_pricing_change: true,
+            unit_description: None,
         }),
         (Some(_), None) => diffs.push(FieldDiff {
             field_path: "contract_bandwidth".to_string(),
             old_value: "(present)".to_string(),
             new_value: "(missing)".to_string(),
             is_pricing_change: true,
+            unit_description: None,
         }),
         _ => {}
     }
@@ -482,12 +509,14 @@ fn compare_state_archival(
             old_value: "(missing)".to_string(),
             new_value: "(present)".to_string(),
             is_pricing_change: true,
+            unit_description: None,
         }),
         (Some(_), None) => diffs.push(FieldDiff {
             field_path: "state_archival".to_string(),
             old_value: "(present)".to_string(),
             new_value: "(missing)".to_string(),
             is_pricing_change: true,
+            unit_description: None,
         }),
         _ => {}
     }
@@ -506,12 +535,18 @@ fn check<T: PartialEq + std::fmt::Display>(
             old_value: old.to_string(),
             new_value: new.to_string(),
             is_pricing_change: is_pricing,
+            unit_description: crate::config_snapshot::model::setting_unit_description(path)
+                .map(|s| s.to_string()),
         });
     }
 }
 
 /// Formats a `ConfigDiff` as a human-readable string for display.
-pub fn format_diff(diff: &ConfigDiff) -> String {
+pub fn format_diff(
+    diff: &ConfigDiff,
+    pricing_only: bool,
+    threshold_percent: Option<f64>,
+) -> String {
     let mut output = String::new();
 
     output.push_str(&format!(
@@ -523,26 +558,71 @@ pub fn format_diff(diff: &ConfigDiff) -> String {
     ));
     output.push_str(&format!("Network: {}\n\n", diff.new_snapshot.network));
 
-    if diff.changes.is_empty() {
-        output.push_str("✅ No changes detected.\n");
+    let mut visible_changes: Vec<&FieldDiff> = Vec::new();
+    let mut omitted_count = 0;
+
+    for change in &diff.changes {
+        if pricing_only && !change.is_pricing_change {
+            omitted_count += 1;
+        } else {
+            visible_changes.push(change);
+        }
+    }
+
+    if visible_changes.is_empty() {
+        if omitted_count > 0 {
+            output.push_str(&format!(
+                "No pricing changes detected ({} non-pricing changes omitted)\n",
+                omitted_count
+            ));
+        } else {
+            output.push_str("✅ No changes detected.\n");
+        }
         return output;
     }
 
     output.push_str(&format!(
         "Found {} field change(s):\n\n",
-        diff.changes.len()
+        visible_changes.len()
     ));
 
-    for change in &diff.changes {
+    for change in visible_changes {
+        let is_exceeding = match (threshold_percent, change.is_pricing_change) {
+            (Some(threshold), true) => {
+                let old: Result<f64, _> = change.old_value.parse();
+                let new: Result<f64, _> = change.new_value.parse();
+                match (old, new) {
+                    (Ok(o), Ok(n)) if o != 0.0 => ((n - o).abs() / o.abs() * 100.0) >= threshold,
+                    _ => true,
+                }
+            }
+            _ => false,
+        };
+
         let icon = if change.is_pricing_change {
             "💰"
         } else {
             "📋"
         };
         let display = field_display_name(&change.field_path);
-        output.push_str(&format!("  {icon} {display}\n"));
-        output.push_str(&format!("      Old: {}\n", change.old_value));
-        output.push_str(&format!("      New: {}\n", change.new_value));
+        let unit_note = match &change.unit_description {
+            Some(u) => format!(" ({})", u),
+            None => String::new(),
+        };
+
+        let header = format!("  {icon} {display}{unit_note}\n");
+        let old_line = format!("      Old: {}\n", change.old_value);
+        let new_line = format!("      New: {}\n", change.new_value);
+
+        if is_exceeding {
+            output.push_str(&format!("\x1b[1;31m{}\x1b[0m", header));
+            output.push_str(&format!("\x1b[1;31m{}\x1b[0m", old_line));
+            output.push_str(&format!("\x1b[1;31m{}\x1b[0m", new_line));
+        } else {
+            output.push_str(&header);
+            output.push_str(&old_line);
+            output.push_str(&new_line);
+        }
     }
 
     if diff.has_pricing_changes {
@@ -641,7 +721,7 @@ mod tests {
         let old = make_snapshot(100, 5);
         let new = make_snapshot(200, 5);
         let diff = diff_snapshots(&old, &new);
-        let output = format_diff(&diff);
+        let output = format_diff(&diff, false, None);
         // Should show human-readable setting name, not raw prefix
         assert!(output.contains("Contract Compute V0"));
         assert!(
@@ -657,7 +737,7 @@ mod tests {
         let old = make_snapshot(100, 5);
         let new = make_snapshot(200, 10);
         let diff = diff_snapshots(&old, &new);
-        let output = format_diff(&diff);
+        let output = format_diff(&diff, false, None);
         assert!(output.contains("Contract Compute V0"));
         assert!(output.contains("Contract Bandwidth V0"));
     }

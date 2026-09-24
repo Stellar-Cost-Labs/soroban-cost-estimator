@@ -64,12 +64,27 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::Snapshot { network, out, json } => {
                 cmd_config_snapshot(&network, out.as_deref(), json).await
             }
-            cli::ConfigAction::Diff { network, against } => {
-                cmd_config_diff(&network, against.as_deref()).await
+            cli::ConfigAction::Diff {
+                network,
+                against,
+                pricing_only,
+                threshold_percent,
+            } => {
+                cmd_config_diff(
+                    &network,
+                    against.as_deref(),
+                    pricing_only,
+                    threshold_percent,
+                )
+                .await
             }
             cli::ConfigAction::History { network } => cmd_config_history(&network),
             cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network),
             cli::ConfigAction::Validate { network } => cmd_config_validate(&network),
+            cli::ConfigAction::Export { network, output } => {
+                cmd_config_export(network.as_deref(), &output)
+            }
+            cli::ConfigAction::Import { bundle } => cmd_config_import(&bundle),
         },
         cli::Command::Cache { action } => match action {
             cli::CacheAction::Warm {
@@ -80,7 +95,11 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             } => cmd_cache_warm(&wasm, &network, id.as_deref(), json).await,
             cli::CacheAction::Verify => cmd_cache_verify(),
         },
-        cli::Command::Watch { network, interval } => cmd_watch(&network, &interval).await,
+        cli::Command::Watch {
+            network,
+            interval,
+            threshold_percent,
+        } => cmd_watch(&network, &interval, threshold_percent).await,
     }
 }
 
@@ -750,7 +769,12 @@ fn upgrade_detected(diff: &config_snapshot::diff::ConfigDiff) -> bool {
 }
 
 /// `config diff` command: compare current config against a snapshot.
-async fn cmd_config_diff(network: &str, against_path: Option<&str>) -> error::AppResult<()> {
+async fn cmd_config_diff(
+    network: &str,
+    against_path: Option<&str>,
+    pricing_only: bool,
+    threshold_percent: Option<f64>,
+) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::{debug, info_span};
 
@@ -775,7 +799,10 @@ async fn cmd_config_diff(network: &str, against_path: Option<&str>) -> error::Ap
             has_pricing = diff.has_pricing_changes,
             "diff computed"
         );
-        println!("{}", config_snapshot::diff::format_diff(&diff));
+        println!(
+            "{}",
+            config_snapshot::diff::format_diff(&diff, pricing_only, threshold_percent)
+        );
 
         if upgrade_detected(&diff) {
             match config_snapshot::store::save_snapshot(&new_snapshot, None) {
@@ -795,7 +822,12 @@ async fn cmd_config_diff(network: &str, against_path: Option<&str>) -> error::Ap
 
         print_stale_estimates(network, new_snapshot.ledger);
 
-        if diff.has_pricing_changes {
+        let should_exit = match threshold_percent {
+            Some(t) => diff.has_significant_pricing_changes(t),
+            None => diff.has_pricing_changes,
+        };
+
+        if should_exit {
             std::process::exit(1);
         }
         Ok(())
@@ -958,7 +990,11 @@ async fn shutdown_signal() -> error::AppResult<()> {
 ///
 /// # Network calls
 /// Makes one batched `getLedgerEntries` RPC call.
-async fn watch_poll_once(network: &str, first: &mut bool) -> error::AppResult<()> {
+async fn watch_poll_once(
+    network: &str,
+    first: &mut bool,
+    threshold_percent: Option<f64>,
+) -> error::AppResult<()> {
     use tracing::{debug, warn};
 
     match fetch_config_snapshot(network).await {
@@ -968,7 +1004,10 @@ async fn watch_poll_once(network: &str, first: &mut bool) -> error::AppResult<()
                     let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &snapshot);
                     if !diff.changes.is_empty() {
                         debug!(change_count = diff.changes.len(), "config changes detected");
-                        println!("{}", config_snapshot::diff::format_diff(&diff));
+                        println!(
+                            "{}",
+                            config_snapshot::diff::format_diff(&diff, false, threshold_percent)
+                        );
                     }
 
                     print_stale_estimates(network, snapshot.ledger);
@@ -991,7 +1030,11 @@ async fn watch_poll_once(network: &str, first: &mut bool) -> error::AppResult<()
 /// Polls immediately, then on `interval`, until SIGINT (Ctrl-C) or SIGTERM
 /// is received — then exits cleanly with code 0. The in-flight poll is
 /// cancelled rather than writing a partial snapshot.
-async fn cmd_watch(network: &str, interval: &str) -> error::AppResult<()> {
+async fn cmd_watch(
+    network: &str,
+    interval: &str,
+    threshold_percent: Option<f64>,
+) -> error::AppResult<()> {
     use tracing::info;
 
     let interval_secs: u64 = parse_interval_secs(interval);
@@ -1012,7 +1055,7 @@ async fn cmd_watch(network: &str, interval: &str) -> error::AppResult<()> {
                 return Ok(());
             }
             () = async {
-                let _ = watch_poll_once(network, &mut first).await;
+                let _ = watch_poll_once(network, &mut first, threshold_percent).await;
                 tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
             } => {}
         }
@@ -1067,6 +1110,18 @@ async fn cmd_cache_warm(
     json_flag: bool,
 ) -> error::AppResult<()> {
     cmd_estimate_all(wasm_path, network, contract_id, json_flag).await
+}
+
+fn cmd_config_export(network: Option<&str>, output: &str) -> error::AppResult<()> {
+    config_snapshot::store::export_snapshots(network, output)?;
+    println!("Exported snapshots to {}", output);
+    Ok(())
+}
+
+fn cmd_config_import(bundle: &str) -> error::AppResult<()> {
+    let count = config_snapshot::store::import_snapshots(bundle)?;
+    println!("Imported {} new snapshot(s) from {}", count, bundle);
+    Ok(())
 }
 
 #[cfg(test)]

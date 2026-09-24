@@ -79,7 +79,7 @@ fn test_detects_multiple_changes() {
 fn test_format_diff_no_changes() {
     let snap = make_snapshot(100, 5);
     let diff = diff::diff_snapshots(&snap, &snap);
-    let output = diff::format_diff(&diff);
+    let output = diff::format_diff(&diff, false, None);
     assert!(output.contains("No changes detected"));
 }
 
@@ -88,7 +88,7 @@ fn test_format_diff_with_changes() {
     let old = make_snapshot(100, 5);
     let new = make_snapshot(200, 5);
     let diff = diff::diff_snapshots(&old, &new);
-    let output = diff::format_diff(&diff);
+    let output = diff::format_diff(&diff, false, None);
     // Should use human-readable setting and field names
     assert!(output.contains("Contract Compute V0"));
     assert!(output.contains("Fee Rate Per Instructions Increment"));
