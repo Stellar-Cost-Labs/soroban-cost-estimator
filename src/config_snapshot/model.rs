@@ -14,6 +14,16 @@ pub struct ConfigSnapshot {
     pub state_archival: Option<StateArchivalV0>,
 }
 
+impl std::fmt::Display for ConfigSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Network: {} (ledger {} at {})",
+            self.network, self.ledger, self.timestamp
+        )
+    }
+}
+
 /// ConfigSettingContractComputeV0
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContractComputeV0 {
@@ -77,4 +87,28 @@ pub struct StateArchivalV0 {
     pub live_soroban_state_size_window_sample_period: u32,
     pub eviction_scan_size: u32,
     pub starting_eviction_scan_level: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_snapshot_display() {
+        let snapshot = ConfigSnapshot {
+            network: "testnet".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            ledger: 100,
+            contract_compute: None,
+            contract_ledger_cost: None,
+            contract_historical_data: None,
+            contract_events: None,
+            contract_bandwidth: None,
+            state_archival: None,
+        };
+        assert_eq!(
+            format!("{}", snapshot),
+            "Network: testnet (ledger 100 at 2026-01-01T00:00:00Z)"
+        );
+    }
 }
