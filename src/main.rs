@@ -285,6 +285,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 to.as_deref(),
                 json,
             ),
+            cli::CacheAction::Stats { json } => cmd_cache_stats(json),
         },
         cli::Command::Watch { network, interval } => {
             cmd_watch(
@@ -1600,11 +1601,16 @@ async fn cmd_watch(
 ///
 /// # Network calls
 /// None — pure SQLite I/O.
-fn cmd_cache_stats() -> error::AppResult<()> {
+fn cmd_cache_stats(json: bool) -> error::AppResult<()> {
     let stats = cache::cache_stats()?;
 
+    if json {
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+        return Ok(());
+    }
+
     if stats.total_entries == 0 {
-        println!("Cache is empty — no cached estimates.");
+        println!("Cache is empty (0 entries, 0 bytes)");
         return Ok(());
     }
 

@@ -249,6 +249,13 @@ pub enum CacheAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Show cache health overview: total entries, disk usage, and age.
+    Stats {
+        /// Output as JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
