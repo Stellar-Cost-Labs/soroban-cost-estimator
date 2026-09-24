@@ -1,6 +1,7 @@
 use comfy_table::Table;
 
 use crate::report::fee_calc::FeeBreakdown;
+use crate::wasm::parser::WasmStructureSummary;
 
 /// A complete cost report for a single contract invocation.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -81,4 +82,20 @@ pub fn format_report_table(report: &CostReport) -> String {
 /// Formats a cost report as a JSON string.
 pub fn format_report_json(report: &CostReport) -> String {
     serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Formats the WASM memory configuration for `--verbose` / `--wasm-info` output.
+///
+/// Renders declared linear-memory limits (initial/maximum pages) from a
+/// [`WasmStructureSummary`]. Integer-only rendering; no fee math.
+#[must_use]
+pub fn format_wasm_memory_config(summary: &WasmStructureSummary) -> String {
+    crate::wasm::parser::format_structure_summary(summary)
+}
+
+/// Collects WASM memory-limit warnings (e.g. initial pages above the
+/// standard Soroban limit) for display alongside cost reports.
+#[must_use]
+pub fn wasm_memory_warnings(summary: &WasmStructureSummary) -> Vec<String> {
+    summary.warnings()
 }

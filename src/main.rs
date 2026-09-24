@@ -39,6 +39,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             id,
             args,
             json,
+            verbose,
+            wasm_info,
         } => {
             cmd_estimate(
                 &wasm,
@@ -48,6 +50,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 r#fn.as_deref(),
                 &args,
                 json,
+                verbose,
+                wasm_info,
             )
             .await
         }
@@ -56,7 +60,9 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             network,
             id,
             json,
-        } => cmd_estimate_all(&wasm, &network, id.as_deref(), json).await,
+            verbose,
+            wasm_info,
+        } => cmd_estimate_all(&wasm, &network, id.as_deref(), json, verbose, wasm_info).await,
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot { network, out, json } => {
                 cmd_config_snapshot(&network, out.as_deref(), json).await
@@ -217,6 +223,34 @@ async fn fetch_fee_rates(client: &rpc::client::RpcClient) -> report::fee_calc::F
     rates
 }
 
+/// Emits the WASM structure summary (entry points, memory, host imports)
+/// for `--verbose` / `--wasm-info` modes and warns when initial memory
+/// exceeds the standard Soroban limit.
+///
+/// In JSON mode the summary goes to stderr so stdout stays machine-readable;
+/// otherwise it goes to stdout. Memory-limit warnings always go to stderr
+/// (and `tracing::warn!`) so high initialization costs are never silent.
+fn emit_wasm_structure(
+    wasm_info: &wasm::parser::WasmInfo,
+    verbose: bool,
+    wasm_info_flag: bool,
+    json_flag: bool,
+) {
+    let warnings = report::cost_report::wasm_memory_warnings(&wasm_info.structure);
+    for warning in &warnings {
+        warn!(warning = %warning, "WASM memory exceeds Soroban limit");
+        eprintln!("Warning: {warning}");
+    }
+    if verbose || wasm_info_flag {
+        let summary = report::cost_report::format_wasm_memory_config(&wasm_info.structure);
+        if json_flag {
+            eprintln!("{summary}");
+        } else {
+            println!("{summary}");
+        }
+    }
+}
+
 /// `estimate` command: simulate a single invocation and print cost report.
 async fn cmd_estimate(
     wasm_path: &str,
@@ -226,6 +260,8 @@ async fn cmd_estimate(
     fn_name: Option<&str>,
     args: &[String],
     json_flag: bool,
+    verbose: bool,
+    wasm_info_flag: bool,
 ) -> error::AppResult<()> {
     use sha2::Digest;
     use tracing::{Instrument, info_span};
@@ -241,6 +277,7 @@ async fn cmd_estimate(
         info!("loading WASM");
         let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
         debug!(functions = wasm_info.functions.len(), has_spec = wasm_info.has_spec, "WASM loaded");
+        emit_wasm_structure(&wasm_info, verbose, wasm_info_flag, json_flag);
 
         let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
         let client = rpc::client::RpcClient::new(&endpoint);
@@ -342,6 +379,8 @@ async fn cmd_estimate_all(
     network: &str,
     contract_id: Option<&str>,
     json_flag: bool,
+    verbose: bool,
+    wasm_info_flag: bool,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -349,6 +388,7 @@ async fn cmd_estimate_all(
     let span = info_span!("cmd_estimate_all", wasm_path, network);
     async {
         let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
+        emit_wasm_structure(&wasm_info, verbose, wasm_info_flag, json_flag);
         let endpoint = rpc::client::resolve_endpoint(network, None)?;
         let client = rpc::client::RpcClient::new(&endpoint);
 

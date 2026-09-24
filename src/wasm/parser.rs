@@ -6,6 +6,20 @@ use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
 
+/// Maximum initial linear memory, in WASM pages, expected for Soroban
+/// contracts.
+///
+/// Contracts declaring more than this warn in `--verbose` / `--wasm-info`
+/// output because excess initial memory drives up memory fees and
+/// initialization costs.
+pub const SOROBAN_MAX_MEMORY_PAGES: u64 = 16;
+
+/// Size of one WASM linear-memory page in bytes (64 KiB).
+pub const WASM_PAGE_SIZE_BYTES: u64 = 65_536;
+
+/// Import module used by Soroban contracts for host functions (`env._` imports).
+pub const HOST_IMPORT_MODULE: &str = "env";
+
 /// Loads a compiled Soroban contract `.wasm` file from disk.
 ///
 /// Reads the file bytes, performs basic structural validation via
@@ -43,10 +57,12 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
     }
 
     trace!(functions = functions.len(), has_spec, "WASM parsed");
+    let structure = parse_structure(&bytes)?;
     Ok(WasmInfo {
         bytes,
         functions,
         has_spec,
+        structure,
     })
 }
 
@@ -252,4 +268,253 @@ pub struct WasmInfo {
     pub functions: Vec<FunctionInfo>,
     /// Whether the WASM carries a Soroban contract spec (`contractspecv0`).
     pub has_spec: bool,
+    /// Structural summary: memories, host imports, start function, tables.
+    pub structure: WasmStructureSummary,
+}
+
+/// Linear-memory limits declared in the WASM memory section, in pages.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryLimits {
+    /// Initial linear-memory size in WASM pages (64 KiB each).
+    pub initial_pages: u64,
+    /// Optional maximum linear-memory size in WASM pages.
+    pub maximum_pages: Option<u64>,
+}
+
+/// A host function imported from the `env` module (e.g. storage, crypto,
+/// context functions).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ImportedHostFunction {
+    /// Import module, always `"env"` for host functions.
+    pub module: String,
+    /// Imported function name (e.g. `"_" suffixed host dispatch names).
+    pub name: String,
+}
+
+/// Table limits declared in the WASM table section, in elements.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TableSummary {
+    /// Initial table size in elements.
+    pub initial: u64,
+    /// Optional maximum table size in elements.
+    pub maximum: Option<u64>,
+}
+
+/// Structural summary of a WASM binary: entry points and memory layout.
+///
+/// Built by [`parse_structure`] via `wasmparser::Parser`, traversing
+/// `Payload::MemorySection`, `Payload::ImportSection`, `Payload::ExportSection`,
+/// `Payload::StartSection`, and `Payload::TableSection`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WasmStructureSummary {
+    /// Memory limits from the memory section (usually zero or one entry).
+    pub memories: Vec<MemoryLimits>,
+    /// Host functions imported from the `env` module.
+    pub imported_host_functions: Vec<ImportedHostFunction>,
+    /// Total number of imported functions (any module).
+    pub imported_function_count: u32,
+    /// Total number of imports of any kind.
+    pub total_import_count: u32,
+    /// Names of exported functions (contract entry points).
+    pub exported_functions: Vec<String>,
+    /// Start function index, if the module declares one.
+    pub start_function: Option<u32>,
+    /// Table limits from the table section.
+    pub tables: Vec<TableSummary>,
+}
+
+impl WasmStructureSummary {
+    /// Initial memory pages of the first declared memory, if any.
+    #[must_use]
+    pub fn initial_memory_pages(&self) -> Option<u64> {
+        self.memories.first().map(|m| m.initial_pages)
+    }
+
+    /// Maximum memory pages of the first declared memory, if any.
+    #[must_use]
+    pub fn maximum_memory_pages(&self) -> Option<u64> {
+        self.memories.first().and_then(|m| m.maximum_pages)
+    }
+
+    /// True when any declared memory exceeds [`SOROBAN_MAX_MEMORY_PAGES`].
+    #[must_use]
+    pub fn initial_memory_exceeds_limit(&self) -> bool {
+        self.memories
+            .iter()
+            .any(|m| m.initial_pages > SOROBAN_MAX_MEMORY_PAGES)
+    }
+
+    /// Human-readable warnings (e.g. excess initial memory).
+    #[must_use]
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for memory in &self.memories {
+            if memory.initial_pages > SOROBAN_MAX_MEMORY_PAGES {
+                out.push(format!(
+                    "initial memory ({} pages) exceeds standard Soroban limit of {} pages",
+                    memory.initial_pages, SOROBAN_MAX_MEMORY_PAGES
+                ));
+            }
+        }
+        out
+    }
+}
+
+/// Parses WASM structural information: memory limits, host imports,
+/// exports, start function, and tables.
+///
+/// Returns a [`WasmStructureSummary`] for display in `--verbose` or
+/// `--wasm-info` modes.
+pub fn parse_structure(bytes: &[u8]) -> AppResult<WasmStructureSummary> {
+    let mut memories: Vec<MemoryLimits> = Vec::new();
+    let mut imported_host_functions: Vec<ImportedHostFunction> = Vec::new();
+    let mut imported_function_count: u32 = 0;
+    let mut total_import_count: u32 = 0;
+    let mut exported_functions: Vec<String> = Vec::new();
+    let mut start_function: Option<u32> = None;
+    let mut tables: Vec<TableSummary> = Vec::new();
+
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        let payload = payload.map_err(|e| AppError::WasmParse(e.to_string()))?;
+        match payload {
+            wasmparser::Payload::MemorySection(section) => {
+                for memory in section {
+                    let memory = memory.map_err(|e| AppError::WasmParse(e.to_string()))?;
+                    memories.push(MemoryLimits {
+                        initial_pages: memory.initial,
+                        maximum_pages: memory.maximum,
+                    });
+                }
+            }
+            wasmparser::Payload::ImportSection(section) => {
+                for import in section.into_imports() {
+                    let import = import.map_err(|e| AppError::WasmParse(e.to_string()))?;
+                    total_import_count = total_import_count.saturating_add(1);
+                    let is_func = matches!(
+                        import.ty,
+                        wasmparser::TypeRef::Func(_) | wasmparser::TypeRef::FuncExact(_)
+                    );
+                    if is_func {
+                        imported_function_count = imported_function_count.saturating_add(1);
+                        if import.module == HOST_IMPORT_MODULE {
+                            imported_host_functions.push(ImportedHostFunction {
+                                module: import.module.to_string(),
+                                name: import.name.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            wasmparser::Payload::ExportSection(section) => {
+                for export in section {
+                    let export = export.map_err(|e| AppError::WasmParse(e.to_string()))?;
+                    if matches!(export.kind, wasmparser::ExternalKind::Func) {
+                        exported_functions.push(export.name.to_string());
+                    }
+                }
+            }
+            wasmparser::Payload::StartSection { func, .. } => {
+                start_function = Some(func);
+            }
+            wasmparser::Payload::TableSection(section) => {
+                for table in section {
+                    let table = table.map_err(|e| AppError::WasmParse(e.to_string()))?;
+                    tables.push(TableSummary {
+                        initial: table.ty.initial,
+                        maximum: table.ty.maximum,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(WasmStructureSummary {
+        memories,
+        imported_host_functions,
+        imported_function_count,
+        total_import_count,
+        exported_functions,
+        start_function,
+        tables,
+    })
+}
+
+/// Formats a [`WasmStructureSummary`] as human-readable lines for
+/// `--verbose` / `--wasm-info` output, including the memory configuration
+/// and any limit warnings. Integer-only rendering; no fee math here.
+#[must_use]
+pub fn format_structure_summary(summary: &WasmStructureSummary) -> String {
+    let mut out = String::new();
+    out.push_str("WASM structure:\n");
+
+    if summary.memories.is_empty() {
+        out.push_str("  Memory: none declared\n");
+    } else {
+        for (i, memory) in summary.memories.iter().enumerate() {
+            let max = memory
+                .maximum_pages
+                .map_or_else(|| "unbounded".to_string(), |m| m.to_string());
+            let initial_bytes = memory.initial_pages.saturating_mul(WASM_PAGE_SIZE_BYTES);
+            out.push_str(&format!(
+                "  Memory[{i}]: initial={} pages ({} bytes), max={} pages\n",
+                memory.initial_pages, initial_bytes, max
+            ));
+        }
+    }
+
+    out.push_str(&format!(
+        "  Imports: {} function(s) total, {} from `{}` module\n",
+        summary.imported_function_count,
+        summary.imported_host_functions.len(),
+        HOST_IMPORT_MODULE
+    ));
+    for imported in summary.imported_host_functions.iter().take(20) {
+        out.push_str(&format!("    - {}.{}\n", imported.module, imported.name));
+    }
+    if summary.imported_host_functions.len() > 20 {
+        out.push_str(&format!(
+            "    ... and {} more\n",
+            summary.imported_host_functions.len().saturating_sub(20)
+        ));
+    }
+
+    out.push_str(&format!(
+        "  Exports: {} function(s)\n",
+        summary.exported_functions.len()
+    ));
+    for name in summary.exported_functions.iter().take(20) {
+        out.push_str(&format!("    - {name}\n"));
+    }
+    if summary.exported_functions.len() > 20 {
+        out.push_str(&format!(
+            "    ... and {} more\n",
+            summary.exported_functions.len().saturating_sub(20)
+        ));
+    }
+
+    match summary.start_function {
+        Some(func) => out.push_str(&format!("  Start function: {func}\n")),
+        None => out.push_str("  Start function: none\n"),
+    }
+
+    if summary.tables.is_empty() {
+        out.push_str("  Tables: none\n");
+    } else {
+        for (i, table) in summary.tables.iter().enumerate() {
+            let max = table
+                .maximum
+                .map_or_else(|| "unbounded".to_string(), |m| m.to_string());
+            out.push_str(&format!(
+                "  Table[{i}]: initial={} entries, max={max} entries\n",
+                table.initial
+            ));
+        }
+    }
+
+    for warning in summary.warnings() {
+        out.push_str(&format!("  Warning: {warning}\n"));
+    }
+
+    out
 }

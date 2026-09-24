@@ -43,6 +43,14 @@ pub enum Command {
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
         json: bool,
+
+        /// Show verbose output, including WASM memory and import details.
+        #[arg(long)]
+        verbose: bool,
+
+        /// Show WASM structure info (entry points, memory, host imports).
+        #[arg(long)]
+        wasm_info: bool,
     },
 
     /// Enumerate all public contract functions and estimate each one.
@@ -62,6 +70,14 @@ pub enum Command {
         /// Output as JSON instead of a human-readable list.
         #[arg(long)]
         json: bool,
+
+        /// Show verbose output, including WASM memory and import details.
+        #[arg(long)]
+        verbose: bool,
+
+        /// Show WASM structure info (entry points, memory, host imports).
+        #[arg(long)]
+        wasm_info: bool,
     },
 
     /// Fetch and store a snapshot of the network's resource-pricing configuration.
