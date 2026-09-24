@@ -123,14 +123,16 @@ pub struct RpcClient {
     /// exponential backoff.
     max_retries: usize,
     /// Custom HTTP headers attached to every outbound request.
+    #[allow(dead_code)]
     headers: HeaderMap,
+    verbose: bool,
 }
 
 impl RpcClient {
     /// Create a new RPC client pointing at the given URL, without rate
     /// limiting and with the default request timeout.
-    pub fn new(url: &str) -> Self {
-        Self::with_rate_limit(url, None)
+    pub fn new(url: &str, verbose: bool) -> Self {
+        Self::with_rate_limit(url, None, verbose)
     }
 
     /// Create a new RPC client pointing at the given URL, optionally capping
@@ -145,8 +147,8 @@ impl RpcClient {
     /// The underlying `reqwest::Client` is configured with connection pooling
     /// and TCP keep-alive so that HTTP connections are reused across multiple
     /// RPC calls within a single run, reducing handshake overhead.
-    pub fn with_rate_limit(url: &str, rps: Option<u64>) -> Self {
-        Self::with_options(url, rps, DEFAULT_TIMEOUT, DEFAULT_MAX_RETRIES)
+    pub fn with_rate_limit(url: &str, rps: Option<u64>, verbose: bool) -> Self {
+        Self::with_options(url, rps, DEFAULT_TIMEOUT, DEFAULT_MAX_RETRIES, verbose)
     }
 
     /// Create a new RPC client pointing at the given URL, optionally capping
@@ -165,8 +167,9 @@ impl RpcClient {
         rps: Option<u64>,
         timeout: Duration,
         max_retries: usize,
+        verbose: bool,
     ) -> Self {
-        Self::with_fallback(url, None, rps, timeout, max_retries)
+        Self::with_fallback(url, None, rps, timeout, max_retries, verbose)
     }
 
     /// Create a new RPC client pointing at the given URL, with an optional
@@ -190,15 +193,16 @@ impl RpcClient {
         rps: Option<u64>,
         timeout: Duration,
         max_retries: usize,
+        verbose: bool,
     ) -> Self {
-        Self::with_fallback_headers(url, fallback_url, rps, timeout, max_retries, &[])
+        Self::with_fallback_headers(url, fallback_url, rps, timeout, max_retries, &[], verbose)
     }
 
     /// Create a new RPC client that attaches custom HTTP headers (each a
     /// `"Key: Value"` string) to every request, without rate limiting, with
     /// the default request timeout and the default retry policy. Entries
     /// that cannot be parsed (or that carry an empty value) are skipped.
-    pub fn with_headers(url: &str, headers: &[String]) -> Self {
+    pub fn with_headers(url: &str, headers: &[String], verbose: bool) -> Self {
         Self::with_fallback_headers(
             url,
             None,
@@ -206,6 +210,7 @@ impl RpcClient {
             DEFAULT_TIMEOUT,
             DEFAULT_MAX_RETRIES,
             headers,
+            verbose,
         )
     }
 
@@ -223,6 +228,7 @@ impl RpcClient {
         timeout: Duration,
         max_retries: usize,
         headers: &[String],
+        verbose: bool,
     ) -> Self {
         debug!(
             url,
@@ -248,6 +254,7 @@ impl RpcClient {
             limiter: rps.and_then(build_rate_limiter),
             max_retries,
             headers,
+            verbose,
         }
     }
 
@@ -373,14 +380,20 @@ impl RpcClient {
             "params": params,
         });
 
-        let is_debug = std::env::var("RUST_LOG")
-            .map(|v| v.contains("debug"))
-            .unwrap_or(false)
-            || std::env::args().any(|arg| arg == "--verbose" || arg == "-v");
-
-        if is_debug {
-            let body_str = serde_json::to_string(&body)?;
-            eprintln!("[RPC REQ] Method: {}, ID: 1, Params: {}", method, body_str);
+        if self.verbose {
+            let body_str = serde_json::to_string(&body)
+                .unwrap_or_else(|_| "<failed to serialize>".to_string());
+            let id = match body.get("id") {
+                Some(val) => match val.as_u64() {
+                    Some(num) => num,
+                    None => 1,
+                },
+                None => 1,
+            };
+            eprintln!(
+                "[RPC REQ] Method: {}, ID: {}, Params: {}",
+                method, id, body_str
+            );
         }
 
         trace!(method, "sending RPC request");
@@ -449,7 +462,28 @@ impl RpcClient {
         .await?;
 
         let status = response.status();
-        let response_body: Value = response.json().await?;
+
+        if self.verbose {
+            eprintln!("[RPC RES] Status: {}", status);
+            eprintln!("[RPC RES] Headers:");
+            for (k, v) in response.headers() {
+                let k_str = k.as_str().to_ascii_lowercase();
+                if k_str.contains("auth") || k_str.contains("token") {
+                    eprintln!("  {}: ***", k);
+                } else {
+                    let val = match v.to_str() {
+                        Ok(s) => s,
+                        Err(_) => "<INVALID HEADER VALUE>",
+                    };
+                    eprintln!("  {}: {}", k, val);
+                }
+            }
+        }
+
+        let raw_body = response.text().await?;
+        if self.verbose {
+            eprintln!("[RPC RES] Body: {}", raw_body);
+        }
 
         let response_body: Value = serde_json::from_str(&raw_body)?;
 
@@ -652,7 +686,7 @@ mod tests {
     #[tokio::test]
     async fn test_dedup_sequential_identical_requests() {
         let (url, counter) = spawn_json_rpc_stub(0).await;
-        let client = RpcClient::new(&url);
+        let client = RpcClient::new(&url, false);
         let params = serde_json::json!({"k": "v"});
 
         let _: Value = client
@@ -674,7 +708,7 @@ mod tests {
     #[tokio::test]
     async fn test_dedup_distinct_params_not_deduplicated() {
         let (url, counter) = spawn_json_rpc_stub(0).await;
-        let client = RpcClient::new(&url);
+        let client = RpcClient::new(&url, false);
 
         let _: Value = client
             .call("test.method", serde_json::json!({"k": 1}))
@@ -695,7 +729,7 @@ mod tests {
     #[tokio::test]
     async fn test_dedup_concurrent_identical_requests() {
         let (url, counter) = spawn_json_rpc_stub(0).await;
-        let client = Arc::new(RpcClient::new(&url));
+        let client = Arc::new(RpcClient::new(&url, false));
 
         let mut handles = Vec::new();
         for _ in 0..5 {
@@ -725,7 +759,7 @@ mod tests {
     #[tokio::test]
     async fn test_dedup_failed_leader_followers_retry() {
         let (url, counter) = spawn_json_rpc_stub(1).await;
-        let client = Arc::new(RpcClient::new(&url));
+        let client = Arc::new(RpcClient::new(&url, false));
 
         let params = serde_json::json!({"k": "v"});
         let task_a = {
@@ -758,7 +792,7 @@ mod tests {
     #[tokio::test]
     async fn test_rate_limiter_spaces_outbound_requests() {
         let (url, counter) = spawn_json_rpc_stub(0).await;
-        let client = RpcClient::with_rate_limit(&url, Some(20));
+        let client = RpcClient::with_rate_limit(&url, Some(20), false);
 
         let start = std::time::Instant::now();
         let _: Value = client
@@ -788,7 +822,7 @@ mod tests {
     #[tokio::test]
     async fn test_rate_limiter_preserves_dedup() {
         let (url, counter) = spawn_json_rpc_stub(0).await;
-        let client = RpcClient::with_rate_limit(&url, Some(20));
+        let client = RpcClient::with_rate_limit(&url, Some(20), false);
         let params = serde_json::json!({"k": "v"});
 
         let start = std::time::Instant::now();
@@ -817,7 +851,7 @@ mod tests {
     #[tokio::test]
     async fn test_no_rate_limit_when_disabled() {
         let (url, counter) = spawn_json_rpc_stub(0).await;
-        let client = RpcClient::with_rate_limit(&url, Some(0));
+        let client = RpcClient::with_rate_limit(&url, Some(0), false);
 
         let start = std::time::Instant::now();
         let _: Value = client
@@ -862,7 +896,7 @@ mod tests {
     #[tokio::test]
     async fn test_request_timeout_applies() {
         let url = spawn_hanging_stub().await;
-        let client = RpcClient::with_options(&url, None, Duration::from_millis(100), 0);
+        let client = RpcClient::with_options(&url, None, Duration::from_millis(100), 0, false);
 
         let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
 
@@ -896,6 +930,7 @@ mod tests {
             None,
             Duration::from_secs(30),
             DEFAULT_MAX_RETRIES,
+            false,
         );
 
         let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
@@ -924,6 +959,7 @@ mod tests {
             None,
             Duration::from_secs(30),
             DEFAULT_MAX_RETRIES,
+            false,
         );
 
         let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
@@ -941,7 +977,7 @@ mod tests {
     async fn test_health_check_ok_when_healthy() {
         let (url, _) =
             spawn_json_rpc_stub_with_result(0, r#"{"status":"healthy","latestLedger":42}"#).await;
-        let client = RpcClient::new(&url);
+        let client = RpcClient::new(&url, false);
 
         client
             .health_check()
@@ -954,7 +990,7 @@ mod tests {
     #[tokio::test]
     async fn test_health_check_errs_on_non_healthy_status() {
         let (url, _) = spawn_json_rpc_stub_with_result(0, r#"{"status":"degraded"}"#).await;
-        let client = RpcClient::new(&url);
+        let client = RpcClient::new(&url, false);
 
         let err = client
             .health_check()
@@ -976,7 +1012,7 @@ mod tests {
         // `max_retries: 0` keeps this fast: a refused connection is retryable,
         // and the default backoff (0.5s + 1s + 2s) is irrelevant to the
         // health check failing fast on an unreachable endpoint.
-        let client = RpcClient::with_options(&dead_url, None, Duration::from_millis(500), 0);
+        let client = RpcClient::with_options(&dead_url, None, Duration::from_millis(500), 0, false);
 
         let err = client
             .health_check()
@@ -1066,7 +1102,7 @@ mod header_tests {
 
     #[test]
     fn test_with_headers_empty() {
-        let client = RpcClient::with_headers("http://localhost", &[]);
+        let client = RpcClient::with_headers("http://localhost", &[], false);
         assert!(client.headers.is_empty());
     }
 
@@ -1078,6 +1114,7 @@ mod header_tests {
                 "X-API-Key: secret".to_string(),
                 "Authorization: Bearer tok".to_string(),
             ],
+            false,
         );
         assert_eq!(client.headers.len(), 2);
         assert_eq!(
@@ -1104,6 +1141,7 @@ mod header_tests {
                 "NoColonHere".to_string(),
                 "Also-Bad:".to_string(),
             ],
+            false,
         );
         // Only the valid header should be stored.
         assert_eq!(client.headers.len(), 1);
@@ -1112,7 +1150,7 @@ mod header_tests {
 
     #[test]
     fn test_rpc_client_new_has_no_custom_headers() {
-        let client = RpcClient::new("http://localhost");
+        let client = RpcClient::new("http://localhost", false);
         assert!(client.headers.is_empty());
     }
 }

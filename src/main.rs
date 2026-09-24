@@ -524,6 +524,8 @@ async fn cmd_estimate(
         }
 
         let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
+        let verbose = std::env::args().any(|arg| arg == "--verbose" || arg == "-v")
+            || match std::env::var("RUST_LOG") { Ok(v) => v.contains("debug"), Err(_) => false };
         let client = rpc::client::RpcClient::with_fallback_headers(
             &endpoint,
             rpc_fallback_url,
@@ -531,6 +533,7 @@ async fn cmd_estimate(
             std::time::Duration::from_secs(timeout),
             max_retries,
             extra_headers,
+            verbose,
         );
 
         let sc_vals: Vec<stellar_xdr::ScVal> = args
@@ -729,6 +732,8 @@ async fn cmd_estimate_all(
         }
 
         let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
+        let verbose = std::env::args().any(|arg| arg == "--verbose" || arg == "-v")
+            || match std::env::var("RUST_LOG") { Ok(v) => v.contains("debug"), Err(_) => false };
         let client = rpc::client::RpcClient::with_fallback_headers(
             &endpoint,
             rpc_fallback_url,
@@ -736,6 +741,7 @@ async fn cmd_estimate_all(
             std::time::Duration::from_secs(timeout),
             max_retries,
             extra_headers,
+            verbose,
         );
 
         // Validate the RPC endpoint is reachable before running a full batch
@@ -1108,6 +1114,11 @@ async fn fetch_config_snapshot(
     let span = info_span!("fetch_config_snapshot", network);
     async {
         let endpoint = rpc::client::resolve_endpoint(network, None)?;
+        let verbose = std::env::args().any(|arg| arg == "--verbose" || arg == "-v")
+            || match std::env::var("RUST_LOG") {
+                Ok(v) => v.contains("debug"),
+                Err(_) => false,
+            };
         let client = rpc::client::RpcClient::with_fallback_headers(
             &endpoint,
             rpc_fallback_url,
@@ -1115,6 +1126,7 @@ async fn fetch_config_snapshot(
             std::time::Duration::from_secs(timeout),
             max_retries,
             extra_headers,
+            verbose,
         );
         debug!("fetching all config settings");
         let raw_entries = rpc::config::fetch_all_config_settings(&client).await?;
