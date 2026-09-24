@@ -139,6 +139,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
     let rps = args.rps;
     let timeout = args.timeout;
     let max_retries = args.max_retries;
+    let verbose = args.verbose;
     let fallback = args.rpc_fallback_url.as_deref();
     let headers = args.headers;
     match args.command {
@@ -174,6 +175,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 max_retries,
                 precision,
                 &headers,
+                verbose,
             )
             .await
         }
@@ -199,6 +201,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 max_retries,
                 precision,
                 &headers,
+                verbose,
             )
             .await
         }
@@ -214,6 +217,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     timeout,
                     max_retries,
                     &headers,
+                    verbose,
                 )
                 .await
             }
@@ -234,6 +238,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     timeout,
                     max_retries,
                     &headers,
+                    verbose,
                 )
                 .await
             }
@@ -261,6 +266,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     timeout,
                     max_retries,
                     &headers,
+                    verbose,
                 )
                 .await
             }
@@ -295,6 +301,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 timeout,
                 max_retries,
                 &headers,
+                verbose,
             )
             .await
         }
@@ -373,7 +380,7 @@ async fn fetch_fee_rates(client: &rpc::client::RpcClient) -> report::fee_calc::F
     // ConfigSettingContractComputeV0.fee_rate_per_instructions_increment
     // is stroops per 10,000 instructions (not per instruction).
     let compute_per_10k = match raw_compute {
-        Ok(raw) => match xdr_helper::decode_config_entry_xdr(&raw.config_xdr) {
+        Ok(raw) => match xdr_helper::decode_config_entry_xdr(&raw.config_xdr, client.verbose) {
             Ok(stellar_xdr::ConfigSettingEntry::ContractComputeV0(s)) => {
                 s.fee_rate_per_instructions_increment
             }
@@ -392,7 +399,7 @@ async fn fetch_fee_rates(client: &rpc::client::RpcClient) -> report::fee_calc::F
     // per-KB disk read fee — all part of the non-refundable fee in
     // stellar-core's resource fee model.
     let (read_entry, write_entry, read_1kb) = match raw_ledger_cost {
-        Ok(raw) => match xdr_helper::decode_config_entry_xdr(&raw.config_xdr) {
+        Ok(raw) => match xdr_helper::decode_config_entry_xdr(&raw.config_xdr, client.verbose) {
             Ok(stellar_xdr::ConfigSettingEntry::ContractLedgerCostV0(s)) => (
                 s.fee_disk_read_ledger_entry,
                 s.fee_write_ledger_entry,
@@ -412,7 +419,7 @@ async fn fetch_fee_rates(client: &rpc::client::RpcClient) -> report::fee_calc::F
     // ConfigSettingContractBandwidthV0.fee_tx_size1_kb
     // is stroops per 1KB of tx size (not per byte).
     let bandwidth_per_kb = match raw_bandwidth {
-        Ok(raw) => match xdr_helper::decode_config_entry_xdr(&raw.config_xdr) {
+        Ok(raw) => match xdr_helper::decode_config_entry_xdr(&raw.config_xdr, client.verbose) {
             Ok(stellar_xdr::ConfigSettingEntry::ContractBandwidthV0(s)) => s.fee_tx_size1_kb,
             _ => {
                 degraded.push("ContractBandwidthV0");
@@ -467,6 +474,7 @@ async fn cmd_estimate(
     max_retries: usize,
     precision: u32,
     extra_headers: &[String],
+    verbose: bool,
 ) -> error::AppResult<()> {
     let json_flag = format == "json";
     let table_mode = format == "table";
@@ -531,6 +539,7 @@ async fn cmd_estimate(
             std::time::Duration::from_secs(timeout),
             max_retries,
             extra_headers,
+            verbose,
         );
 
         let sc_vals: Vec<stellar_xdr::ScVal> = args
@@ -683,6 +692,7 @@ async fn cmd_estimate_all(
     max_retries: usize,
     precision: u32,
     extra_headers: &[String],
+    verbose: bool,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -736,6 +746,7 @@ async fn cmd_estimate_all(
             std::time::Duration::from_secs(timeout),
             max_retries,
             extra_headers,
+            verbose,
         );
 
         // Validate the RPC endpoint is reachable before running a full batch
@@ -971,8 +982,10 @@ async fn estimate_all_function(
                         cpu_fee_stroops: 0,
                         storage_fee_stroops: 0,
                         bandwidth_fee_stroops: 0,
+                        base_fee_stroops: 0,
                         total_stroops: total_fee,
                         total_xlm: xlm.clone(),
+                        fee_percentages: std::collections::BTreeMap::new(),
                     },
                 };
 
@@ -1101,6 +1114,7 @@ async fn fetch_config_snapshot(
     timeout: u64,
     max_retries: usize,
     extra_headers: &[String],
+    verbose: bool,
 ) -> error::AppResult<config_snapshot::model::ConfigSnapshot> {
     use tracing::Instrument;
     use tracing::{debug, info_span};
@@ -1115,6 +1129,7 @@ async fn fetch_config_snapshot(
             std::time::Duration::from_secs(timeout),
             max_retries,
             extra_headers,
+            verbose,
         );
         debug!("fetching all config settings");
         let raw_entries = rpc::config::fetch_all_config_settings(&client).await?;
@@ -1122,7 +1137,7 @@ async fn fetch_config_snapshot(
 
         let mut snapshot = xdr_helper::begin_snapshot(network, 0);
         for raw in &raw_entries {
-            let config_entry = xdr_helper::decode_config_entry_xdr(&raw.config_xdr)?;
+            let config_entry = xdr_helper::decode_config_entry_xdr(&raw.config_xdr, verbose)?;
             xdr_helper::apply_config_entry(&mut snapshot, config_entry);
         }
         if let Some(latest) = raw_entries.iter().map(|e| e.last_modified_ledger).max() {
@@ -1173,6 +1188,7 @@ async fn cmd_config_snapshot(
     timeout: u64,
     max_retries: usize,
     extra_headers: &[String],
+    verbose: bool,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -1187,6 +1203,7 @@ async fn cmd_config_snapshot(
             timeout,
             max_retries,
             extra_headers,
+            verbose,
         )
         .await?;
 
@@ -1248,6 +1265,7 @@ async fn cmd_config_diff(
     timeout: u64,
     max_retries: usize,
     extra_headers: &[String],
+    verbose: bool,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::{debug, info_span};
@@ -1272,6 +1290,7 @@ async fn cmd_config_diff(
             timeout,
             max_retries,
             extra_headers,
+            verbose,
         )
         .await?;
 
@@ -1503,6 +1522,7 @@ async fn watch_poll_once(
     timeout: u64,
     max_retries: usize,
     extra_headers: &[String],
+    verbose: bool,
 ) -> error::AppResult<()> {
     use tracing::{debug, warn};
 
@@ -1513,6 +1533,7 @@ async fn watch_poll_once(
         timeout,
         max_retries,
         extra_headers,
+        verbose,
     )
     .await;
 
@@ -1554,6 +1575,7 @@ async fn cmd_watch(
     timeout: u64,
     max_retries: usize,
     extra_headers: &[String],
+    verbose: bool,
 ) -> error::AppResult<()> {
     use tracing::info;
 
@@ -1583,6 +1605,7 @@ async fn cmd_watch(
                     timeout,
                     max_retries,
                     extra_headers,
+                    verbose,
                 )
                 .await;
                 tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
@@ -1803,6 +1826,7 @@ async fn cmd_cache_warm(
     timeout: u64,
     max_retries: usize,
     extra_headers: &[String],
+    verbose: bool,
 ) -> error::AppResult<()> {
     let fmt = if json_flag { "json" } else { "table" };
     cmd_estimate_all(
@@ -1817,6 +1841,7 @@ async fn cmd_cache_warm(
         max_retries,
         7,
         extra_headers,
+        verbose,
     )
     .await
 }
@@ -2002,8 +2027,10 @@ mod tests {
                     cpu_fee_stroops: 1,
                     storage_fee_stroops: 0,
                     bandwidth_fee_stroops: 0,
+                    base_fee_stroops: 0,
                     total_stroops: 3,
                     total_xlm: "0.0000003".to_string(),
+                    fee_percentages: std::collections::BTreeMap::new(),
                 }),
             },
             EstimateAllResult::skipped("needs_args", "needs --fn/--arg (1 param(s))"),

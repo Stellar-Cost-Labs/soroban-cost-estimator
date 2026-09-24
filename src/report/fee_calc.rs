@@ -21,10 +21,14 @@ pub struct FeeBreakdown {
     pub storage_fee_stroops: i64,
     /// Transaction size / bandwidth fee (subset of non-refundable).
     pub bandwidth_fee_stroops: i64,
+    /// Base inclusion fee.
+    pub base_fee_stroops: i64,
     /// Total resource fee.
     pub total_stroops: i64,
     /// Total fee in XLM (as a string to avoid float precision issues).
     pub total_xlm: String,
+    /// Percentage contribution of each fee component, summing to exactly 100.0%.
+    pub fee_percentages: std::collections::BTreeMap<String, String>,
 }
 
 /// Fee rates sourced from the network's `ConfigSettingContract*` entries.
@@ -133,12 +137,76 @@ pub fn compute_fee_breakdown(
     // `i64::MIN`, not at zero.)
     let refundable = total_resource_fee.saturating_sub(non_refundable).max(0);
 
-    let total_xlm = stroops_to_xlm(total_resource_fee, precision);
+    let base_fee_stroops = if total_resource_fee > 0 { 100 } else { 0 };
+    let total_stroops = total_resource_fee.saturating_add(base_fee_stroops);
+    let total_xlm = stroops_to_xlm(total_stroops, precision);
 
     // Combined storage I/O fee for the report breakdown.
     let storage_fee = read_entry_fee
         .saturating_add(write_entry_fee)
         .saturating_add(read_bytes_fee);
+
+    // Compute exact percentages summing to 100.0%
+    let parts = [
+        cpu_fee,
+        storage_fee,
+        bandwidth_fee,
+        base_fee_stroops,
+        refundable,
+    ];
+    let mut permilles: Vec<i64> = parts
+        .iter()
+        .map(|&p| {
+            if total_stroops <= 0 {
+                0
+            } else {
+                let p_128 = p as i128;
+                let tot_128 = total_stroops as i128;
+                let num = p_128 * 1000;
+                let half = tot_128 / 2;
+                let rounded = if num >= 0 {
+                    (num + half) / tot_128
+                } else {
+                    (num - half) / tot_128
+                };
+                rounded.try_into().unwrap_or_else(|_| if rounded > 0 { i64::MAX } else { i64::MIN })
+            }
+        })
+        .collect();
+
+    if total_stroops > 0 {
+        let sum: i128 = permilles.iter().map(|&x| x as i128).sum();
+        if let Ok(sum_i64) = i64::try_from(sum) {
+            let diff = 1000i64.saturating_sub(sum_i64);
+            if diff != 0 {
+                if let Some((idx, _)) = parts.iter().enumerate().max_by_key(|&(_, &p)| p) {
+                    permilles[idx] = permilles[idx].saturating_add(diff);
+                }
+            }
+        }
+    }
+
+    let mut fee_percentages = std::collections::BTreeMap::new();
+    fee_percentages.insert(
+        "cpu_instructions".to_string(),
+        format!("{:.1}%", permilles[0] as f64 / 10.0),
+    );
+    fee_percentages.insert(
+        "storage_read_write".to_string(),
+        format!("{:.1}%", permilles[1] as f64 / 10.0),
+    );
+    fee_percentages.insert(
+        "transaction_size".to_string(),
+        format!("{:.1}%", permilles[2] as f64 / 10.0),
+    );
+    fee_percentages.insert(
+        "base_fee".to_string(),
+        format!("{:.1}%", permilles[3] as f64 / 10.0),
+    );
+    fee_percentages.insert(
+        "rent".to_string(),
+        format!("{:.1}%", permilles[4] as f64 / 10.0),
+    );
 
     FeeBreakdown {
         non_refundable_stroops: non_refundable,
@@ -146,8 +214,10 @@ pub fn compute_fee_breakdown(
         cpu_fee_stroops: cpu_fee,
         storage_fee_stroops: storage_fee,
         bandwidth_fee_stroops: bandwidth_fee,
-        total_stroops: total_resource_fee,
+        base_fee_stroops,
+        total_stroops,
         total_xlm,
+        fee_percentages,
     }
 }
 
@@ -329,7 +399,7 @@ mod tests {
             cpu_and_bandwidth_only_rates(),
             DEFAULT_PRECISION,
         );
-        assert_eq!(breakdown.total_stroops, 5_000);
+        assert_eq!(breakdown.total_stroops, 5_100);
         assert_eq!(breakdown.non_refundable_stroops, 10_250);
         assert_eq!(breakdown.refundable_stroops, 0);
     }
@@ -415,8 +485,8 @@ mod tests {
             cpu_and_bandwidth_only_rates(),
             DEFAULT_PRECISION,
         );
-        assert_eq!(breakdown.total_stroops, 1_000_000);
-        assert_eq!(breakdown.total_xlm, "0.1000000");
+        assert_eq!(breakdown.total_stroops, 1_000_100);
+        assert_eq!(breakdown.total_xlm, "0.1000100");
         assert_eq!(breakdown.non_refundable_stroops, 10_250);
         assert_eq!(breakdown.refundable_stroops, 989_750);
     }
@@ -449,6 +519,6 @@ mod tests {
         );
         assert_eq!(breakdown.non_refundable_stroops, 4_496);
         assert_eq!(breakdown.refundable_stroops, 15_427 - 4_496);
-        assert_eq!(breakdown.total_stroops, 15_427);
+        assert_eq!(breakdown.total_stroops, 15_527);
     }
 }
