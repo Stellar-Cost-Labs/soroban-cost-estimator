@@ -12,12 +12,32 @@ use crate::wasm::parser::FunctionInfo;
 /// The Soroban RPC `getLedgerEntries` returns the entry data as a `LedgerEntryData`
 /// XDR (not the full `LedgerEntry` which includes `lastModifiedLedgerSeq` and `ext`
 /// fields that are returned as separate JSON fields).
-pub fn decode_config_entry_xdr(xdr_b64: &str) -> AppResult<stellar_xdr::ConfigSettingEntry> {
+pub fn decode_config_entry_xdr(
+    xdr_b64: &str,
+    verbose: bool,
+) -> AppResult<stellar_xdr::ConfigSettingEntry> {
+    if verbose {
+        eprintln!(
+            "[XDR] Decoding config entry from base64 ({} chars)",
+            xdr_b64.len()
+        );
+    }
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, xdr_b64)
         .map_err(|e| AppError::XdrDecode(format!("base64 decode: {e}")))?;
 
+    if verbose {
+        eprintln!("[XDR] -> Decoded to {} bytes", bytes.len());
+    }
+
     let entry_data = stellar_xdr::LedgerEntryData::from_xdr(&bytes, stellar_xdr::Limits::none())
         .map_err(|e| AppError::XdrDecode(format!("LedgerEntryData from_xdr: {e}")))?;
+
+    if verbose {
+        eprintln!(
+            "[XDR] -> Parsed LedgerEntryData variant: {}",
+            entry_data.name()
+        );
+    }
 
     match entry_data {
         stellar_xdr::LedgerEntryData::ConfigSetting(config_entry) => Ok(config_entry),

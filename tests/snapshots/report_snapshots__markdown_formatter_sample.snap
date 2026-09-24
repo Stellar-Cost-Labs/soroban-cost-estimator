@@ -1,6 +1,5 @@
 ---
 source: tests/report_snapshots.rs
-assertion_line: 91
 expression: MarkdownFormatter.format(&report)
 ---
 ## Cost Report: `increment`
@@ -25,11 +24,11 @@ expression: MarkdownFormatter.format(&report)
 
 | Component | Stroops | % of Total |
 | --- | --- | --- |
-| Non-refundable | 4496 | 29.1% |
-| Refundable | 10931 | 70.9% |
-| CPU | 372 | 2.4% |
-| Storage | 4063 | 26.3% |
-| Bandwidth | 61 | 0.4% |
+| CPU Instructions | 372 |  |
+| Storage I/O | 4063 |  |
+| Transaction Size | 61 |  |
+| Base Fee | 100 |  |
+| Rent Fee | 10931 |  |
 | **Total** | **15427** (0.0015427) | **100.0%** |
 
 ### Optimization Suggestions

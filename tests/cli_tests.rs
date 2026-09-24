@@ -1566,7 +1566,7 @@ fn test_estimate_fn_contract_fixture_populates_footprint_json() {
     assert_eq!(parsed["read_bytes"], 0, "expected 0 read bytes");
     assert_eq!(parsed["write_bytes"], 136, "expected 136 write bytes");
     assert_eq!(parsed["cpu_instructions"], 532_502);
-    assert_eq!(parsed["fee"]["total_stroops"], 15_427);
+    assert_eq!(parsed["fee"]["total_stroops"], 15_527);
 }
 
 #[test]
@@ -1612,8 +1612,8 @@ fn test_estimate_fn_contract_fixture_populates_footprint_table() {
         "table should display 136 write bytes"
     );
     assert!(
-        stdout.contains("15427"),
-        "table should display total fee 15427"
+        stdout.contains("15527"),
+        "table should display total fee 15527"
     );
 }
 

@@ -157,20 +157,31 @@ pub fn compute_fee_breakdown(
     let mut permilles: Vec<i64> = parts
         .iter()
         .map(|&p| {
-            if total_stroops == 0 {
+            if total_stroops <= 0 {
                 0
             } else {
-                ((p as f64 / total_stroops as f64) * 1000.0).round() as i64
+                let p_128 = p as i128;
+                let tot_128 = total_stroops as i128;
+                let num = p_128 * 1000;
+                let half = tot_128 / 2;
+                let rounded = if num >= 0 {
+                    (num + half) / tot_128
+                } else {
+                    (num - half) / tot_128
+                };
+                rounded.try_into().unwrap_or_else(|_| if rounded > 0 { i64::MAX } else { i64::MIN })
             }
         })
         .collect();
 
     if total_stroops > 0 {
-        let sum: i64 = permilles.iter().sum();
-        let diff = 1000 - sum;
-        if diff != 0 {
-            if let Some((idx, _)) = parts.iter().enumerate().max_by_key(|&(_, &p)| p) {
-                permilles[idx] += diff;
+        let sum: i128 = permilles.iter().map(|&x| x as i128).sum();
+        if let Ok(sum_i64) = i64::try_from(sum) {
+            let diff = 1000i64.saturating_sub(sum_i64);
+            if diff != 0 {
+                if let Some((idx, _)) = parts.iter().enumerate().max_by_key(|&(_, &p)| p) {
+                    permilles[idx] = permilles[idx].saturating_add(diff);
+                }
             }
         }
     }

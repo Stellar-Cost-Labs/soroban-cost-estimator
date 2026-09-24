@@ -23,7 +23,7 @@ fn unknown_network_error_propagates() {
 
 #[test]
 fn xdr_decode_error_propagates() {
-    let result = decode_config_entry_xdr("not-valid-base64!!!");
+    let result = decode_config_entry_xdr("not-valid-base64!!!", false);
 
     assert!(matches!(result, Err(AppError::XdrDecode(_))));
 }
