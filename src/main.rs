@@ -155,6 +155,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             format,
             precision,
             auto_snapshot,
+            dry_run,
         } => {
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
@@ -176,6 +177,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 precision,
                 &headers,
                 auto_snapshot,
+                dry_run,
             )
             .await
         }
@@ -472,6 +474,7 @@ async fn cmd_estimate(
     precision: u32,
     extra_headers: &[String],
     auto_snapshot: bool,
+    dry_run: bool,
 ) -> error::AppResult<()> {
     let json_flag = format == "json";
     let table_mode = format == "table";
@@ -552,6 +555,47 @@ async fn cmd_estimate(
 
         let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
         debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
+
+        // In dry-run mode, print the planned simulation payload and exit
+        // without contacting the network. Useful for air-gapped environments
+        // or local contract verification.
+        if dry_run {
+            let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
+            println!("Dry run — planned simulation payload (no network calls):");
+            println!();
+            println!("  Resolved RPC endpoint: {endpoint}");
+            println!(
+                "  Contract ID:           {}",
+                contract_id.unwrap_or("(wasm upload)")
+            );
+            println!(
+                "  Function name:         {}",
+                fn_name.unwrap_or("(wasm upload)")
+            );
+            println!("  Network:               {network}");
+            println!();
+            println!("  WASM SHA-256:          {wasm_hash}");
+            println!("  WASM size:             {} bytes", wasm_info.bytes.len());
+            println!(
+                "  Contract spec:         {}",
+                if wasm_info.has_spec {
+                    "present"
+                } else {
+                    "absent"
+                }
+            );
+            println!();
+            println!("  Arguments ({}):", args.len());
+            for (i, (arg, sc_val)) in args.iter().zip(&sc_vals).enumerate() {
+                println!("    [{i}] {arg} → {sc_val:?}");
+            }
+            println!();
+            println!("  Transaction envelope:");
+            println!("    XDR size:   {} bytes", tx_xdr.len());
+            println!("    Base64 size: {} bytes", tx_b64.len());
+            println!("    Base64 data: {tx_b64}");
+            return Ok(());
+        }
 
         // Fail fast on a misconfigured --rpc-url or down node (#55): validate
         // the endpoint is reachable and healthy before running any simulation.
@@ -1521,10 +1565,7 @@ async fn auto_snapshot_if_changed(
     use tracing::{debug, info};
 
     // Try to load the latest snapshot; if none exists, save a new one.
-    let old_snapshot = match config_snapshot::store::load_latest_snapshot(network) {
-        Ok(snap) => Some(snap),
-        Err(_) => None,
-    };
+    let old_snapshot = config_snapshot::store::load_latest_snapshot(network).ok();
 
     let new_snapshot = fetch_config_snapshot(
         network,
