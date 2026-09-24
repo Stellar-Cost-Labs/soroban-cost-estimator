@@ -2,18 +2,7 @@ use comfy_table::Table;
 
 use crate::report::fee_calc::{FeeBreakdown, FeeRates};
 
-/// Compute what percentage `part` is of `total`.
-///
-/// Returns a formatted string like `"29.3%"`. Returns `"0.0%"` when the
-/// total is zero to avoid division by zero.
-pub fn fee_percentage(part: i64, total: i64) -> String {
-    if total == 0 {
-        "0.0%".to_string()
-    } else {
-        let pct = (part as f64 / total as f64) * 100.0;
-        format!("{pct:.1}%")
-    }
-}
+// fee_percentage removed since we now use the precalculated exact percentages
 
 /// Maximum width of the bar in the ASCII cost breakdown chart (characters).
 const CHART_BAR_WIDTH: usize = 40;
@@ -343,38 +332,60 @@ pub fn format_report_table(report: &CostReport) -> String {
     output.push_str(&table.to_string());
     output.push('\n');
 
-    output.push_str(&format!("\nFee Breakdown:\n"));
-    let total = report.fee.total_stroops;
-    output.push_str(&format!(
-        "  Non-refundable: {} stroops ({})\n",
-        report.fee.non_refundable_stroops,
-        fee_percentage(report.fee.non_refundable_stroops, total),
-    ));
-    output.push_str(&format!(
-        "  Refundable:     {} stroops ({})\n",
-        report.fee.refundable_stroops,
-        fee_percentage(report.fee.refundable_stroops, total),
-    ));
-    output.push_str(&format!("\n  Components (of non-refundable):\n"));
-    output.push_str(&format!(
-        "    CPU:        {} stroops ({})\n",
-        report.fee.cpu_fee_stroops,
-        fee_percentage(report.fee.cpu_fee_stroops, total),
-    ));
-    output.push_str(&format!(
-        "    Storage:    {} stroops ({})\n",
-        report.fee.storage_fee_stroops,
-        fee_percentage(report.fee.storage_fee_stroops, total),
-    ));
-    output.push_str(&format!(
-        "    Bandwidth:  {} stroops ({})\n",
-        report.fee.bandwidth_fee_stroops,
-        fee_percentage(report.fee.bandwidth_fee_stroops, total),
-    ));
-    output.push_str(&format!(
-        "\n  Total:          {} stroops ({})\n",
-        report.fee.total_stroops, report.fee.total_xlm,
-    ));
+    output.push_str("\nFee Breakdown:\n\n");
+    let pct = &report.fee.fee_percentages;
+    let mut fee_table = Table::new();
+    fee_table.set_header(vec!["Component", "Fee"]);
+    fee_table.add_row(vec![
+        "CPU Instructions",
+        &format!(
+            "{} stroops ({})",
+            report.fee.cpu_fee_stroops,
+            pct.get("cpu_instructions").unwrap_or(&"".to_string())
+        ),
+    ]);
+    fee_table.add_row(vec![
+        "Storage I/O",
+        &format!(
+            "{} stroops ({})",
+            report.fee.storage_fee_stroops,
+            pct.get("storage_read_write").unwrap_or(&"".to_string())
+        ),
+    ]);
+    fee_table.add_row(vec![
+        "Transaction Size",
+        &format!(
+            "{} stroops ({})",
+            report.fee.bandwidth_fee_stroops,
+            pct.get("transaction_size").unwrap_or(&"".to_string())
+        ),
+    ]);
+    fee_table.add_row(vec![
+        "Base Fee",
+        &format!(
+            "{} stroops ({})",
+            report.fee.base_fee_stroops,
+            pct.get("base_fee").unwrap_or(&"".to_string())
+        ),
+    ]);
+    fee_table.add_row(vec![
+        "Rent Fee",
+        &format!(
+            "{} stroops ({})",
+            report.fee.refundable_stroops,
+            pct.get("rent").unwrap_or(&"".to_string())
+        ),
+    ]);
+    fee_table.add_row(vec![
+        "Total",
+        &format!(
+            "{} stroops ({})",
+            report.fee.total_stroops, report.fee.total_xlm
+        ),
+    ]);
+
+    output.push_str(&fee_table.to_string());
+    output.push('\n');
 
     // ASCII bar chart for visual cost breakdown
     output.push_str(&format_cost_breakdown_chart(
@@ -395,26 +406,6 @@ pub fn format_report_json(report: &CostReport) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_fee_percentage_normal() {
-        assert_eq!(fee_percentage(50, 100), "50.0%");
-        assert_eq!(fee_percentage(1, 3), "33.3%");
-        assert_eq!(fee_percentage(0, 100), "0.0%");
-    }
-
-    #[test]
-    fn test_fee_percentage_zero_total() {
-        assert_eq!(fee_percentage(0, 0), "0.0%");
-        assert_eq!(fee_percentage(100, 0), "0.0%");
-    }
-
-    #[test]
-    fn test_fee_percentage_rounding() {
-        assert_eq!(fee_percentage(1, 10), "10.0%");
-        assert_eq!(fee_percentage(1, 3), "33.3%");
-        assert_eq!(fee_percentage(2, 3), "66.7%");
-    }
-
     fn report_with_rates(rates: FeeRates) -> CostReport {
         CostReport {
             function: "increment".to_string(),
@@ -432,8 +423,10 @@ mod tests {
                 cpu_fee_stroops: 372,
                 storage_fee_stroops: 4_063,
                 bandwidth_fee_stroops: 61,
-                total_stroops: 15_427,
-                total_xlm: "0.0015427".to_string(),
+                base_fee_stroops: 100,
+                total_stroops: 15_527,
+                total_xlm: "0.0015527".to_string(),
+                fee_percentages: std::collections::BTreeMap::new(),
             },
             ledger: 3_894_195,
             network: "testnet".to_string(),
@@ -545,8 +538,10 @@ mod tests {
                 cpu_fee_stroops: 0,
                 storage_fee_stroops: 0,
                 bandwidth_fee_stroops: 0,
+                base_fee_stroops: 0,
                 total_stroops: 0,
                 total_xlm: "0.0000000".to_string(),
+                fee_percentages: std::collections::BTreeMap::new(),
             },
             ledger: 0,
             network: "testnet".to_string(),
