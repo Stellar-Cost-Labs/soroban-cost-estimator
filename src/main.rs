@@ -182,6 +182,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             network,
             rpc_url,
             id,
+            fn_names,
             json,
             format,
             precision,
@@ -193,6 +194,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 rpc_url.as_deref(),
                 fallback,
                 id.as_deref(),
+                &fn_names,
                 &format,
                 rps,
                 timeout,
@@ -677,6 +679,7 @@ async fn cmd_estimate_all(
     rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     contract_id: Option<&str>,
+    fn_names: &[String],
     format: &str,
     rps: Option<u64>,
     timeout: u64,
@@ -697,6 +700,36 @@ async fn cmd_estimate_all(
         use sha2::Digest;
         let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
 
+        // `--fn` filter (#25): validate the requested names against the WASM
+        // and keep only the matching functions for simulation. A typo must
+        // fail loudly, not silently estimate nothing.
+        let selected: Vec<&wasm::parser::FunctionInfo> = if fn_names.is_empty() {
+            wasm_info.functions.iter().collect()
+        } else {
+            let missing: Vec<&str> = fn_names
+                .iter()
+                .map(String::as_str)
+                .filter(|name| !wasm_info.functions.iter().any(|f| f.name == *name))
+                .collect();
+            if !missing.is_empty() {
+                let available = wasm_info
+                    .functions
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(error::AppError::General(format!(
+                    "function(s) not found in WASM: {} (available functions: {available})",
+                    missing.join(", ")
+                )));
+            }
+            wasm_info
+                .functions
+                .iter()
+                .filter(|f| fn_names.iter().any(|n| n == &f.name))
+                .collect()
+        };
+
         let json_flag = format == "json";
         let text_mode = format == "table" || format == "markdown";
         if text_mode {
@@ -709,7 +742,18 @@ async fn cmd_estimate_all(
                 wasm_info.functions.len()
             );
             for (i, fn_info) in wasm_info.functions.iter().enumerate() {
-                println!("  {}. {}", i + 1, wasm::parser::format_function(fn_info));
+                let suffix = if fn_names.is_empty()
+                    || selected.iter().any(|s| s.name == fn_info.name)
+                {
+                    String::new()
+                } else {
+                    "  — Skipped: filtered out".to_string()
+                };
+                println!(
+                    "  {}. {}{suffix}",
+                    i + 1,
+                    wasm::parser::format_function(fn_info)
+                );
             }
             println!();
             println!(
@@ -754,10 +798,10 @@ async fn cmd_estimate_all(
         let mut csv_rows: Vec<String> = Vec::new();
 
         let mut json_results: Vec<EstimateAllResult> = Vec::new();
-        let total = wasm_info.functions.len();
+        let total = selected.len();
         debug!(total, "enumerated functions");
 
-        for (i, fn_info) in wasm_info.functions.iter().enumerate() {
+        for (i, fn_info) in selected.iter().enumerate() {
             if text_mode {
                 println!("[{}/{}] {}", i + 1, total, fn_info.name);
             }
@@ -1811,6 +1855,7 @@ async fn cmd_cache_warm(
         rpc_url,
         rpc_fallback_url,
         contract_id,
+        &[],
         fmt,
         rps,
         timeout,

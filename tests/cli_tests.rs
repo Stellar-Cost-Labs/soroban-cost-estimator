@@ -1654,3 +1654,51 @@ fn test_estimate_minimal_wasm_upload_zero_footprint() {
     assert_eq!(parsed["read_bytes"], 0);
     assert_eq!(parsed["write_bytes"], 0);
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// `estimate-all --fn` filter (Issue #25)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_estimate_all_fn_flag_accepted() {
+    let (_, stderr, code) = run_cli(&[
+        "estimate-all",
+        "--wasm",
+        "test.wasm",
+        "--fn",
+        "increment",
+        "--fn",
+        "transfer",
+    ]);
+    assert_ne!(code, 0, "missing WASM file should still error");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--fn should be a recognized, repeatable argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_all_fn_unknown_function_errors() {
+    // A typo must fail loudly, listing the available functions, before any
+    // RPC call.
+    let home = temp_home("estimate-all-fn-unknown");
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "estimate-all",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--fn",
+            "no_such_function",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "an unknown --fn should exit 1; stderr: {stderr}");
+    assert!(
+        stderr.contains("not found in WASM"),
+        "the error should say the function was not found; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("increment"),
+        "the error should list the available functions; got: {stderr}"
+    );
+}
