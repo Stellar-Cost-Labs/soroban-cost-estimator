@@ -122,8 +122,6 @@ pub struct RpcClient {
     /// Maximum number of retries on transient (HTTP) failures, with
     /// exponential backoff.
     max_retries: usize,
-    /// Custom HTTP headers attached to every outbound request.
-    headers: HeaderMap,
 }
 
 impl RpcClient {
@@ -247,7 +245,6 @@ impl RpcClient {
             dedup: Arc::new(Mutex::new(DedupState::default())),
             limiter: rps.and_then(build_rate_limiter),
             max_retries,
-            headers,
         }
     }
 
@@ -1052,54 +1049,36 @@ mod header_tests {
     }
 
     #[test]
-    fn test_with_headers_empty() {
-        let client = RpcClient::with_headers("http://localhost", &[]);
-        assert!(client.headers.is_empty());
+    fn test_parse_headers_empty() {
+        assert!(parse_headers(&[]).is_empty());
     }
 
     #[test]
-    fn test_with_headers_stores_parsed() {
-        let client = RpcClient::with_headers(
-            "http://localhost",
-            &[
-                "X-API-Key: secret".to_string(),
-                "Authorization: Bearer tok".to_string(),
-            ],
-        );
-        assert_eq!(client.headers.len(), 2);
+    fn test_parse_headers_stores_parsed() {
+        let headers = parse_headers(&[
+            "X-API-Key: secret".to_string(),
+            "Authorization: Bearer tok".to_string(),
+        ]);
+        assert_eq!(headers.len(), 2);
         assert_eq!(
-            client.headers.get("x-api-key").unwrap().to_str().unwrap(),
+            headers.get("x-api-key").unwrap().to_str().unwrap(),
             "secret"
         );
         assert_eq!(
-            client
-                .headers
-                .get("authorization")
-                .unwrap()
-                .to_str()
-                .unwrap(),
+            headers.get("authorization").unwrap().to_str().unwrap(),
             "Bearer tok"
         );
     }
 
     #[test]
-    fn test_with_headers_skips_malformed() {
-        let client = RpcClient::with_headers(
-            "http://localhost",
-            &[
-                "Good: ok".to_string(),
-                "NoColonHere".to_string(),
-                "Also-Bad:".to_string(),
-            ],
-        );
-        // Only the valid header should be stored.
-        assert_eq!(client.headers.len(), 1);
-        assert!(client.headers.contains_key("good"));
-    }
-
-    #[test]
-    fn test_rpc_client_new_has_no_custom_headers() {
-        let client = RpcClient::new("http://localhost");
-        assert!(client.headers.is_empty());
+    fn test_parse_headers_skips_malformed() {
+        let headers = parse_headers(&[
+            "Good: ok".to_string(),
+            "NoColonHere".to_string(),
+            "Also-Bad:".to_string(),
+        ]);
+        // Only the valid header should be kept.
+        assert_eq!(headers.len(), 1);
+        assert!(headers.contains_key("good"));
     }
 }

@@ -6,9 +6,7 @@ use soroban_cost_estimator::cli;
 use soroban_cost_estimator::config_snapshot;
 use soroban_cost_estimator::error;
 use soroban_cost_estimator::report;
-use soroban_cost_estimator::report::formatter::{
-    ReportFormatter, TableFormatter, formatter_by_name,
-};
+use soroban_cost_estimator::report::formatter::{TableFormatter, formatter_by_name};
 use soroban_cost_estimator::rpc;
 use soroban_cost_estimator::wasm;
 use soroban_cost_estimator::xdr_helper;
@@ -154,6 +152,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             json,
             format,
             precision,
+            watch,
         } => {
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
@@ -174,6 +173,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 max_retries,
                 precision,
                 &headers,
+                watch,
             )
             .await
         }
@@ -444,12 +444,27 @@ async fn fetch_fee_rates(client: &rpc::client::RpcClient) -> report::fee_calc::F
     rates
 }
 
+/// Outcome of one `estimate` run, letting the caller decide how to render it.
+#[allow(clippy::large_enum_variant)] // report outlives the match arm, so boxing buys nothing
+enum EstimateRun {
+    /// A fresh simulation produced a full [`report::cost_report::CostReport`].
+    Simulated {
+        report: report::cost_report::CostReport,
+    },
+    /// A still-fresh cached estimate was reused and already printed by
+    /// [`estimate_once`]; nothing more to render.
+    Cached,
+}
+
 /// `estimate` command: simulate a single invocation and print cost report.
 ///
 /// All RPC traffic (simulation and fee-rate fetches) goes through one
 /// `RpcClient`, which deduplicates identical requests — the same method with
 /// the same params — so a repeated WASM-upload envelope (when `--fn` is
 /// omitted) or identical fee-rate fetches transmit at most once.
+///
+/// With `--watch`, switches to [`cmd_estimate_watch`] instead: poll the WASM
+/// file and re-estimate on every settled rebuild.
 #[allow(clippy::too_many_lines)]
 async fn cmd_estimate(
     wasm_path: &str,
@@ -467,7 +482,85 @@ async fn cmd_estimate(
     max_retries: usize,
     precision: u32,
     extra_headers: &[String],
+    watch: bool,
 ) -> error::AppResult<()> {
+    if watch {
+        return cmd_estimate_watch(
+            wasm_path,
+            network,
+            rpc_url,
+            rpc_fallback_url,
+            contract_id,
+            fn_name,
+            args,
+            format,
+            rps,
+            timeout,
+            max_retries,
+            precision,
+            extra_headers,
+        )
+        .await;
+    }
+
+    let run = estimate_once(
+        wasm_path,
+        network,
+        rpc_url,
+        rpc_fallback_url,
+        contract_id,
+        fn_name,
+        args,
+        cache_ttl,
+        clear_cache,
+        format,
+        precision,
+        extra_headers,
+        rps,
+        timeout,
+        max_retries,
+        format == "table",
+    )
+    .await?;
+
+    if let EstimateRun::Simulated { report, .. } = &run {
+        let formatter = formatter_by_name(format).unwrap_or_else(|| Box::new(TableFormatter));
+        println!("{}", formatter.format(report));
+    }
+    Ok(())
+}
+
+/// Run a single estimation for `estimate` (and each `estimate --watch` build).
+///
+/// Performs the full pipeline — WASM load + hash, cache lookup, transaction
+/// construction, argument validation, endpoint health check, simulation,
+/// fee-rate fetch, fee breakdown, and cache write — and returns the outcome
+/// for the caller to render. Only the `WASM SHA-256` preamble (when
+/// `print_wasm_hash` is set, i.e. human single-shot runs) and the cache-hit
+/// message are emitted inline.
+///
+/// # Network calls
+/// One `simulateTransaction` RPC call plus (when not served from cache) up
+/// to three configuration-setting fetches for the fee-rate breakdown.
+#[allow(clippy::too_many_lines)]
+async fn estimate_once(
+    wasm_path: &str,
+    network: &str,
+    rpc_url: Option<&str>,
+    rpc_fallback_url: Option<&str>,
+    contract_id: Option<&str>,
+    fn_name: Option<&str>,
+    args: &[String],
+    cache_ttl: Option<&str>,
+    clear_cache: bool,
+    format: &str,
+    precision: u32,
+    extra_headers: &[String],
+    rps: Option<u64>,
+    timeout: u64,
+    max_retries: usize,
+    print_wasm_hash: bool,
+) -> error::AppResult<EstimateRun> {
     let json_flag = format == "json";
     let table_mode = format == "table";
     use sha2::Digest;
@@ -504,10 +597,10 @@ async fn cmd_estimate(
         let function_name = fn_name.unwrap_or("(wasm upload)");
 
         // Show the hash before anything else — the user can verify they are
-        // simulating the intended file before any RPC traffic is sent.
-        // Only the human-readable table mode gets this header; machine
-        // formats (json/csv/markdown) emit their own self-contained output.
-        if table_mode {
+        // simulating the intended file before any RPC traffic is sent. Only
+        // the human-readable table mode gets this preamble; watch mode prints
+        // the hash inside its own per-build header instead.
+        if print_wasm_hash {
             println!("WASM SHA-256: {wasm_hash}");
         }
 
@@ -520,7 +613,7 @@ async fn cmd_estimate(
             let ttl_secs = ttl_secs.unwrap_or_default();
             info!(ttl_secs, function = %function_name, "cache hit — reusing fresh estimate");
             print_cached_estimate(&fresh, ttl_secs, json_flag, precision);
-            return Ok(());
+            return Ok(EstimateRun::Cached);
         }
 
         let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
@@ -627,15 +720,385 @@ async fn cmd_estimate(
         );
         info!(total_stroops = fee.total_stroops, total_xlm = %fee.total_xlm, "estimate complete");
 
-        match formatter_by_name(format) {
-            Some(formatter) => println!("{}", formatter.format(&report)),
-            None => println!("{}", TableFormatter.format(&report)),
-        }
-
-        Ok(())
+        Ok(EstimateRun::Simulated { report })
     }
     .instrument(span)
     .await
+}
+
+/// Poll interval for `estimate --watch`.
+const WATCH_POLL_DURATION: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Mutable state carried across `estimate --watch` poll cycles.
+struct EstimateWatchState {
+    /// SHA-256 of the build that was last (attempted to be) estimated.
+    last_hash: Option<String>,
+    /// SHA-256 observed in a previous poll that has not yet been accepted.
+    pending_hash: Option<String>,
+    /// Total fee (stroops) of the last successful estimate, for cost deltas.
+    last_total_stroops: Option<i64>,
+    /// Number of builds estimated so far (for the header).
+    build: u32,
+}
+
+/// Decide whether a poll observing `observed` signals a finished rebuild.
+///
+/// A build is accepted only once its SHA-256 is seen on **two consecutive
+/// polls** — the double-sample that lets watch mode ignore the transient,
+/// possibly partial bytes a compiler leaves behind while actively writing
+/// the binary. Once accepted, `pending` is cleared so the same content is
+/// not re-triggered; the caller records the accepted hash as
+/// `last_estimated` to keep polling quiescent between builds.
+fn settled_new_build_detected(
+    last_estimated: Option<&str>,
+    pending: &mut Option<String>,
+    observed: &str,
+) -> bool {
+    if last_estimated == Some(observed) {
+        *pending = None;
+        return false;
+    }
+    if pending.as_deref() == Some(observed) {
+        *pending = None;
+        return true;
+    }
+    *pending = Some(observed.to_string());
+    false
+}
+
+/// SHA-256 (hex) of a file's bytes, or `None` when it does not exist yet.
+///
+/// The `None` case lets watch mode tolerate compilers that delete and
+/// rewrite the target artifact across releases.
+fn wasm_content_hash(path: &std::path::Path) -> std::io::Result<Option<String>> {
+    use sha2::Digest;
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(hex::encode(sha2::Sha256::digest(&bytes)))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Print a watch-status line to stdout for human formats and to stderr for
+/// machine formats, keeping structured output (e.g. JSON) clean — the same
+/// convention as the `--clear-cache` announcement.
+fn watch_say(human: bool, line: impl std::fmt::Display) {
+    if human {
+        println!("{line}");
+    } else {
+        eprintln!("{line}");
+    }
+}
+
+/// The fee-change line for the watch header: signed stroops and XLM versus
+/// the previous build, or a "no change" note when the totals match.
+fn watch_cost_delta(current: i64, previous: i64, precision: u32) -> String {
+    let delta = current - previous;
+    if delta == 0 {
+        return "  Change vs previous build: no change\n".to_string();
+    }
+    let xlm = report::fee_calc::stroops_to_xlm(delta, precision);
+    let stroops_label = if delta > 0 {
+        format!("+{delta}")
+    } else {
+        format!("{delta}")
+    };
+    let xlm_label = if delta > 0 {
+        format!("+{xlm}")
+    } else {
+        xlm // `stroops_to_xlm` already emits the `-` sign for negatives
+    };
+    format!("  Change vs previous build: {stroops_label} stroops ({xlm_label} XLM)\n")
+}
+
+/// Render the clean header printed before each watch-mode report: build
+/// number, timestamp, WASM hash, total fee, and — from the second build on —
+/// the fee change versus the previous build.
+fn watch_build_header(
+    report: &report::cost_report::CostReport,
+    previous_total_stroops: Option<i64>,
+    build: u32,
+    now: &str,
+    precision: u32,
+) -> String {
+    let mut out = format!("── Build #{build} — {now} ──\n");
+    out.push_str(&format!("  WASM SHA-256: {}\n", report.wasm_hash));
+    out.push_str(&format!(
+        "  Total fee: {} stroops ({} XLM)\n",
+        report.fee.total_stroops, report.fee.total_xlm
+    ));
+    if let Some(previous) = previous_total_stroops {
+        out.push_str(&watch_cost_delta(
+            report.fee.total_stroops,
+            previous,
+            precision,
+        ));
+    }
+    out
+}
+
+/// Run one estimation of the currently observed WASM build: render the watch
+/// header (build #, timestamp, fee delta) and the report body, then advance
+/// the watch state. A failing estimate is reported as a warning without
+/// aborting the watcher.
+///
+/// # Network calls
+/// One full estimation (see [`estimate_once`]).
+#[allow(clippy::too_many_lines)]
+async fn emit_watch_estimate(
+    state: &mut EstimateWatchState,
+    wasm_path: &str,
+    network: &str,
+    rpc_url: Option<&str>,
+    rpc_fallback_url: Option<&str>,
+    contract_id: Option<&str>,
+    fn_name: Option<&str>,
+    args: &[String],
+    format: &str,
+    rps: Option<u64>,
+    timeout: u64,
+    max_retries: usize,
+    precision: u32,
+    extra_headers: &[String],
+    human: bool,
+) {
+    match estimate_once(
+        wasm_path,
+        network,
+        rpc_url,
+        rpc_fallback_url,
+        contract_id,
+        fn_name,
+        args,
+        None,
+        false,
+        format,
+        precision,
+        extra_headers,
+        rps,
+        timeout,
+        max_retries,
+        false,
+    )
+    .await
+    {
+        Ok(EstimateRun::Simulated { report, .. }) => {
+            state.build += 1;
+            let now = chrono::Utc::now();
+            let now_str = now.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+            let header = watch_build_header(
+                &report,
+                state.last_total_stroops,
+                state.build,
+                &now_str,
+                precision,
+            );
+            state.last_total_stroops = Some(report.fee.total_stroops);
+            if human {
+                print!("{header}");
+            } else {
+                eprint!("{header}");
+            }
+            let formatter = formatter_by_name(format).unwrap_or_else(|| Box::new(TableFormatter));
+            println!("{}", formatter.format(&report));
+        }
+        Ok(EstimateRun::Cached) => {
+            // Unreachable in watch mode: the cache store is only consulted
+            // when `--cache-ttl` is supplied, which watch never does.
+            debug!("unexpected cache hit during watch");
+        }
+        Err(e) => {
+            warn!(error = %e, "estimate failed");
+            watch_say(human, format!("Warning: estimate failed: {e}"));
+        }
+    }
+}
+
+/// One `estimate --watch` poll: fingerprint the WASM file and, when it has
+/// settled on a new build, re-estimate it.
+///
+/// # Network calls
+/// None when nothing changed; otherwise one full estimation (see
+/// [`emit_watch_estimate`]).
+#[allow(clippy::too_many_lines)]
+async fn estimate_watch_poll_once(
+    state: &mut EstimateWatchState,
+    wasm_path: &str,
+    network: &str,
+    rpc_url: Option<&str>,
+    rpc_fallback_url: Option<&str>,
+    contract_id: Option<&str>,
+    fn_name: Option<&str>,
+    args: &[String],
+    format: &str,
+    rps: Option<u64>,
+    timeout: u64,
+    max_retries: usize,
+    precision: u32,
+    extra_headers: &[String],
+    human: bool,
+) -> error::AppResult<()> {
+    let path = std::path::Path::new(wasm_path);
+    let hash = match wasm_content_hash(path) {
+        Ok(Some(hash)) => hash,
+        Ok(None) => {
+            // File temporarily absent (compiler replacing the artifact):
+            // reset the settling tracker so the reappearing build triggers
+            // afresh.
+            state.pending_hash = None;
+            return Ok(());
+        }
+        Err(e) => {
+            // Unreadable (locked/partial) is not a content change.
+            warn!(error = %e, "failed to read watched wasm");
+            return Ok(());
+        }
+    };
+
+    if !settled_new_build_detected(state.last_hash.as_deref(), &mut state.pending_hash, &hash) {
+        return Ok(());
+    }
+
+    // Accept the build as the new baseline even if its estimation fails, so
+    // a broken build does not hot-loop through the RPC on every poll.
+    state.last_hash = Some(hash);
+    emit_watch_estimate(
+        state,
+        wasm_path,
+        network,
+        rpc_url,
+        rpc_fallback_url,
+        contract_id,
+        fn_name,
+        args,
+        format,
+        rps,
+        timeout,
+        max_retries,
+        precision,
+        extra_headers,
+        human,
+    )
+    .await;
+    Ok(())
+}
+
+/// `estimate --watch` command: poll the WASM file and re-estimate on every
+/// settled rebuild until SIGINT (Ctrl-C) or SIGTERM is received — then exit
+/// cleanly with code 0.
+///
+/// Change detection fingerprint-polls the file every 500ms; a rebuild is
+/// accepted only after its SHA-256 is observed on two consecutive polls, so
+/// temporary partial writes during active compilation are ignored and a
+/// briefly absent or unreadable file is tolerated. Each accepted build
+/// re-simulates from scratch (the estimate cache is bypassed so the delta
+/// is meaningful) and prints a clean header with a timestamp and the fee
+/// change versus the previous build.
+///
+/// # Network calls
+/// One full estimation per accepted rebuild.
+#[allow(clippy::too_many_lines)]
+async fn cmd_estimate_watch(
+    wasm_path: &str,
+    network: &str,
+    rpc_url: Option<&str>,
+    rpc_fallback_url: Option<&str>,
+    contract_id: Option<&str>,
+    fn_name: Option<&str>,
+    args: &[String],
+    format: &str,
+    rps: Option<u64>,
+    timeout: u64,
+    max_retries: usize,
+    precision: u32,
+    extra_headers: &[String],
+) -> error::AppResult<()> {
+    use tracing::info;
+
+    let human = format == "table";
+    let path = std::path::Path::new(wasm_path);
+
+    info!(wasm_path, "starting estimate watch");
+    watch_say(
+        human,
+        format!("Watching {wasm_path} for changes... (Ctrl-C to stop)"),
+    );
+
+    let mut state = EstimateWatchState {
+        last_hash: None,
+        pending_hash: None,
+        last_total_stroops: None,
+        build: 0,
+    };
+
+    // Baseline estimation before polling so the user gets immediate output.
+    // A missing or unreadable file is tolerated — the watcher fires when a
+    // readable build appears.
+    match wasm_content_hash(path) {
+        Ok(Some(hash)) => {
+            state.last_hash = Some(hash);
+            emit_watch_estimate(
+                &mut state,
+                wasm_path,
+                network,
+                rpc_url,
+                rpc_fallback_url,
+                contract_id,
+                fn_name,
+                args,
+                format,
+                rps,
+                timeout,
+                max_retries,
+                precision,
+                extra_headers,
+                human,
+            )
+            .await;
+        }
+        Ok(None) => {
+            watch_say(human, format!("Waiting for {wasm_path} to appear..."));
+        }
+        Err(e) => {
+            watch_say(
+                human,
+                format!(
+                    "Warning: could not read {wasm_path}: {e}; waiting for a readable build..."
+                ),
+            );
+        }
+    }
+
+    loop {
+        tokio::select! {
+            signal = shutdown_signal() => {
+                signal?;
+                info!("received stop signal");
+                watch_say(human, "Received stop signal — exiting cleanly.");
+                return Ok(());
+            }
+            () = async {
+                let _ = estimate_watch_poll_once(
+                    &mut state,
+                    wasm_path,
+                    network,
+                    rpc_url,
+                    rpc_fallback_url,
+                    contract_id,
+                    fn_name,
+                    args,
+                    format,
+                    rps,
+                    timeout,
+                    max_retries,
+                    precision,
+                    extra_headers,
+                    human,
+                ).await;
+                tokio::time::sleep(WATCH_POLL_DURATION).await;
+            } => {}
+        }
+    }
 }
 
 /// Converts an `EstimateAllResult` to a CSV row.
@@ -1600,6 +2063,7 @@ async fn cmd_watch(
 ///
 /// # Network calls
 /// None — pure SQLite I/O.
+#[allow(dead_code)] // wired once the `config cache stats` subcommand (#41) lands
 fn cmd_cache_stats() -> error::AppResult<()> {
     let stats = cache::cache_stats()?;
 
@@ -1635,6 +2099,7 @@ fn cmd_cache_stats() -> error::AppResult<()> {
 }
 
 /// Format a byte count as a human-readable string (KB, MB, GB).
+#[allow(dead_code)] // used by cmd_cache_stats once the `config cache stats` subcommand (#41) lands
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -1826,8 +2291,12 @@ mod tests {
     use super::EstimateAllResult;
     use super::EstimateAllStatus;
     use super::parse_interval_secs;
+    use super::settled_new_build_detected;
     use super::upgrade_detected;
+    use super::wasm_content_hash;
     use super::wasm_info_json;
+    use super::watch_build_header;
+    use super::watch_cost_delta;
     use soroban_cost_estimator::config_snapshot::diff;
     use soroban_cost_estimator::config_snapshot::model::{
         ConfigSnapshot, ContractComputeV0, ContractLedgerCostV0,
@@ -2034,5 +2503,142 @@ mod tests {
         let errored = &value[2];
         assert_eq!(errored["status"], "error");
         assert_eq!(errored["error"], "boom");
+    }
+
+    // ── estimate --watch detection & header helpers ────────────────────
+
+    #[test]
+    fn test_settled_new_build_detected_unchanged_build_is_quiescent() {
+        let mut pending = Some("h1".to_string());
+        assert!(!settled_new_build_detected(Some("h1"), &mut pending, "h1"));
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn test_settled_new_build_detected_first_observation_arms() {
+        let mut pending = None;
+        assert!(!settled_new_build_detected(None, &mut pending, "h1"));
+        assert_eq!(pending.as_deref(), Some("h1"));
+    }
+
+    #[test]
+    fn test_settled_new_build_detected_second_observation_triggers() {
+        let mut pending = Some("h1".to_string());
+        assert!(settled_new_build_detected(None, &mut pending, "h1"));
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn test_settled_new_build_detected_ignores_partial_writes() {
+        // A compiler writes several distinct intermediate buffers before the
+        // final file: only the final content, seen twice, triggers a
+        // re-estimation while the transient partials are ignored.
+        let mut pending = None;
+        assert!(!settled_new_build_detected(
+            Some("old"),
+            &mut pending,
+            "partial1"
+        ));
+        assert!(!settled_new_build_detected(
+            Some("old"),
+            &mut pending,
+            "partial2"
+        ));
+        assert!(!settled_new_build_detected(
+            Some("old"),
+            &mut pending,
+            "final"
+        ));
+        assert!(settled_new_build_detected(
+            Some("old"),
+            &mut pending,
+            "final"
+        ));
+    }
+
+    #[test]
+    fn test_wasm_content_hash_missing_file_is_none() {
+        let path = std::path::Path::new("missing/watched/WatchedContract.wasm");
+        assert!(wasm_content_hash(path).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_wasm_content_hash_is_reproducible() {
+        let dir = std::env::temp_dir().join("soroban-estimator-watch-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sample.wasm");
+        std::fs::write(&path, b"\0asm\x01\x00\x00\x00").unwrap();
+
+        let a = wasm_content_hash(&path).unwrap().unwrap();
+        let b = wasm_content_hash(&path).unwrap().unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 64);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_watch_cost_delta_increase_decrease_same() {
+        assert_eq!(
+            watch_cost_delta(15_427, 14_000, 7),
+            "  Change vs previous build: +1427 stroops (+0.0001427 XLM)\n"
+        );
+        assert_eq!(
+            watch_cost_delta(14_000, 15_427, 7),
+            "  Change vs previous build: -1427 stroops (-0.0001427 XLM)\n"
+        );
+        assert_eq!(
+            watch_cost_delta(15_427, 15_427, 7),
+            "  Change vs previous build: no change\n"
+        );
+    }
+
+    fn watch_report() -> soroban_cost_estimator::report::cost_report::CostReport {
+        soroban_cost_estimator::report::cost_report::CostReport {
+            function: "increment".to_string(),
+            wasm_hash: "deadbeef".to_string(),
+            cpu_instructions: 532_502,
+            memory_bytes: 0,
+            tx_size: 156,
+            read_entries: 1,
+            write_entries: 1,
+            read_bytes: 0,
+            write_bytes: 136,
+            fee: soroban_cost_estimator::report::fee_calc::FeeBreakdown {
+                non_refundable_stroops: 4_496,
+                refundable_stroops: 10_931,
+                cpu_fee_stroops: 372,
+                storage_fee_stroops: 4_063,
+                bandwidth_fee_stroops: 61,
+                total_stroops: 15_427,
+                total_xlm: "0.0015427".to_string(),
+            },
+            ledger: 3_894_195,
+            network: "testnet".to_string(),
+            rpc_latency_ms: 87,
+            rates: None,
+        }
+    }
+
+    #[test]
+    fn test_watch_build_header_first_build_has_no_delta() {
+        let header = watch_build_header(&watch_report(), None, 1, "2026-09-24 14:00:00 UTC", 7);
+        assert!(header.contains("── Build #1 — 2026-09-24 14:00:00 UTC ──"));
+        assert!(header.contains("WASM SHA-256: deadbeef"));
+        assert!(header.contains("Total fee: 15427 stroops (0.0015427 XLM)"));
+        assert!(!header.contains("Change vs previous build"));
+    }
+
+    #[test]
+    fn test_watch_build_header_second_build_shows_delta() {
+        let header = watch_build_header(
+            &watch_report(),
+            Some(14_000),
+            2,
+            "2026-09-24 14:05:00 UTC",
+            7,
+        );
+        assert!(header.contains("── Build #2 — 2026-09-24 14:05:00 UTC ──"));
+        assert!(header.contains("+1427 stroops (+0.0001427 XLM)"));
     }
 }
