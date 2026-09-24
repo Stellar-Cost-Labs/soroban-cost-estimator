@@ -11,6 +11,8 @@ Usage: soroban-cost-estimator config diff [OPTIONS]
 Options:
       --network <NETWORK>  Network to compare against [default: testnet]
       --against <AGAINST>  Explicit snapshot path to compare against (defaults to latest)
+      --against-previous   Diff the two most recent on-disk snapshots against each other
+                           instead of the live network (conflicts with --against)
       --summary            Print a single-line count summary instead of the full diff
   -h, --help               Print help
 ```
@@ -39,6 +41,42 @@ Options:
   `~/.soroban-cost-estimator/snapshots/`, so it becomes the baseline for the
   next diff. A failed save is reported as a warning and does not change the
   exit code.
+
+## `--against-previous` — comparing two snapshots on disk
+
+By default `config diff` contrasts *the live network* with *the newest stored
+snapshot*, which needs a reachable RPC endpoint and folds two independent
+things into one answer: what the network looks like right now, and what moved
+between the snapshots you already saved. `--against-previous` decouples them by
+comparing the **newest snapshot with the one immediately before it**, using only
+what is already on disk:
+
+```bash
+soroban-cost-estimator config diff --network testnet --against-previous
+```
+
+- Sorts the network's snapshots by timestamp and diffs snapshot **N-1 → N**.
+- Makes **no network calls** — it works offline, and the network name only
+  selects which snapshot files to read.
+- Errors with the snapshot count when fewer than two snapshots exist for the
+  network:
+
+  ```text
+  Error: failed to load snapshots: need at least 2 for network testnet, found 1
+  (run `config snapshot --network testnet` to capture another)
+  ```
+
+- Keeps the same exit-code contract: **0** when nothing changed, **1** when a
+  pricing change was detected.
+- Never auto-saves, because the newer snapshot is already the one on disk.
+
+The `--summary` and `--json` flags work exactly as they do in the live mode, so
+`--json` consumers get the same `{ diff, stale_estimates }` envelope whichever
+mode produced it.
+
+This is the flag to reach for when a scheduled job or `watch` process has been
+saving snapshots and you want to review "what moved since last time" without
+trusting the live endpoint to be up or unchanged.
 
 ## Example — nothing changed
 

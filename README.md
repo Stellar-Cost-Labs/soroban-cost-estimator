@@ -177,6 +177,14 @@ instead of the full diff, handy for CI status lines:
 soroban-cost-estimator config diff --network testnet --summary
 ```
 
+Add `--against-previous` to diff the **two newest snapshots on disk** against
+each other instead of the live network. It makes no network calls, so it works
+offline and stays meaningful after the endpoint has moved on:
+
+```bash
+soroban-cost-estimator config diff --network testnet --against-previous
+```
+
 - Exits **0** if no changes detected
 - Exits **1** with a detailed field-by-field diff if pricing changed
 - **Auto-saves a snapshot of the new config** when a protocol upgrade is
