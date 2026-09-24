@@ -172,6 +172,16 @@ impl RpcClient {
             "params": params,
         });
 
+        let is_debug = std::env::var("RUST_LOG")
+            .map(|v| v.contains("debug"))
+            .unwrap_or(false)
+            || std::env::args().any(|arg| arg == "--verbose" || arg == "-v");
+
+        if is_debug {
+            let body_str = serde_json::to_string(&body)?;
+            eprintln!("[RPC REQ] Method: {}, ID: 1, Params: {}", method, body_str);
+        }
+
         trace!(method, "sending RPC request");
 
         let client = self.client.clone();
@@ -201,15 +211,29 @@ impl RpcClient {
             }
         })
         .await?;
+
         let status = response.status();
-        let response_body: Value = response.json().await?;
-        if std::env::var("SCE_DEBUG_RPC").is_ok() {
-            debug!(
-                method,
-                response = %serde_json::to_string(&response_body).unwrap_or_default(),
-                "RPC response"
-            );
+
+        if is_debug {
+            eprintln!("[RPC RES] Status: {}", status);
+            eprintln!("[RPC RES] Headers:");
+            for (k, v) in response.headers() {
+                let k_str = k.as_str().to_ascii_lowercase();
+                if k_str.contains("auth") || k_str.contains("token") {
+                    eprintln!("  {}: ***", k);
+                } else {
+                    let val = v.to_str().unwrap_or("<INVALID HEADER VALUE>");
+                    eprintln!("  {}: {}", k, val);
+                }
+            }
         }
+
+        let raw_body = response.text().await?;
+        if is_debug {
+            eprintln!("[RPC RES] Body: {}", raw_body);
+        }
+
+        let response_body: Value = serde_json::from_str(&raw_body)?;
 
         if let Some(error) = response_body.get("error") {
             let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
