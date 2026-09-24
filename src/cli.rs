@@ -161,16 +161,6 @@ pub enum Command {
         #[command(subcommand)]
         action: CacheAction,
     },
-
-    /// Poll network config on an interval and print diffs when they appear.
-    Watch {
-        /// Network to watch.
-        #[arg(long, default_value = "testnet")]
-        network: String,
-        /// Polling interval (e.g. "30m", "1h").
-        #[arg(long, default_value = "1h")]
-        interval: String,
-    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -280,6 +270,10 @@ pub enum ConfigAction {
         /// Network to compare against.
         #[arg(long, default_value = "testnet")]
         network: String,
+
+        /// Explicit RPC URL (overrides network-based resolution).
+        #[arg(long)]
+        rpc_url: Option<String>,
 
         /// Explicit snapshot path to compare against (defaults to latest).
         #[arg(long)]

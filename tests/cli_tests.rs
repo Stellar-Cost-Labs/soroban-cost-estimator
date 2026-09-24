@@ -193,18 +193,6 @@ fn test_config_diff_help() {
     }
 }
 
-#[test]
-fn test_watch_help() {
-    let (stdout, stderr, code) = run_cli(&["watch", "--help"]);
-    assert_eq!(code, 0, "watch --help should exit 0; stderr: {stderr}");
-    for flag in ["--network", "--interval"] {
-        assert!(
-            stdout.contains(flag),
-            "watch help should mention {flag}; got: {stdout}"
-        );
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 // Argument parsing errors
 // ─────────────────────────────────────────────────────────────────────────
@@ -1036,37 +1024,6 @@ fn test_config_diff_loads_valid_snapshot_before_network() {
 // `watch`
 // ─────────────────────────────────────────────────────────────────────────
 
-#[test]
-fn test_watch_unknown_network_is_non_fatal() {
-    // `watch` is a long-running loop: a failing poll warns and retries rather
-    // than exiting. Verify it accepts the args, warns, and keeps running —
-    // then kill it, since it would otherwise never return.
-    let home = temp_home("watch-loop");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
-        .args(["watch", "--network", "not-a-network", "--interval", "1h"])
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("failed to spawn watch");
-
-    // Give the first poll a moment to run, then confirm it has not exited.
-    std::thread::sleep(std::time::Duration::from_millis(750));
-    let status = child.try_wait().expect("failed to poll watch process");
-    assert!(
-        status.is_none(),
-        "watch should still be running after a failed poll, got: {status:?}"
-    );
-
-    let _ = child.kill();
-    let output = child.wait_with_output().expect("failed to reap watch");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("Watching not-a-network for config changes every 3600s"),
-        "watch should announce its network and resolved interval; got: {stdout}"
-    );
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 // `wasm-info` — contractmeta display
 // ─────────────────────────────────────────────────────────────────────────
@@ -1160,29 +1117,6 @@ fn test_wasm_info_reports_absent_contract_meta() {
     assert!(
         stdout.contains("Contract meta: absent"),
         "bare WASM should report absent meta; got: {stdout}"
-    );
-}
-
-#[test]
-fn test_watch_interval_suffixes_are_parsed() {
-    // `30m` must resolve to 1800s in the banner — the interval parser is unit
-    // tested in-crate, this pins the wiring through the CLI.
-    let home = temp_home("watch-interval");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
-        .args(["watch", "--network", "not-a-network", "--interval", "30m"])
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("failed to spawn watch");
-
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    let _ = child.kill();
-    let output = child.wait_with_output().expect("failed to reap watch");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("every 1800s"),
-        "`30m` should resolve to 1800s; got: {stdout}"
     );
 }
 

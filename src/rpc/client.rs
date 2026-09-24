@@ -23,6 +23,20 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// None — returns hardcoded well-known URLs. Custom URLs override network resolution.
 pub fn resolve_endpoint(network: &str, custom_url: Option<&str>) -> AppResult<String> {
     if let Some(url) = custom_url {
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|e| AppError::InvalidRpcUrl(format!("malformed URL: {e}")))?;
+
+        let scheme = parsed.scheme();
+        if scheme != "http" && scheme != "https" {
+            return Err(AppError::InvalidRpcUrl(format!(
+                "invalid scheme '{scheme}', must be http or https"
+            )));
+        }
+
+        if parsed.host().is_none() {
+            return Err(AppError::InvalidRpcUrl("missing host".to_string()));
+        }
+
         debug!(url, "using custom RPC endpoint");
         return Ok(url.to_string());
     }
