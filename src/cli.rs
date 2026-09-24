@@ -36,6 +36,11 @@ pub struct Cli {
     #[arg(long, short, global = true)]
     pub verbose: bool,
 
+    /// Suppress progress spinners, info banners, and non-error notices.
+    /// Outputs only the final result or error.
+    #[arg(long, short, global = true)]
+    pub quiet: bool,
+
     /// Custom HTTP header to send with every RPC request, e.g.
     /// `--header "X-API-Key: secret"`. Repeatable for multiple headers.
     #[arg(long = "header", value_name = "KEY: VALUE", global = true)]
