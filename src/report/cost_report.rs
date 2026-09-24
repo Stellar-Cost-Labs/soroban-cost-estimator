@@ -1,4 +1,4 @@
-use comfy_table::Table;
+use comfy_table::{Cell, Table};
 
 use crate::report::fee_calc::{FeeBreakdown, FeeRates};
 
@@ -391,9 +391,328 @@ pub fn format_report_json(report: &CostReport) -> String {
     serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// Per-contract row in a multi-contract batch cost summary.
+///
+/// One row is produced for every `.wasm` file passed to a batch run (repeated
+/// `--wasm` flags or `--wasm-dir`). Fields are optional because a contract may
+/// fail part-way (unparseable file, failed upload simulation, or failed
+/// per-function simulation); the batch keeps going and records the reason in
+/// `error` rather than aborting the whole run.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ContractCostSummary {
+    /// WASM path exactly as given on the command line (or discovered under
+    /// `--wasm-dir`).
+    pub path: String,
+    /// SHA-256 of the WASM bytes (hex). `None` when the file could not be
+    /// parsed at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wasm_hash: Option<String>,
+    /// Number of exported functions discovered in the module.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_count: Option<usize>,
+    /// Cost of the bytecode-upload envelope, in stroops.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_cost_stroops: Option<i64>,
+    /// Lowest per-function invocation fee observed, in stroops.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_invocation_fee_stroops: Option<i64>,
+    /// Highest per-function invocation fee observed, in stroops.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_invocation_fee_stroops: Option<i64>,
+    /// How many functions were successfully simulated (excludes functions with
+    /// parameters, which need explicit `--arg` values, and functions whose
+    /// simulation failed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub functions_simulated: Option<usize>,
+    /// Human-readable reason the contract could not be fully evaluated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl ContractCostSummary {
+    /// Build a row for a contract whose WASM could not be read or parsed.
+    #[must_use]
+    pub fn unloadable(path: impl Into<String>, error: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            wasm_hash: None,
+            function_count: None,
+            upload_cost_stroops: None,
+            min_invocation_fee_stroops: None,
+            max_invocation_fee_stroops: None,
+            functions_simulated: None,
+            error: Some(error.into()),
+        }
+    }
+
+    /// Whether the contract was evaluated without any recorded error.
+    #[must_use]
+    pub fn is_ok(&self) -> bool {
+        self.error.is_none()
+    }
+
+    /// One-word status for tabular output: `ok`, `partial`, or `error`.
+    #[must_use]
+    pub fn status(&self) -> &'static str {
+        match (self.wasm_hash.is_some(), self.error.is_some()) {
+            (false, _) => "error",
+            (true, true) => "partial",
+            (true, false) => "ok",
+        }
+    }
+}
+
+/// Aggregated result of a multi-contract (`--wasm-dir` / repeated `--wasm`)
+/// batch run.
+///
+/// `succeeded` counts contracts evaluated without any recorded error;
+/// `failed` counts contracts that hit at least one error, whether the file was
+/// unreadable, the upload simulation failed, or a function simulation failed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BatchCostReport {
+    /// Network every contract was simulated against.
+    pub network: String,
+    /// Per-contract summary rows, in command-line order.
+    pub contracts: Vec<ContractCostSummary>,
+    /// Total number of contracts attempted.
+    pub total_contracts: usize,
+    /// Contracts evaluated without errors.
+    pub succeeded: usize,
+    /// Contracts that recorded at least one error.
+    pub failed: usize,
+}
+
+impl BatchCostReport {
+    /// Build a batch report, deriving the success/failure totals from the rows.
+    #[must_use]
+    pub fn new(network: impl Into<String>, contracts: Vec<ContractCostSummary>) -> Self {
+        let total_contracts = contracts.len();
+        let failed = contracts.iter().filter(|c| !c.is_ok()).count();
+        let succeeded = total_contracts - failed;
+        Self {
+            network: network.into(),
+            contracts,
+            total_contracts,
+            succeeded,
+            failed,
+        }
+    }
+}
+
+/// Render an optional numeric field for tabular output, using `-` for values
+/// that were not produced (parse or simulation failure).
+#[must_use]
+pub fn optional_num<T: std::fmt::Display>(value: Option<T>) -> String {
+    value.map_or_else(|| "-".to_string(), |v| v.to_string())
+}
+
+/// Formats a batch cost report as a human-readable summary table.
+///
+/// The table shows, per contract, its function count, bytecode-upload cost,
+/// and the min/max invocation fee. Contracts that failed are marked in the
+/// status column and their reasons are listed underneath the table.
+#[must_use]
+pub fn format_batch_report_table(report: &BatchCostReport) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "Batch cost summary — {} contract(s) on {}\n\n",
+        report.total_contracts, report.network
+    ));
+
+    let mut table = Table::new();
+    table.set_header(vec![
+        "Contract",
+        "Functions",
+        "Upload (stroops)",
+        "Min Fee (stroops)",
+        "Max Fee (stroops)",
+        "Status",
+    ]);
+
+    for contract in &report.contracts {
+        table.add_row(vec![
+            Cell::new(&contract.path),
+            Cell::new(optional_num(contract.function_count)),
+            Cell::new(optional_num(contract.upload_cost_stroops)),
+            Cell::new(optional_num(contract.min_invocation_fee_stroops)),
+            Cell::new(optional_num(contract.max_invocation_fee_stroops)),
+            Cell::new(contract.status()),
+        ]);
+    }
+
+    output.push_str(&table.to_string());
+    output.push('\n');
+    output.push_str(&format!("\n{} succeeded, {} failed.\n", report.succeeded, report.failed));
+
+    let errors: Vec<&ContractCostSummary> = report
+        .contracts
+        .iter()
+        .filter(|c| c.error.is_some())
+        .collect();
+    if !errors.is_empty() {
+        output.push_str("\nErrors:\n");
+        for contract in errors {
+            output.push_str(&format!(
+                "  - {}: {}\n",
+                contract.path,
+                contract.error.as_deref().unwrap_or("unknown error")
+            ));
+        }
+    }
+
+    output
+}
+
+/// Formats a batch cost report as a JSON string.
+#[must_use]
+pub fn format_batch_report_json(report: &BatchCostReport) -> String {
+    serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Formats a batch cost report as a CSV document (header + one row per
+/// contract).
+#[must_use]
+pub fn format_batch_report_csv(report: &BatchCostReport) -> String {
+    let mut output = String::from(
+        "path,wasm_hash,function_count,upload_cost_stroops,min_invocation_fee_stroops,\
+         max_invocation_fee_stroops,functions_simulated,status,error\n",
+    );
+    for contract in &report.contracts {
+        let fields = [
+            contract.path.clone(),
+            contract.wasm_hash.clone().unwrap_or_default(),
+            optional_num(contract.function_count),
+            optional_num(contract.upload_cost_stroops),
+            optional_num(contract.min_invocation_fee_stroops),
+            optional_num(contract.max_invocation_fee_stroops),
+            optional_num(contract.functions_simulated),
+            contract.status().to_string(),
+            contract.error.clone().unwrap_or_default(),
+        ];
+        let row = fields
+            .iter()
+            .map(|f| csv_escape_batch(f))
+            .collect::<Vec<_>>()
+            .join(",");
+        output.push_str(&row);
+        output.push('\n');
+    }
+    output
+}
+
+/// Escape a batch CSV field per RFC 4180.
+fn csv_escape_batch(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+/// Formats a batch cost report as a GitHub-flavored Markdown document.
+#[must_use]
+pub fn format_batch_report_markdown(report: &BatchCostReport) -> String {
+    let mut output = String::new();
+    output.push_str("## Batch Cost Summary\n\n");
+    output.push_str(&format!("- **Network:** {}\n", report.network));
+    output.push_str(&format!(
+        "- **Contracts:** {} ({} succeeded, {} failed)\n\n",
+        report.total_contracts, report.succeeded, report.failed
+    ));
+    output.push_str("| Contract | Functions | Upload (stroops) | Min Fee (stroops) | ");
+    output.push_str("Max Fee (stroops) | Status |\n");
+    output.push_str("| --- | --- | --- | --- | --- | --- |\n");
+    for contract in &report.contracts {
+        output.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} | {} |\n",
+            contract.path,
+            optional_num(contract.function_count),
+            optional_num(contract.upload_cost_stroops),
+            optional_num(contract.min_invocation_fee_stroops),
+            optional_num(contract.max_invocation_fee_stroops),
+            contract.status(),
+        ));
+    }
+
+    let errors: Vec<&ContractCostSummary> = report
+        .contracts
+        .iter()
+        .filter(|c| c.error.is_some())
+        .collect();
+    if !errors.is_empty() {
+        output.push_str("\n### Errors\n\n");
+        for contract in errors {
+            output.push_str(&format!(
+                "- `{}`: {}\n",
+                contract.path,
+                contract.error.as_deref().unwrap_or("unknown error")
+            ));
+        }
+    }
+
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_batch_report_totals_and_status() {
+        let contracts = vec![
+            ContractCostSummary {
+                path: "a.wasm".to_string(),
+                wasm_hash: Some("aa".to_string()),
+                function_count: Some(3),
+                upload_cost_stroops: Some(1_000),
+                min_invocation_fee_stroops: Some(200),
+                max_invocation_fee_stroops: Some(400),
+                functions_simulated: Some(3),
+                error: None,
+            },
+            ContractCostSummary::unloadable("b.wasm", "failed to load WASM: bad magic"),
+        ];
+        let report = BatchCostReport::new("testnet", contracts);
+        assert_eq!(report.total_contracts, 2);
+        assert_eq!(report.succeeded, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.contracts[0].status(), "ok");
+        assert_eq!(report.contracts[1].status(), "error");
+    }
+
+    #[test]
+    fn test_format_batch_report_table_lists_error() {
+        let report = BatchCostReport::new(
+            "testnet",
+            vec![ContractCostSummary::unloadable("bad.wasm", "boom")],
+        );
+        let out = format_batch_report_table(&report);
+        assert!(out.contains("bad.wasm"));
+        assert!(out.contains("Errors:"));
+        assert!(out.contains("boom"));
+        assert!(out.contains("0 succeeded, 1 failed."));
+    }
+
+    #[test]
+    fn test_format_batch_report_json_is_parseable() {
+        let report = BatchCostReport::new(
+            "testnet",
+            vec![ContractCostSummary {
+                path: "a.wasm".to_string(),
+                wasm_hash: Some("aa".to_string()),
+                function_count: Some(2),
+                upload_cost_stroops: Some(1_000),
+                min_invocation_fee_stroops: Some(200),
+                max_invocation_fee_stroops: Some(400),
+                functions_simulated: Some(2),
+                error: None,
+            }],
+        );
+        let json = format_batch_report_json(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(parsed["total_contracts"], 1);
+        assert_eq!(parsed["contracts"][0]["function_count"], 2);
+    }
 
     #[test]
     fn test_fee_percentage_normal() {
