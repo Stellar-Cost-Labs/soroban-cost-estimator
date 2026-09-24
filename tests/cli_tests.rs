@@ -1112,12 +1112,15 @@ fn custom_section(name: &str, payload: &[u8]) -> Vec<u8> {
 #[test]
 fn test_wasm_info_displays_contract_meta() {
     // Extend the bare fixture with a contractmeta section and point wasm-info
-    // at it: name/version/description must be shown (table and JSON modes).
+    // at it: name/version/description/author/SDK version must be shown
+    // (table and JSON modes).
     let mut bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
     let mut payload = Vec::new();
     payload.extend_from_slice(&xdr_meta_entry("name", "MetaContract"));
     payload.extend_from_slice(&xdr_meta_entry("version", "9.9.9"));
     payload.extend_from_slice(&xdr_meta_entry("description", "A meta description"));
+    payload.extend_from_slice(&xdr_meta_entry("author", "Stellar Dev"));
+    payload.extend_from_slice(&xdr_meta_entry("rs_sdk_version", "25.3.2"));
     bytes.extend_from_slice(&custom_section("contractmetav0", &payload));
 
     let home = temp_home("wasm-info-meta");
@@ -1133,6 +1136,8 @@ fn test_wasm_info_displays_contract_meta() {
     assert!(stdout.contains("name: MetaContract"));
     assert!(stdout.contains("version: 9.9.9"));
     assert!(stdout.contains("description: A meta description"));
+    assert!(stdout.contains("author: Stellar Dev"));
+    assert!(stdout.contains("sdk_version: 25.3.2"));
 
     let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
         .args(["wasm-info", "--wasm", path.to_str().unwrap(), "--json"])
@@ -1147,6 +1152,8 @@ fn test_wasm_info_displays_contract_meta() {
     assert_eq!(parsed["contract_meta"]["name"], "MetaContract");
     assert_eq!(parsed["contract_meta"]["version"], "9.9.9");
     assert_eq!(parsed["contract_meta"]["description"], "A meta description");
+    assert_eq!(parsed["contract_meta"]["author"], "Stellar Dev");
+    assert_eq!(parsed["contract_meta"]["sdk_version"], "25.3.2");
 }
 
 #[test]

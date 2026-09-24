@@ -282,16 +282,37 @@ fn custom_section(name: &str, payload: &[u8]) -> Vec<u8> {
 }
 
 /// The bare fixture extended with a `contractmetav0` section carrying
-/// name/version/description plus one custom key.
+/// name/version/description/author/SDK version plus one custom key.
 fn wasm_with_contract_meta() -> Vec<u8> {
     let mut bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
+    bytes.extend_from_slice(&contract_meta_section("contractmetav0"));
+    bytes
+}
+
+/// The bare fixture extended with the unversioned `contractmeta` section
+/// name emitted by the SDK's `contractmeta` macro.
+fn wasm_with_plain_contract_meta() -> Vec<u8> {
+    let mut bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
+    bytes.extend_from_slice(&contract_meta_section("contractmeta"));
+    bytes
+}
+
+/// The `contractmeta` payload used by the helpers above: name, version,
+/// description, author, SDK version, and one unrecognized custom key.
+fn contract_meta_payload() -> Vec<u8> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&xdr_meta_entry("name", "MetaContract"));
     payload.extend_from_slice(&xdr_meta_entry("version", "9.9.9"));
     payload.extend_from_slice(&xdr_meta_entry("description", "A meta description"));
+    payload.extend_from_slice(&xdr_meta_entry("author", "Stellar Dev"));
+    payload.extend_from_slice(&xdr_meta_entry("rs_sdk_version", "25.3.2"));
     payload.extend_from_slice(&xdr_meta_entry("custom_key", "custom_value"));
-    bytes.extend_from_slice(&custom_section("contractmetav0", &payload));
-    bytes
+    payload
+}
+
+/// Wraps the standard payload in a custom section named `section_name`.
+fn contract_meta_section(section_name: &str) -> Vec<u8> {
+    custom_section(section_name, &contract_meta_payload())
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -307,11 +328,28 @@ fn test_parse_contract_meta_extracts_name_version_description() {
     assert_eq!(meta.name.as_deref(), Some("MetaContract"));
     assert_eq!(meta.version.as_deref(), Some("9.9.9"));
     assert_eq!(meta.description.as_deref(), Some("A meta description"));
-    assert_eq!(meta.entries.len(), 4);
+    assert_eq!(meta.author.as_deref(), Some("Stellar Dev"));
+    assert_eq!(meta.sdk_version.as_deref(), Some("25.3.2"));
+    assert_eq!(meta.entries.len(), 6);
     assert!(
         meta.entries
             .contains(&("custom_key".to_string(), "custom_value".to_string()))
     );
+}
+
+/// The unversioned `contractmeta` section name (as emitted by the SDK's
+/// `contractmeta` macro) must decode exactly like `contractmetav0`.
+#[test]
+fn test_parse_contract_meta_accepts_plain_contractmeta_section() {
+    let bytes = wasm_with_plain_contract_meta();
+    let meta = soroban_cost_estimator::wasm::parser::parse_contract_meta(&bytes)
+        .expect("plain contractmeta section should parse");
+
+    assert_eq!(meta.name.as_deref(), Some("MetaContract"));
+    assert_eq!(meta.version.as_deref(), Some("9.9.9"));
+    assert_eq!(meta.author.as_deref(), Some("Stellar Dev"));
+    assert_eq!(meta.sdk_version.as_deref(), Some("25.3.2"));
+    assert_eq!(meta.entries.len(), 6);
 }
 
 #[test]
@@ -334,6 +372,8 @@ fn test_load_wasm_populates_contract_meta() {
     assert!(formatted.contains("name: MetaContract"));
     assert!(formatted.contains("version: 9.9.9"));
     assert!(formatted.contains("description: A meta description"));
+    assert!(formatted.contains("author: Stellar Dev"));
+    assert!(formatted.contains("sdk_version: 25.3.2"));
     assert!(formatted.contains("custom_key: custom_value"));
 
     let _ = std::fs::remove_file(&temp);
@@ -372,9 +412,18 @@ fn test_parse_contract_meta_real_fixture() {
         meta.entries.iter().any(|(k, _)| k == "rssdkver"),
         "fixture meta should include the sdk version entry"
     );
+    // The SDK version key must also land in the typed field.
+    assert!(
+        meta.sdk_version.is_some(),
+        "rssdkver should populate the typed sdk_version field; got {:?}",
+        meta.sdk_version
+    );
 
     let formatted = soroban_cost_estimator::wasm::parser::format_contract_meta(meta);
     assert!(formatted.contains("Contract meta: present"));
-    assert!(formatted.contains("rsver:"));
-    assert!(formatted.contains("rssdkver:"));
+    assert!(formatted.contains("sdk_version:"));
+    assert!(
+        !formatted.contains("  rssdkver:"),
+        "recognized SDK version key should be folded into sdk_version, not repeated"
+    );
 }

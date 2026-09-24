@@ -1,9 +1,9 @@
 ---
 source: tests/report_snapshots.rs
-assertion_line: 75
 expression: JsonFormatter.format(&report)
 ---
 {
+  "contract_meta": {},
   "cpu_instructions": 532502,
   "fee": {
     "bandwidth_fee_stroops": 61,

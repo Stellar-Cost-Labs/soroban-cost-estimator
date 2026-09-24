@@ -1,6 +1,7 @@
 use comfy_table::Table;
 
 use crate::report::fee_calc::{FeeBreakdown, FeeRates};
+use crate::wasm::parser::{ContractMeta, format_contract_meta};
 
 /// Compute what percentage `part` is of `total`.
 ///
@@ -199,6 +200,11 @@ pub struct CostReport {
     /// serialized output; `None` when the rates were unavailable.
     #[serde(skip)]
     pub rates: Option<FeeRates>,
+    /// Contract metadata parsed from the WASM `contractmeta` custom
+    /// section. Empty (and rendered as absent) when the binary carries no
+    /// decodable section; deserialized as empty from older payloads.
+    #[serde(default)]
+    pub contract_meta: ContractMeta,
 }
 
 /// A concrete, actionable cost-optimization suggestion derived from a report.
@@ -324,6 +330,11 @@ pub fn format_report_table(report: &CostReport) -> String {
     output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
     output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
 
+    // Contract metadata from the WASM `contractmeta` section: present or
+    // absent, always rendered so the reader knows the section was checked.
+    output.push_str(&format_contract_meta(&report.contract_meta));
+    output.push_str("\n\n");
+
     let mut table = Table::new();
 
     table.set_header(vec!["Resource", "Consumed", "Fee (stroops)"]);
@@ -439,6 +450,7 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
             rates: Some(rates),
+            contract_meta: ContractMeta::default(),
         }
     }
 
@@ -552,6 +564,7 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 0,
             rates: None,
+            contract_meta: ContractMeta::default(),
         };
 
         let table_out = format_report_table(&report);
@@ -564,5 +577,63 @@ mod tests {
         assert_eq!(parsed["write_entries"], 0);
         assert_eq!(parsed["read_bytes"], 0);
         assert_eq!(parsed["write_bytes"], 0);
+    }
+
+    #[test]
+    fn test_format_report_includes_contract_meta_when_present() {
+        let mut report = report_with_rates(sample_rates());
+        report.contract_meta = ContractMeta {
+            name: Some("MetaContract".to_string()),
+            version: Some("9.9.9".to_string()),
+            description: Some("A meta description".to_string()),
+            author: Some("Stellar Dev".to_string()),
+            sdk_version: Some("25.3.2".to_string()),
+            entries: vec![
+                ("name".to_string(), "MetaContract".to_string()),
+                ("version".to_string(), "9.9.9".to_string()),
+                ("description".to_string(), "A meta description".to_string()),
+                ("author".to_string(), "Stellar Dev".to_string()),
+                ("rs_sdk_version".to_string(), "25.3.2".to_string()),
+                ("custom_key".to_string(), "custom_value".to_string()),
+            ],
+        };
+
+        let table_out = format_report_table(&report);
+        assert!(table_out.contains("Contract meta: present"));
+        assert!(table_out.contains("name: MetaContract"));
+        assert!(table_out.contains("version: 9.9.9"));
+        assert!(table_out.contains("description: A meta description"));
+        assert!(table_out.contains("author: Stellar Dev"));
+        assert!(table_out.contains("sdk_version: 25.3.2"));
+        assert!(table_out.contains("custom_key: custom_value"));
+
+        let json_out = format_report_json(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json_out).expect("valid json");
+        assert_eq!(parsed["contract_meta"]["name"], "MetaContract");
+        assert_eq!(parsed["contract_meta"]["version"], "9.9.9");
+        assert_eq!(parsed["contract_meta"]["description"], "A meta description");
+        assert_eq!(parsed["contract_meta"]["author"], "Stellar Dev");
+        assert_eq!(parsed["contract_meta"]["sdk_version"], "25.3.2");
+        assert_eq!(
+            parsed["contract_meta"]["entries"][5],
+            serde_json::json!(["custom_key", "custom_value"])
+        );
+    }
+
+    /// A WASM without a `contractmeta` section must not error: the table
+    /// reports the section as absent and the JSON payload keeps a stable
+    /// (empty) `contract_meta` object.
+    #[test]
+    fn test_format_report_contract_meta_absent_without_section() {
+        let report = report_with_rates(sample_rates());
+        assert!(report.contract_meta.is_empty());
+
+        let table_out = format_report_table(&report);
+        assert!(table_out.contains("Contract meta: absent"));
+
+        let json_out = format_report_json(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json_out).expect("valid json");
+        assert!(parsed["contract_meta"].is_object());
+        assert_eq!(parsed["contract_meta"].as_object().unwrap().len(), 0);
     }
 }
