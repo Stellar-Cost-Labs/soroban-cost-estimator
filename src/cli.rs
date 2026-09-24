@@ -182,6 +182,17 @@ pub enum CacheAction {
         out: Option<String>,
     },
 
+    /// List every cached estimate for a network (newest first).
+    List {
+        /// Network whose cached estimates to list.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+
+        /// Output the full cached-estimate records as a JSON array.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Check that every cached estimate is valid JSON and not corrupted.
     Verify,
 
