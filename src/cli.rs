@@ -285,6 +285,11 @@ pub enum ConfigAction {
         #[arg(long)]
         against: Option<String>,
 
+        /// Diff the two most recent on-disk snapshots against each other
+        /// instead of the live network. Never contacts the RPC endpoint.
+        #[arg(long, conflicts_with = "against")]
+        against_previous: bool,
+
         /// Print a single-line summary (counts of pricing/non-pricing changes)
         /// instead of the full diff. Useful for CI status lines.
         #[arg(long)]
