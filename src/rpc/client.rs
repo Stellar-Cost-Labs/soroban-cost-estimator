@@ -123,6 +123,9 @@ pub struct RpcClient {
     /// exponential backoff.
     max_retries: usize,
     /// Custom HTTP headers attached to every outbound request.
+    /// Read in tests to verify header parsing; production code only passes
+    /// these to the reqwest `ClientBuilder`.
+    #[allow(dead_code)]
     headers: HeaderMap,
 }
 
