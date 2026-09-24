@@ -110,6 +110,12 @@ pub enum Command {
         /// configuration has changed since the last snapshot.
         #[arg(long)]
         auto_snapshot: bool,
+
+        /// Parse WASM, validate arguments, and print the planned simulation
+        /// payload without contacting the network. Useful for air-gapped
+        /// environments or local contract verification.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Enumerate all public contract functions and estimate each one.
