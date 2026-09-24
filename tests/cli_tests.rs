@@ -92,6 +92,27 @@ fn write_snapshot(home: &Path, network: &str, timestamp: &str, ledger: u32) -> P
     path
 }
 
+/// An RFC 3339 timestamp `days` in the past, in the same shape
+/// `begin_snapshot` records.
+fn days_ago(days: i64) -> String {
+    (chrono::Utc::now() - chrono::TimeDelta::days(days)).to_rfc3339()
+}
+
+/// Snapshot filenames on disk for `network` under `home`, oldest first.
+fn snapshot_files(home: &Path, network: &str) -> Vec<String> {
+    let dir = home.join(".soroban-cost-estimator").join("snapshots");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with(&format!("{network}-")) && name.ends_with(".json"))
+        .collect();
+    names.sort();
+    names
+}
+
 /// Runs the CLI with `HOME` isolated and tracing silenced.
 ///
 /// `tracing`'s `info!` lines go to stdout in this binary, so `RUST_LOG=error`
@@ -210,7 +231,7 @@ fn test_config_snapshot_help() {
         code, 0,
         "config snapshot --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--network", "--out", "--json"] {
+    for flag in ["--network", "--out", "--json", "--retain", "prune"] {
         assert!(
             stdout.contains(flag),
             "snapshot help should mention {flag}; got: {stdout}"
@@ -878,6 +899,246 @@ fn test_config_snapshot_unknown_network() {
             "Error: failed to locate RPC endpoint: not configured for network not-a-network"
         ),
         "the error should name the unknown network; got: {stderr}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `config snapshot` retention
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_config_snapshot_retain_flag_is_accepted() {
+    // `--retain` must parse; the failure should come from the unresolvable
+    // network, not from clap rejecting the flag.
+    let home = temp_home("snapshot-retain-flag");
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "snapshot",
+            "--retain",
+            "3",
+            "--network",
+            "not-a-network",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "the unknown network should exit 1");
+    assert!(
+        stderr.contains("failed to locate RPC endpoint"),
+        "the failure should come from the network, not the flag; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--retain must not be rejected by the parser; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_prune_help() {
+    let (stdout, stderr, code) = run_cli(&["config", "snapshot", "prune", "--help"]);
+    assert_eq!(code, 0, "prune --help should exit 0; stderr: {stderr}");
+    for flag in ["--network", "--older-than", "--json"] {
+        assert!(
+            stdout.contains(flag),
+            "prune help should mention {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_config_snapshot_prune_requires_older_than() {
+    let (_, stderr, code) = run_cli(&["config", "snapshot", "prune"]);
+    assert_ne!(code, 0, "prune without --older-than must be rejected");
+    assert!(
+        stderr.contains("--older-than"),
+        "the error should name the missing flag; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_prune_rejects_fetch_flags() {
+    // Pruning never fetches a snapshot, so combining it with the fetching
+    // flags would silently ignore them. It must be an explicit error instead.
+    let (_, stderr, code) = run_cli(&[
+        "config",
+        "snapshot",
+        "--retain",
+        "3",
+        "prune",
+        "--older-than",
+        "1",
+    ]);
+    assert_ne!(code, 0, "--retain with prune should be rejected");
+    assert!(
+        stderr.contains("--retain") && stderr.contains("prune"),
+        "the error should name both the flag and the subcommand; got: {stderr}"
+    );
+
+    let (_, stderr, code) = run_cli(&[
+        "config",
+        "snapshot",
+        "--out",
+        "/tmp/x.json",
+        "prune",
+        "--older-than",
+        "1",
+    ]);
+    assert_ne!(code, 0, "--out with prune should be rejected");
+    assert!(
+        stderr.contains("--out") && stderr.contains("prune"),
+        "the error should name both the flag and the subcommand; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_prune_deletes_only_stale_snapshots() {
+    let home = temp_home("prune-stale");
+    write_snapshot(&home, "testnet", &days_ago(40), 1);
+    write_snapshot(&home, "testnet", &days_ago(10), 2);
+    write_snapshot(&home, "testnet", &days_ago(1), 3);
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "snapshot",
+            "prune",
+            "--network",
+            "testnet",
+            "--older-than",
+            "30",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 0, "pruning should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("Pruned 1 snapshot(s)"),
+        "the count of pruned snapshots must be logged; got: {stdout}"
+    );
+    assert_eq!(
+        snapshot_files(&home, "testnet").len(),
+        2,
+        "only the 40-day-old snapshot should be gone; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_prune_keeps_latest_however_old_it_is() {
+    // Every snapshot is older than the threshold, but the newest one is the
+    // only thing left to diff against, so it has to survive.
+    let home = temp_home("prune-latest");
+    write_snapshot(&home, "testnet", &days_ago(300), 1);
+    write_snapshot(&home, "testnet", &days_ago(200), 2);
+    write_snapshot(&home, "testnet", &days_ago(100), 3);
+    let newest = snapshot_files(&home, "testnet")
+        .pop()
+        .expect("three snapshots were written");
+
+    let (stdout, _, code) = run_cli_in_home(
+        &[
+            "config",
+            "snapshot",
+            "prune",
+            "--network",
+            "testnet",
+            "--older-than",
+            "0",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 0, "pruning should exit 0");
+    assert!(
+        stdout.contains("Pruned 2 snapshot(s)"),
+        "only the two older snapshots should go; got: {stdout}"
+    );
+    assert_eq!(
+        snapshot_files(&home, "testnet"),
+        vec![newest],
+        "the newest snapshot must survive any age threshold"
+    );
+}
+
+#[test]
+fn test_config_snapshot_prune_without_snapshots_is_a_noop() {
+    let home = temp_home("prune-empty");
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "snapshot",
+            "prune",
+            "--network",
+            "testnet",
+            "--older-than",
+            "1",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 0,
+        "an empty snapshots dir is not an error; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Pruned 0 snapshot(s)"),
+        "a no-op run should still report its count; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_prune_json_reports_the_run() {
+    let home = temp_home("prune-json");
+    write_snapshot(&home, "testnet", &days_ago(90), 1);
+    write_snapshot(&home, "testnet", &days_ago(30), 2);
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "config",
+            "snapshot",
+            "prune",
+            "--network",
+            "testnet",
+            "--older-than",
+            "60",
+            "--json",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 0, "prune --json should exit 0; stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("valid JSON; {e}: {stdout}"));
+    assert_eq!(parsed["network"], "testnet");
+    assert_eq!(parsed["retain_days"], 60);
+    assert_eq!(parsed["pruned_count"], 1);
+    assert_eq!(parsed["remaining"], 1);
+    assert_eq!(parsed["pruned"].as_array().map(Vec::len), Some(1));
+}
+
+#[test]
+fn test_config_snapshot_prune_leaves_other_networks_alone() {
+    let home = temp_home("prune-network");
+    write_snapshot(&home, "testnet", &days_ago(90), 1);
+    write_snapshot(&home, "testnet", &days_ago(1), 2);
+    write_snapshot(&home, "mainnet", &days_ago(90), 9);
+
+    let (_, _, code) = run_cli_in_home(
+        &[
+            "config",
+            "snapshot",
+            "prune",
+            "--network",
+            "testnet",
+            "--older-than",
+            "30",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 0);
+    assert_eq!(
+        snapshot_files(&home, "mainnet").len(),
+        1,
+        "another network's snapshots must be untouched"
     );
 }
 

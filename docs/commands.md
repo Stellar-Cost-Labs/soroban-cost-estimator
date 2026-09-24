@@ -274,6 +274,7 @@ them, and save to disk.
 
 ```
 soroban-cost-estimator config snapshot [OPTIONS]
+soroban-cost-estimator config snapshot <COMMAND>
 ```
 
 **Flags**
@@ -283,7 +284,14 @@ soroban-cost-estimator config snapshot [OPTIONS]
 | `--network <NETWORK>` | | `testnet` | Network to fetch config from (`testnet`, `mainnet`, `futurenet`) |
 | `--out <OUT>` | | `~/.soroban-cost-estimator/snapshots/` | Explicit output path |
 | `--json` | | `false` | Print the snapshot as JSON (still saves it) |
+| `--retain <COUNT>` | | | Keep only the N most recent snapshots, pruning older ones after the save |
 | `--help` | `-h` | | Print help |
+
+**Subcommands**
+
+| Subcommand | Description |
+|------------|-------------|
+| `prune --older-than <DAYS>` | Delete snapshots recorded more than D days ago (never the newest one) |
 
 **Behavior**
 
@@ -296,6 +304,12 @@ soroban-cost-estimator config snapshot [OPTIONS]
   timestamp makes every snapshot a versioned artifact.
 - `--json` also prints the full snapshot as JSON to stdout.
 - `--out` writes to an explicit path instead of the default directory.
+- `--retain <COUNT>` runs a retention pass once the new snapshot is safely on
+  disk, and logs how many snapshots it pruned.
+- `prune` deletes stale files by age. It is pure file I/O — no RPC call — so it
+  is safe to schedule offline. It is also mutually exclusive with this
+  command's fetching flags (`--out`, `--retain`), so `config snapshot --retain
+  3 prune ...` is rejected rather than silently ignoring `--retain`.
 
 **What you get**
 
@@ -318,6 +332,18 @@ most recent snapshot.
 
 ```bash
 soroban-cost-estimator config snapshot --network testnet
+```
+
+Keep only the ten most recent snapshots:
+
+```bash
+soroban-cost-estimator config snapshot --network testnet --retain 10
+```
+
+Drop everything older than 30 days (the newest snapshot is always kept):
+
+```bash
+soroban-cost-estimator config snapshot prune --network testnet --older-than 30
 ```
 
 **Sample output**
