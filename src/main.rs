@@ -141,6 +141,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
     let max_retries = args.max_retries;
     let fallback = args.rpc_fallback_url.as_deref();
     let headers = args.headers;
+    let quiet = args.quiet;
     match args.command {
         cli::Command::Estimate {
             wasm,
@@ -174,6 +175,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 max_retries,
                 precision,
                 &headers,
+                quiet,
             )
             .await
         }
@@ -199,6 +201,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 max_retries,
                 precision,
                 &headers,
+                quiet,
             )
             .await
         }
@@ -261,6 +264,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     timeout,
                     max_retries,
                     &headers,
+                    quiet,
                 )
                 .await
             }
@@ -444,6 +448,23 @@ async fn fetch_fee_rates(client: &rpc::client::RpcClient) -> report::fee_calc::F
     rates
 }
 
+/// Prints the "unoptimized WASM" tip to stderr when the loaded binary carries
+/// debug symbols, so users learn the upload cost is inflated before they pay
+/// for it.
+///
+/// The tip is suppressed in `--quiet` mode and in JSON output: the former
+/// explicitly asks for no non-essential output, and the latter promises
+/// machine-readable stdout (the tip goes to stderr, but honoring `--json`
+/// keeps the contract exact and avoids noise in scripted pipelines).
+fn maybe_emit_optimization_tip(info: &wasm::parser::WasmInfo, quiet: bool, json_flag: bool) {
+    if quiet || json_flag {
+        return;
+    }
+    if let Some(tip) = wasm::parser::format_optimization_tip(info) {
+        eprintln!("{tip}");
+    }
+}
+
 /// `estimate` command: simulate a single invocation and print cost report.
 ///
 /// All RPC traffic (simulation and fee-rate fetches) goes through one
@@ -467,10 +488,10 @@ async fn cmd_estimate(
     max_retries: usize,
     precision: u32,
     extra_headers: &[String],
+    quiet: bool,
 ) -> error::AppResult<()> {
     let json_flag = format == "json";
     let table_mode = format == "table";
-    use sha2::Digest;
     use tracing::{Instrument, info_span};
 
     let span = info_span!(
@@ -500,7 +521,7 @@ async fn cmd_estimate(
         let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
         debug!(functions = wasm_info.functions.len(), has_spec = wasm_info.has_spec, "WASM loaded");
 
-        let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
+        let wasm_hash = wasm_info.wasm_hash.clone();
         let function_name = fn_name.unwrap_or("(wasm upload)");
 
         // Show the hash before anything else — the user can verify they are
@@ -510,6 +531,7 @@ async fn cmd_estimate(
         if table_mode {
             println!("WASM SHA-256: {wasm_hash}");
         }
+        maybe_emit_optimization_tip(&wasm_info, quiet, json_flag);
 
         // With --cache-ttl, reuse a still-fresh cached estimate and skip the
         // (expensive) simulation entirely.
@@ -683,6 +705,7 @@ async fn cmd_estimate_all(
     max_retries: usize,
     precision: u32,
     extra_headers: &[String],
+    quiet: bool,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -694,11 +717,11 @@ async fn cmd_estimate_all(
         // Confirm the exact file being estimated up front — printed before any
         // endpoint resolution or simulation, so the hash is visible even when
         // the network cannot be reached.
-        use sha2::Digest;
-        let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
+        let wasm_hash = wasm_info.wasm_hash.clone();
 
         let json_flag = format == "json";
         let text_mode = format == "table" || format == "markdown";
+        maybe_emit_optimization_tip(&wasm_info, quiet, json_flag);
         if text_mode {
             println!("WASM SHA-256: {wasm_hash}");
             println!();
@@ -1021,10 +1044,8 @@ async fn estimate_all_function(
 /// # Network calls
 /// None — pure file I/O + parsing.
 fn cmd_wasm_info(wasm_path: &str, json_flag: bool) -> error::AppResult<()> {
-    use sha2::Digest;
-
     let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
-    let hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
+    let hash = wasm_info.wasm_hash.clone();
 
     if json_flag {
         println!(
@@ -1037,6 +1058,18 @@ fn cmd_wasm_info(wasm_path: &str, json_flag: bool) -> error::AppResult<()> {
     println!("WASM info: {wasm_path}");
     println!("  Size:      {} bytes", wasm_info.bytes.len());
     println!("  SHA-256:   {hash}");
+    println!(
+        "  Debug symbols: {}",
+        if wasm_info.has_debug_symbols {
+            format!(
+                "present ({} bytes; ~{}% reclaimable)",
+                wasm_info.debug_symbol_bytes,
+                wasm_info.estimated_size_reduction_percent()
+            )
+        } else {
+            "absent".to_string()
+        }
+    );
     println!("  Functions: {}", wasm_info.functions.len());
     for (i, fn_info) in wasm_info.functions.iter().enumerate() {
         println!("    [{}] {}", i + 1, wasm::parser::format_function(fn_info));
@@ -1067,6 +1100,9 @@ fn wasm_info_json(
         "size": wasm_info.bytes.len(),
         "sha256": hash,
         "has_spec": wasm_info.has_spec,
+        "has_debug_symbols": wasm_info.has_debug_symbols,
+        "debug_symbol_bytes": wasm_info.debug_symbol_bytes,
+        "estimated_size_reduction_percent": wasm_info.estimated_size_reduction_percent(),
         "contract_meta": {
             "name": wasm_info.contract_meta.name,
             "version": wasm_info.contract_meta.version,
@@ -1803,6 +1839,7 @@ async fn cmd_cache_warm(
     timeout: u64,
     max_retries: usize,
     extra_headers: &[String],
+    quiet: bool,
 ) -> error::AppResult<()> {
     let fmt = if json_flag { "json" } else { "table" };
     cmd_estimate_all(
@@ -1817,6 +1854,7 @@ async fn cmd_cache_warm(
         max_retries,
         7,
         extra_headers,
+        quiet,
     )
     .await
 }
@@ -1947,7 +1985,10 @@ mod tests {
     #[test]
     fn test_wasm_info_json_structure() {
         let info = WasmInfo {
+            wasm_hash: "deadbeef".to_string(),
             bytes: vec![0u8; 44],
+            has_debug_symbols: false,
+            debug_symbol_bytes: 0,
             has_spec: true,
             contract_meta: ContractMeta::default(),
             functions: vec![FunctionInfo {

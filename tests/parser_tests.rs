@@ -378,3 +378,115 @@ fn test_parse_contract_meta_real_fixture() {
     assert!(formatted.contains("rsver:"));
     assert!(formatted.contains("rssdkver:"));
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// WASM identity (SHA-256) and unoptimized-build detection
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Loading the bare fixture must expose the same SHA-256 as `sha256sum`:
+/// `8f581f88…8fe0`. This is the identity Soroban uses on-chain, so pinning it
+/// catches accidental byte changes to the fixture.
+#[test]
+fn test_wasm_hash_matches_known_minimal_fixture() {
+    let path = Path::new("tests/fixtures/minimal.wasm");
+    let wasm_info =
+        soroban_cost_estimator::wasm::parser::load_wasm(path).expect("failed to load test WASM");
+
+    assert_eq!(
+        wasm_info.wasm_hash,
+        "8f581f8899890a7479c20494f53cc5d60156a4d42e39d6a587a9f3089f198fe0"
+    );
+    assert_eq!(wasm_info.wasm_hash.len(), 64, "SHA-256 hex is 64 chars");
+}
+
+/// The real-contract fixture's hash must match the value recorded in the
+/// fixture README (the binary actually deployed to testnet).
+#[test]
+fn test_wasm_hash_matches_known_contract_fixture() {
+    let path = Path::new("tests/fixtures/contract.wasm");
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(path)
+        .expect("failed to load contract fixture");
+
+    assert_eq!(
+        wasm_info.wasm_hash,
+        "ea14bca998e98f0ddb338e8e5cef6e19f07378a3b71e8b4f8868cedc857e4ecd"
+    );
+}
+
+/// `is_debug_custom_section` recognizes exactly the `name` symbol table and
+/// the DWARF `.debug*` family.
+#[test]
+fn test_is_debug_custom_section() {
+    use soroban_cost_estimator::wasm::parser::is_debug_custom_section;
+
+    assert!(is_debug_custom_section("name"));
+    assert!(is_debug_custom_section(".debug_info"));
+    assert!(is_debug_custom_section(".debug_line"));
+    assert!(is_debug_custom_section(".debug_abbrev"));
+
+    assert!(!is_debug_custom_section("contractspecv0"));
+    assert!(!is_debug_custom_section("contractmetav0"));
+    assert!(!is_debug_custom_section("producers"));
+    assert!(!is_debug_custom_section("namex"));
+}
+
+/// The bare fixture carries no custom sections, so it must not be flagged as
+/// unoptimized and must produce no tip.
+#[test]
+fn test_minimal_fixture_has_no_debug_symbols() {
+    let path = Path::new("tests/fixtures/minimal.wasm");
+    let wasm_info =
+        soroban_cost_estimator::wasm::parser::load_wasm(path).expect("failed to load test WASM");
+
+    assert!(!wasm_info.has_debug_symbols);
+    assert_eq!(wasm_info.debug_symbol_bytes, 0);
+    assert_eq!(wasm_info.estimated_size_reduction_percent(), 0);
+    assert!(soroban_cost_estimator::wasm::parser::format_optimization_tip(&wasm_info).is_none());
+}
+
+/// The real-contract fixture keeps its 3 KB `name` section (~64% of the
+/// binary): the parser must flag it and the tip must quantify the saving.
+#[test]
+fn test_contract_fixture_has_debug_symbols_and_tip() {
+    let path = Path::new("tests/fixtures/contract.wasm");
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(path)
+        .expect("failed to load contract fixture");
+
+    assert!(wasm_info.has_debug_symbols);
+    assert!(
+        wasm_info.debug_symbol_bytes > 0,
+        "name section should contribute bytes"
+    );
+
+    let pct = wasm_info.estimated_size_reduction_percent();
+    assert!(
+        (40..=70).contains(&pct),
+        "stripping a debug name section should land in the 40-70% band, got {pct}%"
+    );
+
+    let tip = soroban_cost_estimator::wasm::parser::format_optimization_tip(&wasm_info)
+        .expect("unoptimized WASM should produce a tip");
+    assert!(tip.contains("Unoptimized WASM detected"));
+    assert!(tip.contains("soroban contract optimize"));
+    assert!(tip.contains("wasm-opt"));
+    assert!(tip.contains(&format!("~{pct}%")));
+}
+
+/// A synthetic `.debug_info` section must be detected even when the base
+/// module carried none, and the size estimate must be non-zero.
+#[test]
+fn test_load_wasm_detects_synthetic_debug_section() {
+    let mut bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
+    bytes.extend_from_slice(&custom_section(".debug_info", &[0u8; 64]));
+
+    let temp = std::env::temp_dir().join(format!("sce-debug-{}.wasm", std::process::id()));
+    std::fs::write(&temp, &bytes).expect("write fixture");
+
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(&temp)
+        .expect("wasm with appended debug section should load");
+    assert!(wasm_info.has_debug_symbols);
+    assert!(wasm_info.debug_symbol_bytes >= 64);
+    assert!(wasm_info.estimated_size_reduction_percent() >= 1);
+
+    let _ = std::fs::remove_file(&temp);
+}

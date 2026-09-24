@@ -36,6 +36,10 @@ pub struct Cli {
     #[arg(long, short, global = true)]
     pub verbose: bool,
 
+    /// Suppress non-essential notices (currently the unoptimized-WASM tip).
+    #[arg(long, short, global = true)]
+    pub quiet: bool,
+
     /// Custom HTTP header to send with every RPC request, e.g.
     /// `--header "X-API-Key: secret"`. Repeatable for multiple headers.
     #[arg(long = "header", value_name = "KEY: VALUE", global = true)]
