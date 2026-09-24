@@ -41,7 +41,8 @@ pub struct Cli {
     #[arg(long = "header", value_name = "KEY: VALUE", global = true)]
     pub headers: Vec<String>,
 
-    /// Fallback RPC URL used when the primary endpoint is unreachable.
+    /// Fallback RPC URL used when the primary endpoint is unreachable or
+    /// returns a transient gateway error (HTTP 502/503/504).
     #[arg(long, global = true, value_name = "URL")]
     pub rpc_fallback_url: Option<String>,
 

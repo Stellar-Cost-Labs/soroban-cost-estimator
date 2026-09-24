@@ -8,7 +8,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
 use crate::rpc::retry::{DEFAULT_MAX_RETRIES, with_retry};
@@ -176,9 +176,10 @@ impl RpcClient {
     /// with exponential backoff.
     ///
     /// When a request to the primary endpoint fails with a network-level
-    /// error (connection refused, timeout, DNS failure, etc.) and a fallback
-    /// URL is configured, the request is retried against the fallback before
-    /// the error is propagated. RPC-level errors (e.g. bad method, invalid
+    /// error (connection refused, timeout, DNS failure, etc.) or returns a
+    /// transient gateway status (HTTP 502/503/504) and a fallback URL is
+    /// configured, the request is retried against the fallback before the
+    /// error is propagated. RPC-level errors (e.g. bad method, invalid
     /// params) are not retried against the fallback — they would fail there
     /// too.
     ///
@@ -357,7 +358,8 @@ impl RpcClient {
     ///
     /// Tries the primary endpoint first. If the primary fails with a
     /// network-level error (connection refused, timeout, DNS failure, etc.)
-    /// and a fallback URL is configured, retries against the fallback.
+    /// or a transient gateway status (HTTP 502/503/504) and a fallback URL is
+    /// configured, retries against the fallback, logging a notice to stderr.
     ///
     /// RPC-level errors (e.g. bad method, invalid params) are **not** retried
     /// against the fallback — they would fail there too.
@@ -376,14 +378,17 @@ impl RpcClient {
         trace!(method, "sending RPC request");
         match self.post_and_parse(method, &body, &self.url).await {
             Ok(result) => Ok(result),
-            Err(e) if Self::is_network_error(&e) => {
+            Err(e) if Self::is_failover_trigger(&e) => {
                 if let Some(ref fallback) = self.fallback_url {
-                    warn!(
+                    // The operator-facing notice goes to stderr so it never
+                    // contaminates machine-readable stdout (json/csv/markdown).
+                    eprintln!("Primary RPC failed, failing over to fallback endpoint: {fallback}");
+                    debug!(
                         method,
                         primary = %self.url,
                         fallback = %fallback,
                         error = %e,
-                        "primary RPC endpoint failed — trying fallback"
+                        "primary RPC endpoint failed — failing over to fallback"
                     );
                     self.post_and_parse(method, &body, fallback).await
                 } else {
@@ -394,15 +399,22 @@ impl RpcClient {
         }
     }
 
-    /// Check whether an error is a network-level failure (as opposed to an
-    /// RPC-level error returned inside a successful HTTP response).
-    fn is_network_error(error: &AppError) -> bool {
+    /// True when `error` should trigger a failover attempt against the
+    /// configured fallback endpoint.
+    ///
+    /// This covers transport-level failures (connection refused, timeout,
+    /// DNS failure, ...) and transient gateway statuses (HTTP 502/503/504).
+    /// RPC-level errors returned inside a successful HTTP response — bad
+    /// method, invalid params — are **not** failover triggers: they would
+    /// fail identically on the fallback.
+    fn is_failover_trigger(error: &AppError) -> bool {
         match error {
             AppError::Http(e) => {
                 // reqwest errors that indicate connectivity problems — these
                 // are the cases where a fallback endpoint might succeed.
                 e.is_connect() || e.is_timeout() || e.is_request()
             }
+            AppError::RpcUnavailable { .. } => true,
             _ => false,
         }
     }
@@ -438,6 +450,23 @@ impl RpcClient {
         })
         .await?;
         let status = response.status();
+
+        // A 502/503/504 means the endpoint is briefly unavailable rather than
+        // misconfigured. Surface it as a dedicated error *before* parsing the
+        // body — gateways commonly return an HTML error page, and both the
+        // retry loop and the failover logic key off this variant.
+        let status_code = status.as_u16();
+        if matches!(status_code, 502..=504) {
+            debug!(
+                method,
+                status = status_code,
+                "transient gateway error from RPC endpoint"
+            );
+            return Err(AppError::RpcUnavailable {
+                status: status_code,
+            });
+        }
+
         let response_body: Value = response.json().await?;
 
         if let Some(error) = response_body.get("error") {
@@ -634,6 +663,42 @@ mod tests {
         stream.write_all(response.as_bytes()).await?;
         stream.flush().await?;
         Ok(())
+    }
+
+    /// Spawns a tiny HTTP server that always answers with `status` and a
+    /// plain-text (non-JSON) body, counting how many requests it received.
+    /// Used to exercise transient gateway failures (HTTP 502/503/504) and
+    /// other non-JSON error statuses.
+    async fn spawn_status_stub(status: u16) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind stub server");
+        let addr = listener.local_addr().expect("no local address");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let server_counter = Arc::clone(&counter);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let counter = Arc::clone(&server_counter);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let body = "upstream unavailable";
+                    let response = format!(
+                        "HTTP/1.1 {status} Error\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+
+        (format!("http://{addr}"), counter)
     }
 
     #[tokio::test]
@@ -920,6 +985,65 @@ mod tests {
             fallback_counter.load(Ordering::SeqCst),
             0,
             "fallback must not be contacted for RPC-level errors"
+        );
+    }
+
+    /// A primary endpoint answering 502/503/504 is transiently unavailable:
+    /// the request must fail over to the fallback instead of surfacing the
+    /// gateway error. `max_retries: 0` keeps the test fast.
+    #[tokio::test]
+    async fn test_failover_on_primary_gateway_error() {
+        for status in [502u16, 503, 504] {
+            let (primary_url, primary_counter) = spawn_status_stub(status).await;
+            let (fallback_url, fallback_counter) = spawn_json_rpc_stub(0).await;
+            let client = RpcClient::with_fallback(
+                &primary_url,
+                Some(&fallback_url),
+                None,
+                Duration::from_secs(30),
+                0,
+            );
+
+            let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
+
+            assert!(
+                result.is_ok(),
+                "HTTP {status} from the primary must fail over to the fallback: {result:?}"
+            );
+            assert_eq!(
+                primary_counter.load(Ordering::SeqCst),
+                1,
+                "primary should be tried exactly once with retries disabled"
+            );
+            assert_eq!(
+                fallback_counter.load(Ordering::SeqCst),
+                1,
+                "fallback endpoint should have served the request"
+            );
+        }
+    }
+
+    /// A non-transient HTTP error (e.g. 500) is not a failover trigger: the
+    /// error must propagate without contacting the fallback.
+    #[tokio::test]
+    async fn test_no_failover_on_non_gateway_http_error() {
+        let (primary_url, _) = spawn_status_stub(500).await;
+        let (fallback_url, fallback_counter) = spawn_json_rpc_stub(0).await;
+        let client = RpcClient::with_fallback(
+            &primary_url,
+            Some(&fallback_url),
+            None,
+            Duration::from_secs(30),
+            0,
+        );
+
+        let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
+
+        assert!(result.is_err(), "HTTP 500 must be propagated");
+        assert_eq!(
+            fallback_counter.load(Ordering::SeqCst),
+            0,
+            "fallback must not be contacted for a non-gateway HTTP error"
         );
     }
 
