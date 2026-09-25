@@ -447,6 +447,26 @@ fn test_help_lists_global_flags() {
 }
 
 #[test]
+fn test_estimate_history_flag_accepted() {
+    // `--history` must be a recognized flag for `estimate` and documented.
+    let (stdout, stderr, code) = run_cli(&["estimate", "--help"]);
+    assert_eq!(code, 0, "estimate --help should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("--history"),
+        "estimate help should list --history; got: {stdout}"
+    );
+
+    // At runtime it fails only because test.wasm is missing, not as an
+    // unknown argument.
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--history"]);
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument") && !stderr.contains("invalid value"),
+        "--history should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
 fn test_estimate_all_format_flag_accepted() {
     // Verify --format is a recognized argument for estimate-all.
     let (_, stderr, code) = run_cli(&["estimate-all", "--wasm", "test.wasm", "--format", "csv"]);

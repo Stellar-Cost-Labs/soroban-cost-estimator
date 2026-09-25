@@ -160,6 +160,25 @@ pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
             PRIMARY KEY (wasm_hash, function, args_hash)
         );",
     )?;
+    // Append-only log of every estimate ever saved, used by `estimate
+    // --history` to show how a function's cost evolved across runs (#321).
+    // The `estimates` table upserts on its primary key, so it cannot answer
+    // "what did this function cost last build?" on its own.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS estimate_history (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            wasm_hash        TEXT NOT NULL,
+            function         TEXT NOT NULL,
+            network          TEXT NOT NULL,
+            ledger           INTEGER NOT NULL,
+            total_stroops    INTEGER NOT NULL,
+            cpu_instructions INTEGER NOT NULL,
+            memory_bytes     INTEGER NOT NULL,
+            timestamp        TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_estimate_history_lookup
+            ON estimate_history (wasm_hash, function, timestamp DESC);",
+    )?;
     enable_wal_if_possible(conn);
     Ok(())
 }
@@ -265,6 +284,7 @@ pub fn save_estimate(
         .lock()
         .map_err(|e| AppError::General(format!("cache write lock poisoned: {e}")))?;
     let conn = open_db()?;
+    let timestamp = chrono::Utc::now().to_rfc3339();
     conn.execute(
         "INSERT INTO estimates \
          (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, duration_ms, success) \
@@ -289,14 +309,103 @@ pub fn save_estimate(
             total_stroops,
             cpu_instructions as i64,
             memory_bytes as i64,
-            chrono::Utc::now().to_rfc3339(),
+            timestamp.as_str(),
             duration_ms.map(|v| v as i64),
             success as i64,
         ],
     )?;
 
+    // Append to the unbounded history log so `estimate --history` can show
+    // how this function's cost evolved across runs (#321). Unlike the
+    // `estimates` upsert above, every call adds a row here.
+    conn.execute(
+        "INSERT INTO estimate_history \
+         (wasm_hash, function, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            wasm_hash,
+            function,
+            network,
+            ledger as i64,
+            total_stroops,
+            cpu_instructions as i64,
+            memory_bytes as i64,
+            timestamp.as_str(),
+        ],
+    )?;
+
     debug!(function, network, ledger, "estimate cached (sqlite)");
     Ok(())
+}
+
+/// Default number of previous runs returned by [`load_estimate_history`].
+pub const DEFAULT_HISTORY_LIMIT: usize = 5;
+
+/// One entry in the append-only estimate history log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EstimateHistoryEntry {
+    /// SHA-256 hash of the WASM bytes (hex).
+    pub wasm_hash: String,
+    /// Contract function name.
+    pub function: String,
+    /// Network the simulation ran against.
+    pub network: String,
+    /// Ledger sequence at simulation time.
+    pub ledger: u32,
+    /// Total fee in stroops.
+    pub total_stroops: i64,
+    /// CPU instructions consumed.
+    pub cpu_instructions: u64,
+    /// Memory bytes consumed.
+    pub memory_bytes: u64,
+    /// ISO-8601 timestamp of when the estimate was made.
+    pub timestamp: String,
+}
+
+/// Load up to `limit` previous estimates for the same `(wasm_hash,
+/// function)`, newest first.
+///
+/// Reads the append-only history log written by [`save_estimate`]. Returns an
+/// empty vector when the function has never been estimated before. A `limit`
+/// of 0 yields no rows.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+pub fn load_estimate_history(
+    wasm_hash: &str,
+    function: &str,
+    limit: usize,
+) -> AppResult<Vec<EstimateHistoryEntry>> {
+    let conn = open_db()?;
+    let mut stmt = conn.prepare(
+        "SELECT wasm_hash, function, network, ledger, total_stroops, \
+         cpu_instructions, memory_bytes, timestamp \
+         FROM estimate_history WHERE wasm_hash = ?1 AND function = ?2 \
+         ORDER BY timestamp DESC, id DESC LIMIT ?3",
+    )?;
+
+    let rows = stmt.query_map(
+        rusqlite::params![wasm_hash, function, limit as i64],
+        |row| {
+            Ok(EstimateHistoryEntry {
+                wasm_hash: row.get(0)?,
+                function: row.get(1)?,
+                network: row.get(2)?,
+                ledger: row.get::<_, i64>(3)? as u32,
+                total_stroops: row.get(4)?,
+                cpu_instructions: row.get::<_, i64>(5)? as u64,
+                memory_bytes: row.get::<_, i64>(6)? as u64,
+                timestamp: row.get(7)?,
+            })
+        },
+    )?;
+
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(row?);
+    }
+    trace!(function, count = entries.len(), "loaded estimate history");
+    Ok(entries)
 }
 
 /// Reconstruct a [`CachedEstimate`] from a SQLite row.
@@ -784,6 +893,11 @@ pub fn clear_cache(network: &str) -> AppResult<usize> {
     let conn = open_db()?;
     let removed =
         execute_with_retry(|| conn.execute("DELETE FROM estimates WHERE network = ?1", [network]))?;
+    // Keep the history log consistent with the current cache: clearing a
+    // network's estimates must not leave stale history behind (#321).
+    let _ = execute_with_retry(|| {
+        conn.execute("DELETE FROM estimate_history WHERE network = ?1", [network])
+    })?;
     debug!(network, removed, "cache cleared");
     Ok(removed)
 }
@@ -803,6 +917,14 @@ pub fn remove_cached_estimates_for_wasm(wasm_hash: &str) -> AppResult<usize> {
     let conn = open_db()?;
     let removed = execute_with_retry(|| {
         conn.execute("DELETE FROM estimates WHERE wasm_hash = ?1", [wasm_hash])
+    })?;
+    // Drop matching history rows too: entries from a previous build must not
+    // pollute the trend for the new one (#321).
+    let _ = execute_with_retry(|| {
+        conn.execute(
+            "DELETE FROM estimate_history WHERE wasm_hash = ?1",
+            [wasm_hash],
+        )
     })?;
     Ok(removed)
 }

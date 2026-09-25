@@ -1,4 +1,4 @@
-use comfy_table::Table;
+use comfy_table::{Cell, Color, Table};
 
 use crate::report::fee_calc::{FeeBreakdown, FeeRates};
 
@@ -164,6 +164,338 @@ fn format_stroops_aligned(stroops: i64) -> String {
     format!("{:>6}", stroops)
 }
 
+/// Percentage of a protocol limit at which a [`ResourceWarning`] is raised.
+pub const RESOURCE_WARNING_THRESHOLD_PERCENT: u64 = 80;
+
+/// The subset of the network's resource-limit configuration needed to warn
+/// when a simulation approaches protocol ceilings.
+///
+/// Values mirror `ConfigSettingContractComputeV0`,
+/// `ConfigSettingContractLedgerCostV0`, and `ConfigSettingContractBandwidthV0`.
+/// A field is `None` when the corresponding config setting was unavailable —
+/// that check is then skipped rather than comparing against a bogus zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NetworkConfig {
+    /// `ConfigSettingContractComputeV0.tx_max_instructions`.
+    pub tx_max_instructions: Option<u64>,
+    /// `ConfigSettingContractLedgerCostV0.tx_max_disk_read_entries`.
+    pub tx_max_read_entries: Option<u64>,
+    /// `ConfigSettingContractLedgerCostV0.tx_max_write_ledger_entries`.
+    pub tx_max_write_entries: Option<u64>,
+    /// `ConfigSettingContractLedgerCostV0.tx_max_disk_read_bytes`.
+    pub tx_max_read_bytes: Option<u64>,
+    /// `ConfigSettingContractLedgerCostV0.tx_max_write_bytes`.
+    pub tx_max_write_bytes: Option<u64>,
+    /// `ConfigSettingContractBandwidthV0.tx_max_size_bytes`.
+    pub tx_max_size: Option<u64>,
+}
+
+impl NetworkConfig {
+    /// Build the limit set from a config snapshot.
+    ///
+    /// Missing sections leave the corresponding fields `None`, which disables
+    /// their checks instead of treating an unknown limit as zero. Limits that
+    /// are non-positive in the config are likewise treated as unknown.
+    #[must_use]
+    pub fn from_snapshot(snapshot: &crate::config_snapshot::model::ConfigSnapshot) -> Self {
+        let positive_u64 = |value: i64| u64::try_from(value).ok().filter(|v| *v > 0);
+        let positive_u32 = |value: u32| Some(u64::from(value)).filter(|v| *v > 0);
+
+        let mut config = Self::default();
+        if let Some(compute) = &snapshot.contract_compute {
+            config.tx_max_instructions = positive_u64(compute.tx_max_instructions);
+        }
+        if let Some(cost) = &snapshot.contract_ledger_cost {
+            config.tx_max_read_entries = positive_u32(cost.tx_max_disk_read_entries);
+            config.tx_max_write_entries = positive_u32(cost.tx_max_write_ledger_entries);
+            config.tx_max_read_bytes = positive_u32(cost.tx_max_disk_read_bytes);
+            config.tx_max_write_bytes = positive_u32(cost.tx_max_write_bytes);
+        }
+        if let Some(bandwidth) = &snapshot.contract_bandwidth {
+            config.tx_max_size = positive_u32(bandwidth.tx_max_size_bytes);
+        }
+        config
+    }
+}
+
+/// A warning that a simulated resource is approaching or exceeding a
+/// protocol limit.
+///
+/// `percent` is computed with integer arithmetic only (floor of
+/// `used * 100 / limit`), so it is stable across platforms and never depends
+/// on floating-point rounding.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResourceWarning {
+    /// Machine-readable resource key (e.g. `"cpu_instructions"`).
+    pub resource: String,
+    /// Human-readable resource label (e.g. `"CPU instructions"`).
+    pub label: String,
+    /// Amount consumed by the simulation.
+    pub used: u64,
+    /// Protocol limit for this resource.
+    pub limit: u64,
+    /// Percentage of the limit consumed, floored to a whole percent.
+    pub percent: u32,
+    /// Human-readable explanation suitable for a warning banner.
+    pub message: String,
+}
+
+/// Compare a cost report against network resource limits and return a warning
+/// for every resource at or above
+/// [`RESOURCE_WARNING_THRESHOLD_PERCENT`] of its limit.
+///
+/// Checks run in a fixed order (CPU, entries, bytes, tx size) so output is
+/// deterministic. Resources whose limit is unknown (`None`) or non-positive
+/// are skipped.
+#[must_use]
+pub fn check_resource_limits(report: &CostReport, config: &NetworkConfig) -> Vec<ResourceWarning> {
+    check_resource_limits_raw(
+        report.cpu_instructions,
+        report.read_entries,
+        report.write_entries,
+        report.read_bytes,
+        report.write_bytes,
+        report.tx_size,
+        config,
+    )
+}
+
+/// Threshold check against raw resource values, for callers that hold the
+/// simulator's output before a full [`CostReport`] has been assembled.
+#[must_use]
+pub fn check_resource_limits_raw(
+    cpu_instructions: u64,
+    read_entries: u32,
+    write_entries: u32,
+    read_bytes: u32,
+    write_bytes: u32,
+    tx_size: u32,
+    config: &NetworkConfig,
+) -> Vec<ResourceWarning> {
+    let mut warnings: Vec<ResourceWarning> = Vec::new();
+    push_resource_warning(
+        &mut warnings,
+        "cpu_instructions",
+        "CPU instructions",
+        cpu_instructions,
+        config.tx_max_instructions,
+    );
+    push_resource_warning(
+        &mut warnings,
+        "read_entries",
+        "Ledger read entries",
+        u64::from(read_entries),
+        config.tx_max_read_entries,
+    );
+    push_resource_warning(
+        &mut warnings,
+        "write_entries",
+        "Ledger write entries",
+        u64::from(write_entries),
+        config.tx_max_write_entries,
+    );
+    push_resource_warning(
+        &mut warnings,
+        "read_bytes",
+        "Ledger read bytes",
+        u64::from(read_bytes),
+        config.tx_max_read_bytes,
+    );
+    push_resource_warning(
+        &mut warnings,
+        "write_bytes",
+        "Ledger write bytes",
+        u64::from(write_bytes),
+        config.tx_max_write_bytes,
+    );
+    push_resource_warning(
+        &mut warnings,
+        "tx_size",
+        "Transaction size",
+        u64::from(tx_size),
+        config.tx_max_size,
+    );
+    warnings
+}
+
+/// Append a warning for `resource` when `used` is at or above the threshold
+/// of `limit`. No-op when the limit is unknown or non-positive.
+fn push_resource_warning(
+    out: &mut Vec<ResourceWarning>,
+    resource: &str,
+    label: &str,
+    used: u64,
+    limit: Option<u64>,
+) {
+    let Some(limit) = limit else {
+        return;
+    };
+    if limit == 0 {
+        return;
+    }
+    // Integer-only threshold comparison: used / limit >= threshold / 100.
+    if used.saturating_mul(100) < limit.saturating_mul(RESOURCE_WARNING_THRESHOLD_PERCENT) {
+        return;
+    }
+    let percent = u32::try_from(used.saturating_mul(100) / limit).unwrap_or(u32::MAX);
+    out.push(ResourceWarning {
+        resource: resource.to_string(),
+        label: label.to_string(),
+        used,
+        limit,
+        percent,
+        message: format!("{label} at {percent}% of the network limit ({used} of {limit})"),
+    });
+}
+
+/// Render resource-limit warnings as a human-readable banner.
+///
+/// Returns an empty string when there is nothing to warn about, so callers can
+/// append the result unconditionally without leaving a stray section header.
+#[must_use]
+pub fn format_resource_warnings(warnings: &[ResourceWarning]) -> String {
+    if warnings.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\nResource limit warnings:\n");
+    for warning in warnings {
+        out.push_str(&format!("  - {}\n", warning.message));
+    }
+    out
+}
+
+/// Direction of a historical fee change relative to the current run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CostTrend {
+    /// The historical fee is lower than the current run (cost decreased).
+    Improvement,
+    /// The historical fee is higher than the current run (cost increased).
+    Regression,
+    /// The historical fee equals the current run.
+    Unchanged,
+}
+
+impl CostTrend {
+    /// Classify a `delta = historical - current` fee difference.
+    #[must_use]
+    pub fn for_delta(delta_stroops: i64) -> Self {
+        match delta_stroops.cmp(&0) {
+            std::cmp::Ordering::Greater => Self::Regression,
+            std::cmp::Ordering::Less => Self::Improvement,
+            std::cmp::Ordering::Equal => Self::Unchanged,
+        }
+    }
+}
+
+/// One previous run of the same contract function, alongside its fee delta
+/// against the current run.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HistoryEntry {
+    /// ISO-8601 timestamp of the historical estimate.
+    pub timestamp: String,
+    /// Ledger sequence at the time of the historical estimate.
+    pub ledger: u32,
+    /// CPU instructions consumed by the historical estimate.
+    pub cpu_instructions: u64,
+    /// Total fee of the historical estimate, in stroops.
+    pub total_stroops: i64,
+    /// Total fee of the historical estimate, in XLM.
+    pub total_xlm: String,
+    /// `historical - current` in stroops: positive means a regression.
+    pub delta_stroops: i64,
+    /// Trend classification derived from `delta_stroops`.
+    pub trend: CostTrend,
+}
+
+/// Build [`HistoryEntry`] records from previous runs, computing each one's
+/// delta against the current run's total fee.
+///
+/// Entries are returned in the order supplied (callers pass them
+/// newest-first) with `delta_stroops = entry_fee - current_fee`.
+#[must_use]
+pub fn build_history_entries(
+    current_total_stroops: i64,
+    current_xlm_precision: u32,
+    runs: &[HistoricalRun],
+) -> Vec<HistoryEntry> {
+    runs.iter()
+        .map(|run| {
+            let delta_stroops = run.total_stroops.saturating_sub(current_total_stroops);
+            HistoryEntry {
+                timestamp: run.timestamp.clone(),
+                ledger: run.ledger,
+                cpu_instructions: run.cpu_instructions,
+                total_stroops: run.total_stroops,
+                total_xlm: crate::report::fee_calc::stroops_to_xlm(
+                    run.total_stroops,
+                    current_xlm_precision,
+                ),
+                delta_stroops,
+                trend: CostTrend::for_delta(delta_stroops),
+            }
+        })
+        .collect()
+}
+
+/// A raw previous run used to build [`HistoryEntry`] records.
+///
+/// Kept separate from [`HistoryEntry`] so callers can supply cache rows
+/// without knowing the current run's fee.
+#[derive(Debug, Clone)]
+pub struct HistoricalRun {
+    /// ISO-8601 timestamp of the run.
+    pub timestamp: String,
+    /// Ledger sequence at the time of the run.
+    pub ledger: u32,
+    /// CPU instructions consumed.
+    pub cpu_instructions: u64,
+    /// Total fee in stroops.
+    pub total_stroops: i64,
+}
+
+/// Render the historical cost trend table.
+///
+/// Regressions (cost increases vs the current run) are shown in red,
+/// improvements (cost reductions) in green, and unchanged runs in yellow.
+/// Returns an empty string when there is no history, so callers can append the
+/// result unconditionally.
+#[must_use]
+pub fn format_cost_history(entries: &[HistoryEntry]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+
+    let mut table = Table::new();
+    table.set_header(vec![
+        "Timestamp",
+        "Ledger",
+        "CPU Instructions",
+        "Total Fee",
+        "Delta vs current",
+    ]);
+
+    for entry in entries {
+        let (delta_text, color) = match entry.trend {
+            CostTrend::Regression => (format!("+{}", entry.delta_stroops), Color::Red),
+            CostTrend::Improvement => (format!("{}", entry.delta_stroops), Color::Green),
+            CostTrend::Unchanged => ("0".to_string(), Color::Yellow),
+        };
+        table.add_row(vec![
+            Cell::new(&entry.timestamp),
+            Cell::new(entry.ledger),
+            Cell::new(entry.cpu_instructions),
+            Cell::new(format!("{} ({})", entry.total_stroops, entry.total_xlm)),
+            Cell::new(delta_text).fg(color),
+        ]);
+    }
+
+    let mut out = String::from("\nCost history (previous runs, newest first):\n");
+    out.push_str(&table.to_string());
+    out.push('\n');
+    out
+}
+
 /// A complete cost report for a single contract invocation.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CostReport {
@@ -199,6 +531,16 @@ pub struct CostReport {
     /// serialized output; `None` when the rates were unavailable.
     #[serde(skip)]
     pub rates: Option<FeeRates>,
+    /// Resource-limit warnings for this run (#322). Always serialized so JSON
+    /// consumers see a stable `warnings` array (empty when nothing is near a
+    /// limit).
+    #[serde(default)]
+    pub warnings: Vec<ResourceWarning>,
+    /// Historical trend entries (#321). `None` unless the caller requested
+    /// history (via `--history`); when requested it is always an array in JSON
+    /// output, possibly empty when there are no previous runs to compare.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<Vec<HistoryEntry>>,
 }
 
 /// A concrete, actionable cost-optimization suggestion derived from a report.
@@ -383,6 +725,14 @@ pub fn format_report_table(report: &CostReport) -> String {
         report.fee.refundable_stroops,
     ));
 
+    // Resource-limit warnings (#322) — only when something nears a ceiling.
+    output.push_str(&format_resource_warnings(&report.warnings));
+
+    // Historical trend table (#321) — only populated with `--history`.
+    if let Some(history) = &report.history {
+        output.push_str(&format_cost_history(history));
+    }
+
     output
 }
 
@@ -439,6 +789,8 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
             rates: Some(rates),
+            warnings: Vec::new(),
+            history: None,
         }
     }
 
@@ -552,6 +904,8 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 0,
             rates: None,
+            warnings: Vec::new(),
+            history: None,
         };
 
         let table_out = format_report_table(&report);
@@ -564,5 +918,218 @@ mod tests {
         assert_eq!(parsed["write_entries"], 0);
         assert_eq!(parsed["read_bytes"], 0);
         assert_eq!(parsed["write_bytes"], 0);
+    }
+
+    // ── Resource-limit warnings (#322) ───────────────────────────────
+
+    fn limits_all(value: u64) -> NetworkConfig {
+        NetworkConfig {
+            tx_max_instructions: Some(value),
+            tx_max_read_entries: Some(value),
+            tx_max_write_entries: Some(value),
+            tx_max_read_bytes: Some(value),
+            tx_max_write_bytes: Some(value),
+            tx_max_size: Some(value),
+        }
+    }
+
+    fn report_with_resources(
+        cpu_instructions: u64,
+        read_entries: u32,
+        write_entries: u32,
+        read_bytes: u32,
+        write_bytes: u32,
+        tx_size: u32,
+    ) -> CostReport {
+        CostReport {
+            cpu_instructions,
+            tx_size,
+            read_entries,
+            write_entries,
+            read_bytes,
+            write_bytes,
+            ..report_with_rates(sample_rates())
+        }
+    }
+
+    #[test]
+    fn test_check_resource_limits_triggers_at_threshold() {
+        // Exactly 80% must warn (>= comparison, integer math).
+        let report = report_with_resources(800, 800, 800, 800, 800, 800);
+        let warnings = check_resource_limits(&report, &limits_all(1_000));
+        // All six resources sit at exactly 80% of their 1000-unit limit.
+        assert_eq!(warnings.len(), 6);
+        assert!(warnings.iter().all(|w| w.percent == 80));
+        assert_eq!(warnings[0].resource, "cpu_instructions");
+    }
+
+    #[test]
+    fn test_check_resource_limits_below_threshold_is_empty() {
+        // 79% is below the 80% threshold on every axis.
+        let report = report_with_resources(790_000, 79, 79, 79, 79, 790);
+        let warnings = check_resource_limits(&report, &limits_all(1_000_000));
+        assert!(warnings.is_empty(), "79% must not warn: {warnings:?}");
+    }
+
+    #[test]
+    fn test_check_resource_limits_over_limit_reports_over_100() {
+        let report = report_with_resources(1_500, 0, 0, 0, 0, 0);
+        let config = NetworkConfig {
+            tx_max_instructions: Some(1_000),
+            ..NetworkConfig::default()
+        };
+        let warnings = check_resource_limits(&report, &config);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].percent, 150);
+    }
+
+    #[test]
+    fn test_check_resource_limits_skips_unknown_limit() {
+        let report = report_with_resources(u64::MAX, 100, 100, 100, 100, 1_000);
+        // Only the tx_size limit is known; the others are unknown and skipped.
+        let config = NetworkConfig {
+            tx_max_size: Some(1_000),
+            ..NetworkConfig::default()
+        };
+        let warnings = check_resource_limits(&report, &config);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].resource, "tx_size");
+    }
+
+    #[test]
+    fn test_network_config_from_snapshot_reads_all_sections() {
+        use crate::config_snapshot::model::{
+            ConfigSnapshot, ContractBandwidthV0, ContractComputeV0, ContractLedgerCostV0,
+        };
+        let snapshot = ConfigSnapshot {
+            network: "testnet".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            ledger: 1,
+            contract_compute: Some(ContractComputeV0 {
+                ledger_max_instructions: 10,
+                tx_max_instructions: 400_000_000,
+                fee_rate_per_instructions_increment: 7,
+                tx_memory_limit: 41_943_040,
+            }),
+            contract_ledger_cost: Some(ContractLedgerCostV0 {
+                ledger_max_disk_read_entries: 100,
+                ledger_max_disk_read_bytes: 200,
+                ledger_max_write_ledger_entries: 300,
+                ledger_max_write_bytes: 400,
+                tx_max_disk_read_entries: 100,
+                tx_max_disk_read_bytes: 200,
+                tx_max_write_ledger_entries: 300,
+                tx_max_write_bytes: 400,
+                fee_disk_read_ledger_entry: 1,
+                fee_write_ledger_entry: 1,
+                fee_disk_read1_kb: 1,
+                soroban_state_target_size_bytes: 1,
+                rent_fee1_kb_soroban_state_size_low: 1,
+                rent_fee1_kb_soroban_state_size_high: 1,
+                soroban_state_rent_fee_growth_factor: 1,
+            }),
+            contract_historical_data: None,
+            contract_events: None,
+            contract_bandwidth: Some(ContractBandwidthV0 {
+                ledger_max_txs_size_bytes: 1,
+                tx_max_size_bytes: 132_096,
+                fee_tx_size1_kb: 1,
+            }),
+            state_archival: None,
+        };
+        let config = NetworkConfig::from_snapshot(&snapshot);
+        assert_eq!(config.tx_max_instructions, Some(400_000_000));
+        assert_eq!(config.tx_max_read_entries, Some(100));
+        assert_eq!(config.tx_max_write_entries, Some(300));
+        assert_eq!(config.tx_max_read_bytes, Some(200));
+        assert_eq!(config.tx_max_write_bytes, Some(400));
+        assert_eq!(config.tx_max_size, Some(132_096));
+    }
+
+    #[test]
+    fn test_network_config_from_empty_snapshot_is_all_none() {
+        use crate::config_snapshot::model::ConfigSnapshot;
+        let snapshot = ConfigSnapshot {
+            network: "testnet".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            ledger: 1,
+            contract_compute: None,
+            contract_ledger_cost: None,
+            contract_historical_data: None,
+            contract_events: None,
+            contract_bandwidth: None,
+            state_archival: None,
+        };
+        let config = NetworkConfig::from_snapshot(&snapshot);
+        assert_eq!(config, NetworkConfig::default());
+    }
+
+    #[test]
+    fn test_format_resource_warnings_empty_and_nonempty() {
+        assert_eq!(format_resource_warnings(&[]), "");
+        let report = report_with_resources(900, 0, 0, 0, 0, 0);
+        let config = NetworkConfig {
+            tx_max_instructions: Some(1_000),
+            ..NetworkConfig::default()
+        };
+        let warnings = check_resource_limits(&report, &config);
+        let out = format_resource_warnings(&warnings);
+        assert!(out.contains("Resource limit warnings:"));
+        assert!(out.contains("CPU instructions at 90%"));
+    }
+
+    // ── Historical trend (#321) ─────────────────────────────────────
+
+    #[test]
+    fn test_cost_trend_for_delta() {
+        assert_eq!(CostTrend::for_delta(5), CostTrend::Regression);
+        assert_eq!(CostTrend::for_delta(-5), CostTrend::Improvement);
+        assert_eq!(CostTrend::for_delta(0), CostTrend::Unchanged);
+    }
+
+    #[test]
+    fn test_build_history_entries_computes_delta_vs_current() {
+        let runs = vec![
+            HistoricalRun {
+                timestamp: "2026-01-02T00:00:00Z".to_string(),
+                ledger: 200,
+                cpu_instructions: 500,
+                total_stroops: 20_000,
+            },
+            HistoricalRun {
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                ledger: 100,
+                cpu_instructions: 400,
+                total_stroops: 10_000,
+            },
+        ];
+        let entries = build_history_entries(15_000, 7, &runs);
+        assert_eq!(entries.len(), 2);
+        // newest first, higher than current -> regression
+        assert_eq!(entries[0].delta_stroops, 5_000);
+        assert_eq!(entries[0].trend, CostTrend::Regression);
+        assert_eq!(entries[0].total_xlm, "0.0020000");
+        // older, lower than current -> improvement
+        assert_eq!(entries[1].delta_stroops, -5_000);
+        assert_eq!(entries[1].trend, CostTrend::Improvement);
+    }
+
+    #[test]
+    fn test_format_cost_history_empty_and_nonempty() {
+        assert_eq!(format_cost_history(&[]), "");
+        let entries = build_history_entries(
+            15_000,
+            7,
+            &[HistoricalRun {
+                timestamp: "2026-01-02T00:00:00Z".to_string(),
+                ledger: 200,
+                cpu_instructions: 500,
+                total_stroops: 20_000,
+            }],
+        );
+        let out = format_cost_history(&entries);
+        assert!(out.contains("Cost history"));
+        assert!(out.contains("200"));
+        assert!(out.contains("+5000"));
     }
 }

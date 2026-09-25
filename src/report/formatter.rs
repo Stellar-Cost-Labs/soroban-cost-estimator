@@ -101,6 +101,16 @@ impl ReportFormatter for TableFormatter {
             report.fee.refundable_stroops,
         ));
 
+        // Resource-limit warnings (#322) — only when something nears a ceiling.
+        output.push_str(&crate::report::cost_report::format_resource_warnings(
+            &report.warnings,
+        ));
+
+        // Historical trend table (#321) — only populated with `--history`.
+        if let Some(history) = &report.history {
+            output.push_str(&crate::report::cost_report::format_cost_history(history));
+        }
+
         output.push('\n');
         output.push_str(&crate::report::cost_report::format_suggestions(
             &report.suggest_optimizations(),
@@ -232,8 +242,18 @@ impl ReportFormatter for MarkdownFormatter {
         output.push_str(&format!("| Write Bytes | {} |\n", report.write_bytes));
         output.push_str(&format!("| Transaction Size | {} |\n", report.tx_size));
 
-        // Fee breakdown
-        output.push_str("\n### Fee Breakdown\n\n");
+        // Resource-limit warnings (#322) as a GitHub callout.
+        if !report.warnings.is_empty() {
+            output.push_str("\n### Resource Limit Warnings\n\n");
+            for warning in &report.warnings {
+                output.push_str(&format!("> **Warning:** {}\n\n", warning.message));
+            }
+        }
+
+        // Fee breakdown, nested in a collapsible section so long reports stay
+        // compact when posted as a GitHub PR comment (#325).
+        output.push_str("\n<details>\n<summary>Fee breakdown</summary>\n\n");
+        output.push_str("### Fee Breakdown\n\n");
         output.push_str("| Component | Stroops | % of Total |\n");
         output.push_str("| --- | --- | --- |\n");
         let total = report.fee.total_stroops;
@@ -283,6 +303,7 @@ impl ReportFormatter for MarkdownFormatter {
                 ));
             }
         }
+        output.push_str("\n</details>\n");
 
         output
     }
@@ -363,6 +384,8 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
             rates: None,
+            warnings: Vec::new(),
+            history: None,
         }
     }
 
@@ -390,6 +413,8 @@ mod tests {
             network: "mainnet".to_string(),
             rpc_latency_ms: 0,
             rates: None,
+            warnings: Vec::new(),
+            history: None,
         }
     }
 
@@ -690,5 +715,113 @@ mod tests {
                 formatter.name()
             );
         }
+    }
+
+    // ── Resource warnings & history rendering (#321, #322) ───────────
+
+    fn sample_warning() -> crate::report::cost_report::ResourceWarning {
+        crate::report::cost_report::ResourceWarning {
+            resource: "cpu_instructions".to_string(),
+            label: "CPU instructions".to_string(),
+            used: 900,
+            limit: 1_000,
+            percent: 90,
+            message: "CPU instructions at 90% of the network limit (900 of 1000)".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_json_formatter_always_includes_warnings_array() {
+        let formatter = JsonFormatter;
+        let output = formatter.format(&sample_report());
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(parsed["warnings"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_json_formatter_serializes_warnings_and_history() {
+        let mut report = sample_report();
+        report.warnings = vec![sample_warning()];
+        report.history = Some(vec![crate::report::cost_report::HistoryEntry {
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            ledger: 10,
+            cpu_instructions: 100,
+            total_stroops: 20_000,
+            total_xlm: "0.0020000".to_string(),
+            delta_stroops: 5_000,
+            trend: crate::report::cost_report::CostTrend::Regression,
+        }]);
+
+        let output = JsonFormatter.format(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(parsed["warnings"][0]["resource"], "cpu_instructions");
+        assert_eq!(parsed["warnings"][0]["percent"], 90);
+        assert_eq!(parsed["history"][0]["trend"], "regression");
+        assert_eq!(parsed["history"][0]["delta_stroops"], 5_000);
+    }
+
+    #[test]
+    fn test_json_formatter_omits_history_when_not_requested() {
+        let output = JsonFormatter.format(&sample_report());
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert!(parsed.get("history").is_none());
+    }
+
+    #[test]
+    fn test_json_formatter_includes_empty_history_when_requested() {
+        let mut report = sample_report();
+        report.history = Some(Vec::new());
+        let output = JsonFormatter.format(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(parsed["history"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_table_formatter_renders_resource_warnings() {
+        let mut report = sample_report();
+        report.warnings = vec![sample_warning()];
+        let output = TableFormatter.format(&report);
+        assert!(output.contains("Resource limit warnings:"));
+        assert!(output.contains("CPU instructions at 90%"));
+    }
+
+    #[test]
+    fn test_table_formatter_omits_warnings_when_clean() {
+        let output = TableFormatter.format(&sample_report());
+        assert!(!output.contains("Resource limit warnings:"));
+    }
+
+    #[test]
+    fn test_table_formatter_renders_history() {
+        let mut report = sample_report();
+        report.history = Some(crate::report::cost_report::build_history_entries(
+            report.fee.total_stroops,
+            7,
+            &[crate::report::cost_report::HistoricalRun {
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                ledger: 100,
+                cpu_instructions: 1_000,
+                total_stroops: 20_000,
+            }],
+        ));
+        let output = TableFormatter.format(&report);
+        assert!(output.contains("Cost history (previous runs, newest first):"));
+        assert!(output.contains("+4573"));
+    }
+
+    #[test]
+    fn test_markdown_formatter_has_collapsible_details() {
+        let output = MarkdownFormatter.format(&sample_report());
+        assert!(output.contains("<details>"));
+        assert!(output.contains("</details>"));
+    }
+
+    #[test]
+    fn test_markdown_formatter_renders_resource_warnings() {
+        let mut report = sample_report();
+        report.warnings = vec![sample_warning()];
+        let output = MarkdownFormatter.format(&report);
+        assert!(output.contains("### Resource Limit Warnings"));
+        assert!(output.contains("> **Warning:** CPU instructions at 90%"));
     }
 }
