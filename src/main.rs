@@ -1591,15 +1591,20 @@ async fn cmd_watch(
     }
 }
 
-/// `cache verify` command: check every cache entry parses as valid JSON.
 /// `cache stats` command: show cache health overview.
 ///
 /// Prints total entries, disk usage, age (oldest/newest), and per-network
 /// breakdown. Useful for checking whether the cache is being populated and
 /// how much disk space it consumes.
 ///
+/// Not yet reachable from the CLI: the `cache stats` subcommand variant was
+/// dropped in a merge and its restoration is tracked as a backlog issue.
+/// Kept (with a dead-code `expect`) so the follow-up only needs to
+/// re-add the CLI variant.
+///
 /// # Network calls
 /// None — pure SQLite I/O.
+#[expect(dead_code)]
 fn cmd_cache_stats() -> error::AppResult<()> {
     let stats = cache::cache_stats()?;
 
@@ -1635,6 +1640,9 @@ fn cmd_cache_stats() -> error::AppResult<()> {
 }
 
 /// Format a byte count as a human-readable string (KB, MB, GB).
+///
+/// Only used by [`cmd_cache_stats`]; see that function's doc comment.
+#[expect(dead_code)]
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
