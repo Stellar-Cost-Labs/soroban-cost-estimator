@@ -5,7 +5,6 @@ expression: TableFormatter.format(&report)
 ---
 Function: increment
 Network: testnet (ledger 3894195)
-RPC round-trip: 87 ms
 WASM hash: abc123def456
 
 +------------------+----------+---------------+
@@ -44,3 +43,5 @@ Fee Breakdown Chart:
 
 Optimization Suggestions:
   No cost optimizations identified (fee rates unavailable or no reducible resources).
+
+Simulation latency: 87 ms

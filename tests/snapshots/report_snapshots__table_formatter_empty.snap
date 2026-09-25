@@ -5,7 +5,6 @@ expression: TableFormatter.format(&empty)
 ---
 Function: (wasm upload)
 Network: mainnet (ledger 0)
-RPC round-trip: 0 ms
 WASM hash: 0000000000000000
 
 +------------------+----------+---------------+
@@ -39,3 +38,5 @@ Fee Breakdown:
 
 Optimization Suggestions:
   No cost optimizations identified (fee rates unavailable or no reducible resources).
+
+Simulation latency: 0 ms

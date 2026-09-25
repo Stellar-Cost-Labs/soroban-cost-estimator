@@ -40,7 +40,6 @@ impl ReportFormatter for TableFormatter {
             "Network: {} (ledger {})\n",
             report.network, report.ledger
         ));
-        output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
         output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
 
         let mut table = comfy_table::Table::new();
@@ -106,6 +105,13 @@ impl ReportFormatter for TableFormatter {
             &report.suggest_optimizations(),
         ));
 
+        // Footer: how long the simulated RPC round-trip actually took, so the
+        // network wait is separable from local computation in CI logs (#304).
+        output.push_str(&format!(
+            "\nSimulation latency: {} ms\n",
+            report.simulation_duration_ms
+        ));
+
         output
     }
 
@@ -158,7 +164,7 @@ impl ReportFormatter for CsvFormatter {
             "function,network,ledger,wasm_hash,cpu_instructions,memory_bytes,\
              read_entries,write_entries,read_bytes,write_bytes,tx_size,\
              non_refundable_stroops,refundable_stroops,total_stroops,total_xlm,\
-             rpc_latency_ms\n",
+             simulation_duration_ms\n",
         );
 
         let row = csv_row(&[
@@ -177,7 +183,7 @@ impl ReportFormatter for CsvFormatter {
             &report.fee.refundable_stroops.to_string(),
             &report.fee.total_stroops.to_string(),
             &report.fee.total_xlm,
-            &report.rpc_latency_ms.to_string(),
+            &report.simulation_duration_ms.to_string(),
         ]);
         output.push_str(&row);
         output.push('\n');
@@ -213,8 +219,8 @@ impl ReportFormatter for MarkdownFormatter {
         ));
         output.push_str(&format!("- **WASM hash:** `{}`\n", report.wasm_hash));
         output.push_str(&format!(
-            "- **RPC round-trip:** {} ms\n\n",
-            report.rpc_latency_ms
+            "- **Simulation latency:** {} ms\n\n",
+            report.simulation_duration_ms
         ));
 
         // Resource table
@@ -361,7 +367,7 @@ mod tests {
             },
             ledger: 3_894_195,
             network: "testnet".to_string(),
-            rpc_latency_ms: 87,
+            simulation_duration_ms: 87,
             rates: None,
         }
     }
@@ -388,7 +394,7 @@ mod tests {
             },
             ledger: 0,
             network: "mainnet".to_string(),
-            rpc_latency_ms: 0,
+            simulation_duration_ms: 0,
             rates: None,
         }
     }
@@ -411,10 +417,15 @@ mod tests {
     }
 
     #[test]
-    fn test_table_formatter_contains_rpc_latency() {
+    fn test_table_formatter_footer_contains_simulation_latency() {
         let formatter = TableFormatter;
         let output = formatter.format(&sample_report());
-        assert!(output.contains("RPC round-trip: 87 ms"));
+        assert!(output.contains("Simulation latency: 87 ms"));
+        // The latency line is a footer summary: it closes out the report.
+        assert!(
+            output.trim_end().ends_with("Simulation latency: 87 ms"),
+            "latency should be the last line; got: {output}"
+        );
     }
 
     #[test]
@@ -498,7 +509,7 @@ mod tests {
         assert_eq!(parsed["wasm_hash"], "abc123def456");
         assert_eq!(parsed["ledger"], 3_894_195);
         assert_eq!(parsed["network"], "testnet");
-        assert_eq!(parsed["rpc_latency_ms"], 87);
+        assert_eq!(parsed["simulation_duration_ms"], 87);
         assert_eq!(parsed["fee"]["total_stroops"], 15_427);
         assert_eq!(parsed["fee"]["total_xlm"], "0.0015427");
     }
@@ -631,7 +642,7 @@ mod tests {
         let output = formatter.format(&sample_report());
         assert!(output.contains("**Network:** testnet (ledger 3894195)"));
         assert!(output.contains("**WASM hash:** `abc123def456`"));
-        assert!(output.contains("**RPC round-trip:** 87 ms"));
+        assert!(output.contains("**Simulation latency:** 87 ms"));
     }
 
     #[test]

@@ -20,7 +20,7 @@ expression: JsonFormatter.format(&empty)
   "network": "mainnet",
   "read_bytes": 0,
   "read_entries": 0,
-  "rpc_latency_ms": 0,
+  "simulation_duration_ms": 0,
   "suggestions": [],
   "tx_size": 0,
   "wasm_hash": "0000000000000000",

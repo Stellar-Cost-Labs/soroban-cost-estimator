@@ -20,7 +20,7 @@ expression: JsonFormatter.format(&report)
   "network": "testnet",
   "read_bytes": 0,
   "read_entries": 1,
-  "rpc_latency_ms": 87,
+  "simulation_duration_ms": 87,
   "suggestions": [],
   "tx_size": 156,
   "wasm_hash": "abc123def456",
