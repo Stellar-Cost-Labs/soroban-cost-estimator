@@ -1,0 +1,8 @@
+[package]
+name = "test_comfy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+comfy-table = "7.2.2"
+clap = { version = "4", features = ["derive"] }
