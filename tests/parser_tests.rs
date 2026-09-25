@@ -378,3 +378,118 @@ fn test_parse_contract_meta_real_fixture() {
     assert!(formatted.contains("rsver:"));
     assert!(formatted.contains("rssdkver:"));
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// validate_wasm_limits
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_validate_wasm_limits_valid() {
+    let wasm = soroban_cost_estimator::wasm::parser::WasmInfo {
+        bytes: vec![0; 50],
+        functions: vec![],
+        has_spec: false,
+        contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
+        start_function: None,
+        memories: vec![soroban_cost_estimator::wasm::parser::MemoryInfo {
+            initial_pages: 50,
+            maximum_pages: Some(100),
+            memory64: false,
+        }],
+        imports: vec![],
+        exports: vec![],
+    };
+    assert!(wasm.validate_wasm_limits(100, 100).is_ok());
+}
+
+#[test]
+fn test_validate_wasm_limits_size_exceeded() {
+    let wasm = soroban_cost_estimator::wasm::parser::WasmInfo {
+        bytes: vec![0; 100],
+        functions: vec![],
+        has_spec: false,
+        contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
+        start_function: None,
+        memories: vec![],
+        imports: vec![],
+        exports: vec![],
+    };
+    let res = wasm.validate_wasm_limits(50, 100);
+    assert!(res.is_err());
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("exceeds maximum deployable size")
+    );
+}
+
+#[test]
+fn test_validate_wasm_limits_initial_memory_exceeded() {
+    let wasm = soroban_cost_estimator::wasm::parser::WasmInfo {
+        bytes: vec![0; 10],
+        functions: vec![],
+        has_spec: false,
+        contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
+        start_function: None,
+        memories: vec![soroban_cost_estimator::wasm::parser::MemoryInfo {
+            initial_pages: 200,
+            maximum_pages: Some(200),
+            memory64: false,
+        }],
+        imports: vec![],
+        exports: vec![],
+    };
+    let res = wasm.validate_wasm_limits(100, 100);
+    assert!(res.is_err());
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("initial pages 200 exceeds limit 100")
+    );
+}
+
+#[test]
+fn test_validate_wasm_limits_max_memory_exceeded() {
+    let wasm = soroban_cost_estimator::wasm::parser::WasmInfo {
+        bytes: vec![0; 10],
+        functions: vec![],
+        has_spec: false,
+        contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
+        start_function: None,
+        memories: vec![soroban_cost_estimator::wasm::parser::MemoryInfo {
+            initial_pages: 50,
+            maximum_pages: Some(200),
+            memory64: false,
+        }],
+        imports: vec![],
+        exports: vec![],
+    };
+    let res = wasm.validate_wasm_limits(100, 100);
+    assert!(res.is_err());
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("maximum pages 200 exceeds limit 100")
+    );
+}
+
+#[test]
+fn test_validate_wasm_limits_unbounded_memory_exceeded() {
+    let wasm = soroban_cost_estimator::wasm::parser::WasmInfo {
+        bytes: vec![0; 10],
+        functions: vec![],
+        has_spec: false,
+        contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
+        start_function: None,
+        memories: vec![soroban_cost_estimator::wasm::parser::MemoryInfo {
+            initial_pages: 50,
+            maximum_pages: None,
+            memory64: false,
+        }],
+        imports: vec![],
+        exports: vec![],
+    };
+    let res = wasm.validate_wasm_limits(100, 100);
+    assert!(res.is_err());
+    assert!(res.unwrap_err().to_string().contains("is unbounded"));
+}
