@@ -31,7 +31,7 @@ fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
 /// migrated forward through [`migrate_to_latest`]; entries written by a
 /// *newer* tool (version greater than this) are rejected rather than
 /// silently misread.
-pub const CACHE_SCHEMA_VERSION: u32 = 2;
+pub const CACHE_SCHEMA_VERSION: u32 = 3;
 
 /// Implicit schema version of cache entries written before the `version`
 /// field existed.
@@ -55,6 +55,16 @@ fn default_true() -> bool {
 /// treated as [`INITIAL_SCHEMA_VERSION`].
 fn default_schema_version() -> u32 {
     INITIAL_SCHEMA_VERSION
+}
+
+/// Deserialize the legacy duration field when it is present as a number or
+/// null; old cache entries used `null` for an unknown duration.
+fn deserialize_duration_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<u64>::deserialize(deserializer)?;
+    Ok(value.unwrap_or_default())
 }
 
 /// A cached estimate result.
@@ -82,12 +92,22 @@ pub struct CachedEstimate {
     pub memory_bytes: u64,
     /// ISO-8601 timestamp of when the estimate was made.
     pub timestamp: String,
-    /// Simulation wall-clock duration in milliseconds (`None` if unknown).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub duration_ms: Option<u64>,
+    /// Simulation wall-clock duration in milliseconds (`0` if unknown).
+    #[serde(
+        default,
+        alias = "duration_ms",
+        deserialize_with = "deserialize_duration_ms"
+    )]
+    pub execution_duration_ms: u64,
     /// Whether the simulation succeeded.
     #[serde(default = "default_true")]
     pub success: bool,
+    /// Stellar network passphrase reported by the RPC endpoint.
+    #[serde(default)]
+    pub network_passphrase: Option<String>,
+    /// Stellar Core version reported by the RPC endpoint.
+    #[serde(default)]
+    pub core_version: Option<String>,
 }
 
 /// Optional filters for [`query_estimates`].
@@ -156,11 +176,53 @@ pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
             memory_bytes     INTEGER NOT NULL,
             timestamp        TEXT NOT NULL,
             duration_ms      INTEGER,
+            execution_duration_ms INTEGER NOT NULL DEFAULT 0,
+            network_passphrase TEXT,
+            core_version     TEXT,
             success          INTEGER NOT NULL DEFAULT 1,
             PRIMARY KEY (wasm_hash, function, args_hash)
         );",
     )?;
+    migrate_cache_columns(conn)?;
     enable_wal_if_possible(conn);
+    Ok(())
+}
+
+/// Add metadata columns to databases created before schema version 3.
+fn migrate_cache_columns(conn: &Connection) -> AppResult<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(estimates)")?;
+    let columns: std::collections::HashSet<String> = stmt
+        .query_map([], |row| row.get(1))?
+        .collect::<Result<_, _>>()?;
+
+    if !columns.contains("duration_ms") {
+        conn.execute("ALTER TABLE estimates ADD COLUMN duration_ms INTEGER", [])?;
+    }
+    if !columns.contains("success") {
+        conn.execute(
+            "ALTER TABLE estimates ADD COLUMN success INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
+    if !columns.contains("execution_duration_ms") {
+        conn.execute(
+            "ALTER TABLE estimates ADD COLUMN execution_duration_ms INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE estimates SET execution_duration_ms = COALESCE(duration_ms, 0)",
+            [],
+        )?;
+    }
+    if !columns.contains("network_passphrase") {
+        conn.execute(
+            "ALTER TABLE estimates ADD COLUMN network_passphrase TEXT",
+            [],
+        )?;
+    }
+    if !columns.contains("core_version") {
+        conn.execute("ALTER TABLE estimates ADD COLUMN core_version TEXT", [])?;
+    }
     Ok(())
 }
 
@@ -259,6 +321,37 @@ pub fn save_estimate(
     duration_ms: Option<u64>,
     success: bool,
 ) -> AppResult<()> {
+    save_estimate_with_metadata(
+        wasm_hash,
+        function,
+        args,
+        network,
+        ledger,
+        total_stroops,
+        cpu_instructions,
+        memory_bytes,
+        duration_ms,
+        success,
+        None,
+        None,
+    )
+}
+
+/// Save an estimate result and metadata from the simulation endpoint.
+pub fn save_estimate_with_metadata(
+    wasm_hash: &str,
+    function: &str,
+    args: &[String],
+    network: &str,
+    ledger: u32,
+    total_stroops: i64,
+    cpu_instructions: u64,
+    memory_bytes: u64,
+    duration_ms: Option<u64>,
+    success: bool,
+    network_passphrase: Option<&str>,
+    core_version: Option<&str>,
+) -> AppResult<()> {
     let args_hash = hash_args(args);
 
     let _guard = WRITE_LOCK
@@ -267,8 +360,8 @@ pub fn save_estimate(
     let conn = open_db()?;
     conn.execute(
         "INSERT INTO estimates \
-         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, duration_ms, success) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, duration_ms, execution_duration_ms, network_passphrase, core_version, success) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
          ON CONFLICT(wasm_hash, function, args_hash) DO UPDATE SET \
             version = excluded.version, \
             network = excluded.network, \
@@ -278,6 +371,9 @@ pub fn save_estimate(
             memory_bytes = excluded.memory_bytes, \
             timestamp = excluded.timestamp, \
             duration_ms = excluded.duration_ms, \
+            execution_duration_ms = excluded.execution_duration_ms, \
+            network_passphrase = excluded.network_passphrase, \
+            core_version = excluded.core_version, \
             success = excluded.success",
         rusqlite::params![
             CACHE_SCHEMA_VERSION as i64,
@@ -291,6 +387,9 @@ pub fn save_estimate(
             memory_bytes as i64,
             chrono::Utc::now().to_rfc3339(),
             duration_ms.map(|v| v as i64),
+            duration_ms.unwrap_or_default() as i64,
+            network_passphrase,
+            core_version,
             success as i64,
         ],
     )?;
@@ -312,8 +411,10 @@ fn estimate_from_row(row: &rusqlite::Row<'_>) -> Result<CachedEstimate, rusqlite
         cpu_instructions: row.get::<_, i64>(7)? as u64,
         memory_bytes: row.get::<_, i64>(8)? as u64,
         timestamp: row.get(9)?,
-        duration_ms: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
-        success: row.get::<_, i64>(11)? != 0,
+        execution_duration_ms: row.get::<_, i64>(11)? as u64,
+        network_passphrase: row.get(12)?,
+        core_version: row.get(13)?,
+        success: row.get::<_, i64>(14)? != 0,
     })
 }
 
@@ -340,8 +441,10 @@ pub fn migrate_to_latest(cached: CachedEstimate) -> AppResult<CachedEstimate> {
         ))),
         // v1 entries lack duration_ms and success columns; supply defaults.
         PREVIOUS_SCHEMA_VERSION => {
-            migrated.duration_ms = None;
+            migrated.execution_duration_ms = 0;
             migrated.success = true;
+            migrated.network_passphrase = None;
+            migrated.core_version = None;
             migrated.version = CACHE_SCHEMA_VERSION;
             Ok(migrated)
         }
@@ -374,7 +477,8 @@ pub fn load_estimate(
     let conn = open_db()?;
     let mut stmt = conn.prepare(
         "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-         cpu_instructions, memory_bytes, timestamp, duration_ms, success \
+         cpu_instructions, memory_bytes, timestamp, duration_ms, execution_duration_ms, \
+         network_passphrase, core_version, success \
          FROM estimates WHERE wasm_hash = ?1 AND function = ?2 AND args_hash = ?3",
     )?;
 
@@ -447,7 +551,8 @@ pub fn list_cached_estimates(network: &str) -> AppResult<Vec<CachedEstimate>> {
     let conn = open_db()?;
     let mut stmt = conn.prepare(
         "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-         cpu_instructions, memory_bytes, timestamp, duration_ms, success \
+         cpu_instructions, memory_bytes, timestamp, duration_ms, execution_duration_ms, \
+         network_passphrase, core_version, success \
          FROM estimates WHERE network = ?1 ORDER BY timestamp DESC",
     )?;
 
@@ -561,7 +666,8 @@ pub fn export_cached_estimates() -> AppResult<Vec<CachedEstimate>> {
     let conn = open_db()?;
     let mut stmt = conn.prepare(
         "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-         cpu_instructions, memory_bytes, timestamp \
+         cpu_instructions, memory_bytes, timestamp, duration_ms, execution_duration_ms, \
+         network_passphrase, core_version, success \
          FROM estimates ORDER BY wasm_hash, function, args_hash",
     )?;
 
@@ -632,8 +738,10 @@ pub fn verify_cache() -> AppResult<Vec<CacheEntryStatus>> {
             cpu_instructions: 0,
             memory_bytes: 0,
             timestamp: String::new(),
-            duration_ms: None,
+            execution_duration_ms: 0,
             success: true,
+            network_passphrase: None,
+            core_version: None,
         };
         let valid = migrate_to_latest(cached).is_ok();
 
