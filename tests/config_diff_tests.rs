@@ -1201,3 +1201,106 @@ fn test_symmetry_change_count() {
     let d_ba = diff::diff_snapshots(&b, &a);
     assert_eq!(d_ab.changes.len(), d_ba.changes.len());
 }
+
+// ── CSV / Markdown diff rendering (#279) ──────────────────────────────────
+
+/// A one-change diff used to exercise the machine-readable renderers.
+fn single_change_diff() -> diff::ConfigDiff {
+    diff::ConfigDiff {
+        old_snapshot: diff::SnapshotInfo {
+            network: "testnet".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            ledger: 100,
+        },
+        new_snapshot: diff::SnapshotInfo {
+            network: "testnet".to_string(),
+            timestamp: "2026-01-02T00:00:00Z".to_string(),
+            ledger: 200,
+        },
+        changes: vec![diff::FieldDiff {
+            field_path: "contract_compute.fee_rate_per_instructions_increment".to_string(),
+            old_value: "10".to_string(),
+            new_value: "25".to_string(),
+            is_pricing_change: true,
+            explanation: None,
+        }],
+        has_pricing_changes: true,
+    }
+}
+
+#[test]
+fn test_format_diff_csv_has_header_and_row_per_change() {
+    let diff = diff::diff_snapshots(&empty_snapshot(), &full_snapshot());
+    let csv = diff::format_diff_csv(&diff);
+    let lines: Vec<&str> = csv.lines().collect();
+
+    assert_eq!(lines[0], "field,old_value,new_value,is_pricing_change");
+    assert_eq!(lines.len(), diff.changes.len() + 1);
+}
+
+#[test]
+fn test_format_diff_csv_row_contents() {
+    let csv = diff::format_diff_csv(&single_change_diff());
+    assert!(
+        csv.contains("contract_compute.fee_rate_per_instructions_increment,10,25,true"),
+        "unexpected CSV row: {csv}"
+    );
+}
+
+#[test]
+fn test_format_diff_csv_no_changes_is_header_only() {
+    let snap = full_snapshot();
+    let diff = diff::diff_snapshots(&snap, &snap);
+    assert_eq!(diff::format_diff_csv(&diff).lines().count(), 1);
+}
+
+#[test]
+fn test_format_diff_csv_escapes_special_characters() {
+    let mut diff = single_change_diff();
+    diff.changes[0].old_value = "a,b".to_string();
+    diff.changes[0].new_value = "say \"hi\"".to_string();
+
+    let csv = diff::format_diff_csv(&diff);
+    assert!(
+        csv.contains(",\"a,b\","),
+        "comma value should be quoted: {csv}"
+    );
+    assert!(
+        csv.contains("\"say \"\"hi\"\"\""),
+        "quotes should be doubled per RFC 4180: {csv}"
+    );
+}
+
+#[test]
+fn test_format_diff_markdown_has_table_and_row_per_change() {
+    let diff = diff::diff_snapshots(&empty_snapshot(), &full_snapshot());
+    let md = diff::format_diff_markdown(&diff);
+
+    assert!(md.starts_with("## Config diff:"));
+    assert!(md.contains("| Setting | Old | New | Pricing |"));
+    assert!(md.contains("| --- | --- | --- | --- |"));
+    let rows = md
+        .lines()
+        .filter(|l| l.starts_with("| ") && !l.contains("---") && !l.contains("Setting"))
+        .count();
+    assert_eq!(rows, diff.changes.len());
+}
+
+#[test]
+fn test_format_diff_markdown_marks_pricing_changes() {
+    let md = diff::format_diff_markdown(&single_change_diff());
+    assert!(md.contains("Fee Rate Per Instructions Increment"));
+    assert!(
+        md.contains("💰 yes"),
+        "pricing change should be marked: {md}"
+    );
+}
+
+#[test]
+fn test_format_diff_markdown_no_changes() {
+    let snap = full_snapshot();
+    let diff = diff::diff_snapshots(&snap, &snap);
+    let md = diff::format_diff_markdown(&diff);
+    assert!(md.contains("✅ No changes detected."));
+    assert!(!md.contains("| Setting |"));
+}
