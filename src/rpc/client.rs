@@ -123,6 +123,7 @@ pub struct RpcClient {
     /// exponential backoff.
     max_retries: usize,
     /// Custom HTTP headers attached to every outbound request.
+    #[allow(dead_code)]
     headers: HeaderMap,
 }
 
@@ -232,7 +233,7 @@ impl RpcClient {
             max_retries,
             "creating RPC client"
         );
-        let headers = parse_headers(headers);
+        let headers = parseheaders(headers);
         Self {
             url: url.to_string(),
             fallback_url: fallback_url.map(String::from),
@@ -515,9 +516,9 @@ fn parse_header(raw: &str) -> Result<(HeaderName, HeaderValue), String> {
 
 /// Parse a list of `"Key: Value"` strings into a [`HeaderMap`], skipping any
 /// entry that cannot be parsed or that has an empty value.
-fn parse_headers(raw_headers: &[String]) -> HeaderMap {
+fn parseheaders(rawheaders: &[String]) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    for raw in raw_headers {
+    for raw in rawheaders {
         if let Ok((name, value)) = parse_header(raw) {
             if !value.as_bytes().is_empty() {
                 headers.insert(name, value);
@@ -1098,7 +1099,7 @@ mod header_tests {
     }
 
     #[test]
-    fn test_rpc_client_new_has_no_custom_headers() {
+    fn test_rpc_client_new_has_no_customheaders() {
         let client = RpcClient::new("http://localhost");
         assert!(client.headers.is_empty());
     }
