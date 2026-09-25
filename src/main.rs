@@ -1081,7 +1081,6 @@ async fn cmd_rpc_health(
                 println!("Latency    : {} ms", latency_ms);
                 println!("Error      : {}", e);
             }
-
             Err(e)
         }
     }
