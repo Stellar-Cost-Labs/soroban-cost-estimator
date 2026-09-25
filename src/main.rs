@@ -294,9 +294,14 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 json,
             ),
         },
-        cli::Command::Watch { network, interval } => {
+        cli::Command::Watch {
+            network,
+            rpc_url,
+            interval,
+        } => {
             cmd_watch(
                 &network,
+                rpc_url.as_deref(),
                 fallback,
                 &interval,
                 rps,
@@ -1116,7 +1121,7 @@ async fn fetch_config_snapshot(
 
     let span = info_span!("fetch_config_snapshot", network);
     async {
-        let endpoint = rpc::client::resolve_endpoint(network, None)?;
+        let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
         let client = rpc::client::RpcClient::with_fallback_headers(
             &endpoint,
             rpc_fallback_url,
@@ -1192,6 +1197,7 @@ async fn cmd_config_snapshot(
         info!("taking config snapshot");
         let snapshot = fetch_config_snapshot(
             network,
+            rpc_url,
             rpc_fallback_url,
             rps,
             timeout,
@@ -1278,6 +1284,7 @@ async fn cmd_config_diff(
 
         let new_snapshot = fetch_config_snapshot(
             network,
+            rpc_url,
             rpc_fallback_url,
             rps,
             timeout,
@@ -1520,6 +1527,7 @@ async fn watch_poll_once(
 
     let snapshot_result = fetch_config_snapshot(
         network,
+        rpc_url,
         rpc_fallback_url,
         rps,
         timeout,
