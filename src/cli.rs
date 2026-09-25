@@ -1,4 +1,40 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+/// Unified output format for command results.
+///
+/// Every command that produces a report accepts the same `--format` flag, so
+/// scripting against `soroban-cost-estimator` never has to remember which
+/// command spells which format how.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    /// Human-readable terminal table (the default).
+    Table,
+    /// Structured JSON payload.
+    Json,
+    /// RFC 4180 comma-separated records.
+    Csv,
+    /// GitHub-flavored Markdown tables.
+    Markdown,
+}
+
+impl OutputFormat {
+    /// Lowercase name of this format, matching the value accepted on the CLI
+    /// and the name used by the report formatters.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Json => "json",
+            Self::Csv => "csv",
+            Self::Markdown => "markdown",
+        }
+    }
+}
+
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// Build version string with metadata from build.rs
 fn build_version() -> &'static str {
@@ -51,6 +87,11 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "N", default_value_t = 3)]
     pub max_retries: usize,
 
+    /// Output format: table (default), json, csv, or markdown. Overrides the
+    /// legacy `--json` flag when both are supplied.
+    #[arg(long, global = true, value_enum, value_name = "FORMAT")]
+    pub format: Option<OutputFormat>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -97,11 +138,6 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Output format: table (default), json, csv, or markdown.
-        /// Overrides `--json` when both are supplied.
-        #[arg(long, value_parser = ["table", "json", "csv", "markdown"])]
-        format: Option<String>,
-
         /// Number of decimal places for XLM fee values (0..=18, default 7).
         #[arg(long, default_value_t = 7)]
         precision: u32,
@@ -128,11 +164,6 @@ pub enum Command {
         /// Output as JSON instead of a human-readable list.
         #[arg(long)]
         json: bool,
-
-        /// Output format: table (default), json, csv, or markdown.
-        /// Overrides `--json` when both are supplied.
-        #[arg(long, value_parser = ["table", "json", "csv", "markdown"])]
-        format: Option<String>,
 
         /// Number of decimal places for XLM fee values (0..=18, default 7).
         #[arg(long, default_value_t = 7)]
