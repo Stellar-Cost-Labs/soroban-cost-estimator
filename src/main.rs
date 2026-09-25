@@ -151,6 +151,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             args,
             cache_ttl,
             clear_cache,
+            no_cache,
             json,
             format,
             precision,
@@ -168,6 +169,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 &args,
                 cache_ttl.as_deref(),
                 clear_cache,
+                no_cache,
                 &format,
                 rps,
                 timeout,
@@ -182,6 +184,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             network,
             rpc_url,
             id,
+            no_cache,
             json,
             format,
             precision,
@@ -193,6 +196,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 rpc_url.as_deref(),
                 fallback,
                 id.as_deref(),
+                no_cache,
                 &format,
                 rps,
                 timeout,
@@ -461,6 +465,7 @@ async fn cmd_estimate(
     args: &[String],
     cache_ttl: Option<&str>,
     clear_cache: bool,
+    no_cache: bool,
     format: &str,
     rps: Option<u64>,
     timeout: u64,
@@ -512,11 +517,16 @@ async fn cmd_estimate(
         }
 
         // With --cache-ttl, reuse a still-fresh cached estimate and skip the
-        // (expensive) simulation entirely.
+        // (expensive) simulation entirely. `--no-cache` opts out of cache
+        // reads altogether, so the TTL never short-circuits the simulation.
         let ttl_secs = cache_ttl.map(parse_interval_secs);
-        if let Some(fresh) =
+        let fresh = if no_cache {
+            // Bypass every cache read, even under `--cache-ttl`.
+            None
+        } else {
             fresh_cached_estimate(&wasm_hash, &function_name, args, ttl_secs)?
-        {
+        };
+        if let Some(fresh) = fresh {
             let ttl_secs = ttl_secs.unwrap_or_default();
             info!(ttl_secs, function = %function_name, "cache hit — reusing fresh estimate");
             print_cached_estimate(&fresh, ttl_secs, json_flag, precision);
@@ -613,18 +623,22 @@ async fn cmd_estimate(
             rates: Some(fee_rates),
         };
 
-        let _ = cache::save_estimate(
-            &wasm_hash,
-            function_name,
-            args,
-            network,
-            latest_ledger,
-            fee.total_stroops,
-            cpu_instructions,
-            memory_bytes,
-            Some(rpc_latency_ms),
-            true,
-        );
+        // `--no-cache` also suppresses the write, so a bypassed run leaves
+        // no trace in the local cache.
+        if !no_cache {
+            let _ = cache::save_estimate(
+                &wasm_hash,
+                function_name,
+                args,
+                network,
+                latest_ledger,
+                fee.total_stroops,
+                cpu_instructions,
+                memory_bytes,
+                Some(rpc_latency_ms),
+                true,
+            );
+        }
         info!(total_stroops = fee.total_stroops, total_xlm = %fee.total_xlm, "estimate complete");
 
         match formatter_by_name(format) {
@@ -677,6 +691,7 @@ async fn cmd_estimate_all(
     rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     contract_id: Option<&str>,
+    no_cache: bool,
     format: &str,
     rps: Option<u64>,
     timeout: u64,
@@ -766,6 +781,7 @@ async fn cmd_estimate_all(
                 &wasm_info,
                 fn_info,
                 contract_id,
+                no_cache,
                 &wasm_hash,
                 network,
                 json_flag,
@@ -871,6 +887,7 @@ async fn estimate_all_function(
     wasm_info: &wasm::parser::WasmInfo,
     fn_info: &wasm::parser::FunctionInfo,
     contract_id: Option<&str>,
+    no_cache: bool,
     wasm_hash: &str,
     network: &str,
     json_flag: bool,
@@ -938,18 +955,22 @@ async fn estimate_all_function(
 
                 debug!(cpu, mem, total_fee, ledger, "simulation complete");
 
-                let _ = cache::save_estimate(
-                    wasm_hash,
-                    &fn_info.name,
-                    &[],
-                    network,
-                    ledger,
-                    total_fee,
-                    cpu,
-                    mem,
-                    duration_ms,
-                    true,
-                );
+                // `--no-cache` suppresses the write so a bypassed batch run
+                // leaves the local cache untouched.
+                if !no_cache {
+                    let _ = cache::save_estimate(
+                        wasm_hash,
+                        &fn_info.name,
+                        &[],
+                        network,
+                        ledger,
+                        total_fee,
+                        cpu,
+                        mem,
+                        duration_ms,
+                        true,
+                    );
+                }
 
                 // Itemize the fee breakdown only when we have the network's fee
                 // rates (JSON mode). Otherwise emit a minimal breakdown with just
@@ -1811,6 +1832,7 @@ async fn cmd_cache_warm(
         rpc_url,
         rpc_fallback_url,
         contract_id,
+        false,
         fmt,
         rps,
         timeout,
