@@ -391,6 +391,170 @@ pub fn format_report_json(report: &CostReport) -> String {
     serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// Signed change of a single metric between two estimate runs.
+///
+/// Fee arithmetic stays in integer stroops (`previous`, `current`,
+/// `absolute`); `percent` is derived for display only and is `None` when the
+/// baseline is zero, because a percentage change from zero is undefined.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct MetricDelta {
+    /// Baseline value from the previous estimate.
+    pub previous: i64,
+    /// Value from the current estimate.
+    pub current: i64,
+    /// `current - previous`, saturating rather than wrapping.
+    pub absolute: i64,
+    /// Percentage change, or `None` when `previous == 0`.
+    pub percent: Option<f64>,
+}
+
+impl MetricDelta {
+    /// Compute the delta between two values.
+    #[must_use]
+    pub fn new(previous: i64, current: i64) -> Self {
+        let absolute = current.saturating_sub(previous);
+        let percent = if previous == 0 {
+            None
+        } else {
+            Some(absolute as f64 / previous as f64 * 100.0)
+        };
+        Self {
+            previous,
+            current,
+            absolute,
+            percent,
+        }
+    }
+
+    /// Renders the signed change, e.g. `+12400 (+5.2%)`, `-100 (-1.0%)`,
+    /// `0 (0.0%)`, or just `+5` when the percentage is undefined.
+    #[must_use]
+    pub fn format_signed(&self) -> String {
+        let sign = if self.absolute > 0 { "+" } else { "" };
+        match self.percent {
+            Some(pct) => format!("{sign}{} ({sign}{pct:.1}%)", self.absolute),
+            None => format!("{sign}{}", self.absolute),
+        }
+    }
+}
+
+/// Cost deltas between a previous estimate and the current report.
+///
+/// CPU, memory, and fee are always present because every cached entry stores
+/// them. The ledger entry-count deltas are `None` when the previous estimate
+/// predates I/O recording.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct CostDelta {
+    /// CPU instruction delta.
+    pub cpu_instructions: MetricDelta,
+    /// Memory byte delta.
+    pub memory_bytes: MetricDelta,
+    /// Total fee delta, in stroops.
+    pub fee_stroops: MetricDelta,
+    /// Ledger read-entry delta, when the previous estimate recorded I/O.
+    pub read_entries: Option<MetricDelta>,
+    /// Ledger write-entry delta, when the previous estimate recorded I/O.
+    pub write_entries: Option<MetricDelta>,
+}
+
+impl CostDelta {
+    /// Computes the delta of `current` against a previous estimate's metrics.
+    ///
+    /// `previous_io` is `(read_entries, write_entries)` when the previous
+    /// estimate recorded its ledger I/O footprint.
+    #[must_use]
+    pub fn compute(
+        previous_cpu: u64,
+        previous_memory: u64,
+        previous_fee_stroops: i64,
+        previous_io: Option<(u32, u32)>,
+        current: &CostReport,
+    ) -> Self {
+        Self {
+            cpu_instructions: MetricDelta::new(
+                previous_cpu as i64,
+                current.cpu_instructions as i64,
+            ),
+            memory_bytes: MetricDelta::new(previous_memory as i64, current.memory_bytes as i64),
+            fee_stroops: MetricDelta::new(previous_fee_stroops, current.fee.total_stroops),
+            read_entries: previous_io.map(|(read, _)| {
+                MetricDelta::new(i64::from(read), i64::from(current.read_entries))
+            }),
+            write_entries: previous_io.map(|(_, write)| {
+                MetricDelta::new(i64::from(write), i64::from(current.write_entries))
+            }),
+        }
+    }
+
+    /// `(label, delta)` rows for every metric with a baseline to compare to.
+    fn rows(&self) -> Vec<(&'static str, MetricDelta)> {
+        let mut rows = vec![
+            ("CPU Instructions", self.cpu_instructions),
+            ("Memory Bytes", self.memory_bytes),
+        ];
+        if let Some(delta) = self.read_entries {
+            rows.push(("Read Entries", delta));
+        }
+        if let Some(delta) = self.write_entries {
+            rows.push(("Write Entries", delta));
+        }
+        rows.push(("Fee (stroops)", self.fee_stroops));
+        rows
+    }
+
+    /// Renders the comparison as a terminal table.
+    #[must_use]
+    pub fn format_text(&self) -> String {
+        let mut output = String::from("\nCost delta vs previous estimate:\n");
+        let mut table = Table::new();
+        table.set_header(vec!["Metric", "Previous", "Current", "Change"]);
+        for (label, delta) in self.rows() {
+            table.add_row(vec![
+                label.to_string(),
+                delta.previous.to_string(),
+                delta.current.to_string(),
+                delta.format_signed(),
+            ]);
+        }
+        output.push_str(&table.to_string());
+        output.push('\n');
+        output
+    }
+
+    /// Renders the comparison as a GitHub-flavored markdown table.
+    #[must_use]
+    pub fn format_markdown(&self) -> String {
+        let mut output = String::from("\n### Cost delta vs previous estimate\n\n");
+        output.push_str("| Metric | Previous | Current | Change |\n");
+        output.push_str("| --- | --- | --- | --- |\n");
+        for (label, delta) in self.rows() {
+            output.push_str(&format!(
+                "| {label} | {} | {} | {} |\n",
+                delta.previous,
+                delta.current,
+                delta.format_signed(),
+            ));
+        }
+        output
+    }
+
+    /// Renders the comparison as RFC 4180 CSV records.
+    ///
+    /// The percent column is empty when there is no baseline to divide by.
+    #[must_use]
+    pub fn format_csv(&self) -> String {
+        let mut output = String::from("metric,previous,current,absolute,percent\n");
+        for (label, delta) in self.rows() {
+            let percent = delta.percent.map(|p| format!("{p:.1}")).unwrap_or_default();
+            output.push_str(&format!(
+                "{label},{},{},{},{percent}\n",
+                delta.previous, delta.current, delta.absolute
+            ));
+        }
+        output
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,5 +728,106 @@ mod tests {
         assert_eq!(parsed["write_entries"], 0);
         assert_eq!(parsed["read_bytes"], 0);
         assert_eq!(parsed["write_bytes"], 0);
+    }
+
+    // ── Cost delta math (#278) ──────────────────────────────────────────
+
+    #[test]
+    fn test_metric_delta_positive() {
+        let delta = MetricDelta::new(100, 200);
+        assert_eq!(delta.absolute, 100);
+        assert_eq!(delta.percent, Some(100.0));
+        assert_eq!(delta.format_signed(), "+100 (+100.0%)");
+    }
+
+    #[test]
+    fn test_metric_delta_negative() {
+        let delta = MetricDelta::new(200, 100);
+        assert_eq!(delta.absolute, -100);
+        assert_eq!(delta.percent, Some(-50.0));
+        assert_eq!(delta.format_signed(), "-100 (-50.0%)");
+    }
+
+    #[test]
+    fn test_metric_delta_zero() {
+        let delta = MetricDelta::new(200, 200);
+        assert_eq!(delta.absolute, 0);
+        assert_eq!(delta.percent, Some(0.0));
+        assert_eq!(delta.format_signed(), "0 (0.0%)");
+    }
+
+    #[test]
+    fn test_metric_delta_zero_baseline_has_no_percentage() {
+        let delta = MetricDelta::new(0, 500);
+        assert_eq!(delta.absolute, 500);
+        assert_eq!(delta.percent, None);
+        assert_eq!(delta.format_signed(), "+500");
+    }
+
+    #[test]
+    fn test_metric_delta_saturates_instead_of_wrapping() {
+        assert_eq!(MetricDelta::new(i64::MIN, i64::MAX).absolute, i64::MAX);
+    }
+
+    #[test]
+    fn test_cost_delta_without_previous_io_omits_entry_deltas() {
+        let report = report_with_rates(sample_rates());
+        let delta = CostDelta::compute(500_000, 10, 10_000, None, &report);
+
+        assert_eq!(delta.cpu_instructions.absolute, 32_502);
+        assert_eq!(delta.memory_bytes.absolute, -10);
+        assert_eq!(delta.fee_stroops.absolute, 5_427);
+        assert!(delta.read_entries.is_none());
+        assert!(delta.write_entries.is_none());
+        assert!(!delta.format_markdown().contains("Read Entries"));
+    }
+
+    #[test]
+    fn test_cost_delta_with_previous_io_includes_entry_deltas() {
+        let report = report_with_rates(sample_rates());
+        let delta = CostDelta::compute(532_502, 0, 15_427, Some((3, 0)), &report);
+
+        assert_eq!(delta.read_entries.map(|d| d.absolute), Some(-2));
+        assert_eq!(delta.write_entries.map(|d| d.absolute), Some(1));
+        assert!(delta.format_text().contains("Read Entries"));
+        assert!(delta.format_markdown().contains("Write Entries"));
+    }
+
+    #[test]
+    fn test_cost_delta_is_json_serializable() {
+        let report = report_with_rates(sample_rates());
+        let delta = CostDelta::compute(1, 2, 3, Some((1, 1)), &report);
+        let value = serde_json::to_value(delta).expect("serialize");
+
+        assert_eq!(value["cpu_instructions"]["previous"], 1);
+        assert_eq!(value["cpu_instructions"]["current"], 532_502);
+        assert_eq!(value["memory_bytes"]["absolute"], -2);
+        assert_eq!(value["fee_stroops"]["absolute"], 15_424);
+    }
+
+    #[test]
+    fn test_cost_delta_csv_has_header_and_one_row_per_metric() {
+        let report = report_with_rates(sample_rates());
+        let delta = CostDelta::compute(532_502, 0, 15_427, Some((1, 1)), &report);
+        let csv = delta.format_csv();
+        let lines: Vec<&str> = csv.lines().collect();
+
+        assert_eq!(lines[0], "metric,previous,current,absolute,percent");
+        // cpu, memory, read entries, write entries, fee
+        assert_eq!(lines.len(), 6);
+        assert!(lines[1].starts_with("CPU Instructions,532502,532502,0,0.0"));
+    }
+
+    #[test]
+    fn test_cost_delta_csv_leaves_percent_empty_without_baseline() {
+        let report = report_with_rates(sample_rates());
+        let delta = CostDelta::compute(0, 0, 0, None, &report);
+        let csv = delta.format_csv();
+        let cpu_row = csv.lines().nth(1).expect("cpu row");
+
+        assert!(
+            cpu_row.ends_with(','),
+            "percent column should be empty; got: {cpu_row}"
+        );
     }
 }
