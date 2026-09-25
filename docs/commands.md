@@ -47,6 +47,7 @@ soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
 | `--id <ID>` | | | — | Deployed contract ID (64 hex chars). Required when `--fn` is used |
 | `--arg <KEY=VAL>` | | | — | Function arguments as `key=value` pairs (value is type-inferred; repeatable) |
 | `--cache-ttl <DURATION>` | | | — | Skip re-simulation when a cached estimate is still fresh (e.g. `30m`, `1h`, `7d`) |
+| `--compare` | | | `false` | Show the cost delta against the previous cached estimate for the same function and arguments |
 | `--clear-cache` | | | `false` | Wipe every cached estimate for `--network` before running the simulation |
 | `--json` | | | `false` | Output as JSON instead of a human-readable table |
 | `--help` | `-h` | | | Print help |
@@ -78,6 +79,15 @@ soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
   other flag — including `--cache-ttl`, which then starts from an empty
   cache. Useful after upgrading the tool, after a network upgrade, or after
   debugging a bad estimate.
+- **`--compare`** diffs the fresh simulation against the estimate previously
+  cached for the same function and arguments, appending a section with the
+  absolute **and** percentage change for CPU instructions, memory bytes,
+  ledger read/write entries, and the total fee — e.g. `+12400 (+5.2%)`.
+  I/O rows appear only when the previous estimate recorded its footprint
+  (entries cached by older builds did not). When nothing was cached for the
+  key yet, it prints `No previous estimate found for comparison`. With
+  `--json`, the payload gains `previous_estimate` and `delta` objects
+  (`null` when there is no baseline).
 - **Exit codes**: 0 on success, 1 on any error (simulation failure, missing
   WASM file, network error, etc.).
 

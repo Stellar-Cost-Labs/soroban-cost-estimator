@@ -1059,6 +1059,7 @@ fn test_migrate_to_latest_current_version_is_identity() {
             timestamp: "t".to_string(),
             duration_ms: Some(42),
             success: true,
+            io: None,
         };
         let migrated = cache::migrate_to_latest(entry.clone()).expect("migrate");
         assert_eq!(migrated.version, current_schema_version());
@@ -1084,6 +1085,7 @@ fn test_migrate_to_latest_rejects_future_version() {
             timestamp: "t".to_string(),
             duration_ms: None,
             success: true,
+            io: None,
         };
         let err = cache::migrate_to_latest(entry).expect_err("future version must be rejected");
         assert!(err.to_string().contains("newer"), "unhelpful error: {err}");
@@ -1350,5 +1352,146 @@ fn test_load_fresh_estimate_expired_returns_none() {
         )
         .expect("load fresh");
         assert!(fresh.is_none(), "an expired entry must yield None");
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Ledger I/O footprint (#278)
+// ─────────────────────────────────────────────────────────────────────────
+
+fn sample_io() -> cache::IoFootprint {
+    cache::IoFootprint {
+        read_entries: 3,
+        write_entries: 2,
+        read_bytes: 40,
+        write_bytes: 136,
+    }
+}
+
+/// A SHA-256 args hash, matching the key the library derives internally.
+fn args_hash_of(args: &[&str]) -> String {
+    let mut hasher = sha2::Sha256::new();
+    for arg in args {
+        hasher.update(arg.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+#[test]
+fn test_save_estimate_with_io_roundtrip() {
+    with_temp_home(|_tmp| {
+        let io = sample_io();
+        cache::save_estimate_with_io("h", "f", &[], "testnet", 7, 500, 20, 10, io, Some(12), true)
+            .expect("save with io");
+
+        let loaded = cache::load_estimate("h", "f", &[])
+            .expect("load")
+            .expect("entry should exist");
+        assert_eq!(loaded.io, Some(io));
+        assert_eq!(loaded.duration_ms, Some(12));
+    });
+}
+
+#[test]
+fn test_save_estimate_without_io_leaves_footprint_absent() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h", "f", &[], "testnet", 1, 100, 10, 5, None, true).expect("save");
+
+        let loaded = cache::load_estimate("h", "f", &[])
+            .expect("load")
+            .expect("entry should exist");
+        assert!(
+            loaded.io.is_none(),
+            "save_estimate must not invent an I/O footprint"
+        );
+    });
+}
+
+/// Re-running the same key replaces the stored footprint along with the other
+/// metrics.
+#[test]
+fn test_save_estimate_with_io_updates_existing_entry() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h", "f", &[], "testnet", 1, 100, 10, 5, None, true).expect("first");
+
+        let io = sample_io();
+        cache::save_estimate_with_io("h", "f", &[], "testnet", 2, 200, 20, 10, io, None, true)
+            .expect("second");
+
+        let loaded = cache::load_estimate("h", "f", &[])
+            .expect("load")
+            .expect("entry should exist");
+        assert_eq!(loaded.ledger, 2);
+        assert_eq!(loaded.io, Some(io));
+    });
+}
+
+/// `export_cached_estimates` reads every column the row mapping needs,
+/// including the ones added after the initial schema.
+#[test]
+fn test_export_cached_estimates_includes_footprint() {
+    with_temp_home(|_tmp| {
+        let io = sample_io();
+        cache::save_estimate_with_io("h", "f", &[], "testnet", 3, 42, 7, 9, io, Some(5), true)
+            .expect("save");
+
+        let exported = cache::export_cached_estimates().expect("export");
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].io, Some(io));
+        assert_eq!(exported[0].duration_ms, Some(5));
+        assert!(exported[0].success);
+    });
+}
+
+/// A database written by a build that predates the `io_json` column is
+/// upgraded in place when the library opens it, and its rows still load.
+#[test]
+fn test_legacy_database_without_io_column_still_loads() {
+    with_temp_home(|home| {
+        let dir = home.join(".soroban-cost-estimator");
+        std::fs::create_dir_all(&dir).expect("create data dir");
+        let db = dir.join("cache.db");
+
+        // The schema exactly as it existed before `io_json` was added.
+        {
+            let conn = rusqlite::Connection::open(&db).expect("open cache db");
+            conn.execute_batch(
+                "CREATE TABLE estimates (
+                    version          INTEGER NOT NULL,
+                    wasm_hash        TEXT NOT NULL,
+                    function         TEXT NOT NULL,
+                    args_hash        TEXT NOT NULL,
+                    network          TEXT NOT NULL,
+                    ledger           INTEGER NOT NULL,
+                    total_stroops    INTEGER NOT NULL,
+                    cpu_instructions INTEGER NOT NULL,
+                    memory_bytes     INTEGER NOT NULL,
+                    timestamp        TEXT NOT NULL,
+                    duration_ms      INTEGER,
+                    success          INTEGER NOT NULL DEFAULT 1,
+                    PRIMARY KEY (wasm_hash, function, args_hash)
+                );",
+            )
+            .expect("create legacy schema");
+            conn.execute(
+                "INSERT INTO estimates \
+                 (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, success) \
+                 VALUES (?1, 'old', 'legacy_fn', ?2, 'testnet', 3, 100, 10, 5, '2026-01-01T00:00:00Z', 1)",
+                rusqlite::params![
+                    cache::CACHE_SCHEMA_VERSION as i64,
+                    args_hash_of(&["a"]),
+                ],
+            )
+            .expect("insert legacy row");
+        }
+
+        let loaded = cache::load_estimate("old", "legacy_fn", &["a".to_string()])
+            .expect("load legacy entry")
+            .expect("legacy entry should exist");
+        assert_eq!(loaded.total_stroops, 100);
+        assert!(
+            loaded.io.is_none(),
+            "a pre-io_json row has no footprint to report"
+        );
     });
 }
