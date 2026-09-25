@@ -204,9 +204,15 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
         }
         cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(&wasm, json),
         cli::Command::Config { action } => match action {
-            cli::ConfigAction::Snapshot { network, out, json } => {
+            cli::ConfigAction::Snapshot {
+                network,
+                rpc_url,
+                out,
+                json,
+            } => {
                 cmd_config_snapshot(
                     &network,
+                    rpc_url.as_deref(),
                     fallback,
                     out.as_deref(),
                     json,
@@ -220,12 +226,14 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::List { network } => cmd_config_snapshot_list(&network),
             cli::ConfigAction::Diff {
                 network,
+                rpc_url,
                 against,
                 summary,
                 json,
             } => {
                 cmd_config_diff(
                     &network,
+                    rpc_url.as_deref(),
                     fallback,
                     against.as_deref(),
                     summary,
@@ -286,9 +294,14 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 json,
             ),
         },
-        cli::Command::Watch { network, interval } => {
+        cli::Command::Watch {
+            network,
+            rpc_url,
+            interval,
+        } => {
             cmd_watch(
                 &network,
+                rpc_url.as_deref(),
                 fallback,
                 &interval,
                 rps,
@@ -1096,6 +1109,7 @@ fn wasm_info_json(
 /// Makes one batched `getLedgerEntries` RPC call.
 async fn fetch_config_snapshot(
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     rps: Option<u64>,
     timeout: u64,
@@ -1107,7 +1121,7 @@ async fn fetch_config_snapshot(
 
     let span = info_span!("fetch_config_snapshot", network);
     async {
-        let endpoint = rpc::client::resolve_endpoint(network, None)?;
+        let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
         let client = rpc::client::RpcClient::with_fallback_headers(
             &endpoint,
             rpc_fallback_url,
@@ -1166,6 +1180,7 @@ fn print_stale_estimates(network: &str, ledger: u32) {
 /// `config snapshot` command: fetch config settings and save snapshot.
 async fn cmd_config_snapshot(
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     out_path: Option<&str>,
     json_flag: bool,
@@ -1182,6 +1197,7 @@ async fn cmd_config_snapshot(
         info!("taking config snapshot");
         let snapshot = fetch_config_snapshot(
             network,
+            rpc_url,
             rpc_fallback_url,
             rps,
             timeout,
@@ -1240,6 +1256,7 @@ fn upgrade_detected(diff: &config_snapshot::diff::ConfigDiff) -> bool {
 /// `config diff` command: compare current config against a snapshot.
 async fn cmd_config_diff(
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     against_path: Option<&str>,
     summary: bool,
@@ -1267,6 +1284,7 @@ async fn cmd_config_diff(
 
         let new_snapshot = fetch_config_snapshot(
             network,
+            rpc_url,
             rpc_fallback_url,
             rps,
             timeout,
@@ -1497,6 +1515,7 @@ async fn shutdown_signal() -> error::AppResult<()> {
 /// Makes one batched `getLedgerEntries` RPC call.
 async fn watch_poll_once(
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     first: &mut bool,
     rps: Option<u64>,
@@ -1508,6 +1527,7 @@ async fn watch_poll_once(
 
     let snapshot_result = fetch_config_snapshot(
         network,
+        rpc_url,
         rpc_fallback_url,
         rps,
         timeout,
@@ -1548,6 +1568,7 @@ async fn watch_poll_once(
 /// cancelled rather than writing a partial snapshot.
 async fn cmd_watch(
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     interval: &str,
     rps: Option<u64>,
@@ -1577,6 +1598,7 @@ async fn cmd_watch(
             () = async {
                 let _ = watch_poll_once(
                     network,
+                    rpc_url,
                     rpc_fallback_url,
                     &mut first,
                     rps,
