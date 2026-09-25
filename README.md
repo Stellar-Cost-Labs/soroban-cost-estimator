@@ -162,6 +162,23 @@ soroban-cost-estimator config snapshot --network testnet [--out /custom/path.jso
 Saved to `~/.soroban-cost-estimator/snapshots/<network>-<timestamp>.json`.
 `--json` also prints the snapshot as JSON (and still saves it).
 
+Managing saved snapshots (offline, no RPC calls):
+
+```bash
+# Delete one snapshot, or purge everything older than 30 days
+soroban-cost-estimator config snapshot delete testnet-2026-01-01T00-00-00+00-00.json --yes
+soroban-cost-estimator config snapshot delete --older-than 30 [--network testnet] [--dry-run] [--yes]
+
+# Compare two saved snapshots without touching the network
+soroban-cost-estimator config snapshot diff before.json after.json [--json]
+```
+
+`config snapshot delete` errors if the named snapshot does not exist and skips
+files whose timestamp cannot be parsed; `--dry-run` reports the affected files
+without deleting them. `config snapshot diff` uses the same diff and exit codes
+as [`config diff`](#config-diff) (`1` when pricing changed), and names the
+file in any read/parse error.
+
 ### `config diff`
 
 Compare the current network config against the most recent (or explicit) snapshot.

@@ -6,13 +6,17 @@ them, and save to disk.
 ## Flags
 
 ```
-Usage: soroban-cost-estimator config snapshot [OPTIONS]
+Usage: soroban-cost-estimator config snapshot [OPTIONS] [COMMAND]
 
 Options:
       --network <NETWORK>  Network to fetch config from [default: testnet]
       --out <OUT>          Explicit output path (defaults to ~/.soroban-cost-estimator/snapshots/)
       --json               Print the snapshot as JSON instead of the summary lines
   -h, --help               Print help
+
+Commands:
+  delete  Delete a saved snapshot file, or purge every snapshot older than N days
+  diff    Compare two saved snapshot files offline, without any network calls
 ```
 
 ## Behavior
@@ -61,3 +65,61 @@ the fee rates used by `estimate` (see [Resource Fees](../concepts/resource-fees.
 Take a fresh snapshot after every protocol vote and keep them around:
 [`config diff`](config-diff.md) compares the current configuration against
 your most recent snapshot.
+
+## Deleting snapshots
+
+`config snapshot delete` removes saved snapshots. It never touches the
+network, and it is the counterpart to the accumulating
+`~/.soroban-cost-estimator/snapshots/` directory.
+
+```
+Usage: soroban-cost-estimator config snapshot delete [OPTIONS] [FILENAME]
+
+Arguments:
+  [FILENAME]  Snapshot filename (or path) to delete
+
+Options:
+      --older-than <DAYS>  Delete snapshots older than this many days
+      --dry-run            Show which files would be removed without deleting anything
+  -y, --yes                Skip the confirmation prompt (required in non-interactive sessions)
+      --network <NETWORK>  Restrict --older-than to a single network's snapshots
+  -h, --help               Print help
+```
+
+- `config snapshot delete testnet-2026-01-01T00-00-00+00-00.json` deletes one
+  file, resolved either as given (a path) or as a filename inside the
+  snapshots directory.
+- `config snapshot delete --older-than 30` purges every snapshot whose recorded
+  `timestamp` is more than 30 days old, across all networks (add `--network`
+  to scope it).
+- `--dry-run` lists the affected files and deletes nothing.
+- Deleting a snapshot that does not exist is an error, so a typo never looks
+  like a successful cleanup.
+- Snapshots whose timestamp cannot be parsed are skipped rather than deleted.
+
+## Offline snapshot diff
+
+`config snapshot diff <SNAPSHOT_A> <SNAPSHOT_B>` compares two saved snapshots
+without contacting the network at all, which makes it suitable for comparing
+historical snapshots (e.g. before and after a protocol upgrade) or for CI.
+
+```
+Usage: soroban-cost-estimator config snapshot diff [OPTIONS] <SNAPSHOT_A> <SNAPSHOT_B>
+
+Arguments:
+  <SNAPSHOT_A>  First (older) snapshot file to compare
+  <SNAPSHOT_B>  Second (newer) snapshot file to compare
+
+Options:
+      --json   Output as JSON instead of a human-readable diff
+  -h, --help   Print help
+```
+
+The output is the same field-by-field diff used by
+[`config diff`](config-diff.md), with pricing changes highlighted. Exit codes
+match `config diff`:
+
+- `0` — no pricing changes
+- `1` — pricing changes detected (or either file could not be read/parsed)
+
+The error message names the offending file, since two files are read in one run.
