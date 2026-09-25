@@ -346,6 +346,7 @@ mod tests {
                     type_def: stellar_xdr::ScSpecTypeDef::Symbol,
                 },
             ],
+            returns: Vec::new(),
         }
     }
 
@@ -550,6 +551,7 @@ mod tests {
             param_count: 1,
             result_count: 1,
             params: vec![],
+            returns: vec![],
         };
         let result =
             validate_args_against_spec(Some("plain"), &["anything".to_string()], &[no_spec]);
