@@ -552,7 +552,7 @@ async fn cmd_estimate(
         // the endpoint is reachable and healthy before running any simulation.
         // Local argument errors above are reported first; this guards the
         // (potentially expensive) simulateTransaction call itself.
-        client.health_check().await?;
+        let health_metadata = client.health_check().await?;
 
         // Time the simulateTransaction round-trip so the report can flag
         // slow RPC endpoints. Includes any retries performed by the client.
@@ -613,7 +613,7 @@ async fn cmd_estimate(
             rates: Some(fee_rates),
         };
 
-        let _ = cache::save_estimate(
+        let _ = cache::save_estimate_with_metadata(
             &wasm_hash,
             function_name,
             args,
@@ -624,6 +624,8 @@ async fn cmd_estimate(
             memory_bytes,
             Some(rpc_latency_ms),
             true,
+            health_metadata.network_passphrase.as_deref(),
+            health_metadata.core_version.as_deref(),
         );
         info!(total_stroops = fee.total_stroops, total_xlm = %fee.total_xlm, "estimate complete");
 
@@ -741,7 +743,7 @@ async fn cmd_estimate_all(
         // Validate the RPC endpoint is reachable before running a full batch
         // of simulations (#55): fail fast up front rather than after each
         // function's simulation times out.
-        client.health_check().await?;
+        let health_metadata = client.health_check().await?;
 
         // Fee rates are only needed to itemize the per-function fee breakdown
         // in JSON output; skip the extra RPC calls in table mode.
@@ -770,6 +772,7 @@ async fn cmd_estimate_all(
                 network,
                 json_flag,
                 fee_rates.as_ref(),
+                &health_metadata,
                 precision,
             )
             .await?;
@@ -875,6 +878,7 @@ async fn estimate_all_function(
     network: &str,
     json_flag: bool,
     fee_rates: Option<&report::fee_calc::FeeRates>,
+    health_metadata: &rpc::client::HealthMetadata,
     precision: u32,
 ) -> error::AppResult<EstimateAllResult> {
     use tracing::{Instrument, debug, info_span};
@@ -938,7 +942,7 @@ async fn estimate_all_function(
 
                 debug!(cpu, mem, total_fee, ledger, "simulation complete");
 
-                let _ = cache::save_estimate(
+                let _ = cache::save_estimate_with_metadata(
                     wasm_hash,
                     &fn_info.name,
                     &[],
@@ -949,6 +953,8 @@ async fn estimate_all_function(
                     mem,
                     duration_ms,
                     true,
+                    health_metadata.network_passphrase.as_deref(),
+                    health_metadata.core_version.as_deref(),
                 );
 
                 // Itemize the fee breakdown only when we have the network's fee
@@ -1402,6 +1408,9 @@ fn print_cached_estimate(
                 "total_stroops": fresh.total_stroops,
                 "cpu_instructions": fresh.cpu_instructions,
                 "memory_bytes": fresh.memory_bytes,
+                "execution_duration_ms": fresh.execution_duration_ms,
+                "network_passphrase": fresh.network_passphrase,
+                "core_version": fresh.core_version,
                 "timestamp": fresh.timestamp,
             })
         );
