@@ -123,7 +123,7 @@ pub struct RpcClient {
     /// exponential backoff.
     max_retries: usize,
     /// Custom HTTP headers attached to every outbound request.
-    headers: HeaderMap,
+    pub _headers: HeaderMap,
 }
 
 impl RpcClient {

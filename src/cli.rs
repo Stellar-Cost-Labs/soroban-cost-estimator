@@ -51,6 +51,10 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "N", default_value_t = 3)]
     pub max_retries: usize,
 
+    /// Control ANSI color formatting in terminal output.
+    #[arg(long, global = true, default_value = "auto")]
+    pub color: clap::ColorChoice,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -315,4 +319,27 @@ pub enum ConfigAction {
         #[arg(long, default_value = "testnet")]
         network: String,
     },
+}
+use std::sync::atomic::{AtomicU8, Ordering};
+
+pub static COLOR_CHOICE: AtomicU8 = AtomicU8::new(0);
+
+pub fn init_color(choice: clap::ColorChoice) {
+    let val = match choice {
+        clap::ColorChoice::Auto => 0,
+        clap::ColorChoice::Always => 1,
+        clap::ColorChoice::Never => 2,
+    };
+    COLOR_CHOICE.store(val, Ordering::Relaxed);
+}
+
+pub fn should_colorize() -> bool {
+    match COLOR_CHOICE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            use std::io::IsTerminal;
+            std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
+        }
+    }
 }

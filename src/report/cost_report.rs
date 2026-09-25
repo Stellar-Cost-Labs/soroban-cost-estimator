@@ -325,6 +325,11 @@ pub fn format_report_table(report: &CostReport) -> String {
     output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
 
     let mut table = Table::new();
+    if crate::cli::should_colorize() {
+        table.enforce_styling();
+    } else {
+        table.force_no_tty();
+    }
 
     table.set_header(vec!["Resource", "Consumed", "Fee (stroops)"]);
 

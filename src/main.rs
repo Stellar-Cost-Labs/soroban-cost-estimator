@@ -118,6 +118,8 @@ impl EstimateAllResult {
 async fn main() {
     let args = cli::Cli::parse();
 
+    cli::init_color(args.color);
+
     let default_level = if args.verbose { "debug" } else { "info" };
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -1300,7 +1302,10 @@ async fn cmd_config_diff(
         } else if summary {
             println!("{}", config_snapshot::diff::format_diff_summary(&diff));
         } else {
-            println!("{}", config_snapshot::diff::format_diff(&diff));
+            println!(
+                "{}",
+                config_snapshot::diff::format_diff(&diff, cli::should_colorize())
+            );
         }
 
         if upgrade_detected(&diff) {
@@ -1523,7 +1528,10 @@ async fn watch_poll_once(
                     let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &snapshot);
                     if !diff.changes.is_empty() {
                         debug!(change_count = diff.changes.len(), "config changes detected");
-                        println!("{}", config_snapshot::diff::format_diff(&diff));
+                        println!(
+                            "{}",
+                            config_snapshot::diff::format_diff(&diff, cli::should_colorize())
+                        );
                     }
 
                     print_stale_estimates(network, snapshot.ledger);
@@ -1600,7 +1608,7 @@ async fn cmd_watch(
 ///
 /// # Network calls
 /// None — pure SQLite I/O.
-fn cmd_cache_stats() -> error::AppResult<()> {
+pub fn _cmd_cache_stats() -> error::AppResult<()> {
     let stats = cache::cache_stats()?;
 
     if stats.total_entries == 0 {
@@ -1635,7 +1643,7 @@ fn cmd_cache_stats() -> error::AppResult<()> {
 }
 
 /// Format a byte count as a human-readable string (KB, MB, GB).
-fn format_bytes(bytes: u64) -> String {
+pub fn _format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     const GB: u64 = MB * 1024;
@@ -1748,6 +1756,11 @@ fn cmd_cache_query(
     }
 
     let mut table = Table::new();
+    if crate::cli::should_colorize() {
+        table.enforce_styling();
+    } else {
+        table.force_no_tty();
+    }
     table.set_header(vec![
         "Function",
         "Network",
