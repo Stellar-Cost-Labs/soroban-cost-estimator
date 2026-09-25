@@ -57,6 +57,23 @@ fn default_schema_version() -> u32 {
     INITIAL_SCHEMA_VERSION
 }
 
+/// Ledger I/O footprint of a simulated invocation.
+///
+/// Recorded alongside an estimate so a later run can diff I/O against it.
+/// Only runs that captured the footprint store this (older entries leave it
+/// absent), which is why it lives behind [`CachedEstimate::io`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct IoFootprint {
+    /// Ledger entries read.
+    pub read_entries: u32,
+    /// Ledger entries written.
+    pub write_entries: u32,
+    /// Bytes read from the ledger.
+    pub read_bytes: u32,
+    /// Bytes written to the ledger.
+    pub write_bytes: u32,
+}
+
 /// A cached estimate result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedEstimate {
@@ -88,6 +105,9 @@ pub struct CachedEstimate {
     /// Whether the simulation succeeded.
     #[serde(default = "default_true")]
     pub success: bool,
+    /// Ledger I/O footprint recorded with this estimate, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io: Option<IoFootprint>,
 }
 
 /// Optional filters for [`query_estimates`].
@@ -157,10 +177,41 @@ pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
             timestamp        TEXT NOT NULL,
             duration_ms      INTEGER,
             success          INTEGER NOT NULL DEFAULT 1,
+            io_json          TEXT,
             PRIMARY KEY (wasm_hash, function, args_hash)
         );",
     )?;
+    ensure_added_columns(conn)?;
     enable_wal_if_possible(conn);
+    Ok(())
+}
+
+/// Columns added to `estimates` after the initial schema.
+///
+/// `CREATE TABLE` declares them for fresh databases; existing databases get
+/// them through `ensure_added_columns` on open. They are additive and
+/// nullable, so both older and newer builds read the same table — which is
+/// why `CACHE_SCHEMA_VERSION` does not need to move for them.
+const ADDED_COLUMNS: &[(&str, &str)] = &[("io_json", "TEXT")];
+
+/// Adds any [`ADDED_COLUMNS`] missing from the `estimates` table.
+fn ensure_added_columns(conn: &Connection) -> AppResult<()> {
+    let existing: Vec<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(estimates)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut columns = Vec::new();
+        for row in rows {
+            columns.push(row?);
+        }
+        columns
+    };
+
+    for (name, ty) in ADDED_COLUMNS {
+        if !existing.iter().any(|column| column == name) {
+            debug!(column = name, "adding cache column");
+            conn.execute_batch(&format!("ALTER TABLE estimates ADD COLUMN {name} {ty};"))?;
+        }
+    }
     Ok(())
 }
 
@@ -245,6 +296,9 @@ where
 /// * `duration_ms` - Wall-clock duration of the simulation in milliseconds.
 /// * `success` - Whether the simulation succeeded.
 ///
+/// The ledger I/O footprint is not recorded here — use
+/// [`save_estimate_with_io`] when it is available.
+///
 /// # Network calls
 /// None — local SQLite I/O.
 pub fn save_estimate(
@@ -259,7 +313,79 @@ pub fn save_estimate(
     duration_ms: Option<u64>,
     success: bool,
 ) -> AppResult<()> {
+    persist_estimate(
+        wasm_hash,
+        function,
+        args,
+        network,
+        ledger,
+        total_stroops,
+        cpu_instructions,
+        memory_bytes,
+        None,
+        duration_ms,
+        success,
+    )
+}
+
+/// Save an estimate together with its ledger I/O footprint.
+///
+/// `save_estimate` records only the metrics the cache has always stored; this
+/// variant additionally persists the read/write entry and byte counts, so a
+/// later run can diff I/O against it (`estimate --compare`).
+///
+/// # Network calls
+/// None — local SQLite I/O.
+#[allow(clippy::too_many_arguments)]
+pub fn save_estimate_with_io(
+    wasm_hash: &str,
+    function: &str,
+    args: &[String],
+    network: &str,
+    ledger: u32,
+    total_stroops: i64,
+    cpu_instructions: u64,
+    memory_bytes: u64,
+    io: IoFootprint,
+    duration_ms: Option<u64>,
+    success: bool,
+) -> AppResult<()> {
+    persist_estimate(
+        wasm_hash,
+        function,
+        args,
+        network,
+        ledger,
+        total_stroops,
+        cpu_instructions,
+        memory_bytes,
+        Some(io),
+        duration_ms,
+        success,
+    )
+}
+
+/// Write an estimate row, upserting on the `(wasm_hash, function, args_hash)`
+/// cache key.
+#[allow(clippy::too_many_arguments)]
+fn persist_estimate(
+    wasm_hash: &str,
+    function: &str,
+    args: &[String],
+    network: &str,
+    ledger: u32,
+    total_stroops: i64,
+    cpu_instructions: u64,
+    memory_bytes: u64,
+    io: Option<IoFootprint>,
+    duration_ms: Option<u64>,
+    success: bool,
+) -> AppResult<()> {
     let args_hash = hash_args(args);
+    let io_json = match io {
+        Some(io) => Some(serde_json::to_string(&io)?),
+        None => None,
+    };
 
     let _guard = WRITE_LOCK
         .lock()
@@ -267,8 +393,8 @@ pub fn save_estimate(
     let conn = open_db()?;
     conn.execute(
         "INSERT INTO estimates \
-         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, duration_ms, success) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, duration_ms, success, io_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
          ON CONFLICT(wasm_hash, function, args_hash) DO UPDATE SET \
             version = excluded.version, \
             network = excluded.network, \
@@ -278,7 +404,8 @@ pub fn save_estimate(
             memory_bytes = excluded.memory_bytes, \
             timestamp = excluded.timestamp, \
             duration_ms = excluded.duration_ms, \
-            success = excluded.success",
+            success = excluded.success, \
+            io_json = excluded.io_json",
         rusqlite::params![
             CACHE_SCHEMA_VERSION as i64,
             wasm_hash,
@@ -292,6 +419,7 @@ pub fn save_estimate(
             chrono::Utc::now().to_rfc3339(),
             duration_ms.map(|v| v as i64),
             success as i64,
+            io_json,
         ],
     )?;
 
@@ -314,6 +442,11 @@ fn estimate_from_row(row: &rusqlite::Row<'_>) -> Result<CachedEstimate, rusqlite
         timestamp: row.get(9)?,
         duration_ms: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
         success: row.get::<_, i64>(11)? != 0,
+        // A footprint that cannot be decoded is treated as absent: better to
+        // omit I/O from a comparison than to fail the whole read.
+        io: row
+            .get::<_, Option<String>>(12)?
+            .and_then(|raw| serde_json::from_str(&raw).ok()),
     })
 }
 
@@ -374,7 +507,7 @@ pub fn load_estimate(
     let conn = open_db()?;
     let mut stmt = conn.prepare(
         "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-         cpu_instructions, memory_bytes, timestamp, duration_ms, success \
+         cpu_instructions, memory_bytes, timestamp, duration_ms, success, io_json \
          FROM estimates WHERE wasm_hash = ?1 AND function = ?2 AND args_hash = ?3",
     )?;
 
@@ -447,7 +580,7 @@ pub fn list_cached_estimates(network: &str) -> AppResult<Vec<CachedEstimate>> {
     let conn = open_db()?;
     let mut stmt = conn.prepare(
         "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-         cpu_instructions, memory_bytes, timestamp, duration_ms, success \
+         cpu_instructions, memory_bytes, timestamp, duration_ms, success, io_json \
          FROM estimates WHERE network = ?1 ORDER BY timestamp DESC",
     )?;
 
@@ -561,7 +694,7 @@ pub fn export_cached_estimates() -> AppResult<Vec<CachedEstimate>> {
     let conn = open_db()?;
     let mut stmt = conn.prepare(
         "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-         cpu_instructions, memory_bytes, timestamp \
+         cpu_instructions, memory_bytes, timestamp, duration_ms, success, io_json \
          FROM estimates ORDER BY wasm_hash, function, args_hash",
     )?;
 
@@ -634,6 +767,7 @@ pub fn verify_cache() -> AppResult<Vec<CacheEntryStatus>> {
             timestamp: String::new(),
             duration_ms: None,
             success: true,
+            io: None,
         };
         let valid = migrate_to_latest(cached).is_ok();
 
