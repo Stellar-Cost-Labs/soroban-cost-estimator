@@ -1600,6 +1600,7 @@ async fn cmd_watch(
 ///
 /// # Network calls
 /// None — pure SQLite I/O.
+#[allow(dead_code)]
 fn cmd_cache_stats() -> error::AppResult<()> {
     let stats = cache::cache_stats()?;
 
@@ -1635,6 +1636,7 @@ fn cmd_cache_stats() -> error::AppResult<()> {
 }
 
 /// Format a byte count as a human-readable string (KB, MB, GB).
+#[allow(dead_code)]
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
