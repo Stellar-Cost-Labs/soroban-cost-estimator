@@ -238,7 +238,7 @@ fn test_detects_multiple_changes() {
 fn test_format_diff_no_changes() {
     let snap = make_snapshot(100, 5);
     let d = diff::diff_snapshots(&snap, &snap);
-    let output = diff::format_diff(&d);
+    let output = diff::format_diff(&d, true);
     assert!(output.contains("No changes detected"));
 }
 
@@ -271,7 +271,7 @@ fn test_format_diff_with_changes() {
     let old = make_snapshot(100, 5);
     let new = make_snapshot(200, 5);
     let d = diff::diff_snapshots(&old, &new);
-    let output = diff::format_diff(&d);
+    let output = diff::format_diff(&d, true);
     // Should use human-readable setting and field names
     assert!(output.contains("Contract Compute V0"));
     assert!(output.contains("Fee Rate Per Instructions Increment"));
@@ -284,7 +284,7 @@ fn test_format_diff_shows_explanations() {
     let old = make_snapshot(100, 5);
     let new = make_snapshot(200, 5);
     let diff = diff::diff_snapshots(&old, &new);
-    let output = diff::format_diff(&diff);
+    let output = diff::format_diff(&diff, true);
     // fee_rate_per_instructions_increment has an explanation
     assert!(output.contains("Stroops charged per 10,000 CPU instructions"));
 }
@@ -1008,7 +1008,7 @@ fn test_diff_populates_snapshot_info_with_pricing_change() {
 fn test_format_diff_all_present_identical() {
     let snap = full_snapshot();
     let d = diff::diff_snapshots(&snap, &snap);
-    let output = diff::format_diff(&d);
+    let output = diff::format_diff(&d, true);
     assert!(output.contains("No changes detected"));
     assert!(output.contains("testnet"));
 }
@@ -1018,7 +1018,7 @@ fn test_format_diff_addition_contains_pricing_warning() {
     let old = snapshot_with(false, false, false, false, false, false);
     let new = snapshot_with(true, false, false, false, false, false);
     let d = diff::diff_snapshots(&old, &new);
-    let output = diff::format_diff(&d);
+    let output = diff::format_diff(&d, true);
     assert!(output.contains("Pricing changes detected"));
 }
 
@@ -1027,7 +1027,7 @@ fn test_format_diff_removal_contains_pricing_warning() {
     let old = snapshot_with(true, false, false, false, false, false);
     let new = snapshot_with(false, false, false, false, false, false);
     let d = diff::diff_snapshots(&old, &new);
-    let output = diff::format_diff(&d);
+    let output = diff::format_diff(&d, true);
     assert!(output.contains("Pricing changes detected"));
 }
 
@@ -1037,7 +1037,7 @@ fn test_format_diff_non_pricing_no_warning() {
     let mut new = full_snapshot();
     new.contract_compute.as_mut().unwrap().tx_max_instructions = 200_000;
     let d = diff::diff_snapshots(&old, &new);
-    let output = diff::format_diff(&d);
+    let output = diff::format_diff(&d, true);
     assert!(!output.contains("Pricing changes detected"));
     assert!(output.contains("Tx Max Instructions"));
 }
@@ -1052,7 +1052,7 @@ fn test_format_diff_shows_change_count() {
         .fee_rate_per_instructions_increment = 50;
     new.contract_bandwidth.as_mut().unwrap().fee_tx_size1_kb = 20;
     let d = diff::diff_snapshots(&old, &new);
-    let output = diff::format_diff(&d);
+    let output = diff::format_diff(&d, true);
     assert!(output.contains("2 field change(s)"));
 }
 
@@ -1061,7 +1061,7 @@ fn test_format_diff_shows_addition_and_removal_icons() {
     let old = snapshot_with(false, false, false, false, false, false);
     let new = snapshot_with(true, true, false, false, false, false);
     let d = diff::diff_snapshots(&old, &new);
-    let output = diff::format_diff(&d);
+    let output = diff::format_diff(&d, true);
     // Both additions are pricing changes, so they should show the pricing icon
     assert!(output.contains("Contract Compute V0"));
     assert!(output.contains("Contract Ledger Cost V0"));
