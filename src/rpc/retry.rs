@@ -50,6 +50,12 @@ where
 }
 
 /// Returns `true` when `error` represents a transient failure worth retrying.
+///
+/// [`AppError::ConnectTimeout`] is deliberately excluded: a host that cannot
+/// complete a TCP connect within the configured window is almost certainly
+/// down, and retrying would multiply the hang the connect timeout exists to
+/// prevent. Failover to a configured fallback endpoint (see
+/// `RpcClient::perform_call`) still applies.
 fn is_retryable(error: &AppError) -> bool {
     matches!(error, AppError::Http(_))
 }

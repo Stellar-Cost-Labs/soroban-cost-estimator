@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `--timeout` global flag — configurable HTTP request timeout for RPC calls
   in seconds (default 30).
+- `--connect-timeout` global flag — bounds TCP connection establishment
+  separately from the total request timeout (default 5 seconds; `0` disables).
+  A dead or unreachable RPC host now fails fast with a distinct
+  `Failed to establish connection to RPC host within N seconds` error instead
+  of hanging for the full request timeout.
 - `config diff --summary` — print a single-line summary
   (`X pricing changes, Y non-pricing changes`) instead of the full diff, for CI
   status lines. Exit code and auto-save side effects are unchanged.

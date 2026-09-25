@@ -710,6 +710,7 @@ All commands accept:
 |------|-------------|
 | `--rps <N>` | Cap RPC requests at N per second (0 disables) |
 | `--timeout <SECS>` | HTTP request timeout for RPC calls in seconds (default `30`) |
+| `--connect-timeout <SECS>` | TCP connection establishment timeout in seconds (default `5`; `0` disables). A dead or unreachable host fails within this window instead of hanging for the full `--timeout` |
 | `--help` / `-h` | Print command-specific help |
 
 ## Network Resolution
