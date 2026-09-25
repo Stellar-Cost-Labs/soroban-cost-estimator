@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `watch` subscribes to live ledger-close notifications over a WebSocket
+  (`wss://…/ws`) and re-checks the network config the moment a ledger closes,
+  instead of waiting for the next poll. Dropped connections are re-established
+  with exponential backoff (1s → 30s), and the command falls back to HTTP
+  interval polling when the endpoint is unreachable or has no WebSocket
+  support. `watch --rpc-url` now accepts `wss://`/`ws://` as well as
+  `https://`/`http://` and points both the subscription and the config fetches
+  at the same node.
 - `--timeout` global flag — configurable HTTP request timeout for RPC calls
   in seconds (default 30).
 - `config diff --summary` — print a single-line summary

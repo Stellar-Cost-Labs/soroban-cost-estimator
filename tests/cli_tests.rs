@@ -1186,6 +1186,319 @@ fn test_watch_interval_suffixes_are_parsed() {
     );
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// `watch` over WebSocket ledger-close notifications (Issue #305)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Serves JSON-RPC over HTTP *and* WebSocket on a single loopback port.
+///
+/// `watch` is pointed at `ws://127.0.0.1:PORT/ws`; the command rewrites that
+/// same `--rpc-url` to `http://127.0.0.1:PORT` for its config fetches, so both
+/// halves must answer on one port. The WebSocket half acknowledges the
+/// ledger-close subscription and then pushes one notification per ledger,
+/// which is what makes the CLI re-check the config. Returns the `ws://` URL
+/// and a sender that stops the server thread.
+///
+/// The nested handlers keep the HTTP and WebSocket halves side by side (they
+/// share one port and one stop channel), which makes this deliberately long.
+#[allow(clippy::too_many_lines)]
+fn start_mock_ws_rpc_server(ledgers: &[u32]) -> (String, std::sync::mpsc::Sender<()>) {
+    use tokio::net::TcpListener;
+
+    let ledgers = ledgers.to_vec();
+    let (tx_stop, rx_stop) = std::sync::mpsc::channel::<()>();
+    let (tx_addr, rx_addr) = std::sync::mpsc::channel::<String>();
+
+    // One connection per task: `watch` opens the config fetch and the
+    // WebSocket subscription as separate connections.
+    async fn serve_connection(stream: tokio::net::TcpStream, ledgers: Vec<u32>) {
+        // Peek before consuming: a WebSocket handshake must be handed to
+        // tungstenite intact, and `peek` leaves the bytes in the socket.
+        let mut handshake = String::new();
+        for _ in 0..200 {
+            let mut buf = [0_u8; 2048];
+            match stream.peek(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    handshake = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                    if handshake.contains("\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        if handshake.contains("upgrade: websocket") {
+            serve_ws(stream, &ledgers).await;
+        } else {
+            serve_http(stream).await;
+        }
+    }
+
+    /// Answers the request/response JSON-RPC calls `watch` makes.
+    async fn serve_http(mut stream: tokio::net::TcpStream) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut buf = [0_u8; 8192];
+        let mut request = String::new();
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    request.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if request.contains("\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let body = if request.contains("getHealth") {
+            r#"{"jsonrpc":"2.0","id":1,"result":{"status":"healthy","latestLedger":42}}"#
+                .to_string()
+        } else if request.contains("getLedgerEntries") {
+            r#"{"jsonrpc":"2.0","id":1,"result":{"latestLedger":42,"entries":[]}}"#.to_string()
+        } else {
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#
+                .to_string()
+        };
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.flush().await;
+    }
+
+    /// Acknowledges the `subscribe` request, then streams ledger closes.
+    async fn serve_ws(stream: tokio::net::TcpStream, ledgers: &[u32]) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+            return;
+        };
+        while let Some(Ok(message)) = ws.next().await {
+            let Message::Text(text) = message else {
+                continue;
+            };
+            let Ok(request) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            if request.get("method").and_then(|m| m.as_str()) != Some("subscribe") {
+                continue;
+            }
+            let id = request
+                .get("id")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let ack = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "latestLedger": 42 },
+            });
+            let _ = ws.send(Message::text(ack.to_string())).await;
+            for ledger in ledgers {
+                let notification = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "ledgerClose",
+                    "params": { "ledger": ledger },
+                });
+                let _ = ws.send(Message::text(notification.to_string())).await;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    std::thread::spawn(move || {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        runtime.block_on(async move {
+            let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else {
+                return;
+            };
+            let Ok(addr) = listener.local_addr() else {
+                return;
+            };
+            if tx_addr
+                .send(format!("ws://127.0.0.1:{}/ws", addr.port()))
+                .is_err()
+            {
+                return;
+            }
+
+            loop {
+                if rx_stop.try_recv().is_ok() {
+                    break;
+                }
+                let accepted =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                        .await;
+                if let Ok(Ok((stream, _))) = accepted {
+                    let ledgers = ledgers.clone();
+                    tokio::spawn(serve_connection(stream, ledgers));
+                }
+            }
+        });
+    });
+
+    (
+        rx_addr
+            .recv()
+            .expect("mock server should report its address"),
+        tx_stop,
+    )
+}
+
+/// Spawns a long-running command and streams its stdout lines over a channel,
+/// so a test can assert on output that arrives while the process is alive.
+/// Returns the child, the line receiver, and the reader thread.
+fn spawn_streaming(
+    args: &[&str],
+    home: &Path,
+) -> (
+    std::process::Child,
+    std::sync::mpsc::Receiver<String>,
+    std::thread::JoinHandle<()>,
+) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(args)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("RUST_LOG", "error")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn CLI");
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (tx_line, rx_line) = std::sync::mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if tx_line.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    (child, rx_line, reader)
+}
+
+/// Collects streamed lines until one contains `needle` or `timeout` elapses.
+/// Returns every line seen so far and whether the needle was found.
+fn wait_for_line(
+    rx: &std::sync::mpsc::Receiver<String>,
+    needle: &str,
+    timeout: std::time::Duration,
+) -> (String, bool) {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut seen = String::new();
+    while std::time::Instant::now() < deadline {
+        if let Ok(line) = rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            let found = line.contains(needle);
+            seen.push_str(&line);
+            seen.push('\n');
+            if found {
+                return (seen, true);
+            }
+        }
+    }
+    (seen, false)
+}
+
+#[test]
+fn test_watch_rechecks_config_on_websocket_ledger_close() {
+    // The poll interval is an hour, so any re-check must have been driven by the
+    // WebSocket ledger-close notification rather than by interval polling.
+    let (ws_url, _stop) = start_mock_ws_rpc_server(&[4_242]);
+    let home = temp_home("watch-websocket");
+    let (mut child, rx, reader) = spawn_streaming(
+        &[
+            "watch",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            &ws_url,
+            "--interval",
+            "1h",
+        ],
+        &home,
+    );
+
+    let (seen, saw_ledger_close) = wait_for_line(
+        &rx,
+        "Ledger 4242 closed",
+        std::time::Duration::from_secs(20),
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader.join();
+
+    assert!(
+        seen.contains("Subscribed to ledger-close notifications"),
+        "watch should subscribe over WebSocket; saw:\n{seen}"
+    );
+    assert!(
+        saw_ledger_close,
+        "watch should re-check the config when a ledger closes; saw:\n{seen}"
+    );
+    assert!(
+        !seen.contains("polling every"),
+        "watch should not fall back to polling when the WebSocket works; saw:\n{seen}"
+    );
+}
+
+#[test]
+fn test_watch_falls_back_to_polling_when_websocket_is_unreachable() {
+    // A URL that speaks no WebSocket: `watch` must degrade to interval polling
+    // instead of exiting. The connect budget is 5 attempts with 1s, 2s, 4s, 8s
+    // backoff, so the fallback banner arrives well inside this deadline.
+    let home = temp_home("watch-websocket-fallback");
+    let (mut child, rx, reader) = spawn_streaming(
+        &[
+            "watch",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "ws://127.0.0.1:1/ws",
+            "--interval",
+            "30m",
+        ],
+        &home,
+    );
+
+    let (seen, fell_back) = wait_for_line(
+        &rx,
+        "polling every 1800s",
+        std::time::Duration::from_secs(60),
+    );
+
+    let status = child.try_wait().expect("failed to poll watch process");
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader.join();
+
+    assert!(
+        status.is_none(),
+        "watch should keep running after the WebSocket failure; saw:\n{seen}"
+    );
+    assert!(
+        fell_back,
+        "watch should announce the HTTP polling fallback; saw:\n{seen}"
+    );
+}
+
 // ── cache query tests ────────────────────────────────────────────────
 
 #[test]
