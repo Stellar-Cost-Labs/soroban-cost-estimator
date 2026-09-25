@@ -56,3 +56,21 @@ jobs:
 
       - name: cargo deny
         uses: EmbarkStudios/cargo-deny-action@v2
+
+  integration-tests:
+    name: Integration Tests
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Generate test WASM fixture
+        run: cargo run --bin gen_test_wasm
+
+      - name: Run Integration Tests
+        run: cargo test --test mock_rpc_tests --test cli_tests
