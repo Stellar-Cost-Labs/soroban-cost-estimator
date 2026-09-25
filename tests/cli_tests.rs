@@ -1277,8 +1277,50 @@ fn test_watch_rpc_url_used_for_polls() {
         .spawn()
         .expect("failed to spawn watch");
 
-    // Give the first poll time to fail against the dead endpoint.
-    std::thread::sleep(std::time::Duration::from_millis(750));
+    // Stream both pipes on helper threads so the first poll's failure message
+    // is observed as soon as it is written, rather than after a fixed sleep
+    // that can be too short on slower runners.
+    use std::io::Read as _;
+
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let pipes: [Box<dyn std::io::Read + Send>; 2] = [
+        Box::new(child.stdout.take().expect("stdout is piped")),
+        Box::new(child.stderr.take().expect("stderr is piped")),
+    ];
+    for stream in pipes {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut reader = stream;
+            let mut buffer = [0_u8; 1024];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => {
+                        if tx
+                            .send(String::from_utf8_lossy(&buffer[..read]).into_owned())
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+    drop(tx);
+
+    let mut combined = String::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::time::Instant::now() < deadline && !combined.contains("failed to send HTTP request")
+    {
+        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(chunk) => combined.push_str(&chunk),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    // Watch keeps running (and retrying) after a failed poll.
     let status = child.try_wait().expect("failed to poll watch process");
     assert!(
         status.is_none(),
@@ -1286,10 +1328,7 @@ fn test_watch_rpc_url_used_for_polls() {
     );
 
     let _ = child.kill();
-    let output = child.wait_with_output().expect("failed to reap watch");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}{stderr}");
+    let _ = child.wait();
     assert!(
         !combined.contains("not configured for network"),
         "--rpc-url should override network resolution; got: {combined}"
