@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 /// Build version string with metadata from build.rs
@@ -139,6 +141,12 @@ pub enum Command {
         precision: u32,
     },
 
+    /// Inspect WASM binaries: subcommands for local, offline contract info.
+    Wasm {
+        #[command(subcommand)]
+        action: WasmAction,
+    },
+
     /// Print WASM metadata (functions, contract spec, size, hash) without any RPC calls.
     WasmInfo {
         /// Path to the compiled Soroban contract `.wasm` file.
@@ -174,7 +182,24 @@ pub enum Command {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum WasmAction {
+    /// Print size, SHA-256, exported signatures, embedded metadata, and the
+    /// section size summary for a WASM file. Fully offline: no RPC calls.
+    Info {
+        /// Path to the compiled Soroban contract `.wasm` file.
+        wasm: PathBuf,
+
+        /// Output the full parsed spec/metadata as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum CacheAction {
+    /// Show cache health: total entries, disk usage, age, per-network breakdown.
+    Stats,
+
     /// Export every cached estimate as a JSON array.
     Export {
         /// Write the JSON array to a file instead of standard output.

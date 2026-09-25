@@ -202,7 +202,10 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             )
             .await
         }
-        cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(&wasm, json),
+        cli::Command::Wasm { action } => match action {
+            cli::WasmAction::Info { wasm, json } => cmd_wasm_info(&wasm, json),
+        },
+        cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(std::path::Path::new(&wasm), json),
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot { network, out, json } => {
                 cmd_config_snapshot(
@@ -264,6 +267,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 )
                 .await
             }
+            cli::CacheAction::Stats => cmd_cache_stats(),
             cli::CacheAction::Verify => cmd_cache_verify(),
             cli::CacheAction::Clear { network } => cmd_cache_clear(&network),
             cli::CacheAction::Query {
@@ -1013,28 +1017,30 @@ async fn estimate_all_function(
     .await
 }
 
-/// `wasm-info` command: print WASM metadata without making any RPC calls.
+/// `wasm info` command: print WASM metadata without making any RPC calls.
 ///
-/// Shows the exported functions, contract-spec presence, binary size, and
-/// SHA-256 hash — everything "cheap" to derive from the file itself.
+/// Shows the file size, SHA-256 hash, per-section size summary, exported
+/// functions with their spec-derived argument and return types, the embedded
+/// contract/SDK metadata, and — with `--json` — the full parsed spec AST.
 ///
 /// # Network calls
 /// None — pure file I/O + parsing.
-fn cmd_wasm_info(wasm_path: &str, json_flag: bool) -> error::AppResult<()> {
+fn cmd_wasm_info(wasm_path: &std::path::Path, json_flag: bool) -> error::AppResult<()> {
     use sha2::Digest;
 
-    let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
+    let wasm_info = wasm::parser::load_wasm(wasm_path)?;
     let hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
+    let path = wasm_path.display().to_string();
 
     if json_flag {
         println!(
             "{}",
-            serde_json::to_string_pretty(&wasm_info_json(wasm_path, &wasm_info, &hash))?
+            serde_json::to_string_pretty(&wasm_info_json(&path, &wasm_info, &hash))?
         );
         return Ok(());
     }
 
-    println!("WASM info: {wasm_path}");
+    println!("WASM info: {path}");
     println!("  Size:      {} bytes", wasm_info.bytes.len());
     println!("  SHA-256:   {hash}");
     println!("  Functions: {}", wasm_info.functions.len());
@@ -1044,11 +1050,24 @@ fn cmd_wasm_info(wasm_path: &str, json_flag: bool) -> error::AppResult<()> {
     println!(
         "  Contract spec: {}",
         if wasm_info.has_spec {
-            "present (typed params decoded from contractspecv0)"
+            format!(
+                "present ({} entries, typed params/returns decoded from contractspecv0)",
+                wasm_info.spec_entries.len()
+            )
         } else {
-            "absent (bare WASM exports only)"
+            "absent (bare WASM exports only)".to_string()
         }
     );
+    match (
+        wasm_info.contract_meta.name.as_deref(),
+        wasm_info.contract_meta.sdk_version.as_deref(),
+    ) {
+        (Some(name), Some(sdk)) => println!("  Contract name: {name} (soroban-sdk {sdk})"),
+        (Some(name), None) => println!("  Contract name: {name}"),
+        (None, Some(sdk)) => println!("  SDK version:   {sdk}"),
+        (None, None) => println!("  Contract name: absent"),
+    }
+    println!("{}", wasm::parser::format_sections(&wasm_info));
     println!(
         "{}",
         wasm::parser::format_contract_meta(&wasm_info.contract_meta)
@@ -1056,7 +1075,7 @@ fn cmd_wasm_info(wasm_path: &str, json_flag: bool) -> error::AppResult<()> {
     Ok(())
 }
 
-/// Builds the JSON representation of WASM metadata for `wasm-info --json`.
+/// Builds the JSON representation of WASM metadata for `wasm info --json`.
 fn wasm_info_json(
     wasm_path: &str,
     wasm_info: &wasm::parser::WasmInfo,
@@ -1067,10 +1086,22 @@ fn wasm_info_json(
         "size": wasm_info.bytes.len(),
         "sha256": hash,
         "has_spec": wasm_info.has_spec,
+        "sdk_version": wasm_info.contract_meta.sdk_version,
+        "sections": wasm_info.sections.iter().map(|s| {
+            serde_json::json!({
+                "id": s.id,
+                "name": s.name,
+                "custom": s.custom,
+                "offset": s.offset,
+                "end": s.end,
+                "size": s.size,
+            })
+        }).collect::<Vec<_>>(),
         "contract_meta": {
             "name": wasm_info.contract_meta.name,
             "version": wasm_info.contract_meta.version,
             "description": wasm_info.contract_meta.description,
+            "sdk_version": wasm_info.contract_meta.sdk_version,
             "entries": wasm_info.contract_meta.entries.iter().map(|(key, value)| {
                 serde_json::json!({ "key": key, "value": value })
             }).collect::<Vec<_>>(),
@@ -1080,11 +1111,49 @@ fn wasm_info_json(
                 "name": f.name,
                 "param_count": f.param_count,
                 "result_count": f.result_count,
+                "signature": wasm::parser::format_function(f),
                 "params": f.params.iter().map(|p| {
-                    serde_json::json!({ "name": p.name, "type": p.type_name })
+                    serde_json::json!({
+                        "name": p.name,
+                        "type": p.type_name,
+                        "type_def": wasm::parser::spec_type_json(&p.type_def),
+                    })
+                }).collect::<Vec<_>>(),
+                "returns": f.returns.iter().map(|r| {
+                    serde_json::json!({
+                        "type": r.type_name,
+                        "type_def": wasm::parser::spec_type_json(&r.type_def),
+                    })
                 }).collect::<Vec<_>>(),
             })
         }).collect::<Vec<_>>(),
+        "spec_entries": wasm_info.spec_entries.iter()
+            .map(wasm::parser::spec_entry_json)
+            .collect::<Vec<_>>(),
+        "module": {
+            "start_function": wasm_info.start_function,
+            "memories": wasm_info.memories.iter().map(|m| {
+                serde_json::json!({
+                    "initial_pages": m.initial_pages,
+                    "maximum_pages": m.maximum_pages,
+                    "memory64": m.memory64,
+                })
+            }).collect::<Vec<_>>(),
+            "imports": wasm_info.imports.iter().map(|i| {
+                serde_json::json!({
+                    "module": i.module,
+                    "name": i.name,
+                    "kind": i.kind,
+                })
+            }).collect::<Vec<_>>(),
+            "exports": wasm_info.exports.iter().map(|e| {
+                serde_json::json!({
+                    "name": e.name,
+                    "kind": e.kind,
+                    "index": e.index,
+                })
+            }).collect::<Vec<_>>(),
+        },
     })
 }
 
@@ -1949,6 +2018,7 @@ mod tests {
         let info = WasmInfo {
             bytes: vec![0u8; 44],
             has_spec: true,
+            spec_entries: Vec::new(),
             contract_meta: ContractMeta::default(),
             functions: vec![FunctionInfo {
                 name: "increment".to_string(),
@@ -1959,11 +2029,16 @@ mod tests {
                     type_name: "I64".to_string(),
                     type_def: stellar_xdr::ScSpecTypeDef::I64,
                 }],
+                returns: vec![soroban_cost_estimator::wasm::parser::TypeInfo {
+                    type_name: "i64".to_string(),
+                    type_def: stellar_xdr::ScSpecTypeDef::I64,
+                }],
             }],
             start_function: None,
             memories: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
+            sections: Vec::new(),
         };
         let value = wasm_info_json("/tmp/contract.wasm", &info, "deadbeef");
 
@@ -1976,6 +2051,14 @@ mod tests {
         assert_eq!(value["functions"][0]["name"], "increment");
         assert_eq!(value["functions"][0]["params"][0]["name"], "step");
         assert_eq!(value["functions"][0]["params"][0]["type"], "I64");
+        assert_eq!(value["functions"][0]["returns"][0]["type"], "i64");
+        assert_eq!(
+            value["functions"][0]["signature"],
+            "increment(step: I64) -> i64"
+        );
+        assert_eq!(value["sections"], serde_json::json!([]));
+        assert_eq!(value["spec_entries"], serde_json::json!([]));
+        assert_eq!(value["module"]["imports"], serde_json::json!([]));
     }
 
     #[test]
