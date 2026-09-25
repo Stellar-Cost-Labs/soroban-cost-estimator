@@ -20,6 +20,9 @@ pub enum AppError {
     #[error("failed to send HTTP request: {0}")]
     Http(#[from] reqwest::Error),
 
+    #[error("RPC request timed out after {0} seconds")]
+    RpcTimeout(u64),
+
     // ── WebSocket ────────────────────────────────────────────────
     #[error("WebSocket connection failed: {0}")]
     WsConnect(String),
