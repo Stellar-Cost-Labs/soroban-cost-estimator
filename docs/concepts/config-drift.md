@@ -49,8 +49,12 @@ and prints:
 3. A cross-reference of the estimate cache, naming past estimates that were
    recorded at an earlier ledger and may now be stale.
 
-The exit code is meaningful for scripts: **0** when nothing changed, **1**
-when a pricing change was detected.
+The exit code is meaningful for scripts: **0** when no pricing changes,
+**1** when a pricing change was detected (default). For CI drift detection,
+`--ignore-pricing-exit` forces exit 0 even when pricing changed (informative
+reports that must not fail the build), while `--fail-on-any-change` exits 1
+when *any* setting changed, even non-pricing caps or limits.
+`--ignore-pricing-exit` takes precedence when both flags are passed.
 
 ```
 $ soroban-cost-estimator config diff --network testnet

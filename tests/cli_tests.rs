@@ -126,6 +126,7 @@ fn test_estimate_help() {
         "--fn",
         "--id",
         "--arg",
+        "--interactive",
         "--cache-ttl",
         "--clear-cache",
         "--json",
@@ -185,7 +186,13 @@ fn test_config_diff_help() {
         code, 0,
         "config diff --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--network", "--against", "--summary"] {
+    for flag in [
+        "--network",
+        "--against",
+        "--summary",
+        "--ignore-pricing-exit",
+        "--fail-on-any-change",
+    ] {
         assert!(
             stdout.contains(flag),
             "diff help should mention {flag}; got: {stdout}"
@@ -259,6 +266,102 @@ fn test_cache_verify_empty_cache_succeeds() {
     assert!(
         stdout.contains("empty") || stdout.contains("nothing to verify"),
         "should report an empty cache: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_export_help() {
+    let (stdout, stderr, code) = run_cli(&["cache", "export", "--help"]);
+    assert_eq!(code, 0, "cache export --help should exit 0; stderr: {stderr}");
+    for flag in ["--out", "--network"] {
+        assert!(
+            stdout.contains(flag),
+            "export help should mention {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_cache_export_to_file_with_network_filter() {
+    let home = temp_home("cache-export-file");
+    // Distinct functions: the cache key is (wasm_hash, function, args_hash),
+    // so identical keys would upsert instead of producing two rows.
+    seed_cache_entry_for(&home, "testnet", "f_testnet", 42, "2026-01-01T00:00:00Z");
+    seed_cache_entry_for(&home, "mainnet", "f_mainnet", 43, "2026-01-02T00:00:00Z");
+    let out = home.join("backup.json");
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "cache",
+            "export",
+            "--network",
+            "testnet",
+            "--out",
+            out.to_str().unwrap(),
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "export should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("Exported 1 cache entry to"),
+        "confirmation should name the count and path; got: {stdout}"
+    );
+    assert!(
+        stdout.contains(out.to_str().unwrap()),
+        "confirmation should name the output file; got: {stdout}"
+    );
+
+    let raw = std::fs::read_to_string(&out).expect("read export file");
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON export");
+    assert_eq!(parsed["schema_version"], 1, "envelope should stamp the schema version");
+    assert!(
+        parsed["exported_at"].is_string(),
+        "envelope should carry an export timestamp; got: {parsed}"
+    );
+    assert_eq!(parsed["network"], "testnet");
+    let estimates = parsed["estimates"].as_array().expect("estimates array");
+    assert_eq!(estimates.len(), 1, "only the testnet entry should export");
+    assert_eq!(estimates[0]["network"], "testnet");
+}
+
+#[test]
+fn test_cache_export_all_networks_to_stdout() {
+    let home = temp_home("cache-export-stdout");
+    // Distinct functions: the cache key is (wasm_hash, function, args_hash),
+    // so identical keys would upsert instead of producing two rows.
+    seed_cache_entry_for(&home, "testnet", "f_testnet", 42, "2026-01-01T00:00:00Z");
+    seed_cache_entry_for(&home, "mainnet", "f_mainnet", 43, "2026-01-02T00:00:00Z");
+
+    let (stdout, stderr, code) =
+        run_cli_in_home(&["cache", "export"], Some(&home));
+    assert_eq!(code, 0, "export should exit 0; stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout should be the JSON envelope");
+    assert_eq!(parsed["schema_version"], 1);
+    assert!(parsed.get("network").is_none() || parsed["network"].is_null());
+    assert_eq!(
+        parsed["estimates"].as_array().expect("estimates array").len(),
+        2,
+        "unfiltered export should carry both networks"
+    );
+}
+
+#[test]
+fn test_cache_export_unwritable_destination_errors() {
+    let home = temp_home("cache-export-unwritable");
+    seed_cache_entry_for(&home, "testnet", "(wasm upload)", 42, "2026-01-01T00:00:00Z");
+    // A directory is never a writable file destination.
+    let dir = home.join("a-directory");
+    std::fs::create_dir_all(&dir).expect("create dir");
+
+    let (_, stderr, code) = run_cli_in_home(
+        &["cache", "export", "--out", dir.to_str().unwrap()],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "an unwritable destination should exit 1");
+    assert!(
+        stderr.contains(dir.to_str().unwrap()),
+        "the error should name the destination; got: {stderr}"
     );
 }
 
@@ -559,6 +662,57 @@ fn test_estimate_fn_without_id_errors() {
     assert!(
         stderr.contains("contract id required"),
         "the error should tell the user to pass --id; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_interactive_eof_cancels_cleanly() {
+    // `run_cli` leaves stdin closed, so the first prompt reads EOF. The
+    // command must abort with a clear error — no hang, no panic.
+    let (stdout, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--interactive",
+    ]);
+    assert_eq!(code, 1, "EOF on stdin should exit 1");
+    assert!(
+        stdout.contains("Available functions:"),
+        "the function list should print before the read; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("increment"),
+        "the fixture's increment function should be listed; got: {stdout}"
+    );
+    assert!(
+        stderr.contains("cancelled"),
+        "the error should say the input was cancelled; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "cancelling the prompt must not panic; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_interactive_short_flag_accepted() {
+    // `-i` is the short form of `--interactive`; like above, stdin is
+    // closed, so it must reach the prompt (then cancel) rather than fail
+    // on argument parsing.
+    let (stdout, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "-i",
+    ]);
+    assert_eq!(code, 1, "EOF on stdin should exit 1");
+    assert!(
+        stdout.contains("Available functions:"),
+        "the -i flag should enable the prompt; got: {stdout}; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("cancelled"),
+        "the error should say the input was cancelled; got: {stderr}"
     );
 }
 
@@ -997,6 +1151,45 @@ fn test_config_diff_summary_flag_accepted() {
         ),
         "the failure should come from the network, not the flag; got: {stderr}"
     );
+}
+
+#[test]
+fn test_config_diff_exit_code_flags_accepted() {
+    // `--ignore-pricing-exit` and `--fail-on-any-change` must be recognized
+    // flags (the run still fails, but on the unknown network, not on the
+    // arguments themselves).
+    for (label, flag) in [
+        ("ignore", "--ignore-pricing-exit"),
+        ("fail", "--fail-on-any-change"),
+    ] {
+        let home = temp_home(&format!("diff-exit-flag-{label}"));
+        let path = home.join("snapshot.json");
+        std::fs::write(&path, snapshot_json("not-a-network", 1000)).expect("write fixture");
+
+        let (_, stderr, code) = run_cli_in_home(
+            &[
+                "config",
+                "diff",
+                "--network",
+                "not-a-network",
+                "--against",
+                path.to_str().unwrap(),
+                flag,
+            ],
+            Some(&home),
+        );
+        assert_eq!(code, 1, "the unknown network should exit 1");
+        assert!(
+            !stderr.contains("unexpected argument"),
+            "{flag} should be a recognized argument; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains(
+                "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+            ),
+            "the failure should come from the network, not the flag; got: {stderr}"
+        );
+    }
 }
 
 #[test]

@@ -14,6 +14,7 @@ Options:
       --fn <FN>            Contract function name to invoke
       --id <ID>            Deployed contract ID (64 hex chars) to invoke. Required when --fn is used
       --arg <KEY=VAL>      Function arguments as key=value pairs (value is type-inferred)
+  -i, --interactive        Prompt for the function and its arguments using the contract spec
       --json               Output as JSON instead of a human-readable table
   -h, --help               Print help
 ```
@@ -30,6 +31,13 @@ Options:
   cannot simulate against a zeroed ID.
 - **`--arg` values are type-inferred**: `true`/`false` → bool, integers →
   i64/u64, everything else → string. Enough for cost estimation.
+- **`--interactive` / `-i`** prompts for the function and its arguments
+  instead of requiring `--fn`/`--arg` up front. The contract spec provides
+  names and types (`Enter step (i64): `); each answer is validated against
+  its declared type before proceeding, with re-prompts on mismatch.
+  Explicit `--fn`/`--arg`/`--id` values take precedence — the prompt only
+  fills in the gaps, so a fully-specified invocation never blocks on stdin.
+  EOF (Ctrl-D) aborts with a clear error; Ctrl-C aborts without panicking.
 - The read/write entry counts and byte sizes are decoded from the simulation
   response's resource **footprint** — real values from the ledger footprint,
   not zero-filled placeholders.
@@ -54,6 +62,25 @@ soroban-cost-estimator estimate \
   --id CC4WIEYYSCFGDJXMLZ73FKUUJNDEOJRNOOBZHI55QR27NW4RCNTHAQ5T \
   --network testnet --fn increment --arg step=5
 ```
+
+## Example — interactive argument entry
+
+```bash
+soroban-cost-estimator estimate \
+  --wasm tests/fixtures/contract.wasm \
+  --id CC4WIEYYSCFGDJXMLZ73FKUUJNDEOJRNOOBZHI55QR27NW4RCNTHAQ5T \
+  --network testnet --interactive
+```
+
+```text
+Available functions:
+  1. increment(step: i64)
+Select a function [1-1 or name]: 1
+Enter step (i64): 5
+```
+
+Omit `--id` and it is prompted for too (validated as 64-hex or `C…`
+strkey). Pass `--fn` and/or `--arg` alongside `-i` to skip those prompts.
 
 This is the exact invocation cross-checked against the native Stellar CLI
 (see [Verification](../verification.md)). Actual output from a live testnet run:

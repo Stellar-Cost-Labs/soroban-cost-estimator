@@ -118,6 +118,11 @@ soroban-cost-estimator estimate \
 
 Use `--json` for machine-readable output (e.g., for CI pipelines).
 
+Pass `--interactive` (short `-i`) to be prompted for the function and its
+arguments instead of typing `--fn`/`--arg` — the contract spec supplies names
+and types (`Enter step (i64): `), each answer is validated before proceeding,
+and explicit flags take precedence so the prompt only fills in the gaps.
+
 Pass `--clear-cache` to wipe every cached estimate for `--network` before the
 simulation runs — handy after upgrading the tool, after a major network
 upgrade, or after debugging a bad estimate. It prints
@@ -177,8 +182,12 @@ instead of the full diff, handy for CI status lines:
 soroban-cost-estimator config diff --network testnet --summary
 ```
 
-- Exits **0** if no changes detected
-- Exits **1** with a detailed field-by-field diff if pricing changed
+- Exits **0** if no pricing changes, **1** with a detailed field-by-field
+  diff if pricing changed (default behavior)
+- `--ignore-pricing-exit` forces exit **0** even if pricing changed
+  (informative CI reports that must not fail the build)
+- `--fail-on-any-change` exits **1** if *any* config setting changed, even
+  non-pricing settings
 - **Auto-saves a snapshot of the new config** when a protocol upgrade is
   detected (pricing changed), so it becomes the baseline for future diffs —
   no separate `config snapshot` run needed
@@ -228,6 +237,23 @@ soroban-cost-estimator cache clear --network mainnet
   untouched
 - The same clearing logic backs the `estimate --clear-cache` flag, so both
   paths behave identically
+
+### `cache export`
+
+Dump cached estimates to a single versioned JSON document (schema version,
+export timestamp, and estimate records) for backup or sharing across
+workstations.
+
+```bash
+soroban-cost-estimator cache export --out backup.json
+# → Exported 12 cache entries to backup.json.
+
+soroban-cost-estimator cache export --network testnet --out testnet-backup.json
+```
+
+- Without `--out`, the export is printed to standard output
+- `--network` restricts the export to one network (default: all networks)
+- An unwritable destination fails with an error naming the path
 
 ## Installation
 
