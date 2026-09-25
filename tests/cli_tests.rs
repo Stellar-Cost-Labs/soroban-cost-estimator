@@ -185,7 +185,7 @@ fn test_config_diff_help() {
         code, 0,
         "config diff --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--network", "--against", "--summary"] {
+    for flag in ["--network", "--against", "--summary", "--format", "--json"] {
         assert!(
             stdout.contains(flag),
             "diff help should mention {flag}; got: {stdout}"
@@ -1653,4 +1653,124 @@ fn test_estimate_minimal_wasm_upload_zero_footprint() {
     assert_eq!(parsed["write_entries"], 0);
     assert_eq!(parsed["read_bytes"], 0);
     assert_eq!(parsed["write_bytes"], 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Unified `--format` flag tests (Issue #279)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Runs the CLI with logging quieted (so stdout carries only the command's
+/// own output) and `HOME` redirected into `home`.
+fn run_cli_quiet(args: &[&str], home: &Path) -> (String, String, i32) {
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(args)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run CLI");
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.code().unwrap_or(-1),
+    )
+}
+
+#[test]
+fn test_global_format_flag_accepted_before_subcommand() {
+    // `--format` is a global flag, so it must be accepted in front of the
+    // subcommand as well as after it.
+    let (_, stderr, code) = run_cli(&["--format", "json", "estimate", "--wasm", "test.wasm"]);
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "global --format should be recognized before the subcommand; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_diff_format_flag_accepted() {
+    // A pristine home has no snapshots, so the command fails for that reason —
+    // proving clap accepted `--format` rather than rejecting it.
+    let home = temp_home("diff-format-flag");
+    let (_, stderr, code) = run_cli_in_home(
+        &["config", "diff", "--format", "csv", "--network", "testnet"],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "diff without snapshots should exit 1");
+    assert!(
+        !stderr.contains("unexpected argument") && !stderr.contains("invalid value"),
+        "--format should be a recognized argument for config diff; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("none available for network testnet"),
+        "the failure should be the missing snapshot, not argument parsing; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_diff_format_invalid_value_rejected() {
+    let (_, stderr, code) = run_cli(&["config", "diff", "--format", "xml"]);
+    assert_ne!(code, 0, "invalid --format value should error");
+    assert!(
+        stderr.contains("invalid value") || stderr.contains("possible values"),
+        "clap should reject unknown format; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_unsupported_format_is_rejected_not_ignored() {
+    // `--format` is global; commands that cannot render CSV must say so
+    // instead of silently printing a table.
+    let (_, stderr, code) = run_cli(&[
+        "wasm-info",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--format",
+        "csv",
+    ]);
+    assert_eq!(
+        code, 1,
+        "unsupported format should exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("not supported by `wasm-info`"),
+        "the error should name the command; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("supported: table, json"),
+        "the error should list the supported formats; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_format_json_matches_legacy_json_flag() {
+    // `--format json` and `--json` must produce the same payload.
+    let home = temp_home("format-json-alias");
+    let (with_flag, err_a, code_a) = run_cli_quiet(
+        &[
+            "wasm-info",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--json",
+        ],
+        &home,
+    );
+    let (with_format, err_b, code_b) = run_cli_quiet(
+        &[
+            "wasm-info",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--format",
+            "json",
+        ],
+        &home,
+    );
+    assert_eq!(code_a, 0, "--json should succeed; stderr: {err_a}");
+    assert_eq!(code_b, 0, "--format json should succeed; stderr: {err_b}");
+    assert_eq!(with_flag, with_format, "both spellings must agree");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(with_format.trim()).expect("valid JSON output");
+    assert!(parsed["sha256"].is_string());
 }

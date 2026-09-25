@@ -48,7 +48,8 @@ soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
 | `--arg <KEY=VAL>` | | | — | Function arguments as `key=value` pairs (value is type-inferred; repeatable) |
 | `--cache-ttl <DURATION>` | | | — | Skip re-simulation when a cached estimate is still fresh (e.g. `30m`, `1h`, `7d`) |
 | `--clear-cache` | | | `false` | Wipe every cached estimate for `--network` before running the simulation |
-| `--json` | | | `false` | Output as JSON instead of a human-readable table |
+| `--format <FORMAT>` | | | `table` | Output format: `table`, `json`, `csv`, or `markdown`. Overrides `--json` |
+| `--json` | | | `false` | Legacy alias for `--format json` |
 | `--help` | `-h` | | | Print help |
 
 **Behavior**
@@ -202,7 +203,8 @@ soroban-cost-estimator estimate-all [OPTIONS] --wasm <WASM>
 | `--wasm <WASM>` | `-w` | ✅ | — | Path to the compiled Soroban contract `.wasm` file |
 | `--network <NETWORK>` | | | `testnet` | Network to simulate against |
 | `--id <ID>` | | | — | Deployed contract ID (64 hex chars) to invoke each function against |
-| `--json` | | | `false` | Output as JSON instead of a human-readable list |
+| `--format <FORMAT>` | | | `table` | Output format: `table`, `json`, `csv`, or `markdown`. Overrides `--json` |
+| `--json` | | | `false` | Legacy alias for `--format json` |
 | `--help` | `-h` | | | Print help |
 
 **Behavior**
@@ -353,6 +355,8 @@ soroban-cost-estimator config diff [OPTIONS]
 | `--network <NETWORK>` | | `testnet` | Network to compare against |
 | `--against <AGAINST>` | | latest snapshot | Explicit snapshot path to compare against |
 | `--summary` | | `false` | Print a single-line count summary instead of the full diff (for CI status lines) |
+| `--format <FORMAT>` | | `table` | Output format: `table`, `json`, `csv`, or `markdown` |
+| `--json` | | `false` | Legacy alias for `--format json` |
 | `--help` `-h` | | | Print help |
 
 **Behavior**
@@ -710,6 +714,7 @@ All commands accept:
 |------|-------------|
 | `--rps <N>` | Cap RPC requests at N per second (0 disables) |
 | `--timeout <SECS>` | HTTP request timeout for RPC calls in seconds (default `30`) |
+| `--format <FORMAT>` | Report format for commands that support it: `table`, `json`, `csv`, or `markdown` |
 | `--help` / `-h` | Print command-specific help |
 
 ## Network Resolution

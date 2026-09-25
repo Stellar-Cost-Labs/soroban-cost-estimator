@@ -729,6 +729,84 @@ pub fn format_diff(diff: &ConfigDiff) -> String {
     output
 }
 
+/// Escapes a value for CSV output per RFC 4180.
+///
+/// Values containing a comma, double-quote, or newline are wrapped in
+/// double-quotes with internal quotes doubled.
+fn csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+/// Formats a `ConfigDiff` as RFC 4180 CSV records.
+///
+/// Emits a header row followed by one row per changed field, so the diff can
+/// be piped into a spreadsheet or `mlr`. The trade-off is deliberately
+/// machine-first: ANSI colors, icons, and explanations are omitted.
+pub fn format_diff_csv(diff: &ConfigDiff) -> String {
+    let mut output = String::from("field,old_value,new_value,is_pricing_change\n");
+    for change in &diff.changes {
+        output.push_str(&format!(
+            "{},{},{},{}\n",
+            csv_escape(&change.field_path),
+            csv_escape(&change.old_value),
+            csv_escape(&change.new_value),
+            change.is_pricing_change,
+        ));
+    }
+    output
+}
+
+/// Formats a `ConfigDiff` as a GitHub-flavored Markdown table.
+///
+/// Suitable for pasting straight into a pull request or issue comment.
+pub fn format_diff_markdown(diff: &ConfigDiff) -> String {
+    let mut output = String::new();
+
+    output.push_str(&format!(
+        "## Config diff: {} (ledger {}) → {} (ledger {})\n\n",
+        diff.old_snapshot.timestamp,
+        diff.old_snapshot.ledger,
+        diff.new_snapshot.timestamp,
+        diff.new_snapshot.ledger,
+    ));
+    output.push_str(&format!("- **Network:** {}\n", diff.new_snapshot.network));
+    output.push_str(&format!(
+        "- **Pricing changes:** {}\n\n",
+        if diff.has_pricing_changes {
+            "yes"
+        } else {
+            "no"
+        }
+    ));
+
+    if diff.changes.is_empty() {
+        output.push_str("✅ No changes detected.\n");
+        return output;
+    }
+
+    output.push_str("| Setting | Old | New | Pricing |\n");
+    output.push_str("| --- | --- | --- | --- |\n");
+    for change in &diff.changes {
+        output.push_str(&format!(
+            "| {} | `{}` | `{}` | {} |\n",
+            field_display_name(&change.field_path),
+            change.old_value,
+            change.new_value,
+            if change.is_pricing_change {
+                "💰 yes"
+            } else {
+                "no"
+            },
+        ));
+    }
+
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

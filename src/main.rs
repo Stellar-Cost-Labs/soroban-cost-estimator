@@ -141,6 +141,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
     let max_retries = args.max_retries;
     let fallback = args.rpc_fallback_url.as_deref();
     let headers = args.headers;
+    let format = args.format;
     match args.command {
         cli::Command::Estimate {
             wasm,
@@ -152,12 +153,15 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cache_ttl,
             clear_cache,
             json,
-            format,
             precision,
         } => {
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
-            let format = format.unwrap_or_else(|| if json { "json" } else { "table" }.to_string());
+            let format = format.unwrap_or(if json {
+                cli::OutputFormat::Json
+            } else {
+                cli::OutputFormat::Table
+            });
             cmd_estimate(
                 &wasm,
                 &network,
@@ -168,7 +172,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 &args,
                 cache_ttl.as_deref(),
                 clear_cache,
-                &format,
+                format.as_str(),
                 rps,
                 timeout,
                 max_retries,
@@ -183,17 +187,20 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             rpc_url,
             id,
             json,
-            format,
             precision,
         } => {
-            let format = format.unwrap_or_else(|| if json { "json" } else { "table" }.to_string());
+            let format = format.unwrap_or(if json {
+                cli::OutputFormat::Json
+            } else {
+                cli::OutputFormat::Table
+            });
             cmd_estimate_all(
                 &wasm,
                 &network,
                 rpc_url.as_deref(),
                 fallback,
                 id.as_deref(),
-                &format,
+                format.as_str(),
                 rps,
                 timeout,
                 max_retries,
@@ -202,14 +209,26 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             )
             .await
         }
-        cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(&wasm, json),
+        cli::Command::WasmInfo { wasm, json } => {
+            reject_unsupported_format(
+                format,
+                &[cli::OutputFormat::Table, cli::OutputFormat::Json],
+                "wasm-info",
+            )?;
+            cmd_wasm_info(&wasm, wants_json(json, format))
+        }
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot { network, out, json } => {
+                reject_unsupported_format(
+                    format,
+                    &[cli::OutputFormat::Table, cli::OutputFormat::Json],
+                    "config snapshot",
+                )?;
                 cmd_config_snapshot(
                     &network,
                     fallback,
                     out.as_deref(),
-                    json,
+                    wants_json(json, format),
                     rps,
                     timeout,
                     max_retries,
@@ -224,12 +243,17 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 summary,
                 json,
             } => {
+                let format = format.unwrap_or(if json {
+                    cli::OutputFormat::Json
+                } else {
+                    cli::OutputFormat::Table
+                });
                 cmd_config_diff(
                     &network,
                     fallback,
                     against.as_deref(),
                     summary,
-                    json,
+                    format,
                     rps,
                     timeout,
                     max_retries,
@@ -250,13 +274,18 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 id,
                 json,
             } => {
+                reject_unsupported_format(
+                    format,
+                    &[cli::OutputFormat::Table, cli::OutputFormat::Json],
+                    "cache warm",
+                )?;
                 cmd_cache_warm(
                     &wasm,
                     &network,
                     rpc_url.as_deref(),
                     fallback,
                     id.as_deref(),
-                    json,
+                    wants_json(json, format),
                     rps,
                     timeout,
                     max_retries,
@@ -275,18 +304,26 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 from,
                 to,
                 json,
-            } => cmd_cache_query(
-                &network,
-                function.as_deref(),
-                wasm_hash.as_deref(),
-                min_stroops,
-                max_stroops,
-                from.as_deref(),
-                to.as_deref(),
-                json,
-            ),
+            } => {
+                reject_unsupported_format(
+                    format,
+                    &[cli::OutputFormat::Table, cli::OutputFormat::Json],
+                    "cache query",
+                )?;
+                cmd_cache_query(
+                    &network,
+                    function.as_deref(),
+                    wasm_hash.as_deref(),
+                    min_stroops,
+                    max_stroops,
+                    from.as_deref(),
+                    to.as_deref(),
+                    wants_json(json, format),
+                )
+            }
         },
         cli::Command::Watch { network, interval } => {
+            reject_unsupported_format(format, &[cli::OutputFormat::Table], "watch")?;
             cmd_watch(
                 &network,
                 fallback,
@@ -1228,6 +1265,38 @@ fn cmd_config_snapshot_list(network: &str) -> error::AppResult<()> {
     Ok(())
 }
 
+/// True when JSON output was requested, either through the legacy `--json`
+/// flag or the unified `--format json`.
+fn wants_json(json_flag: bool, format: Option<cli::OutputFormat>) -> bool {
+    json_flag || format == Some(cli::OutputFormat::Json)
+}
+
+/// Rejects a `--format` value a command cannot render.
+///
+/// `--format` is a global flag, so without this check a command that only
+/// knows table/JSON output would silently ignore `--format csv` instead of
+/// telling the user their request cannot be honored.
+fn reject_unsupported_format(
+    format: Option<cli::OutputFormat>,
+    supported: &[cli::OutputFormat],
+    command: &str,
+) -> error::AppResult<()> {
+    let Some(requested) = format else {
+        return Ok(());
+    };
+    if supported.contains(&requested) {
+        return Ok(());
+    }
+    let supported = supported
+        .iter()
+        .map(|f| f.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(error::AppError::General(format!(
+        "--format {requested} is not supported by `{command}` (supported: {supported})"
+    )))
+}
+
 /// True when a config diff signals a network protocol/config upgrade.
 ///
 /// Pricing changes are the tool's proxy for "the network changed its
@@ -1243,7 +1312,7 @@ async fn cmd_config_diff(
     rpc_fallback_url: Option<&str>,
     against_path: Option<&str>,
     summary: bool,
-    json_flag: bool,
+    format: cli::OutputFormat,
     rps: Option<u64>,
     timeout: u64,
     max_retries: usize,
@@ -1251,6 +1320,12 @@ async fn cmd_config_diff(
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::{debug, info_span};
+
+    // Machine formats (JSON/CSV/Markdown) keep stdout parseable, so human
+    // extras like the stale-estimate list stay off it.
+    let json_flag = format == cli::OutputFormat::Json;
+    let machine =
+        json_flag || matches!(format, cli::OutputFormat::Csv | cli::OutputFormat::Markdown);
 
     let span = info_span!("cmd_config_diff", network);
     async {
@@ -1282,32 +1357,42 @@ async fn cmd_config_diff(
             "diff computed"
         );
 
-        if json_flag {
-            // Collect stale estimates for inclusion in JSON output.
-            let stale: Vec<cache::CachedEstimate> = cache::list_cached_estimates(network)
-                .map(|estimates| {
-                    cache::find_stale_estimates(&estimates, new_snapshot.ledger)
-                        .into_iter()
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
-            let json_output = serde_json::json!({
-                "diff": diff,
-                "stale_estimates": stale,
-            });
-            println!("{}", serde_json::to_string_pretty(&json_output)?);
-        } else if summary {
-            println!("{}", config_snapshot::diff::format_diff_summary(&diff));
-        } else {
-            println!("{}", config_snapshot::diff::format_diff(&diff));
+        match format {
+            cli::OutputFormat::Json => {
+                // Collect stale estimates for inclusion in JSON output.
+                let stale: Vec<cache::CachedEstimate> = cache::list_cached_estimates(network)
+                    .map(|estimates| {
+                        cache::find_stale_estimates(&estimates, new_snapshot.ledger)
+                            .into_iter()
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let json_output = serde_json::json!({
+                    "diff": diff,
+                    "stale_estimates": stale,
+                });
+                println!("{}", serde_json::to_string_pretty(&json_output)?);
+            }
+            cli::OutputFormat::Csv => {
+                println!("{}", config_snapshot::diff::format_diff_csv(&diff));
+            }
+            cli::OutputFormat::Markdown => {
+                println!("{}", config_snapshot::diff::format_diff_markdown(&diff));
+            }
+            cli::OutputFormat::Table if summary => {
+                println!("{}", config_snapshot::diff::format_diff_summary(&diff));
+            }
+            cli::OutputFormat::Table => {
+                println!("{}", config_snapshot::diff::format_diff(&diff));
+            }
         }
 
         if upgrade_detected(&diff) {
             match config_snapshot::store::save_snapshot(&new_snapshot, None) {
                 Ok(path) => {
                     info!(path = %path.display(), "auto-saved post-upgrade snapshot");
-                    if !json_flag && !summary {
+                    if !machine && !summary {
                         println!(
                             "  Protocol upgrade detected — new config auto-saved to {}",
                             path.display()
@@ -1316,14 +1401,14 @@ async fn cmd_config_diff(
                 }
                 Err(e) => {
                     warn!(error = %e, "could not auto-save post-upgrade snapshot");
-                    if !json_flag && !summary {
+                    if !machine && !summary {
                         eprintln!("  Warning: could not auto-save post-upgrade snapshot: {e}");
                     }
                 }
             }
         }
 
-        if !json_flag && !summary {
+        if !machine && !summary {
             print_stale_estimates(network, new_snapshot.ledger);
         }
 
