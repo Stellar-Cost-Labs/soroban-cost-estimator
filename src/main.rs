@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use clap::Parser;
 use comfy_table::Cell;
 use comfy_table::Table;
@@ -204,19 +206,44 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
         }
         cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(&wasm, json),
         cli::Command::Config { action } => match action {
-            cli::ConfigAction::Snapshot { network, out, json } => {
-                cmd_config_snapshot(
-                    &network,
-                    fallback,
-                    out.as_deref(),
+            cli::ConfigAction::Snapshot {
+                network,
+                out,
+                json,
+                action,
+            } => match action {
+                Some(cli::SnapshotAction::Delete {
+                    filename,
+                    older_than,
+                    dry_run,
+                    yes,
+                    network,
+                }) => cmd_config_snapshot_delete(
+                    filename.as_deref(),
+                    older_than,
+                    dry_run,
+                    yes,
+                    network.as_deref(),
+                ),
+                Some(cli::SnapshotAction::Diff {
+                    file_a,
+                    file_b,
                     json,
-                    rps,
-                    timeout,
-                    max_retries,
-                    &headers,
-                )
-                .await
-            }
+                }) => cmd_config_snapshot_diff(&file_a, &file_b, json),
+                None => {
+                    cmd_config_snapshot(
+                        &network,
+                        fallback,
+                        out.as_deref(),
+                        json,
+                        rps,
+                        timeout,
+                        max_retries,
+                        &headers,
+                    )
+                    .await
+                }
+            },
             cli::ConfigAction::List { network } => cmd_config_snapshot_list(&network),
             cli::ConfigAction::Diff {
                 network,
@@ -1224,6 +1251,146 @@ fn cmd_config_snapshot_list(network: &str) -> error::AppResult<()> {
             "  {}  ledger {}  {}",
             snapshot.timestamp, snapshot.ledger, path_str
         );
+    }
+    Ok(())
+}
+
+/// Prompts the user for a yes/no answer on stdin.
+///
+/// Returns `false` when stdin is not a terminal (there is nobody to ask) or
+/// when the answer is anything other than `y`/`yes`, so callers must pass
+/// `--yes` explicitly to run non-interactively.
+fn confirm(prompt: &str) -> bool {
+    use std::io::{IsTerminal, Write as _};
+
+    if !std::io::stdin().is_terminal() {
+        return false;
+    }
+
+    print!("{prompt} [y/N] ");
+    let _ = std::io::stdout().flush();
+
+    let mut answer = String::new();
+    match std::io::stdin().read_line(&mut answer) {
+        Ok(_) => matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
+        Err(_) => false,
+    }
+}
+
+/// `config snapshot delete <filename>` / `--older-than <days>` command.
+///
+/// Deletes a single named snapshot, or purges every snapshot whose recorded
+/// timestamp is older than `days`. `--dry-run` reports the affected files
+/// without removing them, and `--yes` skips the confirmation prompt.
+///
+/// # Network calls
+/// None — pure file I/O.
+fn cmd_config_snapshot_delete(
+    filename: Option<&str>,
+    older_than: Option<u64>,
+    dry_run: bool,
+    yes: bool,
+    network: Option<&str>,
+) -> error::AppResult<()> {
+    match (filename, older_than) {
+        (Some(_), Some(_)) => Err(error::AppError::General(
+            "pass either a snapshot FILENAME or --older-than DAYS, not both".to_string(),
+        )),
+        (None, None) => Err(error::AppError::General(
+            "nothing to delete: pass a snapshot FILENAME or --older-than DAYS".to_string(),
+        )),
+        (Some(identifier), None) => delete_one_snapshot(identifier, dry_run, yes),
+        (None, Some(days)) => delete_snapshots_older_than(days, dry_run, yes, network),
+    }
+}
+
+/// Deletes the snapshot file named (or pathed) by `identifier`.
+fn delete_one_snapshot(identifier: &str, dry_run: bool, yes: bool) -> error::AppResult<()> {
+    let path = config_snapshot::store::resolve_snapshot_path(identifier)?;
+
+    if dry_run {
+        println!("Would delete snapshot: {}", path.display());
+        println!("Dry run: no files were deleted.");
+        return Ok(());
+    }
+
+    if !yes && !confirm(&format!("Delete snapshot '{}'?", path.display())) {
+        println!("Aborted — snapshot not deleted (pass --yes to skip the prompt).");
+        return Ok(());
+    }
+
+    config_snapshot::store::delete_snapshot_file(&path)?;
+    println!("Deleted snapshot: {}", path.display());
+    Ok(())
+}
+
+/// Purges every snapshot older than `days` days.
+fn delete_snapshots_older_than(
+    days: u64,
+    dry_run: bool,
+    yes: bool,
+    network: Option<&str>,
+) -> error::AppResult<()> {
+    let stale = config_snapshot::store::find_snapshots_older_than(days, network)?;
+
+    let scope = match network {
+        Some(network) => format!(" for network '{network}'"),
+        None => String::new(),
+    };
+
+    if stale.is_empty() {
+        println!("No snapshots older than {days} day(s){scope} found.");
+        return Ok(());
+    }
+
+    let count = stale.len();
+    println!("{count} snapshot(s) older than {days} day(s){scope}:");
+    for path in &stale {
+        println!("  - {}", path.display());
+    }
+
+    if dry_run {
+        println!("Dry run: no files were deleted.");
+        return Ok(());
+    }
+
+    if !yes && !confirm(&format!("Delete {} snapshot file(s)?", count)) {
+        println!("Aborted — no snapshots deleted (pass --yes to skip the prompt).");
+        return Ok(());
+    }
+
+    let mut deleted = 0usize;
+    for path in &stale {
+        match config_snapshot::store::delete_snapshot_file(path) {
+            Ok(()) => deleted += 1,
+            Err(e) => eprintln!("Warning: could not delete {}: {e}", path.display()),
+        }
+    }
+    println!("Deleted {deleted} of {count} snapshot file(s).");
+    Ok(())
+}
+
+/// `config snapshot diff <a> <b>` command: compare two saved snapshots
+/// offline.
+///
+/// Exits `1` when the diff contains pricing changes (matching `config diff`),
+/// and `0` otherwise.
+///
+/// # Network calls
+/// None — both snapshots are read from disk.
+fn cmd_config_snapshot_diff(file_a: &Path, file_b: &Path, json: bool) -> error::AppResult<()> {
+    let old_snapshot = config_snapshot::store::load_snapshot_checked(file_a)?;
+    let new_snapshot = config_snapshot::store::load_snapshot_checked(file_b)?;
+    let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&diff)?);
+    } else {
+        println!("{}", config_snapshot::diff::format_diff(&diff));
+    }
+
+    if diff.has_pricing_changes {
+        std::process::exit(1);
     }
     Ok(())
 }
