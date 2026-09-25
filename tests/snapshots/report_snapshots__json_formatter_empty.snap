@@ -1,6 +1,5 @@
 ---
 source: tests/report_snapshots.rs
-assertion_line: 76
 expression: JsonFormatter.format(&empty)
 ---
 {
@@ -23,6 +22,7 @@ expression: JsonFormatter.format(&empty)
   "rpc_latency_ms": 0,
   "suggestions": [],
   "tx_size": 0,
+  "warnings": [],
   "wasm_hash": "0000000000000000",
   "write_bytes": 0,
   "write_entries": 0

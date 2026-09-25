@@ -1,6 +1,5 @@
 ---
 source: tests/report_snapshots.rs
-assertion_line: 95
 expression: MarkdownFormatter.format(&empty)
 ---
 ## Cost Report: `(wasm upload)`
@@ -21,6 +20,9 @@ expression: MarkdownFormatter.format(&empty)
 | Write Bytes | 0 |
 | Transaction Size | 0 |
 
+<details>
+<summary>Fee breakdown</summary>
+
 ### Fee Breakdown
 
 | Component | Stroops | % of Total |
@@ -35,3 +37,5 @@ expression: MarkdownFormatter.format(&empty)
 ### Optimization Suggestions
 
 No cost optimizations identified (fee rates unavailable or no reducible resources).
+
+</details>

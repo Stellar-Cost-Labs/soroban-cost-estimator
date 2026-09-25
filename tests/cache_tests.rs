@@ -1327,6 +1327,58 @@ fn test_load_fresh_estimate_returns_fresh_entry() {
     });
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Estimate history (#321)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Every save appends to the history log, newest first, and the log is
+/// scoped to the requested `(wasm_hash, function)` pair.
+#[test]
+fn test_load_estimate_history_newest_first_and_limited() {
+    with_temp_home(|_tmp| {
+        for (ledger, fee) in [(10u32, 100i64), (20, 200), (30, 300)] {
+            cache::save_estimate("h", "f", &[], "testnet", ledger, fee, 1, 1, None, true)
+                .expect("save");
+        }
+        // A different function must not leak into this function's history.
+        cache::save_estimate("h", "other", &[], "testnet", 40, 400, 1, 1, None, true)
+            .expect("save other");
+
+        let all = cache::load_estimate_history("h", "f", 5).expect("history");
+        assert_eq!(all.len(), 3, "three runs of `f` should be recorded");
+        assert_eq!(all[0].total_stroops, 300, "newest run first");
+        assert_eq!(all[1].total_stroops, 200);
+        assert_eq!(all[2].total_stroops, 100);
+        assert_eq!(all[0].ledger, 30);
+        assert_eq!(all[0].function, "f");
+
+        let limited = cache::load_estimate_history("h", "f", 2).expect("history");
+        assert_eq!(limited.len(), 2, "limit must cap the result");
+        assert_eq!(limited[0].total_stroops, 300);
+        assert_eq!(limited[1].total_stroops, 200);
+
+        let zero = cache::load_estimate_history("h", "f", 0).expect("history");
+        assert!(zero.is_empty(), "a zero limit yields no rows");
+
+        let missing = cache::load_estimate_history("h", "missing", 5).expect("history");
+        assert!(missing.is_empty(), "unknown function has no history");
+    });
+}
+
+/// A single save records exactly one history entry (distinct from the
+/// upserting `estimates` table).
+#[test]
+fn test_save_estimate_appends_single_history_entry() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h", "f", &[], "testnet", 1, 100, 10, 5, None, true).expect("save");
+        let history = cache::load_estimate_history("h", "f", 5).expect("history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].cpu_instructions, 10);
+        assert_eq!(history[0].memory_bytes, 5);
+        assert_eq!(history[0].network, "testnet");
+    });
+}
+
 /// An expired entry is treated as a miss even though the file exists: the
 /// caller must re-simulate.
 #[test]

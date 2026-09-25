@@ -68,6 +68,10 @@ pub struct EstimateAllResult {
     pub tx_size: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fee: Option<report::fee_calc::FeeBreakdown>,
+    /// Resource-limit warnings for this function (#322). Always present in
+    /// JSON output (an empty array when nothing is near a protocol limit).
+    #[serde(default)]
+    pub warnings: Vec<report::cost_report::ResourceWarning>,
 }
 
 impl EstimateAllResult {
@@ -89,6 +93,7 @@ impl EstimateAllResult {
             write_bytes: None,
             tx_size: None,
             fee: None,
+            warnings: Vec::new(),
         }
     }
 
@@ -110,6 +115,7 @@ impl EstimateAllResult {
             write_bytes: None,
             tx_size: None,
             fee: None,
+            warnings: Vec::new(),
         }
     }
 }
@@ -151,6 +157,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             args,
             cache_ttl,
             clear_cache,
+            history,
             json,
             format,
             precision,
@@ -168,6 +175,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 &args,
                 cache_ttl.as_deref(),
                 clear_cache,
+                history,
                 &format,
                 rps,
                 timeout,
@@ -444,6 +452,32 @@ async fn fetch_fee_rates(client: &rpc::client::RpcClient) -> report::fee_calc::F
     rates
 }
 
+/// Fetch the network's resource-limit configuration for the 80% warnings
+/// (#322).
+///
+/// Pulls `ConfigSettingContractComputeV0`, `ContractLedgerCostV0`, and
+/// `ContractBandwidthV0` — the same entries `fetch_fee_rates` already reads.
+/// The RPC client deduplicates identical `(method, params)` requests, so on
+/// the `estimate` path this adds no additional network round-trips. Missing
+/// entries leave the corresponding limits as `None` and are simply skipped.
+async fn fetch_network_config(
+    client: &rpc::client::RpcClient,
+) -> report::cost_report::NetworkConfig {
+    let mut snapshot = xdr_helper::begin_snapshot("", 0);
+    for setting in [
+        rpc::config::ConfigSettingId::ContractComputeV0,
+        rpc::config::ConfigSettingId::ContractLedgerCostV0,
+        rpc::config::ConfigSettingId::ContractBandwidthV0,
+    ] {
+        if let Ok(raw) = rpc::config::fetch_config_setting(client, setting).await {
+            if let Ok(entry) = xdr_helper::decode_config_entry_xdr(&raw.config_xdr) {
+                xdr_helper::apply_config_entry(&mut snapshot, entry);
+            }
+        }
+    }
+    report::cost_report::NetworkConfig::from_snapshot(&snapshot)
+}
+
 /// `estimate` command: simulate a single invocation and print cost report.
 ///
 /// All RPC traffic (simulation and fee-rate fetches) goes through one
@@ -461,6 +495,7 @@ async fn cmd_estimate(
     args: &[String],
     cache_ttl: Option<&str>,
     clear_cache: bool,
+    history: bool,
     format: &str,
     rps: Option<u64>,
     timeout: u64,
@@ -596,7 +631,7 @@ async fn cmd_estimate(
             precision,
         );
 
-        let report = report::cost_report::CostReport {
+        let mut report = report::cost_report::CostReport {
             function: function_name.to_string(),
             wasm_hash: wasm_hash.clone(),
             cpu_instructions,
@@ -611,7 +646,48 @@ async fn cmd_estimate(
             network: network.to_string(),
             rpc_latency_ms,
             rates: Some(fee_rates),
+            warnings: Vec::new(),
+            history: None,
         };
+
+        // Warn when any resource approaches the network's protocol limits
+        // (#322). The config entries are already fetched for the fee rates;
+        // the RPC client deduplicates those requests so this is free.
+        let network_config = fetch_network_config(&client).await;
+        report.warnings = report::cost_report::check_resource_limits(&report, &network_config);
+        if !report.warnings.is_empty() {
+            warn!(
+                count = report.warnings.len(),
+                "resource usage approaching network limits"
+            );
+        }
+
+        // Load up to 5 previous runs for the trend table (#321). This must
+        // happen before `save_estimate` so the current run is not counted as
+        // its own history entry.
+        if history {
+            let runs = cache::load_estimate_history(
+                &wasm_hash,
+                function_name,
+                cache::DEFAULT_HISTORY_LIMIT,
+            )?;
+            let historical: Vec<report::cost_report::HistoricalRun> = runs
+                .iter()
+                .map(|run| report::cost_report::HistoricalRun {
+                    timestamp: run.timestamp.clone(),
+                    ledger: run.ledger,
+                    cpu_instructions: run.cpu_instructions,
+                    total_stroops: run.total_stroops,
+                })
+                .collect();
+            let entries = report::cost_report::build_history_entries(
+                report.fee.total_stroops,
+                precision,
+                &historical,
+            );
+            info!(entries = entries.len(), "loaded cost history");
+            report.history = Some(entries);
+        }
 
         let _ = cache::save_estimate(
             &wasm_hash,
@@ -638,30 +714,199 @@ async fn cmd_estimate(
     .await
 }
 
-/// Converts an `EstimateAllResult` to a CSV row.
-fn csv_row(r: &EstimateAllResult) -> String {
-    let q = |s: &str| format!("\"{s}\"");
-    let fee = r.fee.as_ref();
-    [
-        q(&r.function),
-        q(r.network.as_deref().unwrap_or("")),
-        r.ledger.unwrap_or(0).to_string(),
-        q(r.wasm_hash.as_deref().unwrap_or("")),
-        r.cpu_instructions.unwrap_or(0).to_string(),
-        r.memory_bytes.unwrap_or(0).to_string(),
-        r.read_entries.unwrap_or(0).to_string(),
-        r.write_entries.unwrap_or(0).to_string(),
-        r.read_bytes.unwrap_or(0).to_string(),
-        r.write_bytes.unwrap_or(0).to_string(),
-        r.tx_size.unwrap_or(0).to_string(),
-        fee.map(|f| f.non_refundable_stroops)
-            .unwrap_or(0)
-            .to_string(),
-        fee.map(|f| f.refundable_stroops).unwrap_or(0).to_string(),
-        fee.map(|f| f.total_stroops).unwrap_or(0).to_string(),
-        q(fee.map(|f| f.total_xlm.as_str()).unwrap_or("")),
-    ]
-    .join(",")
+/// Header row for `estimate-all --format csv` (#324).
+const ESTIMATE_ALL_CSV_HEADER: &str = "Function,Status,CPU_Instructions,RAM_Bytes,Read_Entries,Write_Entries,Read_Bytes,Write_Bytes,Total_Fee_Stroops,Total_Fee_XLM";
+
+/// Escape a single CSV field per RFC 4180.
+///
+/// A field is wrapped in double-quotes when it contains a comma, a
+/// double-quote, or a line break; embedded double-quotes are doubled. Plain
+/// values are emitted verbatim.
+fn csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+/// Machine-readable status label for a result (`ok` / `skipped` / `error`).
+fn status_label(result: &EstimateAllResult) -> &'static str {
+    match result.status {
+        EstimateAllStatus::Ok => "ok",
+        EstimateAllStatus::Skipped => "skipped",
+        EstimateAllStatus::Error => "error",
+    }
+}
+
+/// Render `estimate-all` results as RFC 4180-compliant CSV (#324).
+///
+/// The column order is fixed and documented by [`ESTIMATE_ALL_CSV_HEADER`].
+/// Functions that were skipped or failed emit `0`/empty resource and fee
+/// fields, so the row count always matches the enumerated function count.
+/// The returned string ends with a trailing newline.
+#[must_use]
+pub fn format_estimate_all_csv(results: &[EstimateAllResult]) -> String {
+    let mut out = String::from(ESTIMATE_ALL_CSV_HEADER);
+    out.push('\n');
+    for result in results {
+        let fee = result.fee.as_ref();
+        let fields = [
+            csv_escape(&result.function),
+            status_label(result).to_string(),
+            result.cpu_instructions.unwrap_or(0).to_string(),
+            result.memory_bytes.unwrap_or(0).to_string(),
+            result.read_entries.unwrap_or(0).to_string(),
+            result.write_entries.unwrap_or(0).to_string(),
+            result.read_bytes.unwrap_or(0).to_string(),
+            result.write_bytes.unwrap_or(0).to_string(),
+            fee.map(|f| f.total_stroops).unwrap_or(0).to_string(),
+            csv_escape(fee.map(|f| f.total_xlm.as_str()).unwrap_or("")),
+        ];
+        out.push_str(&fields.join(","));
+        out.push('\n');
+    }
+    out
+}
+
+/// Escape a value for inclusion in a Markdown table cell.
+///
+/// Pipes would otherwise split the cell, and line breaks would break the row,
+/// so both are neutralised.
+fn markdown_escape(value: &str) -> String {
+    value.replace('|', "\\|").replace(['\n', '\r'], " ")
+}
+
+/// Render `estimate-all` results as a GitHub-flavored Markdown document (#325).
+///
+/// Emits a compact `| Function | CPU | Fee (XLM) |` summary table, a run
+/// summary with fee statistics, and one collapsible `<details>` section per
+/// function with the full resource and fee breakdown — suitable for posting
+/// as an automated pull-request comment. The whole document is plain text (no
+/// terminal escape codes), so it renders natively on GitHub.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn format_estimate_all_markdown(results: &[EstimateAllResult]) -> String {
+    let ok = results
+        .iter()
+        .filter(|r| r.status == EstimateAllStatus::Ok)
+        .count();
+    let skipped = results
+        .iter()
+        .filter(|r| r.status == EstimateAllStatus::Skipped)
+        .count();
+    let errored = results
+        .iter()
+        .filter(|r| r.status == EstimateAllStatus::Error)
+        .count();
+    let fees: Vec<i64> = results
+        .iter()
+        .filter_map(|r| r.fee.as_ref().map(|f| f.total_stroops))
+        .collect();
+
+    let mut out = String::from("## Cost Estimate Summary\n\n");
+    out.push_str(&format!(
+        "- **Functions:** {} ({} ok, {} skipped, {} error)\n",
+        results.len(),
+        ok,
+        skipped,
+        errored
+    ));
+    if let Some(range) = report::fee_calc::fee_range(&fees) {
+        out.push_str(&format!(
+            "- **Fees (stroops):** min {} · avg {} · max {}\n",
+            range.min_stroops, range.avg_stroops, range.max_stroops
+        ));
+    }
+
+    // Compact summary table: exactly the columns called out in #325.
+    out.push_str("\n| Function | CPU | Fee (XLM) |\n| --- | --- | --- |\n");
+    for result in results {
+        let cpu = result
+            .cpu_instructions
+            .map_or_else(|| "—".to_string(), |v| v.to_string());
+        let fee = result
+            .fee
+            .as_ref()
+            .map_or_else(|| "—".to_string(), |f| f.total_xlm.clone());
+        out.push_str(&format!(
+            "| `{}` | {} | {} |\n",
+            markdown_escape(&result.function),
+            cpu,
+            fee
+        ));
+    }
+
+    // Collapsible per-function detail.
+    out.push_str("\n### Per-function details\n\n");
+    for result in results {
+        out.push_str(&format!(
+            "<details>\n<summary><code>{}</code> — {}</summary>\n\n",
+            markdown_escape(&result.function),
+            status_label(result)
+        ));
+        match result.status {
+            EstimateAllStatus::Ok => {
+                out.push_str("| Metric | Value |\n| --- | --- |\n");
+                out.push_str(&format!(
+                    "| CPU Instructions | {} |\n",
+                    result.cpu_instructions.unwrap_or(0)
+                ));
+                out.push_str(&format!(
+                    "| Memory Bytes | {} |\n",
+                    result.memory_bytes.unwrap_or(0)
+                ));
+                out.push_str(&format!(
+                    "| Read Entries | {} |\n",
+                    result.read_entries.unwrap_or(0)
+                ));
+                out.push_str(&format!(
+                    "| Write Entries | {} |\n",
+                    result.write_entries.unwrap_or(0)
+                ));
+                out.push_str(&format!(
+                    "| Read Bytes | {} |\n",
+                    result.read_bytes.unwrap_or(0)
+                ));
+                out.push_str(&format!(
+                    "| Write Bytes | {} |\n",
+                    result.write_bytes.unwrap_or(0)
+                ));
+                out.push_str(&format!("| Ledger | {} |\n", result.ledger.unwrap_or(0)));
+                if let Some(fee) = &result.fee {
+                    out.push_str(&format!("| Total Fee | {} stroops |\n", fee.total_stroops));
+                    out.push_str(&format!("| Total Fee | {} XLM |\n", fee.total_xlm));
+                    out.push_str(&format!(
+                        "| Non-refundable | {} stroops |\n",
+                        fee.non_refundable_stroops
+                    ));
+                    out.push_str(&format!(
+                        "| Refundable | {} stroops |\n",
+                        fee.refundable_stroops
+                    ));
+                }
+                if !result.warnings.is_empty() {
+                    out.push_str("\n> **Resource limit warnings**\n");
+                    for warning in &result.warnings {
+                        out.push_str(&format!("> - {}\n", warning.message));
+                    }
+                }
+            }
+            EstimateAllStatus::Skipped => {
+                if let Some(reason) = &result.reason {
+                    out.push_str(&format!("Skipped: {}\n", markdown_escape(reason)));
+                }
+            }
+            EstimateAllStatus::Error => {
+                if let Some(error) = &result.error {
+                    out.push_str(&format!("Error: {}\n", markdown_escape(error)));
+                }
+            }
+        }
+        out.push_str("\n</details>\n\n");
+    }
+
+    out
 }
 
 /// `estimate-all` command: enumerate all functions and estimate each.
@@ -697,8 +942,10 @@ async fn cmd_estimate_all(
         use sha2::Digest;
         let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
 
-        let json_flag = format == "json";
-        let text_mode = format == "table" || format == "markdown";
+        // `table` is the only human-readable format; everything else must emit
+        // self-contained machine output with no progress noise on stdout.
+        let text_mode = format == "table";
+        let quiet = format != "table";
         if text_mode {
             println!("WASM SHA-256: {wasm_hash}");
             println!();
@@ -743,17 +990,20 @@ async fn cmd_estimate_all(
         // function's simulation times out.
         client.health_check().await?;
 
-        // Fee rates are only needed to itemize the per-function fee breakdown
-        // in JSON output; skip the extra RPC calls in table mode.
-        let fee_rates = if json_flag {
+        // Fee rates itemize the per-function breakdown for JSON/CSV/Markdown.
+        // They share the same three config requests as the resource limits
+        // below, so the deduplicating client transmits them only once.
+        let fee_rates = if quiet {
             Some(fetch_fee_rates(&client).await)
         } else {
             None
         };
 
-        let mut csv_rows: Vec<String> = Vec::new();
+        // Network resource limits for the 80% warnings (#322), fetched once
+        // for the whole batch.
+        let network_config = fetch_network_config(&client).await;
 
-        let mut json_results: Vec<EstimateAllResult> = Vec::new();
+        let mut results: Vec<EstimateAllResult> = Vec::new();
         let total = wasm_info.functions.len();
         debug!(total, "enumerated functions");
 
@@ -768,57 +1018,29 @@ async fn cmd_estimate_all(
                 contract_id,
                 &wasm_hash,
                 network,
-                json_flag,
+                quiet,
                 fee_rates.as_ref(),
+                &network_config,
                 precision,
             )
             .await?;
-            if format == "csv" {
-                let row = csv_row(&result);
-                csv_rows.push(row);
-            } else if format == "markdown" {
-                let r = &result;
-                println!("### {}\n", r.function);
-                if r.status == EstimateAllStatus::Ok {
-                    println!("| Metric | Value |\n|--------|-------|");
-                    println!("| Status | ✅ ok |");
-                    println!("| CPU Instructions | {} |", r.cpu_instructions.unwrap_or(0));
-                    println!("| Memory Bytes | {} |", r.memory_bytes.unwrap_or(0));
-                    if let Some(fee) = &r.fee {
-                        println!("| Fee (stroops) | {} |", fee.total_stroops);
-                        println!("| Fee (XLM) | {} |", fee.total_xlm);
-                    }
-                    println!("| Ledger | {} |", r.ledger.unwrap_or(0));
-                } else {
-                    println!("Status: {}", result.status as u8);
-                    if let Some(reason) = &result.reason {
-                        println!("Reason: {reason}");
-                    }
-                    if let Some(error) = &result.error {
-                        println!("Error: {error}");
-                    }
-                }
-                println!();
-            } else {
-                json_results.push(result);
-            }
+            results.push(result);
         }
 
         // Aggregate fee range across every successfully estimated function
         // (#223): min/max/average in stroops (and XLM) for the whole batch.
-        let fees: Vec<i64> = json_results
+        // Machine formats embed their own summary instead.
+        let fees: Vec<i64> = results
             .iter()
             .filter_map(|r| r.fee.as_ref().map(|f| f.total_stroops))
             .collect();
-        emit_fee_range_summary(&fees, format == "json", precision);
+        emit_fee_range_summary(&fees, quiet, precision);
 
-        if format == "json" {
-            println!("{}", serde_json::to_string_pretty(&json_results)?);
-        } else if format == "csv" {
-            println!("function,network,ledger,wasm_hash,cpu_instructions,memory_bytes,read_entries,write_entries,read_bytes,write_bytes,tx_size,non_refundable_stroops,refundable_stroops,total_stroops,total_xlm");
-            for row in &csv_rows {
-                println!("{row}");
-            }
+        match format {
+            "json" => println!("{}", serde_json::to_string_pretty(&results)?),
+            "csv" => print!("{}", format_estimate_all_csv(&results)),
+            "markdown" => print!("{}", format_estimate_all_markdown(&results)),
+            _ => {}
         }
 
         Ok(())
@@ -863,8 +1085,10 @@ fn emit_fee_range_summary(fees: &[i64], json_flag: bool, precision: u32) {
 /// Estimates one exported function against the network, returning a well-typed
 /// [`EstimateAllResult`].
 ///
-/// The returned record is always built; in table mode it is printed directly
-/// and discarded, while JSON mode collects every record into a uniform array.
+/// The returned record is always built and handed back to the caller, which
+/// collects every record into a uniform array. When `quiet` is false (table
+/// mode) progress lines are printed to stdout/stderr; machine formats keep the
+/// stream clean.
 #[allow(clippy::too_many_lines)]
 async fn estimate_all_function(
     client: &rpc::client::RpcClient,
@@ -873,8 +1097,9 @@ async fn estimate_all_function(
     contract_id: Option<&str>,
     wasm_hash: &str,
     network: &str,
-    json_flag: bool,
+    quiet: bool,
     fee_rates: Option<&report::fee_calc::FeeRates>,
+    network_config: &report::cost_report::NetworkConfig,
     precision: u32,
 ) -> error::AppResult<EstimateAllResult> {
     use tracing::{Instrument, debug, info_span};
@@ -885,7 +1110,7 @@ async fn estimate_all_function(
         if fn_info.param_count > 0 {
             let reason = format!("needs --fn/--arg ({} param(s))", fn_info.param_count);
             debug!(reason, "skipping function");
-            if !json_flag {
+            if !quiet {
                 println!("── Estimating '{}' ── Skipped: {reason}", fn_info.name);
             }
             return Ok(EstimateAllResult::skipped(&fn_info.name, reason));
@@ -900,7 +1125,7 @@ async fn estimate_all_function(
             Ok(tx) => tx,
             Err(e) => {
                 debug!(error = %e, "tx construction failed");
-                if !json_flag {
+                if !quiet {
                     eprintln!("── Estimating '{}' ── Skipped: {e}", fn_info.name);
                 }
                 return Ok(EstimateAllResult::skipped(&fn_info.name, e.to_string()));
@@ -916,7 +1141,7 @@ async fn estimate_all_function(
                 if missing_simulation_data(&resp) {
                     let msg = "simulation returned no cost data and no latest ledger — check --id and the RPC endpoint";
                     debug!(msg, "simulation missing data");
-                    if !json_flag {
+                    if !quiet {
                         eprintln!("── Estimating '{}' ── Error: {msg}", fn_info.name);
                     }
                     return Ok(EstimateAllResult::errored(&fn_info.name, msg));
@@ -976,11 +1201,23 @@ async fn estimate_all_function(
                     },
                 };
 
-                if !json_flag {
+                if !quiet {
                     println!(
                         "CPU: {cpu} insns | Mem: {mem} bytes | Fee: {total_fee} stroops ({xlm} XLM) | Ledger: {ledger}"
                     );
                 }
+
+                // Warn when any resource approaches the network's protocol
+                // limits (#322).
+                let warnings = report::cost_report::check_resource_limits_raw(
+                    cpu,
+                    read_entries,
+                    write_entries,
+                    read_bytes,
+                    write_bytes,
+                    tx_xdr.len() as u32,
+                    network_config,
+                );
 
                 Ok(EstimateAllResult {
                     function: fn_info.name.clone(),
@@ -998,11 +1235,12 @@ async fn estimate_all_function(
                     write_bytes: Some(write_bytes),
                     tx_size: Some(tx_xdr.len() as u32),
                     fee: Some(fee),
+                    warnings,
                 })
             }
             Err(e) => {
                 debug!(error = %e, "simulation failed");
-                if !json_flag {
+                if !quiet {
                     eprintln!("Skipped — simulation failed: {e}");
                 }
                 Ok(EstimateAllResult::errored(&fn_info.name, e.to_string()))
@@ -1825,6 +2063,8 @@ async fn cmd_cache_warm(
 mod tests {
     use super::EstimateAllResult;
     use super::EstimateAllStatus;
+    use super::format_estimate_all_csv;
+    use super::format_estimate_all_markdown;
     use super::parse_interval_secs;
     use super::upgrade_detected;
     use super::wasm_info_json;
@@ -2005,6 +2245,7 @@ mod tests {
                     total_stroops: 3,
                     total_xlm: "0.0000003".to_string(),
                 }),
+                warnings: Vec::new(),
             },
             EstimateAllResult::skipped("needs_args", "needs --fn/--arg (1 param(s))"),
             EstimateAllResult::errored("bad", "boom"),
@@ -2034,5 +2275,144 @@ mod tests {
         let errored = &value[2];
         assert_eq!(errored["status"], "error");
         assert_eq!(errored["error"], "boom");
+    }
+
+    // ── estimate-all CSV export (#324) ───────────────────────────────
+
+    fn csv_fixture() -> Vec<EstimateAllResult> {
+        vec![
+            EstimateAllResult {
+                function: "inc,with\"quotes\"".to_string(),
+                status: EstimateAllStatus::Ok,
+                reason: None,
+                error: None,
+                wasm_hash: Some("deadbeef".to_string()),
+                network: Some("testnet".to_string()),
+                ledger: Some(10),
+                cpu_instructions: Some(100),
+                memory_bytes: Some(5),
+                read_entries: Some(1),
+                write_entries: Some(2),
+                read_bytes: Some(3),
+                write_bytes: Some(4),
+                tx_size: Some(50),
+                fee: Some(soroban_cost_estimator::report::fee_calc::FeeBreakdown {
+                    non_refundable_stroops: 1,
+                    refundable_stroops: 2,
+                    cpu_fee_stroops: 1,
+                    storage_fee_stroops: 0,
+                    bandwidth_fee_stroops: 0,
+                    total_stroops: 3,
+                    total_xlm: "0.0000003".to_string(),
+                }),
+                warnings: Vec::new(),
+            },
+            EstimateAllResult::skipped("needs_args", "needs --fn/--arg (1 param(s))"),
+            EstimateAllResult::errored("bad", "boom"),
+        ]
+    }
+
+    #[test]
+    fn test_estimate_all_csv_header_and_rows() {
+        let csv = format_estimate_all_csv(&csv_fixture());
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines.len(), 4, "header + three function rows");
+        assert_eq!(
+            lines[0],
+            "Function,Status,CPU_Instructions,RAM_Bytes,Read_Entries,Write_Entries,Read_Bytes,Write_Bytes,Total_Fee_Stroops,Total_Fee_XLM"
+        );
+    }
+
+    #[test]
+    fn test_estimate_all_csv_escapes_commas_and_quotes() {
+        let csv = format_estimate_all_csv(&csv_fixture());
+        let data = csv.lines().nth(1).expect("first data row");
+        // Function name with a comma and embedded quotes is fully escaped.
+        assert!(
+            data.starts_with("\"inc,with\"\"quotes\"\"\""),
+            "unescaped function name: {data}"
+        );
+        assert!(data.contains(",ok,100,5,1,2,3,4,3,0.0000003"));
+    }
+
+    #[test]
+    fn test_estimate_all_csv_status_for_skipped_and_error() {
+        let csv = format_estimate_all_csv(&csv_fixture());
+        let lines: Vec<&str> = csv.lines().collect();
+        assert!(lines[2].starts_with("needs_args,skipped,"));
+        assert!(lines[3].starts_with("bad,error,"));
+    }
+
+    #[test]
+    fn test_estimate_all_csv_every_row_has_ten_fields() {
+        // A minimal RFC 4180 parser: split on commas outside quotes.
+        fn parse_row(line: &str) -> Vec<String> {
+            let mut fields = Vec::new();
+            let mut current = String::new();
+            let mut in_quotes = false;
+            let mut chars = line.chars().peekable();
+            while let Some(c) = chars.next() {
+                match c {
+                    '"' if in_quotes => {
+                        if chars.peek() == Some(&'"') {
+                            current.push('"');
+                            chars.next();
+                        } else {
+                            in_quotes = false;
+                        }
+                    }
+                    '"' => in_quotes = true,
+                    ',' if !in_quotes => {
+                        fields.push(std::mem::take(&mut current));
+                    }
+                    other => current.push(other),
+                }
+            }
+            fields.push(current);
+            fields
+        }
+
+        let csv = format_estimate_all_csv(&csv_fixture());
+        for line in csv.lines() {
+            assert_eq!(
+                parse_row(line).len(),
+                10,
+                "row should have 10 fields: {line}"
+            );
+        }
+    }
+
+    // ── estimate-all Markdown export (#325) ──────────────────────────
+
+    #[test]
+    fn test_estimate_all_markdown_summary_table() {
+        let md = format_estimate_all_markdown(&csv_fixture());
+        assert!(md.contains("| Function | CPU | Fee (XLM) |"));
+        assert!(md.contains("| --- | --- | --- |"));
+        assert!(md.contains("## Cost Estimate Summary"));
+    }
+
+    #[test]
+    fn test_estimate_all_markdown_has_summary_stats_and_details() {
+        let md = format_estimate_all_markdown(&csv_fixture());
+        assert!(md.contains("**Functions:** 3 (1 ok, 1 skipped, 1 error)"));
+        assert!(md.contains("<details>"));
+        assert!(md.contains("</details>"));
+        // One collapsible block per function.
+        assert_eq!(md.matches("<details>").count(), 3);
+        assert!(md.contains("Skipped: needs --fn/--arg"));
+        assert!(md.contains("Error: boom"));
+    }
+
+    #[test]
+    fn test_estimate_all_markdown_escapes_pipes_in_function_names() {
+        let mut result = csv_fixture();
+        result[0].function = "a|b".to_string();
+        let md = format_estimate_all_markdown(&result);
+        assert!(md.contains("a\\|b"), "pipe should be escaped: {md}");
+        assert!(
+            !md.contains("| `a|b` |"),
+            "raw pipe must not split the cell"
+        );
     }
 }
