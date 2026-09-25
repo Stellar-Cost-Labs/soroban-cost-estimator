@@ -185,6 +185,9 @@ pub enum CacheAction {
     /// Check that every cached estimate is valid JSON and not corrupted.
     Verify,
 
+    /// Show cache health: entry count, disk usage, age, and per-network breakdown.
+    Stats,
+
     /// Delete every cached estimate recorded for a network.
     Clear {
         /// Network whose cached estimates to delete.
