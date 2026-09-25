@@ -54,7 +54,6 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
 }
-
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Simulate a single contract invocation and print the cost report.
@@ -89,7 +88,7 @@ pub enum Command {
         cache_ttl: Option<String>,
 
         /// Wipe this network's cached estimates before running the
-        /// simulation (e.g. after upgrading the tool or a network upgrade).
+        /// simulation.
         #[arg(long)]
         clear_cache: bool,
 
@@ -150,6 +149,21 @@ pub enum Command {
         json: bool,
     },
 
+    /// Check the health of a Soroban RPC endpoint.
+    RpcHealth {
+        /// Network to check.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+
+        /// Custom RPC endpoint URL.
+        #[arg(long)]
+        rpc_url: Option<String>,
+
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Fetch and store a snapshot of the network's resource-pricing configuration.
     Config {
         #[command(subcommand)]
@@ -167,6 +181,7 @@ pub enum Command {
         /// Network to watch.
         #[arg(long, default_value = "testnet")]
         network: String,
+
         /// Polling interval (e.g. "30m", "1h").
         #[arg(long, default_value = "1h")]
         interval: String,
