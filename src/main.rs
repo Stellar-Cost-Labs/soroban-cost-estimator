@@ -203,6 +203,23 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             .await
         }
         cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(&wasm, json),
+        cli::Command::RpcHealth {
+            network,
+            rpc_url,
+            json,
+        } => {
+            cmd_rpc_health(
+                &network,
+                rpc_url.as_deref(),
+                json,
+                rps,
+                timeout,
+                max_retries,
+                fallback,
+                &headers,
+            )
+            .await
+        }
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot { network, out, json } => {
                 cmd_config_snapshot(
@@ -1017,11 +1034,11 @@ async fn cmd_rpc_health(
     network: &str,
     rpc_url: Option<&str>,
     json: bool,
-    rps: u32,
+    rps: Option<u64>,
     timeout: u64,
-    max_retries: u32,
+    max_retries: usize,
     rpc_fallback_url: Option<&str>,
-    extra_headers: &[(String, String)],
+    extra_headers: &[String],
 ) -> error::AppResult<()> {
     use std::time::Instant;
 
@@ -1061,7 +1078,6 @@ async fn cmd_rpc_health(
 
             Ok(())
         }
-
         Err(e) => {
             if json {
                 println!(
@@ -1081,6 +1097,7 @@ async fn cmd_rpc_health(
                 println!("Latency    : {} ms", latency_ms);
                 println!("Error      : {}", e);
             }
+
             Err(e)
         }
     }
@@ -2108,22 +2125,4 @@ mod tests {
         assert_eq!(errored["status"], "error");
         assert_eq!(errored["error"], "boom");
     }
-}
-
-cli::Command::RpcHealth {
-    network,
-    rpc_url,
-    json,
-} => {
-    cmd_rpc_health(
-        &network,
-        rpc_url.as_deref(),
-        json,
-        rps,
-        timeout,
-        max_retries,
-        rpc_fallback_url,
-        &headers,
-    )
-    .await
 }
