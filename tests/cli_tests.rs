@@ -128,6 +128,7 @@ fn test_estimate_help() {
         "--arg",
         "--cache-ttl",
         "--clear-cache",
+        "--no-cache",
         "--json",
     ] {
         assert!(
@@ -144,7 +145,14 @@ fn test_estimate_all_help() {
         code, 0,
         "estimate-all --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--wasm", "--network", "--id", "--json", "--format"] {
+    for flag in [
+        "--wasm",
+        "--network",
+        "--id",
+        "--no-cache",
+        "--json",
+        "--format",
+    ] {
         assert!(
             stdout.contains(flag),
             "estimate-all help should mention {flag}; got: {stdout}"
@@ -1653,4 +1661,142 @@ fn test_estimate_minimal_wasm_upload_zero_footprint() {
     assert_eq!(parsed["write_entries"], 0);
     assert_eq!(parsed["read_bytes"], 0);
     assert_eq!(parsed["write_bytes"], 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `--no-cache` tests (Issue #271)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Runs the CLI with `HOME` redirected into `home` and logging quieted, so
+/// stdout carries only the command's own output.
+fn run_estimate_with_home(args: &[&str], home: &Path) -> (String, String, i32) {
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(args)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.code().unwrap_or(-1),
+    )
+}
+
+#[test]
+fn test_estimate_no_cache_flag_accepted() {
+    // The flag must be recognized (failure is the missing file, not the arg).
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--no-cache"]);
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument") && !stderr.contains("unrecognized"),
+        "--no-cache should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_all_no_cache_flag_accepted() {
+    let (_, stderr, code) = run_cli(&["estimate-all", "--wasm", "test.wasm", "--no-cache"]);
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument") && !stderr.contains("unrecognized"),
+        "--no-cache should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+/// `--no-cache` skips both the cache read and the cache write:
+///
+/// 1. a run with `--no-cache --cache-ttl` always simulates (never returns a
+///    cache-hit payload) and leaves nothing behind on disk;
+/// 2. a normal run populates the cache;
+/// 3. a later `--cache-ttl` run *does* hit that cache entry — proving the
+///    first run would have too, had `--no-cache` not bypassed it.
+#[test]
+fn test_no_cache_bypasses_cache_reads_and_writes() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("no-cache-bypass");
+    let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+
+    let base: Vec<&str> = vec![
+        "estimate",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--id",
+        contract_id,
+        "--fn",
+        "increment",
+        "--arg",
+        "1",
+        "--rpc-url",
+        &rpc_url,
+        "--json",
+    ];
+
+    // 1. Bypassed run: fresh simulation even though --cache-ttl is set.
+    let mut args = base.clone();
+    args.extend_from_slice(&["--no-cache", "--cache-ttl", "1h"]);
+    let (stdout, stderr, code) = run_estimate_with_home(&args, &home);
+    assert_eq!(
+        code, 0,
+        "no-cache estimate should succeed; stderr: {stderr}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("fresh JSON report; got: {stdout}");
+    assert!(
+        parsed.get("cache").is_none(),
+        "--no-cache must not return a cache-hit payload; got: {stdout}"
+    );
+    assert_eq!(parsed["cpu_instructions"], 532_502);
+
+    // ...and nothing was written to the cache.
+    let (stdout, stderr, code) =
+        run_estimate_with_home(&["cache", "query", "--network", "testnet", "--json"], &home);
+    assert_eq!(code, 0, "cache query should succeed; stderr: {stderr}");
+    assert_eq!(
+        stdout.trim(),
+        "[]",
+        "--no-cache must not persist an estimate; got: {stdout}"
+    );
+
+    // 2. A normal run does populate the cache.
+    let (_, stderr, code) = run_estimate_with_home(&base, &home);
+    assert_eq!(
+        code, 0,
+        "populating estimate should succeed; stderr: {stderr}"
+    );
+    let (stdout, _, _) =
+        run_estimate_with_home(&["cache", "query", "--network", "testnet", "--json"], &home);
+    assert!(
+        stdout.contains("increment"),
+        "normal run should cache the estimate; got: {stdout}"
+    );
+
+    // 3. The cached entry is now visible to --cache-ttl...
+    let mut cached_args = base.clone();
+    cached_args.extend_from_slice(&["--cache-ttl", "1h"]);
+    let (stdout, stderr, code) = run_estimate_with_home(&cached_args, &home);
+    assert_eq!(code, 0, "cached estimate should succeed; stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("cache-hit JSON; got: {stdout}");
+    assert_eq!(
+        parsed["cache"], "hit",
+        "expected a cache hit; got: {stdout}"
+    );
+
+    // ...but `--no-cache` ignores it and simulates anyway.
+    let mut bypassed_args = base.clone();
+    bypassed_args.extend_from_slice(&["--no-cache", "--cache-ttl", "1h"]);
+    let (stdout, stderr, code) = run_estimate_with_home(&bypassed_args, &home);
+    assert_eq!(
+        code, 0,
+        "bypassed estimate should succeed; stderr: {stderr}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("fresh JSON report; got: {stdout}");
+    assert!(
+        parsed.get("cache").is_none(),
+        "--no-cache must ignore the cached entry; got: {stdout}"
+    );
+    assert_eq!(parsed["cpu_instructions"], 532_502);
 }
