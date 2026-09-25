@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `simulation_duration_ms` in `--json`/CSV report output plus a
+  `Simulation latency: X ms` footer on table reports: the wall-clock
+  `simulateTransaction` round-trip, so CI logs can separate RPC network wait
+  from local computation and decoding.
 - `--timeout` global flag — configurable HTTP request timeout for RPC calls
   in seconds (default 30).
 - `config diff --summary` — print a single-line summary
@@ -21,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   command, its flags, and its offline error paths.
 - CI build matrix running fmt, clippy, build, and tests on Linux, macOS, and
   Windows for cross-platform compatibility.
+
+### Changed
+
+- Renamed the report field `rpc_latency_ms` to `simulation_duration_ms`
+  (JSON key, CSV column, and Markdown/table labels) to match the simulation
+  round-trip semantics it measures.
 
 ### Fixed
 

@@ -1427,6 +1427,19 @@ fn start_mock_rpc_server(
     min_fee: &'static str,
     ledger: u64,
 ) -> (String, std::sync::mpsc::Sender<()>) {
+    start_mock_rpc_server_delayed(live_tx_data, min_fee, ledger, 0)
+}
+
+/// Same mock server, but every response is delayed by `delay_ms` so tests can
+/// assert on measured round-trip durations without depending on how fast
+/// loopback happens to be (`Instant::elapsed().as_millis()` truncates, so a
+/// sub-millisecond reply reports 0 ms).
+fn start_mock_rpc_server_delayed(
+    live_tx_data: &'static str,
+    min_fee: &'static str,
+    ledger: u64,
+    delay_ms: u64,
+) -> (String, std::sync::mpsc::Sender<()>) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
@@ -1497,6 +1510,10 @@ fn start_mock_rpc_server(
                     } else {
                         r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#.to_string()
                     };
+
+                    if delay_ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    }
 
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1653,4 +1670,86 @@ fn test_estimate_minimal_wasm_upload_zero_footprint() {
     assert_eq!(parsed["write_entries"], 0);
     assert_eq!(parsed["read_bytes"], 0);
     assert_eq!(parsed["write_bytes"], 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Simulation latency reporting tests (Issue #304)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The mock server delays every reply so the measured round-trip is reliably
+/// above the millisecond truncation floor.
+const MOCK_LATENCY_MS: u64 = 20;
+
+/// Runs `estimate` against the delayed mock server, optionally as JSON, with
+/// tracing quieted (`RUST_LOG=error`) so stdout stays parseable.
+fn estimate_against_mock(home: &Path, rpc_url: &str, json: bool) -> (String, String, i32) {
+    let mut args = vec![
+        "estimate",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--id",
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        "--fn",
+        "increment",
+        "--arg",
+        "1",
+        "--rpc-url",
+        rpc_url,
+    ];
+    if json {
+        args.push("--json");
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(&args)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.code().unwrap_or(-1),
+    )
+}
+
+#[test]
+fn test_estimate_reports_simulation_duration_ms_in_json() {
+    let (rpc_url, _stop) =
+        start_mock_rpc_server_delayed(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195, MOCK_LATENCY_MS);
+    let home = temp_home("estimate-simulation-duration-json");
+
+    let (stdout, stderr, code) = estimate_against_mock(&home, &rpc_url, true);
+    assert_eq!(code, 0, "estimate should succeed; stderr: {stderr}");
+
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON output");
+    let duration = parsed["simulation_duration_ms"].as_u64().unwrap_or(0);
+    assert!(
+        duration > 0,
+        "simulation_duration_ms should be > 0 for a mock simulation response; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_estimate_reports_simulation_latency_in_table_footer() {
+    let (rpc_url, _stop) =
+        start_mock_rpc_server_delayed(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195, MOCK_LATENCY_MS);
+    let home = temp_home("estimate-simulation-duration-table");
+
+    let (stdout, stderr, code) = estimate_against_mock(&home, &rpc_url, false);
+    assert_eq!(code, 0, "estimate should succeed; stderr: {stderr}");
+
+    let footer = stdout
+        .lines()
+        .find(|line| line.starts_with("Simulation latency:"))
+        .unwrap_or_else(|| panic!("table output should have a latency footer; got: {stdout}"));
+    let ms: u64 = footer
+        .trim_start_matches("Simulation latency: ")
+        .trim_end_matches(" ms")
+        .trim()
+        .parse()
+        .expect("footer latency should be an integer number of milliseconds");
+    assert!(ms > 0, "table footer latency should be > 0; got: {footer}");
 }

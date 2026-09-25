@@ -554,11 +554,12 @@ async fn cmd_estimate(
         // (potentially expensive) simulateTransaction call itself.
         client.health_check().await?;
 
-        // Time the simulateTransaction round-trip so the report can flag
-        // slow RPC endpoints. Includes any retries performed by the client.
+        // Time the simulateTransaction round-trip so the report can show how
+        // much of a run was network wait and flag slow RPC endpoints.
+        // Includes any retries performed by the client.
         let rpc_start = std::time::Instant::now();
         let response = rpc::simulate::simulate_transaction(&client, &tx_b64).await?;
-        let rpc_latency_ms = rpc_start.elapsed().as_millis() as u64;
+        let simulation_duration_ms = rpc_start.elapsed().as_millis() as u64;
 
         if missing_simulation_data(&response) {
             return Err(error::AppError::SimulationFailed(
@@ -609,7 +610,7 @@ async fn cmd_estimate(
             fee: fee.clone(),
             ledger: latest_ledger,
             network: network.to_string(),
-            rpc_latency_ms,
+            simulation_duration_ms,
             rates: Some(fee_rates),
         };
 
@@ -622,7 +623,7 @@ async fn cmd_estimate(
             fee.total_stroops,
             cpu_instructions,
             memory_bytes,
-            Some(rpc_latency_ms),
+            Some(simulation_duration_ms),
             true,
         );
         info!(total_stroops = fee.total_stroops, total_xlm = %fee.total_xlm, "estimate complete");

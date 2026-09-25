@@ -191,9 +191,13 @@ pub struct CostReport {
     pub ledger: u32,
     /// Network the simulation ran on.
     pub network: String,
-    /// RPC round-trip time of the `simulateTransaction` call, in
-    /// milliseconds. Helps identify slow or overloaded RPC endpoints.
-    pub rpc_latency_ms: u64,
+    /// Wall-clock duration of the `simulateTransaction` round-trip, in
+    /// milliseconds, measured around the RPC call itself. Serialized as
+    /// `simulation_duration_ms` so CI logs can separate time spent waiting on
+    /// the network from local computation and decoding, and rendered as
+    /// `Simulation latency: X ms` in the table footer. Also helps identify
+    /// slow or overloaded RPC endpoints.
+    pub simulation_duration_ms: u64,
     /// Fee rates used to compute the breakdown (carried so optimization
     /// suggestions can quantify per-resource savings). Excluded from
     /// serialized output; `None` when the rates were unavailable.
@@ -321,7 +325,6 @@ pub fn format_report_table(report: &CostReport) -> String {
         "Network: {} (ledger {})\n",
         report.network, report.ledger
     ));
-    output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
     output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
 
     let mut table = Table::new();
@@ -383,6 +386,12 @@ pub fn format_report_table(report: &CostReport) -> String {
         report.fee.refundable_stroops,
     ));
 
+    // Footer summary: the RPC simulation round-trip measured for this report.
+    output.push_str(&format!(
+        "\nSimulation latency: {} ms\n",
+        report.simulation_duration_ms
+    ));
+
     output
 }
 
@@ -437,7 +446,7 @@ mod tests {
             },
             ledger: 3_894_195,
             network: "testnet".to_string(),
-            rpc_latency_ms: 87,
+            simulation_duration_ms: 87,
             rates: Some(rates),
         }
     }
@@ -550,7 +559,7 @@ mod tests {
             },
             ledger: 0,
             network: "testnet".to_string(),
-            rpc_latency_ms: 0,
+            simulation_duration_ms: 0,
             rates: None,
         };
 
