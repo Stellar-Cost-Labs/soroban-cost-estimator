@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `wasm info <file.wasm>` — fully offline contract inspection: file size,
+  SHA-256, exported functions with spec-derived argument *and return* types,
+  embedded contract/SDK metadata, a per-section size summary, and (with
+  `--json`) the full parsed `contractspecv0` AST. The existing flat
+  `wasm-info --wasm <file.wasm>` form is unchanged.
+- Per-section byte sizes and names for every WASM section, including custom
+  sections such as `contractspecv0`, `contractmetav0`, and `name`.
+- WASM section size breakdown — each section's full footprint (contents plus
+  its own header) and its share of the file, largest first, with the 8-byte
+  module header as its own row so the sizes add up exactly to the file length.
+  Shown by `wasm info`, repeated in `estimate` cost reports, and exposed as a
+  `section_sizes` map in `--json` output.
+- SDK version detection from the `contractmetav0` section (`rssdkver` and
+  common aliases), surfaced in both report modes.
+- `docs/commands/wasm-info.md` plus `wasm info` / `cache stats` sections in
+  `docs/commands.md`.
 - `--timeout` global flag — configurable HTTP request timeout for RPC calls
   in seconds (default 30).
 - `config diff --summary` — print a single-line summary
@@ -24,6 +40,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Restore the `cache stats` subcommand wiring that a CLI refactor merge
+  dropped, leaving `cmd_cache_stats` unreachable dead code.
+- WASM function signatures are now resolved against the *defined* function
+  index space, so export arities stay correct for modules that import
+  functions.
+- Malformed `contractspecv0` / `contractmetav0` custom sections now fail with
+  the section name in the error instead of being silently discarded.
+- Invalid WebAssembly input reports `not a valid WebAssembly binary` instead
+  of a bare validator message.
 - Restore the WebSocket RPC client (`rpc::ws`) after the merge of `main`
   dropped its `AppError` variants and `resolve_ws_endpoint`, which broke
   compilation and red-flagged every CI job.

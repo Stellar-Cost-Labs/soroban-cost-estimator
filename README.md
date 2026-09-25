@@ -150,6 +150,24 @@ Functions requiring arguments are reported as `"Skipped — needs --fn/--arg"`
 A `[i/N] <function>` progress line is printed before each simulation, so you
 can watch progress on contracts with many functions.
 
+### `wasm info`
+
+Inspect a compiled contract offline: size, SHA-256, exported functions with
+their argument and return types, embedded metadata (contract name, SDK
+version), and a section size breakdown — every section's bytes and share of the
+file, largest first, which is where upload-fee and rent surprises come from.
+No RPC calls are made.
+
+```bash
+soroban-cost-estimator wasm info contract.wasm [--json]
+```
+
+`--json` emits the full parsed spec AST (every `contractspecv0` entry —
+functions, UDTs, enums, events — with nested type trees) plus a
+`section_sizes` map, imports, exports, and memory limits. The older flat form
+`soroban-cost-estimator wasm-info --wasm contract.wasm` still works and prints
+the same report.
+
 ### `config snapshot`
 
 Fetch all 6 `ConfigSetting` ledger entries, decode them via XDR, timestamp,

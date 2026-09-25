@@ -1,0 +1,209 @@
+---
+source: tests/report_snapshots.rs
+expression: JsonFormatter.format(&section_report())
+---
+{
+  "cpu_instructions": 532502,
+  "fee": {
+    "bandwidth_fee_stroops": 61,
+    "cpu_fee_stroops": 372,
+    "non_refundable_stroops": 4496,
+    "refundable_stroops": 10931,
+    "storage_fee_stroops": 4063,
+    "total_stroops": 15427,
+    "total_xlm": "0.0015427"
+  },
+  "function": "increment",
+  "ledger": 3894195,
+  "memory_bytes": 0,
+  "network": "testnet",
+  "read_bytes": 0,
+  "read_entries": 1,
+  "rpc_latency_ms": 87,
+  "section_sizes": {
+    "code": 1021,
+    "contractenvmetav0": 32,
+    "contractmetav0": 113,
+    "contractspecv0": 150,
+    "data": 11,
+    "export": 55,
+    "function": 27,
+    "global": 35,
+    "import": 33,
+    "memory": 5,
+    "module header": 8,
+    "name": 3047,
+    "producers": 79,
+    "table": 7,
+    "target_features": 36,
+    "type": 83
+  },
+  "suggestions": [],
+  "tx_size": 156,
+  "wasm_hash": "abc123def456",
+  "wasm_sections": [
+    {
+      "end": 4627,
+      "header_size": 3,
+      "id": 0,
+      "name": "name",
+      "offset": 1583,
+      "percent": 64.26,
+      "size": 3044,
+      "total_size": 3047
+    },
+    {
+      "end": 1274,
+      "header_size": 3,
+      "id": 10,
+      "name": "code",
+      "offset": 256,
+      "percent": 21.53,
+      "size": 1018,
+      "total_size": 1021
+    },
+    {
+      "end": 1435,
+      "header_size": 3,
+      "id": 0,
+      "name": "contractspecv0",
+      "offset": 1288,
+      "percent": 3.16,
+      "size": 147,
+      "total_size": 150
+    },
+    {
+      "end": 1580,
+      "header_size": 2,
+      "id": 0,
+      "name": "contractmetav0",
+      "offset": 1469,
+      "percent": 2.38,
+      "size": 111,
+      "total_size": 113
+    },
+    {
+      "end": 91,
+      "header_size": 2,
+      "id": 1,
+      "name": "type",
+      "offset": 10,
+      "percent": 1.75,
+      "size": 81,
+      "total_size": 83
+    },
+    {
+      "end": 4706,
+      "header_size": 2,
+      "id": 0,
+      "name": "producers",
+      "offset": 4629,
+      "percent": 1.67,
+      "size": 77,
+      "total_size": 79
+    },
+    {
+      "end": 253,
+      "header_size": 2,
+      "id": 7,
+      "name": "export",
+      "offset": 200,
+      "percent": 1.16,
+      "size": 53,
+      "total_size": 55
+    },
+    {
+      "end": 4742,
+      "header_size": 2,
+      "id": 0,
+      "name": "target_features",
+      "offset": 4708,
+      "percent": 0.76,
+      "size": 34,
+      "total_size": 36
+    },
+    {
+      "end": 198,
+      "header_size": 2,
+      "id": 6,
+      "name": "global",
+      "offset": 165,
+      "percent": 0.74,
+      "size": 33,
+      "total_size": 35
+    },
+    {
+      "end": 124,
+      "header_size": 2,
+      "id": 2,
+      "name": "import",
+      "offset": 93,
+      "percent": 0.7,
+      "size": 31,
+      "total_size": 33
+    },
+    {
+      "end": 1467,
+      "header_size": 2,
+      "id": 0,
+      "name": "contractenvmetav0",
+      "offset": 1437,
+      "percent": 0.67,
+      "size": 30,
+      "total_size": 32
+    },
+    {
+      "end": 151,
+      "header_size": 2,
+      "id": 3,
+      "name": "function",
+      "offset": 126,
+      "percent": 0.57,
+      "size": 25,
+      "total_size": 27
+    },
+    {
+      "end": 1285,
+      "header_size": 2,
+      "id": 11,
+      "name": "data",
+      "offset": 1276,
+      "percent": 0.23,
+      "size": 9,
+      "total_size": 11
+    },
+    {
+      "end": null,
+      "header_size": 8,
+      "id": null,
+      "name": "module header",
+      "offset": null,
+      "percent": 0.17,
+      "size": 0,
+      "total_size": 8
+    },
+    {
+      "end": 158,
+      "header_size": 2,
+      "id": 4,
+      "name": "table",
+      "offset": 153,
+      "percent": 0.15,
+      "size": 5,
+      "total_size": 7
+    },
+    {
+      "end": 163,
+      "header_size": 2,
+      "id": 5,
+      "name": "memory",
+      "offset": 160,
+      "percent": 0.11,
+      "size": 3,
+      "total_size": 5
+    }
+  ],
+  "wasm_size": 4742,
+  "write_bytes": 136,
+  "write_entries": 1
+}

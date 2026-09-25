@@ -68,6 +68,316 @@ fn test_load_real_soroban_contract_fixture() {
 }
 
 #[test]
+fn test_spec_returns_are_decoded() {
+    let path = Path::new("tests/fixtures/contract.wasm");
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(path)
+        .expect("failed to load contract fixture");
+
+    let inc = wasm_info
+        .functions
+        .iter()
+        .find(|f| f.name == "increment")
+        .expect("fixture should export 'increment'");
+
+    assert_eq!(inc.result_count, 1, "increment returns one value");
+    assert_eq!(inc.returns.len(), 1);
+    assert_eq!(inc.returns[0].type_name, "i64");
+
+    let signature = soroban_cost_estimator::wasm::parser::format_function(inc);
+    assert_eq!(signature, "increment(step: i64) -> i64");
+}
+
+#[test]
+fn test_spec_entries_preserve_every_entry_kind() {
+    let path = Path::new("tests/fixtures/contract.wasm");
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(path)
+        .expect("failed to load contract fixture");
+
+    let (entries, has_spec) = soroban_cost_estimator::wasm::parser::parse_contract_spec_entries(
+        &std::fs::read(path).expect("read fixture"),
+    )
+    .expect("spec entries should decode");
+    assert!(has_spec);
+    assert_eq!(entries.len(), wasm_info.spec_entries.len());
+    assert!(
+        entries
+            .iter()
+            .any(|e| matches!(e, stellar_xdr::ScSpecEntry::FunctionV0(_))),
+        "fixture should carry at least one function entry"
+    );
+
+    let (functions, has_spec) =
+        soroban_cost_estimator::wasm::parser::parse_contract_spec_functions(
+            &std::fs::read(path).expect("read fixture"),
+        )
+        .expect("spec functions should decode");
+    assert!(has_spec);
+    let increment = functions
+        .iter()
+        .find(|f| f.name == "increment")
+        .expect("spec should declare 'increment'");
+    assert_eq!(increment.inputs.len(), 1);
+    assert_eq!(increment.inputs[0].type_name, "i64");
+    assert_eq!(increment.outputs.len(), 1);
+    assert_eq!(increment.outputs[0].type_name, "i64");
+}
+
+#[test]
+fn test_spec_entry_json_projection() {
+    use soroban_cost_estimator::wasm::parser::{spec_entry_json, spec_type_json};
+
+    let path = Path::new("tests/fixtures/contract.wasm");
+    let bytes = std::fs::read(path).expect("read fixture");
+    let (entries, _) = soroban_cost_estimator::wasm::parser::parse_contract_spec_entries(&bytes)
+        .expect("spec entries should decode");
+
+    let function = entries
+        .iter()
+        .find_map(|entry| match entry {
+            stellar_xdr::ScSpecEntry::FunctionV0(f) if f.name.as_slice() == b"increment" => Some(f),
+            _ => None,
+        })
+        .expect("fixture should declare 'increment'");
+
+    let json = spec_entry_json(&stellar_xdr::ScSpecEntry::FunctionV0(function.clone()));
+    assert_eq!(json["kind"], "function");
+    assert_eq!(json["name"], "increment");
+    assert_eq!(json["inputs"][0]["name"], "step");
+    assert_eq!(json["inputs"][0]["type"], "i64");
+    assert_eq!(json["inputs"][0]["type_def"]["type"], "i64");
+    assert_eq!(json["outputs"][0]["type"], "i64");
+    assert_eq!(json["outputs"].as_array().map(Vec::len), Some(1));
+
+    let nested = stellar_xdr::ScSpecTypeDef::Option(Box::new(stellar_xdr::ScSpecTypeOption {
+        value_type: Box::new(stellar_xdr::ScSpecTypeDef::Vec(Box::new(
+            stellar_xdr::ScSpecTypeVec {
+                element_type: Box::new(stellar_xdr::ScSpecTypeDef::BytesN(
+                    stellar_xdr::ScSpecTypeBytesN { n: 4 },
+                )),
+            },
+        ))),
+    }));
+    let nested_json = spec_type_json(&nested);
+    assert_eq!(nested_json["type"], "option");
+    assert_eq!(nested_json["inner"]["type"], "vec");
+    assert_eq!(nested_json["inner"]["element"]["type"], "bytes_n");
+    assert_eq!(nested_json["inner"]["element"]["length"], 4);
+}
+
+#[test]
+fn test_sections_captured_with_names_and_sizes() {
+    use soroban_cost_estimator::wasm::parser::section_id_name;
+
+    let path = Path::new("tests/fixtures/contract.wasm");
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(path)
+        .expect("failed to load contract fixture");
+
+    assert!(
+        !wasm_info.sections.is_empty(),
+        "sections should be captured"
+    );
+    let content_bytes: usize = wasm_info.sections.iter().map(|s| s.size).sum();
+    assert!(
+        content_bytes <= wasm_info.bytes.len(),
+        "section content cannot exceed the file size"
+    );
+
+    for section in &wasm_info.sections {
+        assert!(section.size > 0, "section {} has no size", section.name);
+        assert_eq!(section.end - section.offset, section.size);
+    }
+
+    let type_section = wasm_info
+        .sections
+        .iter()
+        .find(|s| s.id == 1)
+        .expect("module should have a type section");
+    assert_eq!(type_section.name, "type");
+    assert_eq!(section_id_name(1), "type");
+    assert_eq!(section_id_name(10), "code");
+    assert_eq!(section_id_name(200), "unknown");
+
+    let spec_section = wasm_info
+        .sections
+        .iter()
+        .find(|s| s.name == "contractspecv0")
+        .expect("fixture should have a contractspecv0 custom section");
+    assert!(spec_section.custom);
+    assert_eq!(spec_section.id, 0);
+
+    let summary = soroban_cost_estimator::wasm::parser::format_sections(&wasm_info);
+    assert!(summary.contains("WASM sections:"), "got: {summary}");
+    assert!(summary.contains("contractspecv0"), "got: {summary}");
+    assert!(summary.contains("bytes"), "got: {summary}");
+    assert!(summary.contains('%'), "shares missing from: {summary}");
+}
+
+#[test]
+fn test_section_sizes_sum_to_total_wasm_byte_length() {
+    for fixture in [
+        "tests/fixtures/minimal.wasm",
+        "tests/fixtures/contract.wasm",
+    ] {
+        let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(Path::new(fixture))
+            .unwrap_or_else(|e| panic!("failed to load {fixture}: {e}"));
+        let breakdown = wasm_info.section_breakdown();
+
+        let section_bytes: usize = breakdown
+            .sections
+            .iter()
+            .filter(|s| s.id.is_some())
+            .map(|s| s.total_size)
+            .sum();
+        assert_eq!(
+            section_bytes + breakdown.header_size,
+            wasm_info.bytes.len(),
+            "section sizes must add up to the file length for {fixture}"
+        );
+        assert_eq!(
+            breakdown.accounted_bytes(),
+            wasm_info.bytes.len(),
+            "every byte must be accounted for in {fixture}"
+        );
+        assert_eq!(breakdown.total_size, wasm_info.bytes.len());
+        assert_eq!(breakdown.header_size, 8, "magic + version header");
+
+        let map_total: usize = breakdown.size_map().values().sum();
+        assert_eq!(
+            map_total,
+            wasm_info.bytes.len(),
+            "size_map() must cover the whole file for {fixture}"
+        );
+
+        for entry in &breakdown.sections {
+            assert_eq!(
+                entry.total_size,
+                entry.header_size + entry.size,
+                "{} accounting is inconsistent",
+                entry.name
+            );
+            assert!(entry.percent >= 0.0 && entry.percent <= 100.0);
+        }
+        let shares: f64 = breakdown.sections.iter().map(|s| s.percent).sum();
+        assert!(
+            (shares - 100.0).abs() < 0.05,
+            "shares should total ~100% for {fixture}, got {shares}"
+        );
+
+        let standalone =
+            soroban_cost_estimator::wasm::parser::section_size_breakdown(&wasm_info.bytes)
+                .unwrap_or_else(|e| panic!("standalone breakdown failed for {fixture}: {e}"));
+        assert_eq!(standalone, breakdown, "both builders must agree");
+    }
+}
+
+#[test]
+fn test_section_sizes_are_exact_and_sorted() {
+    let wasm_info =
+        soroban_cost_estimator::wasm::parser::load_wasm(Path::new("tests/fixtures/minimal.wasm"))
+            .expect("failed to load minimal fixture");
+    let breakdown = wasm_info.section_breakdown();
+    let sizes = breakdown.size_map();
+
+    // 44 byte module: 8 byte header plus type(6+2), function(2+2),
+    // export(11+2), code(9+2) bytes of section data.
+    assert_eq!(sizes.get("module header"), Some(&8));
+    assert_eq!(sizes.get("type"), Some(&8));
+    assert_eq!(sizes.get("function"), Some(&4));
+    assert_eq!(sizes.get("export"), Some(&13));
+    assert_eq!(sizes.get("code"), Some(&11));
+    assert_eq!(sizes.values().sum::<usize>(), 44);
+
+    let totals: Vec<usize> = breakdown.sections.iter().map(|s| s.total_size).collect();
+    let mut sorted = totals.clone();
+    sorted.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(totals, sorted, "breakdown should be largest first");
+
+    let code = breakdown
+        .sections
+        .iter()
+        .find(|s| s.name == "code")
+        .expect("code section");
+    assert_eq!(code.id, Some(10));
+    assert_eq!(code.size, 9, "code content bytes");
+    assert_eq!(code.header_size, 2, "id byte + LEB128 size prefix");
+    assert_eq!(code.offset, Some(35));
+    assert_eq!(code.end, Some(44));
+    assert!((code.percent - 25.0).abs() < 0.01, "{}", code.percent);
+}
+
+#[test]
+fn test_section_size_breakdown_rejects_invalid_wasm() {
+    let err = soroban_cost_estimator::wasm::parser::section_size_breakdown(b"not a wasm file")
+        .expect_err("invalid bytes must be rejected");
+    let message = err.to_string();
+    assert!(
+        message.contains("not a valid WebAssembly binary"),
+        "got: {message}"
+    );
+}
+
+#[test]
+fn test_sdk_version_from_contract_meta() {
+    let path = Path::new("tests/fixtures/contract.wasm");
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(path)
+        .expect("failed to load contract fixture");
+
+    let meta = &wasm_info.contract_meta;
+    let sdk_version = meta
+        .sdk_version
+        .as_deref()
+        .expect("sdk-built fixture should carry an SDK version");
+    assert!(!sdk_version.is_empty());
+    assert_eq!(Some(sdk_version), meta.get("rssdkver"));
+}
+
+#[test]
+fn test_contract_meta_sdk_version_key_variants() {
+    let mut bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&xdr_meta_entry("name", "Versioned"));
+    payload.extend_from_slice(&xdr_meta_entry("rssdkver", "22.0.0-rc.1"));
+    bytes.extend_from_slice(&custom_section("contractmetav0", &payload));
+
+    let meta = soroban_cost_estimator::wasm::parser::parse_contract_meta(&bytes)
+        .expect("meta should parse");
+    assert_eq!(meta.sdk_version.as_deref(), Some("22.0.0-rc.1"));
+    assert_eq!(meta.get("name"), Some("Versioned"));
+    assert_eq!(meta.get("missing"), None);
+}
+
+#[test]
+fn test_malformed_contract_spec_reports_context() {
+    let mut bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
+    bytes.extend_from_slice(&custom_section("contractspecv0", &[0xff, 0xff, 0xff, 0xff]));
+
+    let err = soroban_cost_estimator::wasm::parser::parse_contract_spec_entries(&bytes)
+        .expect_err("malformed spec data should fail to decode");
+    let message = err.to_string();
+    assert!(
+        message.contains("contractspecv0"),
+        "error should name the section, got: {message}"
+    );
+
+    let temp = std::env::temp_dir().join(format!("sce-bad-spec-{}.wasm", std::process::id()));
+    std::fs::write(&temp, &bytes).expect("write fixture");
+    let load_err = soroban_cost_estimator::wasm::parser::load_wasm(&temp)
+        .expect_err("malformed spec should not load silently");
+    assert!(load_err.to_string().contains("contractspecv0"));
+    let _ = std::fs::remove_file(&temp);
+}
+
+#[test]
+fn test_invalid_wasm_error_mentions_webassembly() {
+    let err = soroban_cost_estimator::wasm::parser::validate_wasm(b"not a wasm file at all")
+        .expect_err("garbage should not validate");
+    assert!(
+        err.to_string().contains("not a valid WebAssembly binary"),
+        "got: {err}"
+    );
+}
+
+#[test]
 fn test_invalid_wasm_rejected() {
     let invalid_bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]; // magic only, no content
     let temp_dir = std::env::temp_dir();

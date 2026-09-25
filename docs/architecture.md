@@ -179,20 +179,44 @@ returned entries back by re-encoding keys and comparing against the response's
 
 ### `wasm/parser.rs` — WASM Parsing
 
-`load_wasm` reads a `.wasm` file from disk and performs three steps:
+`load_wasm` reads a `.wasm` file from disk and performs four steps:
 
 1. **Validation**: `wasmparser::validate` checks structural correctness.
-2. **Function enumeration**: Walks the WASM type, function, and export
-   sections to build a `Vec<FunctionInfo>` with name, param count, and
-   result count for each exported function.
+2. **Module walk**: Walks the WASM type, import, function, memory, and export
+   sections to build a `Vec<FunctionInfo>` (name, param count, result count)
+   for each exported function, plus the start function, memory limits,
+   imports, exports, and a per-section byte summary
+   (`SectionInfo`: id, name, custom flag, offset, end, content size, header
+   size). Export arities are resolved against the *defined* function index
+   space, so modules that import functions are handled correctly.
 3. **Contract spec decoding**: Looks for a `contractspecv0` custom section
-   and decodes `ScSpecEntry::FunctionV0` XDR entries to extract typed
-   parameter lists (name + type name) that the bare WASM export section
-   cannot express.
+   and decodes **every** `ScSpecEntry` — functions, UDT structs, unions,
+   enums, error enums, and events. Function entries contribute typed
+   parameters *and* return types (name + `ScSpecTypeDef`) that the bare WASM
+   export section cannot express. A malformed section fails the load with the
+   section name in the error rather than being silently discarded.
+4. **Contract metadata**: Decodes the `contractmetav0` custom section into
+   name, version, description, SDK version, and the full ordered key/value
+   list.
 
-The `WasmInfo` struct carries the raw bytes, the function list, and a
-`has_spec` flag. The SHA-256 of the WASM bytes serves as the identity key
-for caching.
+`SectionSizeBreakdown` turns the section list into whole-file size accounting:
+one `SectionSize` row per section plus a row for the fixed 8-byte module
+header, each carrying `size` (contents), `header_size`, `total_size`, and its
+`percent` share of the file. Because a module is that header plus its
+sections, `header_size + sum(row.total_size)` equals the file length exactly —
+which `test_section_sizes_sum_to_total_wasm_byte_length` pins down. The
+breakdown drives the `wasm info` table, the `section_sizes` JSON map, and the
+`WASM sections` table in cost reports.
+
+`spec_type_json` / `spec_entry_json` project the decoded spec into JSON,
+keeping nested type trees (`option`/`result`/`vec`/`map`/`tuple`/`bytes_n`/
+`udt`) structured rather than flattening them to a name.
+
+The `WasmInfo` struct carries the raw bytes, the function list, the decoded
+spec entries, the section list, and a `has_spec` flag;
+`WasmInfo::section_breakdown` derives the size accounting from those. The SHA-256 of the
+WASM bytes serves as the identity key for caching and is printed by
+`wasm info`.
 
 ### `xdr_helper.rs` — XDR and Transaction Construction
 
