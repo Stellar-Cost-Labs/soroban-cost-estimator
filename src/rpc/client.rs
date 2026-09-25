@@ -43,29 +43,98 @@ pub fn resolve_endpoint(network: &str, custom_url: Option<&str>) -> AppResult<St
 /// Resolves a network name to its WebSocket RPC endpoint (`wss://…/ws`).
 ///
 /// Derives the WebSocket URL from the HTTP endpoint returned by
-/// [`resolve_endpoint`] by swapping the scheme (`https` → `wss`, `http` →
-/// `ws`) and appending the `/ws` path used by Stellar RPC for streaming
-/// subscriptions. Custom URLs override network resolution and must already
-/// be in WebSocket form.
+/// [`resolve_endpoint`]; custom URLs override network resolution and are
+/// normalized with [`to_websocket_url`], so `https://host` works as well as
+/// `wss://host`.
 ///
 /// # Network calls
 /// None — pure string transformation of the resolved endpoint.
 pub fn resolve_ws_endpoint(network: &str, custom_url: Option<&str>) -> AppResult<String> {
     if let Some(url) = custom_url {
         debug!(url, "using custom WebSocket RPC endpoint");
-        return Ok(url.to_string());
+        return to_websocket_url(url);
     }
 
     let http_endpoint = resolve_endpoint(network, None)?;
-    let ws_endpoint = match http_endpoint.strip_prefix("https://") {
-        Some(host) => format!("wss://{host}/ws"),
-        None => match http_endpoint.strip_prefix("http://") {
-            Some(host) => format!("ws://{host}/ws"),
-            None => return Err(AppError::UnknownNetwork(network.to_string())),
-        },
-    };
+    let ws_endpoint = to_websocket_url(&http_endpoint)?;
     debug!(network, ws_endpoint, "resolved WebSocket RPC endpoint");
     Ok(ws_endpoint)
+}
+
+/// Rewrites an RPC URL into its WebSocket form.
+///
+/// * `ws://` / `wss://` URLs are kept as-is.
+/// * `http://` / `https://` URLs have their scheme swapped (`http` → `ws`,
+///   `https` → `wss`).
+/// * A URL that carries no path (or only `/`) gets the `/ws` path Stellar RPC
+///   serves its streaming subscriptions on.
+///
+/// # Network calls
+/// None — pure string transformation.
+pub fn to_websocket_url(url: &str) -> AppResult<String> {
+    let (scheme, rest) = split_url_scheme(url)?;
+    let ws_scheme = match scheme.as_str() {
+        "ws" | "wss" => scheme.clone(),
+        "http" => "ws".to_string(),
+        "https" => "wss".to_string(),
+        _ => return Err(unsupported_scheme(url)),
+    };
+    Ok(format!("{ws_scheme}://{}", with_ws_path(rest)))
+}
+
+/// Rewrites an RPC URL into its HTTP form (the inverse of
+/// [`to_websocket_url`]).
+///
+/// `http://` / `https://` URLs are kept as-is; `ws://` / `wss://` URLs have
+/// their scheme swapped and any trailing `/ws` path stripped, so the same
+/// `--rpc-url` value can drive both the WebSocket subscription and the
+/// request/response JSON-RPC calls.
+///
+/// # Network calls
+/// None — pure string transformation.
+pub fn to_http_url(url: &str) -> AppResult<String> {
+    let (scheme, rest) = split_url_scheme(url)?;
+    let http_scheme = match scheme.as_str() {
+        "http" | "https" => scheme.clone(),
+        "ws" => "http".to_string(),
+        "wss" => "https".to_string(),
+        _ => return Err(unsupported_scheme(url)),
+    };
+    let rest = rest.strip_suffix("/ws").unwrap_or(rest);
+    Ok(format!("{http_scheme}://{rest}"))
+}
+
+/// Splits `scheme://rest` into its lowercased scheme and the remainder.
+fn split_url_scheme(url: &str) -> AppResult<(String, &str)> {
+    match url.split_once("://") {
+        Some((scheme, rest)) if !scheme.is_empty() && !rest.is_empty() => {
+            Ok((scheme.to_ascii_lowercase(), rest))
+        }
+        _ => Err(unsupported_scheme(url)),
+    }
+}
+
+/// Appends the `/ws` subscription path when the URL has no path of its own.
+///
+/// Only the authority (plus any path) is inspected; a trailing `/` counts as
+/// "no path" so `https://host/` becomes `wss://host/ws`.
+fn with_ws_path(rest: &str) -> String {
+    let path_part = rest.split(['?', '#']).next().unwrap_or(rest);
+    let has_path = path_part
+        .split_once('/')
+        .is_some_and(|(_, path)| !path.is_empty());
+    if has_path {
+        rest.to_string()
+    } else {
+        format!("{}/ws", path_part.trim_end_matches('/'))
+    }
+}
+
+/// Error for a URL whose scheme this tool cannot speak.
+fn unsupported_scheme(url: &str) -> AppError {
+    AppError::General(format!(
+        "unsupported RPC URL `{url}`: expected a ws://, wss://, http://, or https:// URL"
+    ))
 }
 
 /// Key identifying a deduplicable JSON-RPC request: `(method, serialized params)`.
@@ -241,7 +310,6 @@ impl RpcClient {
             // construction infallible.
             client: reqwest::Client::builder()
                 .timeout(timeout)
-                .default_headers(headers.clone())
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             dedup: Arc::new(Mutex::new(DedupState::default())),
@@ -414,12 +482,16 @@ impl RpcClient {
         let url = url.to_string();
         let request_body = body.clone();
         let limiter = self.limiter.clone();
+        // Custom headers are attached per request (rather than as client
+        // defaults) so the stored configuration stays authoritative.
+        let headers = self.headers.clone();
 
         let response = with_retry(self.max_retries, || {
             let client = client.clone();
             let url = url.clone();
             let request_body = request_body.clone();
             let limiter = limiter.clone();
+            let headers = headers.clone();
 
             async move {
                 // Every outbound attempt (including retries) consumes a
@@ -430,6 +502,7 @@ impl RpcClient {
                 }
                 client
                     .post(&url)
+                    .headers(headers)
                     .json(&request_body)
                     .send()
                     .await
@@ -540,7 +613,7 @@ mod tests {
     use crate::error::{AppError, AppResult};
     use crate::rpc::retry::DEFAULT_MAX_RETRIES;
 
-    use super::{RpcClient, resolve_ws_endpoint};
+    use super::{RpcClient, resolve_ws_endpoint, to_http_url, to_websocket_url};
 
     /// Spawns a tiny HTTP server that answers JSON-RPC
     /// `simulateTransaction`-style calls with `{"result":{"pong":true}}`,
@@ -1006,6 +1079,74 @@ mod tests {
             resolve_ws_endpoint("testnet", Some("ws://localhost:8000/ws")).unwrap(),
             "ws://localhost:8000/ws"
         );
+    }
+
+    #[test]
+    fn test_resolve_ws_endpoint_accepts_https_custom_url() {
+        assert_eq!(
+            resolve_ws_endpoint("testnet", Some("https://soroban-testnet.stellar.org")).unwrap(),
+            "wss://soroban-testnet.stellar.org/ws"
+        );
+        assert_eq!(
+            resolve_ws_endpoint("testnet", Some("https://soroban-testnet.stellar.org/")).unwrap(),
+            "wss://soroban-testnet.stellar.org/ws"
+        );
+    }
+
+    #[test]
+    fn test_to_websocket_url_converts_schemes_and_defaults_path() {
+        assert_eq!(
+            to_websocket_url("https://soroban.stellar.org").unwrap(),
+            "wss://soroban.stellar.org/ws"
+        );
+        assert_eq!(
+            to_websocket_url("http://127.0.0.1:8000").unwrap(),
+            "ws://127.0.0.1:8000/ws"
+        );
+        assert_eq!(
+            to_websocket_url("wss://example.org/ws").unwrap(),
+            "wss://example.org/ws"
+        );
+    }
+
+    #[test]
+    fn test_to_websocket_url_keeps_explicit_path() {
+        assert_eq!(
+            to_websocket_url("https://example.org/custom/stream").unwrap(),
+            "wss://example.org/custom/stream"
+        );
+    }
+
+    #[test]
+    fn test_to_websocket_url_rejects_unknown_scheme() {
+        assert!(to_websocket_url("ftp://example.org").is_err());
+        assert!(to_websocket_url("soroban-testnet.stellar.org").is_err());
+    }
+
+    #[test]
+    fn test_to_http_url_is_the_inverse_for_local_endpoints() {
+        // A single `--rpc-url` value drives both the WebSocket subscription and
+        // the request/response JSON-RPC calls.
+        assert_eq!(
+            to_http_url("ws://127.0.0.1:8000/ws").unwrap(),
+            "http://127.0.0.1:8000"
+        );
+        assert_eq!(
+            to_http_url("wss://soroban-testnet.stellar.org/ws").unwrap(),
+            "https://soroban-testnet.stellar.org"
+        );
+        assert_eq!(
+            to_http_url("https://soroban-testnet.stellar.org").unwrap(),
+            "https://soroban-testnet.stellar.org"
+        );
+        assert!(to_http_url("ftp://example.org").is_err());
+    }
+
+    #[test]
+    fn test_ws_and_http_round_trip() {
+        let http = "http://127.0.0.1:8000";
+        let ws = to_websocket_url(http).unwrap();
+        assert_eq!(to_http_url(&ws).unwrap(), http);
     }
 }
 

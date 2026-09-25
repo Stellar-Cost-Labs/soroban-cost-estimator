@@ -646,8 +646,10 @@ soroban-cost-estimator cache clear --network mainnet
 
 ### `watch`
 
-Poll the network's resource-pricing configuration on an interval and print a
-diff whenever something changes.
+Watch the network's resource-pricing configuration and print a diff whenever
+something changes. Subscribes to **ledger-close notifications over a
+WebSocket** so a config change is re-checked the moment its ledger lands, and
+falls back to interval polling when WebSockets are unavailable.
 
 **Usage**
 
@@ -660,12 +662,19 @@ soroban-cost-estimator watch [OPTIONS]
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
 | `--network <NETWORK>` | | `testnet` | Network to watch |
-| `--interval <INTERVAL>` | | `1h` | Polling interval (accepts `s`/`m`/`h`/`d` suffixes or bare seconds) |
+| `--rpc-url <RPC_URL>` | | | Explicit RPC URL used for both the WebSocket subscription and the config fetches (`wss://`/`ws://` or `https://`/`http://`) |
+| `--interval <INTERVAL>` | | `1h` | Polling interval, used as the fallback when WebSocket notifications are unavailable (accepts `s`/`m`/`h`/`d` suffixes or bare seconds) |
 | `--help` | `-h` | | Print help |
 
 **Behavior**
 
-- Polls **immediately**, then every `--interval`.
+- Connects to the node's WebSocket endpoint (`wss://…/ws`) and re-checks the
+  config **on every ledger close**; the network's HTTP endpoint is derived from
+  `--rpc-url` when one is given.
+- Reconnects with exponential backoff (1s, 2s, 4s, … capped at 30s) after a
+  dropped connection, then resubscribes from the last ledger seen.
+- Falls back to polling **immediately**, then every `--interval`, when the
+  endpoint cannot be reached or does not support WebSocket subscriptions.
 - Intervals accept `s`/`m`/`h`/`d` suffixes or bare seconds:
   `3600`, `3600s`, `30m`, `1h`, `1d`. Unparseable input falls back to
   one hour.
@@ -695,6 +704,8 @@ soroban-cost-estimator watch --network mainnet --interval 10m
 
 ```text
 Watching testnet for config changes every 3600s... (Ctrl-C to stop)
+Subscribed to ledger-close notifications from ledger 3894195 — re-checking config on every new ledger.
+Ledger 3894196 closed — re-checking config.
 Received stop signal — exiting cleanly.
 ```
 

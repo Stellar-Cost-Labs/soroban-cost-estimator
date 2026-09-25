@@ -187,13 +187,23 @@ soroban-cost-estimator config diff --network testnet --summary
 
 ### `watch`
 
-Poll network config on an interval and print a diff whenever something changes.
+Watch network config and print a diff whenever something changes. `watch`
+subscribes to **ledger-close notifications over WebSocket**, so a pricing
+change is re-checked the moment its ledger closes instead of on a fixed
+interval.
 
 ```bash
 soroban-cost-estimator watch --network testnet --interval 30m
 ```
 
-Intervals accept `s`/`m`/`h`/`d` suffixes or bare seconds (default `1h`).
+- Re-checks the config on every new ledger; reconnects with exponential
+  backoff if the socket drops.
+- Falls back to HTTP polling every `--interval` when the endpoint is
+  unreachable or has no WebSocket support. Intervals accept `s`/`m`/`h`/`d`
+  suffixes or bare seconds (default `1h`).
+- `--rpc-url` accepts `wss://`/`ws://` (or `https://`/`http://`) and is used
+  for both the subscription and the config fetches.
+
 Useful in CI or cron jobs to monitor for unexpected pricing changes.
 
 Press `Ctrl-C` (SIGINT) or send `SIGTERM` to stop **cleanly** (exit code 0):
@@ -340,6 +350,7 @@ Full reproduction steps (`stellar contract install` → `create` →
 | `config snapshot` (6 config settings) | ✅ |
 | `config diff` + stale cache detection | ✅ |
 | `watch` (polling) | ✅ |
+| `watch` (WebSocket ledger-close subscriptions) | ✅ |
 | JSON output (`--json`) | ✅ |
 | Fee breakdown (non-refundable/refundable) | ✅ |
 | Estimate result caching | ✅ |
