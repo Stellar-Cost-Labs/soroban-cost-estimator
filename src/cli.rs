@@ -316,3 +316,18 @@ pub enum ConfigAction {
         network: String,
     },
 }
+
+/// Check the health of a Soroban RPC endpoint.
+RpcHealth {
+    /// Network to check: testnet, mainnet, or futurenet.
+    #[arg(long, default_value = "testnet")]
+    network: String,
+
+    /// Custom RPC endpoint URL.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Output as JSON.
+    #[arg(long)]
+    json: bool,
+},

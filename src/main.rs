@@ -1013,6 +1013,80 @@ async fn estimate_all_function(
     .await
 }
 
+async fn cmd_rpc_health(
+    network: &str,
+    rpc_url: Option<&str>,
+    json: bool,
+    rps: u32,
+    timeout: u64,
+    max_retries: u32,
+    rpc_fallback_url: Option<&str>,
+    extra_headers: &[(String, String)],
+) -> error::AppResult<()> {
+    use std::time::Instant;
+
+    let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
+
+    let client = rpc::client::RpcClient::with_fallback_headers(
+        &endpoint,
+        rpc_fallback_url,
+        rps,
+        std::time::Duration::from_secs(timeout),
+        max_retries,
+        extra_headers,
+    );
+
+    let start = Instant::now();
+    let result = client.health_check().await;
+    let latency_ms = start.elapsed().as_millis();
+
+    match result {
+        Ok(()) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "healthy",
+                        "network": network,
+                        "endpoint": endpoint,
+                        "latency_ms": latency_ms
+                    })
+                );
+            } else {
+                println!("RPC Status : healthy");
+                println!("Network    : {}", network);
+                println!("Endpoint   : {}", endpoint);
+                println!("Latency    : {} ms", latency_ms);
+            }
+
+            Ok(())
+        }
+
+        Err(e) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "unhealthy",
+                        "network": network,
+                        "endpoint": endpoint,
+                        "latency_ms": latency_ms,
+                        "error": e.to_string()
+                    })
+                );
+            } else {
+                println!("RPC Status : unhealthy");
+                println!("Network    : {}", network);
+                println!("Endpoint   : {}", endpoint);
+                println!("Latency    : {} ms", latency_ms);
+                println!("Error      : {}", e);
+            }
+
+            Err(e)
+        }
+    }
+}
+
 /// `wasm-info` command: print WASM metadata without making any RPC calls.
 ///
 /// Shows the exported functions, contract-spec presence, binary size, and
@@ -2035,4 +2109,22 @@ mod tests {
         assert_eq!(errored["status"], "error");
         assert_eq!(errored["error"], "boom");
     }
+}
+
+cli::Command::RpcHealth {
+    network,
+    rpc_url,
+    json,
+} => {
+    cmd_rpc_health(
+        &network,
+        rpc_url.as_deref(),
+        json,
+        rps,
+        timeout,
+        max_retries,
+        rpc_fallback_url,
+        &headers,
+    )
+    .await
 }
