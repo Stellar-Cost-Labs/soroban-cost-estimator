@@ -123,7 +123,9 @@ pub struct RpcClient {
     /// exponential backoff.
     max_retries: usize,
     /// Custom HTTP headers attached to every outbound request.
+    #[cfg_attr(not(test), allow(dead_code))]
     headers: HeaderMap,
+    timeout_secs: u64,
 }
 
 impl RpcClient {
@@ -236,6 +238,8 @@ impl RpcClient {
         Self {
             url: url.to_string(),
             fallback_url: fallback_url.map(String::from),
+            timeout_secs: timeout.as_secs(),
+
             // `ClientBuilder::build` only fails on invalid configuration (a
             // default builder cannot), so fall back to a plain client to keep
             // construction infallible.
@@ -390,7 +394,15 @@ impl RpcClient {
                     Err(e)
                 }
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                if let AppError::Http(ref error) = e {
+                    if error.is_timeout() {
+                        return Err(AppError::RpcTimeout(self.timeout_secs));
+                    }
+                }
+
+                Err(e)
+            }
         }
     }
 
@@ -415,19 +427,17 @@ impl RpcClient {
         let request_body = body.clone();
         let limiter = self.limiter.clone();
 
-        let response = with_retry(self.max_retries, || {
+        let response = match with_retry(self.max_retries, || {
             let client = client.clone();
             let url = url.clone();
             let request_body = request_body.clone();
             let limiter = limiter.clone();
 
             async move {
-                // Every outbound attempt (including retries) consumes a
-                // token, so the wire rate never exceeds the configured
-                // requests-per-second cap.
                 if let Some(limiter) = &limiter {
                     limiter.until_ready().await;
                 }
+
                 client
                     .post(&url)
                     .json(&request_body)
@@ -436,7 +446,15 @@ impl RpcClient {
                     .map_err(AppError::from)
             }
         })
-        .await?;
+        .await
+        {
+            Ok(response) => response,
+            Err(AppError::Http(error)) if error.is_timeout() => {
+                return Err(AppError::RpcTimeout(self.timeout_secs));
+            }
+            Err(error) => return Err(error),
+        };
+
         let status = response.status();
         let response_body: Value = response.json().await?;
 
@@ -849,14 +867,13 @@ mod tests {
     #[tokio::test]
     async fn test_request_timeout_applies() {
         let url = spawn_hanging_stub().await;
-        let client = RpcClient::with_options(&url, None, Duration::from_millis(100), 0);
+        let client = RpcClient::with_options(&url, None, Duration::from_secs(1), 0);
 
         let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
 
-        assert!(
-            result.is_err(),
-            "a hanging server must eventually produce a timeout error"
-        );
+        let error = result.expect_err("request should time out");
+
+        assert_eq!(error.to_string(), "RPC request timed out after 1 seconds");
     }
 
     /// Reserves a port and immediately closes it, so connecting to it yields
