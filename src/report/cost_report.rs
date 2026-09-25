@@ -1,6 +1,16 @@
 use comfy_table::Table;
 
 use crate::report::fee_calc::{FeeBreakdown, FeeRates};
+use crate::wasm::parser::SectionSize;
+
+/// `serde` helper: skips a `usize` field when it is zero, so reports built
+/// without a local WASM file keep their original JSON shape.
+///
+/// `serde` passes skipped fields by reference, hence the signature.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
 
 /// Compute what percentage `part` is of `total`.
 ///
@@ -171,6 +181,14 @@ pub struct CostReport {
     pub function: String,
     /// WASM bytes SHA-256 hash (hex).
     pub wasm_hash: String,
+    /// Total size of the WASM file, in bytes. `0` when the report was built
+    /// without a local WASM file.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub wasm_size: usize,
+    /// Byte size breakdown of the WASM file, largest section first. Empty
+    /// when the report was not built from a local WASM file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wasm_sections: Vec<SectionSize>,
     /// CPU instructions consumed.
     pub cpu_instructions: u64,
     /// Memory bytes used.
@@ -312,6 +330,46 @@ pub fn format_suggestions(suggestions: &[OptimizationSuggestion]) -> String {
     out
 }
 
+/// Renders the WASM section size breakdown carried by a [`CostReport`] as a
+/// table, largest section first.
+///
+/// Each row shows the section's full footprint (header + contents) and its
+/// share of the file, so the rows add up to the WASM size shown in the
+/// report header. WASM size drives upload fees and rent, and a bloated
+/// `contractspecv0` or oversized data segment shows up here immediately.
+#[must_use]
+pub fn format_section_size_table(sections: &[SectionSize]) -> String {
+    if sections.is_empty() {
+        return String::new();
+    }
+    let section_bytes: usize = sections
+        .iter()
+        .filter(|s| s.id.is_some())
+        .map(|s| s.total_size)
+        .sum();
+    let total: usize = sections.iter().map(|s| s.total_size).sum();
+    let mut out = format!(
+        "WASM sections ({} bytes of section data, largest first):\n",
+        section_bytes
+    );
+    let mut table = Table::new();
+    table.set_header(vec!["Section", "Bytes", "Share"]);
+    for entry in sections {
+        table.add_row(vec![
+            &entry.name,
+            &entry.total_size.to_string(),
+            &format!("{:.1}%", entry.percent),
+        ]);
+    }
+    out.push_str(&table.to_string());
+    out.push('\n');
+    let shares: f64 = sections.iter().map(|s| s.percent).sum();
+    out.push_str(&format!(
+        "  {total} bytes accounted for ({shares:.1}% of the file)\n"
+    ));
+    out
+}
+
 /// Formats a cost report as a human-readable table.
 pub fn format_report_table(report: &CostReport) -> String {
     let mut output = String::new();
@@ -322,6 +380,9 @@ pub fn format_report_table(report: &CostReport) -> String {
         report.network, report.ledger
     ));
     output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
+    if report.wasm_size > 0 {
+        output.push_str(&format!("WASM size: {} bytes\n", report.wasm_size));
+    }
     output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
 
     let mut table = Table::new();
@@ -342,6 +403,11 @@ pub fn format_report_table(report: &CostReport) -> String {
 
     output.push_str(&table.to_string());
     output.push('\n');
+
+    if !report.wasm_sections.is_empty() {
+        output.push_str(&format_section_size_table(&report.wasm_sections));
+        output.push('\n');
+    }
 
     output.push_str(&format!("\nFee Breakdown:\n"));
     let total = report.fee.total_stroops;
@@ -394,6 +460,7 @@ pub fn format_report_json(report: &CostReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wasm::parser::SectionInfo;
 
     #[test]
     fn test_fee_percentage_normal() {
@@ -419,6 +486,8 @@ mod tests {
         CostReport {
             function: "increment".to_string(),
             wasm_hash: "abc".to_string(),
+            wasm_size: 0,
+            wasm_sections: Vec::new(),
             cpu_instructions: 532_502,
             memory_bytes: 0,
             tx_size: 156,
@@ -532,6 +601,8 @@ mod tests {
         let report = CostReport {
             function: "(wasm upload)".to_string(),
             wasm_hash: "0000".to_string(),
+            wasm_size: 0,
+            wasm_sections: Vec::new(),
             cpu_instructions: 0,
             memory_bytes: 0,
             tx_size: 0,
@@ -564,5 +635,65 @@ mod tests {
         assert_eq!(parsed["write_entries"], 0);
         assert_eq!(parsed["read_bytes"], 0);
         assert_eq!(parsed["write_bytes"], 0);
+        assert!(
+            parsed.get("wasm_size").is_none(),
+            "reports without a local file keep their original shape"
+        );
+    }
+
+    #[test]
+    fn test_format_report_table_renders_section_breakdown() {
+        let mut report = report_with_rates(FeeRates {
+            fee_per_10k_insns: 30,
+            fee_per_read_entry: 1,
+            fee_per_write_entry: 1,
+            fee_per_read_1kb: 0,
+            fee_per_1kb: 1,
+        });
+        report.wasm_size = 44;
+        // 44 byte module: 8 byte header, then type at 10..16 (8 bytes with
+        // its header) and code at 18..44 (28 bytes with its header).
+        report.wasm_sections = crate::wasm::parser::SectionSizeBreakdown::from_sections(
+            &[
+                SectionInfo {
+                    id: 10,
+                    name: "code".to_string(),
+                    custom: false,
+                    offset: 18,
+                    end: 44,
+                    size: 26,
+                    header_size: 2,
+                },
+                SectionInfo {
+                    id: 1,
+                    name: "type".to_string(),
+                    custom: false,
+                    offset: 10,
+                    end: 16,
+                    size: 6,
+                    header_size: 2,
+                },
+            ],
+            44,
+        )
+        .sections;
+
+        let table_out = format_report_table(&report);
+        assert!(
+            table_out.contains("WASM size: 44 bytes"),
+            "got: {table_out}"
+        );
+        assert!(table_out.contains("WASM sections"), "got: {table_out}");
+        assert!(table_out.contains("code"), "got: {table_out}");
+        assert!(table_out.contains("63.6%"), "got: {table_out}");
+        assert!(
+            table_out.contains("44 bytes accounted for (100.0% of the file)"),
+            "got: {table_out}"
+        );
+    }
+
+    #[test]
+    fn test_format_section_size_table_is_empty_without_sections() {
+        assert_eq!(format_section_size_table(&[]), "");
     }
 }

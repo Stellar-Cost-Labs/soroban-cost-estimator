@@ -603,6 +603,8 @@ async fn cmd_estimate(
         let report = report::cost_report::CostReport {
             function: function_name.to_string(),
             wasm_hash: wasm_hash.clone(),
+            wasm_size: wasm_info.bytes.len(),
+            wasm_sections: wasm_info.section_breakdown().sections,
             cpu_instructions,
             memory_bytes,
             tx_size: tx_xdr.len() as u32,
@@ -1081,22 +1083,28 @@ fn wasm_info_json(
     wasm_info: &wasm::parser::WasmInfo,
     hash: &str,
 ) -> serde_json::Value {
+    let breakdown = wasm_info.section_breakdown();
     serde_json::json!({
         "path": wasm_path,
         "size": wasm_info.bytes.len(),
         "sha256": hash,
         "has_spec": wasm_info.has_spec,
         "sdk_version": wasm_info.contract_meta.sdk_version,
-        "sections": wasm_info.sections.iter().map(|s| {
+        "section_sizes": breakdown.size_map(),
+        "sections": breakdown.sections.iter().map(|s| {
             serde_json::json!({
                 "id": s.id,
                 "name": s.name,
-                "custom": s.custom,
+                "custom": s.id == Some(0),
                 "offset": s.offset,
                 "end": s.end,
                 "size": s.size,
+                "header_size": s.header_size,
+                "total_size": s.total_size,
+                "percent": s.percent,
             })
         }).collect::<Vec<_>>(),
+
         "contract_meta": {
             "name": wasm_info.contract_meta.name,
             "version": wasm_info.contract_meta.version,
@@ -2038,7 +2046,35 @@ mod tests {
             memories: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
-            sections: Vec::new(),
+            sections: vec![
+                soroban_cost_estimator::wasm::parser::SectionInfo {
+                    id: 1,
+                    name: "type".to_string(),
+                    custom: false,
+                    offset: 10,
+                    end: 16,
+                    size: 6,
+                    header_size: 2,
+                },
+                soroban_cost_estimator::wasm::parser::SectionInfo {
+                    id: 3,
+                    name: "function".to_string(),
+                    custom: false,
+                    offset: 18,
+                    end: 22,
+                    size: 4,
+                    header_size: 2,
+                },
+                soroban_cost_estimator::wasm::parser::SectionInfo {
+                    id: 10,
+                    name: "code".to_string(),
+                    custom: false,
+                    offset: 24,
+                    end: 44,
+                    size: 20,
+                    header_size: 2,
+                },
+            ],
         };
         let value = wasm_info_json("/tmp/contract.wasm", &info, "deadbeef");
 
@@ -2056,9 +2092,36 @@ mod tests {
             value["functions"][0]["signature"],
             "increment(step: I64) -> i64"
         );
-        assert_eq!(value["sections"], serde_json::json!([]));
         assert_eq!(value["spec_entries"], serde_json::json!([]));
         assert_eq!(value["module"]["imports"], serde_json::json!([]));
+
+        // Section accounting: 8 byte module header + 8 + 6 + 22 = 44 bytes.
+        let size_map = value["section_sizes"]
+            .as_object()
+            .expect("section_sizes map");
+        assert_eq!(
+            size_map.get("module header").and_then(|v| v.as_u64()),
+            Some(8)
+        );
+        assert_eq!(size_map.get("type").and_then(|v| v.as_u64()), Some(8));
+        assert_eq!(size_map.get("function").and_then(|v| v.as_u64()), Some(6));
+        assert_eq!(size_map.get("code").and_then(|v| v.as_u64()), Some(22));
+        let mapped: u64 = size_map
+            .values()
+            .filter_map(serde_json::Value::as_u64)
+            .sum();
+        assert_eq!(mapped, 44, "section_sizes must cover the whole file");
+
+        let sections = value["sections"].as_array().expect("sections array");
+        assert_eq!(sections.len(), 4, "module header plus three sections");
+        let code = sections
+            .iter()
+            .find(|s| s["name"] == "code")
+            .expect("code section entry");
+        assert_eq!(code["size"], 20);
+        assert_eq!(code["header_size"], 2);
+        assert_eq!(code["total_size"], 22);
+        assert!((code["percent"].as_f64().expect("percent") - 50.0).abs() < 0.01);
     }
 
     #[test]

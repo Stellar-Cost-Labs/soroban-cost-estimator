@@ -1201,8 +1201,12 @@ fn test_wasm_info_nested_subcommand_reports_offline_metadata() {
     assert!(stdout.contains("WASM info:"), "got: {stdout}");
     assert!(stdout.contains("Size:"), "got: {stdout}");
     assert!(stdout.contains("SHA-256:"), "got: {stdout}");
-    assert!(stdout.contains("Sections:"), "got: {stdout}");
+    assert!(stdout.contains("WASM sections:"), "got: {stdout}");
     assert!(stdout.contains("contractspecv0"), "got: {stdout}");
+    assert!(
+        stdout.contains('%'),
+        "section shares missing; got: {stdout}"
+    );
     assert!(stdout.contains("Functions:"), "got: {stdout}");
     assert!(
         stdout.contains("increment(step: i64) -> i64"),
@@ -1240,13 +1244,56 @@ fn test_wasm_info_nested_json_emits_full_spec() {
 
     let sections = parsed["sections"].as_array().expect("sections array");
     assert!(!sections.is_empty());
-    assert!(sections.iter().all(|s| s["size"].as_u64().unwrap_or(0) > 0));
+    assert!(
+        sections
+            .iter()
+            .filter(|s| !s["id"].is_null())
+            .all(|s| s["size"].as_u64().unwrap_or(0) > 0),
+        "every real section has content; got: {parsed}"
+    );
+    assert!(
+        sections
+            .iter()
+            .any(|s| s["id"].is_null() && s["name"] == "module header"),
+        "the 8 byte module header is accounted for; got: {parsed}"
+    );
     assert!(
         sections
             .iter()
             .any(|s| s["name"] == "contractspecv0" && s["custom"] == true),
         "custom contractspecv0 section missing; got: {parsed}"
     );
+    assert!(
+        sections.iter().all(|s| {
+            let size = s["size"].as_u64().unwrap_or_default();
+            let header = s["header_size"].as_u64().unwrap_or_default();
+            let total = s["total_size"].as_u64().unwrap_or_default();
+            total == size + header
+                && s["percent"].as_f64().is_some()
+                && (!s["id"].is_null() || (size == 0 && header == 8))
+        }),
+        "each section should carry size, header_size, total_size, percent; got: {parsed}"
+    );
+
+    // The section_sizes map must reconcile with the reported file size.
+    let size_map = parsed["section_sizes"]
+        .as_object()
+        .expect("section_sizes map");
+    let mapped: u64 = size_map
+        .values()
+        .map(|v| v.as_u64().expect("byte counts are integers"))
+        .sum();
+    assert_eq!(
+        mapped,
+        parsed["size"].as_u64().expect("size"),
+        "section_sizes must add up to the file size; got: {parsed}"
+    );
+    assert_eq!(
+        size_map.get("module header").and_then(|v| v.as_u64()),
+        Some(8)
+    );
+    assert!(size_map.contains_key("code"), "got: {parsed}");
+    assert!(size_map.contains_key("contractspecv0"), "got: {parsed}");
 
     let functions = parsed["functions"].as_array().expect("functions array");
     let increment = functions

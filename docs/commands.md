@@ -709,8 +709,14 @@ available and prints exactly the same report.
 - Shows the embedded contract metadata (`contractmetav0`): contract name,
   version, description, and the Soroban SDK version the contract was built
   with.
-- Prints a per-section size summary (name, id, and byte size of every section,
-  including custom sections such as `contractspecv0`).
+- Prints a **section size breakdown table**: every section (code, data, type,
+  function, export, import, …) and custom sections such as `contractspecv0`,
+  `name`, and `producers`, each with its byte size and its share of the file,
+  largest first. Each row's size is the section's full footprint (contents plus
+  its own header), and the 8-byte module header is listed as its own row, so
+  the rows add up exactly to the file size.
+- `estimate` prints the same breakdown for the simulated contract, and
+  `--json` output includes a `section_sizes` map.
 - `--json` emits the full parsed AST: every `contractspecv0` entry (functions,
   UDT structs/unions/enums, error enums, and events) with their nested type
   trees, plus imports, exports, and memory limits.
@@ -734,10 +740,13 @@ WASM info: tests/fixtures/contract.wasm
     [1] increment(step: i64) -> i64
   Contract spec: present (1 entries, typed params/returns decoded from contractspecv0)
   SDK version:   25.3.2
-Sections: 15 (4701 bytes of section content in a 4742 byte file)
-  [1] type (id 1): 81 bytes
+WASM sections: 15 section(s), 4734 bytes of section data in a 4742 byte file (8 byte module header)
+  section            bytes  share
+  name               3047   64.3%
+  code               1021   21.5%
+  contractspecv0      150    3.2%
   ...
-  [10] contractspecv0 (id 0): 147 bytes
+  module header         8    0.2%
 Contract meta: present
   rsver: 1.96.0
   rssdkver: 25.3.2
@@ -750,8 +759,13 @@ soroban-cost-estimator wasm info target/contract.wasm --json
 ```
 
 Top-level keys: `path`, `size`, `sha256`, `has_spec`, `sdk_version`,
-`sections`, `contract_meta`, `functions`, `spec_entries`, and `module`
+`section_sizes` (name → bytes, summing to `size`), `sections` (each row with
+`id`, `name`, `custom`, `offset`, `end`, `size`, `header_size`, `total_size`,
+and `percent`), `contract_meta`, `functions`, `spec_entries`, and `module`
 (start function, memories, imports, exports).
+
+See [`wasm info`](commands/wasm-info.md) for the full reference, including
+how the section bytes are accounted for.
 
 ---
 
