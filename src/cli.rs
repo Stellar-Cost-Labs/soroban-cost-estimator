@@ -4,10 +4,14 @@ use clap::{Parser, Subcommand};
 fn build_version() -> &'static str {
     concat!(
         env!("CARGO_PKG_VERSION"),
-        " (",
+        " (commit: ",
         env!("GIT_HASH"),
-        " ",
+        " built: ",
         env!("BUILD_DATE"),
+        " target: ",
+        env!("TARGET"),
+        " rustc: ",
+        env!("RUSTC_VERSION"),
         ")"
     )
 }
@@ -35,6 +39,11 @@ pub struct Cli {
     /// response summaries.
     #[arg(long, short, global = true)]
     pub verbose: bool,
+
+    /// Suppress progress spinners, info banners, and non-error notices.
+    /// Outputs only the final result or error.
+    #[arg(long, short, global = true)]
+    pub quiet: bool,
 
     /// Custom HTTP header to send with every RPC request, e.g.
     /// `--header "X-API-Key: secret"`. Repeatable for multiple headers.
