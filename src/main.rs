@@ -298,16 +298,18 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             )
             .await
         }
-        cli::Command::Completions { shell } => cmd_completions(shell),
+        cli::Command::Completions { shell } => {
+            cmd_completions(shell);
+            Ok(())
+        }
     }
 }
 
 /// `completions` command: generate shell completion script to stdout.
-fn cmd_completions(shell: clap_complete::Shell) -> error::AppResult<()> {
+fn cmd_completions(shell: clap_complete::Shell) {
     let mut cmd = cli::Cli::command();
     let bin_name = cmd.get_name().to_string();
     clap_complete::generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
-    Ok(())
 }
 
 /// True when a simulation response carried neither cost data, nor
