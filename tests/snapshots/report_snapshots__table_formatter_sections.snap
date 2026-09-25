@@ -1,0 +1,83 @@
+---
+source: tests/report_snapshots.rs
+expression: TableFormatter.format(&section_report())
+---
+Function: increment
+Network: testnet (ledger 3894195)
+RPC round-trip: 87 ms
+WASM size: 4742 bytes
+WASM hash: abc123def456
+
++------------------+----------+---------------+
+| Resource         | Consumed | Fee (stroops) |
++=============================================+
+| CPU Instructions | 532502   |               |
+|------------------+----------+---------------|
+| Memory Bytes     | 0        |               |
+|------------------+----------+---------------|
+| Read Entries     | 1        |               |
+|------------------+----------+---------------|
+| Write Entries    | 1        |               |
+|------------------+----------+---------------|
+| Read Bytes       | 0        |               |
+|------------------+----------+---------------|
+| Write Bytes      | 136      |               |
+|------------------+----------+---------------|
+| Transaction Size | 156      |               |
++------------------+----------+---------------+
+WASM sections (4734 bytes of section data, largest first):
++-------------------+-------+-------+
+| Section           | Bytes | Share |
++===================================+
+| name              | 3047  | 64.3% |
+|-------------------+-------+-------|
+| code              | 1021  | 21.5% |
+|-------------------+-------+-------|
+| contractspecv0    | 150   | 3.2%  |
+|-------------------+-------+-------|
+| contractmetav0    | 113   | 2.4%  |
+|-------------------+-------+-------|
+| type              | 83    | 1.8%  |
+|-------------------+-------+-------|
+| producers         | 79    | 1.7%  |
+|-------------------+-------+-------|
+| export            | 55    | 1.2%  |
+|-------------------+-------+-------|
+| target_features   | 36    | 0.8%  |
+|-------------------+-------+-------|
+| global            | 35    | 0.7%  |
+|-------------------+-------+-------|
+| import            | 33    | 0.7%  |
+|-------------------+-------+-------|
+| contractenvmetav0 | 32    | 0.7%  |
+|-------------------+-------+-------|
+| function          | 27    | 0.6%  |
+|-------------------+-------+-------|
+| data              | 11    | 0.2%  |
+|-------------------+-------+-------|
+| module header     | 8     | 0.2%  |
+|-------------------+-------+-------|
+| table             | 7     | 0.1%  |
+|-------------------+-------+-------|
+| memory            | 5     | 0.1%  |
++-------------------+-------+-------+
+  4742 bytes accounted for (100.0% of the file)
+
+Fee Breakdown:
+  Non-refundable: 4496 stroops (29.1%)
+  Refundable:     10931 stroops (70.9%)
+
+  Components (of non-refundable):
+    CPU:        372 stroops (2.4%)
+    Storage:    4063 stroops (26.3%)
+    Bandwidth:  61 stroops (0.4%)
+
+  Total:          15427 stroops (0.0015427)
+
+Fee Breakdown Chart:
+
+  Refundable     | ######################################## |  10931 (70.9%)
+  Non-refundable | ################                         |   4496 (29.1%)
+
+Optimization Suggestions:
+  No cost optimizations identified (fee rates unavailable or no reducible resources).

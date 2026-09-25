@@ -206,9 +206,114 @@ fn test_sections_captured_with_names_and_sizes() {
     assert_eq!(spec_section.id, 0);
 
     let summary = soroban_cost_estimator::wasm::parser::format_sections(&wasm_info);
-    assert!(summary.contains("Sections:"), "got: {summary}");
+    assert!(summary.contains("WASM sections:"), "got: {summary}");
     assert!(summary.contains("contractspecv0"), "got: {summary}");
     assert!(summary.contains("bytes"), "got: {summary}");
+    assert!(summary.contains('%'), "shares missing from: {summary}");
+}
+
+#[test]
+fn test_section_sizes_sum_to_total_wasm_byte_length() {
+    for fixture in [
+        "tests/fixtures/minimal.wasm",
+        "tests/fixtures/contract.wasm",
+    ] {
+        let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(Path::new(fixture))
+            .unwrap_or_else(|e| panic!("failed to load {fixture}: {e}"));
+        let breakdown = wasm_info.section_breakdown();
+
+        let section_bytes: usize = breakdown
+            .sections
+            .iter()
+            .filter(|s| s.id.is_some())
+            .map(|s| s.total_size)
+            .sum();
+        assert_eq!(
+            section_bytes + breakdown.header_size,
+            wasm_info.bytes.len(),
+            "section sizes must add up to the file length for {fixture}"
+        );
+        assert_eq!(
+            breakdown.accounted_bytes(),
+            wasm_info.bytes.len(),
+            "every byte must be accounted for in {fixture}"
+        );
+        assert_eq!(breakdown.total_size, wasm_info.bytes.len());
+        assert_eq!(breakdown.header_size, 8, "magic + version header");
+
+        let map_total: usize = breakdown.size_map().values().sum();
+        assert_eq!(
+            map_total,
+            wasm_info.bytes.len(),
+            "size_map() must cover the whole file for {fixture}"
+        );
+
+        for entry in &breakdown.sections {
+            assert_eq!(
+                entry.total_size,
+                entry.header_size + entry.size,
+                "{} accounting is inconsistent",
+                entry.name
+            );
+            assert!(entry.percent >= 0.0 && entry.percent <= 100.0);
+        }
+        let shares: f64 = breakdown.sections.iter().map(|s| s.percent).sum();
+        assert!(
+            (shares - 100.0).abs() < 0.05,
+            "shares should total ~100% for {fixture}, got {shares}"
+        );
+
+        let standalone =
+            soroban_cost_estimator::wasm::parser::section_size_breakdown(&wasm_info.bytes)
+                .unwrap_or_else(|e| panic!("standalone breakdown failed for {fixture}: {e}"));
+        assert_eq!(standalone, breakdown, "both builders must agree");
+    }
+}
+
+#[test]
+fn test_section_sizes_are_exact_and_sorted() {
+    let wasm_info =
+        soroban_cost_estimator::wasm::parser::load_wasm(Path::new("tests/fixtures/minimal.wasm"))
+            .expect("failed to load minimal fixture");
+    let breakdown = wasm_info.section_breakdown();
+    let sizes = breakdown.size_map();
+
+    // 44 byte module: 8 byte header plus type(6+2), function(2+2),
+    // export(11+2), code(9+2) bytes of section data.
+    assert_eq!(sizes.get("module header"), Some(&8));
+    assert_eq!(sizes.get("type"), Some(&8));
+    assert_eq!(sizes.get("function"), Some(&4));
+    assert_eq!(sizes.get("export"), Some(&13));
+    assert_eq!(sizes.get("code"), Some(&11));
+    assert_eq!(sizes.values().sum::<usize>(), 44);
+
+    let totals: Vec<usize> = breakdown.sections.iter().map(|s| s.total_size).collect();
+    let mut sorted = totals.clone();
+    sorted.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(totals, sorted, "breakdown should be largest first");
+
+    let code = breakdown
+        .sections
+        .iter()
+        .find(|s| s.name == "code")
+        .expect("code section");
+    assert_eq!(code.id, Some(10));
+    assert_eq!(code.size, 9, "code content bytes");
+    assert_eq!(code.header_size, 2, "id byte + LEB128 size prefix");
+    assert_eq!(code.offset, Some(35));
+    assert_eq!(code.end, Some(44));
+    assert!((code.percent - 25.0).abs() < 0.01, "{}", code.percent);
+}
+
+#[test]
+fn test_section_size_breakdown_rejects_invalid_wasm() {
+    let err = soroban_cost_estimator::wasm::parser::section_size_breakdown(b"not a wasm file")
+        .expect_err("invalid bytes must be rejected");
+    let message = err.to_string();
+    assert!(
+        message.contains("not a valid WebAssembly binary"),
+        "got: {message}"
+    );
 }
 
 #[test]

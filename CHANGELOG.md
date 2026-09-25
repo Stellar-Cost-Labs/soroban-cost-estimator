@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `wasm-info --wasm <file.wasm>` form is unchanged.
 - Per-section byte sizes and names for every WASM section, including custom
   sections such as `contractspecv0`, `contractmetav0`, and `name`.
+- WASM section size breakdown — each section's full footprint (contents plus
+  its own header) and its share of the file, largest first, with the 8-byte
+  module header as its own row so the sizes add up exactly to the file length.
+  Shown by `wasm info`, repeated in `estimate` cost reports, and exposed as a
+  `section_sizes` map in `--json` output.
 - SDK version detection from the `contractmetav0` section (`rssdkver` and
   common aliases), surfaced in both report modes.
 - `docs/commands/wasm-info.md` plus `wasm info` / `cache stats` sections in

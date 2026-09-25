@@ -32,9 +32,11 @@ is still supported and produces the same report.
 - Reports the contract metadata from the `contractmetav0` section: name,
   version, description, custom keys, and the Soroban SDK version
   (`rssdkver`) the contract was built with.
-- Summarizes every WASM section with its name, id, and byte size, including
-  custom sections such as `contractspecv0`, `contractmetav0`, `name`, and
-  `producers`.
+- Prints a section size breakdown table: every section (code, data, type,
+  function, export, import, …) and custom sections such as `contractspecv0`,
+  `contractmetav0`, `name`, and `producers`, each with its byte size and its
+  share of the file, largest first. See
+  [Section size accounting](#section-size-accounting).
 - With `--json`, emits the full parsed AST: all `contractspecv0` entries
   (functions, UDT structs, unions, enums, error enums, events) with their
   nested type trees, plus the module's imports, exports, and memory limits.
@@ -55,26 +57,46 @@ WASM info: tests/fixtures/contract.wasm
     [1] increment(step: i64) -> i64
   Contract spec: present (1 entries, typed params/returns decoded from contractspecv0)
   SDK version:   25.3.2
-Sections: 15 (4701 bytes of section content in a 4742 byte file)
-  [1] type (id 1): 81 bytes
-  [2] import (id 2): 31 bytes
-  [3] function (id 3): 25 bytes
-  [4] table (id 4): 5 bytes
-  [5] memory (id 5): 3 bytes
-  [6] global (id 6): 33 bytes
-  [7] export (id 7): 53 bytes
-  [8] code (id 10): 1018 bytes
-  [9] data (id 11): 9 bytes
-  [10] contractspecv0 (id 0): 147 bytes
-  [11] contractenvmetav0 (id 0): 30 bytes
-  [12] contractmetav0 (id 0): 111 bytes
-  [13] name (id 0): 3044 bytes
-  [14] producers (id 0): 77 bytes
-  [15] target_features (id 0): 34 bytes
+WASM sections: 15 section(s), 4734 bytes of section data in a 4742 byte file (8 byte module header)
+  section            bytes  share
+  name               3047   64.3%
+  code               1021   21.5%
+  contractspecv0      150    3.2%
+  contractmetav0      113    2.4%
+  type                 83    1.8%
+  producers            79    1.7%
+  export               55    1.2%
+  target_features      36    0.8%
+  global               35    0.7%
+  import               33    0.7%
+  contractenvmetav0    32    0.7%
+  function             27    0.6%
+  data                 11    0.2%
+  module header         8    0.2%
+  table                  7    0.1%
+  memory                 5    0.1%
 Contract meta: present
   rsver: 1.96.0
   rssdkver: 25.3.2
 ```
+
+WASM size drives upload fees and rent, so the breakdown makes it obvious
+where the bytes go: in the example above, the `name` custom section alone
+accounts for 64.3% of the file.
+
+## Section size accounting
+
+A WASM module is the 8-byte magic + version header followed by sections, and
+nothing else — so this breakdown accounts for every byte of the file:
+
+- Each row's size is the section's **full footprint**: its contents plus its
+  own header (the section id byte and its LEB128 size prefix).
+- The fixed 8-byte module header is reported as its own `module header` row.
+- Section bytes + `module header` therefore add up **exactly** to the file
+  length, and the shares add up to 100%.
+- Sections are listed largest first. Byte offsets and raw content sizes for
+  each section are available in the `sections` array of `--json` output.
+
 
 ## JSON output
 
@@ -91,7 +113,8 @@ The document has these top-level keys:
 | `sha256` | Hex SHA-256 digest of the file bytes |
 | `has_spec` | Whether a `contractspecv0` section was found |
 | `sdk_version` | Soroban SDK version from `contractmetav0`, or `null` |
-| `sections` | One object per section: `id`, `name`, `custom`, `offset`, `end`, `size` |
+| `section_sizes` | Map of section name → bytes (header included), including the `module header` row; the values sum to `size` |
+| `sections` | One object per row, largest first: `id`, `name`, `custom`, `offset`, `end`, `size` (contents), `header_size`, `total_size`, `percent` |
 | `contract_meta` | `name`, `version`, `description`, `sdk_version`, and the full ordered `entries` list |
 | `functions` | Exported functions with `param_count`, `result_count`, `signature`, `params`, and `returns` |
 | `spec_entries` | Every decoded `contractspecv0` entry (`kind`, `name`, `doc`, plus kind-specific fields) |
@@ -108,4 +131,48 @@ Pipe the output through any JSON tool, for example:
 
 ```bash
 soroban-cost-estimator wasm info contract.wasm --json | jq '.spec_entries[].name'
+soroban-cost-estimator wasm info contract.wasm --json | jq '.section_sizes'
 ```
+
+```json
+{
+  "code": 1021,
+  "contractmetav0": 113,
+  "contractspecv0": 150,
+  "data": 11,
+  "export": 55,
+  "function": 27,
+  "global": 35,
+  "import": 33,
+  "memory": 5,
+  "module header": 8,
+  "name": 3047,
+  "producers": 79,
+  "table": 7,
+  "target_features": 36
+}
+```
+
+## Section breakdown in cost reports
+
+`estimate` prints the same breakdown for the contract it just simulated, right
+after the resource table, so a fee estimate shows what is being uploaded:
+
+```text
+WASM size: 4742 bytes
+WASM hash: ea14bca998e98f0…
+…
+WASM sections (4734 bytes of section data, largest first):
++-------------------+-------+-------+
+| Section           | Bytes | Share |
++===================================+
+| name              | 3047  | 64.3% |
+| code              | 1021  | 21.5% |
+| contractspecv0    | 150   | 3.2%  |
+| …                 |       |       |
++-------------------+-------+-------+
+  4742 bytes accounted for (100.0% of the file)
+```
+
+`estimate --format json` carries the same data as `wasm_size`, `wasm_sections`
+(an array with `percent` per row), and a `section_sizes` map.
