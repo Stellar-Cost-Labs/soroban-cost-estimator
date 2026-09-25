@@ -9,10 +9,12 @@ recent snapshot.
 Usage: soroban-cost-estimator config diff [OPTIONS]
 
 Options:
-      --network <NETWORK>  Network to compare against [default: testnet]
-      --against <AGAINST>  Explicit snapshot path to compare against (defaults to latest)
-      --summary            Print a single-line count summary instead of the full diff
-  -h, --help               Print help
+      --network <NETWORK>   Network to compare against [default: testnet]
+      --against <AGAINST>   Explicit snapshot path to compare against (defaults to latest)
+      --summary             Print a single-line count summary instead of the full diff
+      --ignore-pricing-exit Force exit code 0 even when pricing changes are detected
+      --fail-on-any-change  Exit 1 when any setting changed, even non-pricing settings
+  -h, --help                Print help
 ```
 
 ## Behavior
@@ -23,8 +25,22 @@ Options:
   marks a non-pricing change (a cap, limit, or window size).
 - Always cross-references the estimate cache and reports cached estimates
   recorded at an earlier ledger as potentially stale.
-- **Exit code 0** when nothing changed; **exit code 1** when a pricing change
-  was detected — scripts and CI can branch on it.
+- **Exit code 0** when no pricing changes; **exit code 1** when a pricing
+  change was detected — scripts and CI can branch on it.
+- **CI exit code semantics:** `--ignore-pricing-exit` forces exit code 0 even
+  when pricing changed (informative reports that must not fail the build);
+  `--fail-on-any-change` exits 1 when *any* setting changed, even non-pricing
+  caps/limits. `--ignore-pricing-exit` takes precedence when both are passed.
+  Examples:
+
+  ```bash
+  # Fail the build on pricing drift (default).
+  soroban-cost-estimator config diff --network testnet
+  # Report drift without failing the build.
+  soroban-cost-estimator config diff --network testnet --ignore-pricing-exit
+  # Fail the build on any drift, including non-pricing limits.
+  soroban-cost-estimator config diff --network testnet --fail-on-any-change
+  ```
 - `--summary` prints a single line, `X pricing changes, Y non-pricing changes`
   (and suppresses the stale-cache and auto-save chatter), so you can read it
   directly into a CI status line. The exit code and auto-save side effects are

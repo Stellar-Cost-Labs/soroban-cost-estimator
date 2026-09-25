@@ -1352,3 +1352,80 @@ fn test_load_fresh_estimate_expired_returns_none() {
         assert!(fresh.is_none(), "an expired entry must yield None");
     });
 }
+
+/// The export envelope carries a schema version, an export timestamp, and
+/// the estimate records — everything a backup needs to be self-describing.
+#[test]
+fn test_export_cache_envelope_shape() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true)
+            .expect("save");
+
+        let export = cache::export_cache(None).expect("export");
+        assert_eq!(
+            export.schema_version,
+            cache::CACHE_EXPORT_SCHEMA_VERSION,
+            "envelope should stamp the export schema version"
+        );
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&export.exported_at).is_ok(),
+            "exported_at should be RFC-3339: {}",
+            export.exported_at
+        );
+        assert!(export.network.is_none(), "unfiltered export has no network");
+        assert_eq!(export.estimates.len(), 1, "should export the seeded entry");
+        assert_eq!(export.estimates[0].function, "f1");
+    });
+}
+
+/// A network filter restricts the export to that network's estimates.
+#[test]
+fn test_export_cache_filters_by_network() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h1", "f_testnet", &[], "testnet", 1, 100, 10, 5, None, true)
+            .expect("testnet save");
+        cache::save_estimate(
+            "h1",
+            "f_mainnet",
+            &[],
+            "mainnet",
+            2,
+            200,
+            20,
+            10,
+            None,
+            true,
+        )
+        .expect("mainnet save");
+
+        let testnet = cache::export_cache(Some("testnet")).expect("export testnet");
+        assert_eq!(testnet.network, Some("testnet".to_string()));
+        assert_eq!(testnet.estimates.len(), 1, "should export only testnet");
+        assert_eq!(testnet.estimates[0].function, "f_testnet");
+
+        let all = cache::export_cache(None).expect("export all");
+        assert!(all.network.is_none());
+        assert_eq!(all.estimates.len(), 2, "unfiltered export should carry both");
+
+        let empty = cache::export_cache(Some("futurenet")).expect("export futurenet");
+        assert_eq!(empty.network, Some("futurenet".to_string()));
+        assert!(empty.estimates.is_empty(), "unknown network exports nothing");
+    });
+}
+
+/// The envelope round-trips through JSON — the shape backups are stored in.
+#[test]
+fn test_export_cache_json_round_trip() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true)
+            .expect("save");
+
+        let export = cache::export_cache(Some("testnet")).expect("export");
+        let json = serde_json::to_string_pretty(&export).expect("serialize");
+        let parsed: cache::CacheExport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.schema_version, cache::CACHE_EXPORT_SCHEMA_VERSION);
+        assert_eq!(parsed.network, Some("testnet".to_string()));
+        assert_eq!(parsed.estimates.len(), 1);
+        assert_eq!(parsed.estimates[0].total_stroops, 100);
+    });
+}

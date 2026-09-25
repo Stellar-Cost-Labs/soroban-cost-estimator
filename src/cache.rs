@@ -577,6 +577,63 @@ pub fn export_cached_estimates() -> AppResult<Vec<CachedEstimate>> {
     Ok(estimates)
 }
 
+/// Schema version of the `cache export` file format.
+///
+/// Independent from [`CACHE_SCHEMA_VERSION`] (which versions individual
+/// cache *entries*): this versions the *export envelope* so backups stay
+/// readable as the envelope gains fields.
+pub const CACHE_EXPORT_SCHEMA_VERSION: u32 = 1;
+
+/// A portable, self-describing dump of cached estimates.
+///
+/// Written by `cache export` for backup, sharing across workstations, and
+/// archiving. The envelope carries everything needed to interpret the
+/// records without the exporting tool's help.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheExport {
+    /// Version of the export envelope format ([`CACHE_EXPORT_SCHEMA_VERSION`]).
+    pub schema_version: u32,
+    /// RFC-3339 timestamp of when the export was created.
+    pub exported_at: String,
+    /// Network the export was filtered to, or `None` for all networks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    /// The exported estimates in deterministic
+    /// `(wasm_hash, function, args_hash)` order.
+    pub estimates: Vec<CachedEstimate>,
+}
+
+/// Build a versioned [`CacheExport`] of cached estimates.
+///
+/// * `network` - Only include estimates recorded for this network, or `None`
+///   for every network. Unknown networks simply yield an empty list.
+///
+/// Like [`export_cached_estimates`], a malformed or unsupported entry
+/// returns an error rather than producing an incomplete backup.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+pub fn export_cache(network: Option<&str>) -> AppResult<CacheExport> {
+    let estimates: Vec<CachedEstimate> = export_cached_estimates()?
+        .into_iter()
+        .filter(|e| match network {
+            Some(n) => e.network == n,
+            None => true,
+        })
+        .collect();
+
+    debug!(
+        count = estimates.len(),
+        network, "built cache export envelope"
+    );
+    Ok(CacheExport {
+        schema_version: CACHE_EXPORT_SCHEMA_VERSION,
+        exported_at: chrono::Utc::now().to_rfc3339(),
+        network: network.map(str::to_string),
+        estimates,
+    })
+}
+
 /// Integrity status of a single cache entry file.
 #[derive(Debug, Clone)]
 pub struct CacheEntryStatus {

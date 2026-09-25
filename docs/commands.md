@@ -46,6 +46,7 @@ soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
 | `--fn <FN>` | | | — | Contract function name to invoke |
 | `--id <ID>` | | | — | Deployed contract ID (64 hex chars). Required when `--fn` is used |
 | `--arg <KEY=VAL>` | | | — | Function arguments as `key=value` pairs (value is type-inferred; repeatable) |
+| `--interactive` | `-i` | | `false` | Prompt for the function and its arguments using the contract spec (explicit `--fn`/`--arg`/`--id` take precedence) |
 | `--cache-ttl <DURATION>` | | | — | Skip re-simulation when a cached estimate is still fresh (e.g. `30m`, `1h`, `7d`) |
 | `--clear-cache` | | | `false` | Wipe every cached estimate for `--network` before running the simulation |
 | `--json` | | | `false` | Output as JSON instead of a human-readable table |
@@ -61,6 +62,10 @@ soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
   simulate against a zeroed ID.
 - **`--arg` values are type-inferred**: `true`/`false` → bool, integers →
   `i64`/`u64`, everything else → string. This is enough for cost estimation.
+- **`--interactive` / `-i`** prompts for the function (when `--fn` is absent)
+  and each parameter with its spec name and type (`Enter step (i64): `),
+  validating every answer before proceeding. Explicit flags win; the prompt
+  only fills gaps. EOF aborts cleanly; Ctrl-C aborts without panicking.
 - The read/write entry counts and byte sizes are decoded from the simulation
   response's resource **footprint** — real values from the ledger footprint, not
   zero-filled placeholders.
@@ -353,6 +358,8 @@ soroban-cost-estimator config diff [OPTIONS]
 | `--network <NETWORK>` | | `testnet` | Network to compare against |
 | `--against <AGAINST>` | | latest snapshot | Explicit snapshot path to compare against |
 | `--summary` | | `false` | Print a single-line count summary instead of the full diff (for CI status lines) |
+| `--ignore-pricing-exit` | | `false` | Force exit code 0 even when pricing changes are detected |
+| `--fail-on-any-change` | | `false` | Exit 1 when any setting changed, even non-pricing settings |
 | `--help` `-h` | | | Print help |
 
 **Behavior**
@@ -363,8 +370,12 @@ soroban-cost-estimator config diff [OPTIONS]
   marks a non-pricing change (a cap, limit, or window size).
 - Always cross-references the estimate cache and reports cached estimates
   recorded at an earlier ledger as potentially stale.
-- **Exit code 0** when nothing changed; **exit code 1** when a pricing change
-  was detected — scripts and CI can branch on it.
+- **Exit code 0** when no pricing changes; **exit code 1** when a pricing
+  change was detected — scripts and CI can branch on it.
+- **CI exit code semantics:** `--ignore-pricing-exit` forces exit 0 even when
+  pricing changed (informative reports); `--fail-on-any-change` exits 1 when
+  *any* setting changed, even non-pricing caps/limits. `--ignore-pricing-exit`
+  takes precedence when both are passed.
 - When a pricing change (protocol/config upgrade) is detected, the new config
   is **automatically saved** as a snapshot, so it becomes the baseline for the
   next diff. A failed save is reported as a warning and does not change the
@@ -638,6 +649,48 @@ soroban-cost-estimator cache clear
 
 soroban-cost-estimator cache clear --network mainnet
 # → Cleared 3 cached estimate(s) for mainnet.
+```
+
+---
+
+### `cache export`
+
+Dump cached estimates to a single versioned JSON document for backup,
+sharing across workstations, or archiving.
+
+**Usage**
+
+```
+soroban-cost-estimator cache export [OPTIONS]
+```
+
+**Flags**
+
+| Flag | Short | Required | Default | Description |
+|------|-------|----------|---------|-------------|
+| `--out <OUT>` | `-o` | | — | Write the export to a file instead of standard output |
+| `--network <NETWORK>` | | | — | Only export estimates recorded for this network (default: all networks) |
+| `--help` | `-h` | | | Print help |
+
+**Behavior**
+
+- The export envelope carries a `schema_version`, an `exported_at`
+  (RFC-3339) timestamp, the `network` filter when one was given, and the
+  `estimates` records in deterministic order.
+- With `--out`, the file is written and a confirmation prints the entry
+  count and path (`Exported N cache entr(y|ies) to <path>.`); an unwritable
+  destination fails with an error naming the path.
+- Without `--out`, the envelope is printed to standard output.
+- No network calls are made — this is pure local cache I/O.
+
+**Examples**
+
+```bash
+soroban-cost-estimator cache export --out backup.json
+# → Exported 12 cache entries to backup.json.
+
+soroban-cost-estimator cache export --network testnet --out testnet-backup.json
+# → Exported 9 cache entries to testnet-backup.json.
 ```
 
 ---
