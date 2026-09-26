@@ -225,6 +225,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::Diff {
                 network,
                 against,
+                pricing_only,
+                threshold_percent,
                 summary,
                 json,
             } => {
@@ -232,6 +234,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     &network,
                     fallback,
                     against.as_deref(),
+                    pricing_only,
+                    threshold_percent,
                     summary,
                     json,
                     rps,
@@ -244,6 +248,10 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::History { network } => cmd_config_history(&network),
             cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network),
             cli::ConfigAction::Validate { network } => cmd_config_validate(&network),
+            cli::ConfigAction::Export { network, output } => {
+                cmd_config_export(network.as_deref(), &output)
+            }
+            cli::ConfigAction::Import { bundle } => cmd_config_import(&bundle),
         },
         cli::Command::Cache { action } => match action {
             cli::CacheAction::Export { out } => cmd_cache_export(out.as_deref()),
@@ -290,11 +298,16 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 json,
             ),
         },
-        cli::Command::Watch { network, interval } => {
+        cli::Command::Watch {
+            network,
+            interval,
+            threshold_percent,
+        } => {
             cmd_watch(
                 &network,
                 fallback,
                 &interval,
+                threshold_percent,
                 rps,
                 timeout,
                 max_retries,
@@ -1280,6 +1293,8 @@ async fn cmd_config_diff(
     network: &str,
     rpc_fallback_url: Option<&str>,
     against_path: Option<&str>,
+    pricing_only: bool,
+    threshold_percent: Option<f64>,
     summary: bool,
     json_flag: bool,
     rps: Option<u64>,
@@ -1319,7 +1334,6 @@ async fn cmd_config_diff(
             has_pricing = diff.has_pricing_changes,
             "diff computed"
         );
-
         if json_flag {
             // Collect stale estimates for inclusion in JSON output.
             let stale: Vec<cache::CachedEstimate> = cache::list_cached_estimates(network)
@@ -1338,7 +1352,10 @@ async fn cmd_config_diff(
         } else if summary {
             println!("{}", config_snapshot::diff::format_diff_summary(&diff));
         } else {
-            println!("{}", config_snapshot::diff::format_diff(&diff));
+            println!(
+                "{}",
+                config_snapshot::diff::format_diff(&diff, pricing_only, threshold_percent)
+            );
         }
 
         if upgrade_detected(&diff) {
@@ -1365,7 +1382,12 @@ async fn cmd_config_diff(
             print_stale_estimates(network, new_snapshot.ledger);
         }
 
-        if diff.has_pricing_changes {
+        let should_exit = match threshold_percent {
+            Some(t) => diff.has_significant_pricing_changes(t),
+            None => diff.has_pricing_changes,
+        };
+
+        if should_exit {
             std::process::exit(1);
         }
         Ok(())
@@ -1596,6 +1618,7 @@ async fn watch_poll_once(
     network: &str,
     rpc_fallback_url: Option<&str>,
     first: &mut bool,
+    threshold_percent: Option<f64>,
     rps: Option<u64>,
     timeout: u64,
     max_retries: usize,
@@ -1620,7 +1643,10 @@ async fn watch_poll_once(
                     let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &snapshot);
                     if !diff.changes.is_empty() {
                         debug!(change_count = diff.changes.len(), "config changes detected");
-                        println!("{}", config_snapshot::diff::format_diff(&diff));
+                        println!(
+                            "{}",
+                            config_snapshot::diff::format_diff(&diff, false, threshold_percent)
+                        );
                     }
 
                     print_stale_estimates(network, snapshot.ledger);
@@ -1647,6 +1673,7 @@ async fn cmd_watch(
     network: &str,
     rpc_fallback_url: Option<&str>,
     interval: &str,
+    threshold_percent: Option<f64>,
     rps: Option<u64>,
     timeout: u64,
     max_retries: usize,
@@ -1676,6 +1703,7 @@ async fn cmd_watch(
                     network,
                     rpc_fallback_url,
                     &mut first,
+                    threshold_percent,
                     rps,
                     timeout,
                     max_retries,
@@ -1917,6 +1945,18 @@ async fn cmd_cache_warm(
         false,
     )
     .await
+}
+
+fn cmd_config_export(network: Option<&str>, output: &str) -> error::AppResult<()> {
+    config_snapshot::store::export_snapshots(network, output)?;
+    println!("Exported snapshots to {}", output);
+    Ok(())
+}
+
+fn cmd_config_import(bundle: &str) -> error::AppResult<()> {
+    let count = config_snapshot::store::import_snapshots(bundle)?;
+    println!("Imported {} new snapshot(s) from {}", count, bundle);
+    Ok(())
 }
 
 #[cfg(test)]
