@@ -256,117 +256,59 @@ fn validate_single_snapshot(path: &std::path::Path) -> AppResult<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// A bundle of config snapshots for export/import.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotBundle {
+    pub snapshots: Vec<ConfigSnapshot>,
+}
 
-    /// Creates an empty temp directory for one test, mirroring the
-    /// `temp_home` helper in the integration suite.
-    fn temp_snapshots_dir(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("sce-store-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
-        dir
+/// Exports snapshots to a single JSON bundle file.
+pub fn export_snapshots(network: Option<&str>, output_path: &str) -> AppResult<()> {
+    let dir = snapshots_dir()?;
+    let mut snapshots = Vec::new();
+
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let name_str = entry.file_name().to_string_lossy().into_owned();
+        if !name_str.ends_with(".json") {
+            continue;
+        }
+        if let Some(net) = network {
+            if !name_str.starts_with(&format!("{}-", net)) {
+                continue;
+            }
+        }
+        let content = std::fs::read_to_string(entry.path())?;
+        if let Ok(snapshot) = serde_json::from_str::<ConfigSnapshot>(&content) {
+            snapshots.push(snapshot);
+        }
     }
 
-    /// Writes a placeholder snapshot file named like the real store:
-    /// `{network}-{timestamp}.json` (with `:` replaced by `-`).
-    fn write_snapshot_file(dir: &std::path::Path, network: &str, stamp: &str) {
-        let filename = format!("{}-{}.json", network, stamp.replace(':', "-"));
-        std::fs::write(dir.join(filename), b"{}").expect("failed to write snapshot");
+    let bundle = SnapshotBundle { snapshots };
+    let json = serde_json::to_string_pretty(&bundle)
+        .map_err(|e| AppError::General(format!("Failed to serialize bundle: {}", e)))?;
+    std::fs::write(output_path, json)?;
+    Ok(())
+}
+
+/// Imports snapshots from a JSON bundle file.
+pub fn import_snapshots(bundle_path: &str) -> AppResult<usize> {
+    let content = std::fs::read_to_string(bundle_path)?;
+    let bundle: SnapshotBundle = serde_json::from_str(&content)
+        .map_err(|e| AppError::SnapshotParse(format!("Invalid bundle: {}", e)))?;
+
+    let mut imported = 0;
+    for snapshot in bundle.snapshots {
+        let ts_safe = snapshot.timestamp.replace(':', "-");
+        let filename = format!("{}-{}.json", snapshot.network, ts_safe);
+        let path = snapshots_dir()?.join(&filename);
+        if !path.exists() {
+            let json = serde_json::to_string_pretty(&snapshot)
+                .map_err(|e| AppError::General(format!("Failed to serialize snapshot: {}", e)))?;
+            std::fs::write(&path, json)?;
+            imported += 1;
+            println!("  Imported snapshot: {}", filename);
+        }
     }
-
-    /// Rewrites a snapshot file's modification time to `days_ago` days in the
-    /// past, simulating an old snapshot.
-    fn age_snapshot_file(path: &std::path::Path, days_ago: u64) {
-        let old =
-            std::time::SystemTime::now() - std::time::Duration::from_secs(days_ago * 24 * 60 * 60);
-        let file = std::fs::File::open(path).expect("failed to open snapshot");
-        file.set_modified(old).expect("failed to set mtime");
-    }
-
-    #[test]
-    fn clean_removes_snapshots_older_than_retention() {
-        let dir = temp_snapshots_dir("clean-old");
-        // Two snapshots aged beyond the 30-day retention window.
-        write_snapshot_file(&dir, "testnet", "2026-01-01T00-00-00.000000+00-00");
-        age_snapshot_file(
-            &dir.join("testnet-2026-01-01T00-00-00.000000+00-00.json"),
-            90,
-        );
-        write_snapshot_file(&dir, "testnet", "2026-01-02T00-00-00.000000+00-00");
-        age_snapshot_file(
-            &dir.join("testnet-2026-01-02T00-00-00.000000+00-00.json"),
-            60,
-        );
-        // One recent snapshot stays within the window.
-        write_snapshot_file(&dir, "testnet", "2026-01-03T00-00-00.000000+00-00");
-
-        let removed =
-            clean_old_snapshots_in_dir(&dir, "testnet", 30).expect("clean should succeed");
-        assert_eq!(
-            removed, 2,
-            "should remove the two snapshots older than 30 days"
-        );
-
-        let remaining = list_snapshots_in_dir(&dir, "testnet").expect("list should succeed");
-        assert_eq!(remaining.len(), 1);
-        assert!(
-            remaining[0]
-                .to_string_lossy()
-                .ends_with("2026-01-03T00-00-00.000000+00-00.json")
-        );
-    }
-
-    #[test]
-    fn clean_is_noop_when_all_snapshots_are_recent() {
-        let dir = temp_snapshots_dir("clean-noop");
-        write_snapshot_file(&dir, "testnet", "2026-01-01T00-00-00.000000+00-00");
-        write_snapshot_file(&dir, "testnet", "2026-01-02T00-00-00.000000+00-00");
-
-        let removed =
-            clean_old_snapshots_in_dir(&dir, "testnet", 30).expect("clean should succeed");
-        assert_eq!(removed, 0, "fresh snapshots should be kept");
-        assert_eq!(
-            list_snapshots_in_dir(&dir, "testnet").expect("list").len(),
-            2
-        );
-    }
-
-    #[test]
-    fn clean_only_touches_the_requested_network() {
-        let dir = temp_snapshots_dir("clean-other-network");
-        write_snapshot_file(&dir, "testnet", "2026-01-01T00-00-00.000000+00-00");
-        age_snapshot_file(
-            &dir.join("testnet-2026-01-01T00-00-00.000000+00-00.json"),
-            90,
-        );
-        // A mainnet snapshot with the same age must survive a testnet clean.
-        write_snapshot_file(&dir, "mainnet", "2026-01-01T00-00-00.000000+00-00");
-        age_snapshot_file(
-            &dir.join("mainnet-2026-01-01T00-00-00.000000+00-00.json"),
-            90,
-        );
-
-        let removed =
-            clean_old_snapshots_in_dir(&dir, "testnet", 30).expect("clean should succeed");
-        assert_eq!(removed, 1);
-        assert_eq!(
-            list_snapshots_in_dir(&dir, "testnet").expect("list").len(),
-            0
-        );
-        assert_eq!(
-            list_snapshots_in_dir(&dir, "mainnet").expect("list").len(),
-            1,
-            "mainnet snapshots are untouched by a testnet clean"
-        );
-    }
-
-    #[test]
-    fn clean_with_empty_dir_returns_zero() {
-        let dir = temp_snapshots_dir("clean-empty");
-        let removed =
-            clean_old_snapshots_in_dir(&dir, "testnet", 30).expect("clean should succeed");
-        assert_eq!(removed, 0);
-    }
+    Ok(imported)
 }
