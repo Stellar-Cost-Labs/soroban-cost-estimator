@@ -31,6 +31,7 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
 
     let metadata = enumerate_module_metadata(&bytes)?;
     let (spec_functions, has_spec) = parse_contract_spec(&bytes).unwrap_or_default();
+    let contract_meta = parse_contract_meta(&bytes).unwrap_or_default();
 
     let mut functions = metadata.functions;
     if !spec_functions.is_empty() {
@@ -47,6 +48,7 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
         bytes,
         functions,
         has_spec,
+        contract_meta,
         start_function: metadata.start_function,
         memories: metadata.memories,
         imports: metadata.imports,
@@ -290,6 +292,113 @@ pub fn parse_contract_spec(bytes: &[u8]) -> AppResult<(SpecFunctions, bool)> {
     Ok((spec_functions, has_spec))
 }
 
+/// Metadata parsed from the Soroban `contractmetaV0` custom section.
+///
+/// Contract developers attach this section (typically via the SDK's
+/// `contractmetadata`/`contractmeta` macros) to carry human-readable
+/// information about the contract: a name, a version, and a description,
+/// plus arbitrary extra key/value pairs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContractMeta {
+    /// Contract name, when the section carries a `name` key.
+    pub name: Option<String>,
+    /// Contract version, when the section carries a `version` key.
+    pub version: Option<String>,
+    /// Contract description, when the section carries a `description`
+    /// (or `desc`) key.
+    pub description: Option<String>,
+    /// Every key/value pair found in the section, in section order —
+    /// including the recognized keys above and any custom ones.
+    pub entries: Vec<(String, String)>,
+}
+
+impl ContractMeta {
+    /// True when the WASM carried no decodable `contractmetaV0` entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Parses the Soroban contract metadata (`contractmetaV0` custom section).
+///
+/// Returns the parsed name/version/description plus the full ordered list of
+/// key/value pairs. The section is optional — a WASM without one yields an
+/// empty `ContractMeta`, never an error.
+///
+/// Like `contractspecv0`, the section payload is **not** a count-prefixed
+/// vector: it is a concatenation of raw `ScMetaEntry` XDR union values, each
+/// starting with its 4-byte union discriminant (`00 00 00 00` = `ScMetaV0`)
+/// followed by the `{ key, val }` struct. Entries are decoded one at a time
+/// from a cursor; a truncated or malformed trailing entry stops the loop
+/// without discarding the entries already decoded.
+pub fn parse_contract_meta(bytes: &[u8]) -> AppResult<ContractMeta> {
+    let mut meta = ContractMeta::default();
+
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        let payload = payload.map_err(|e| AppError::WasmParse(e.to_string()))?;
+        if let wasmparser::Payload::CustomSection(section) = payload {
+            if section.name() != "contractmetav0" {
+                continue;
+            }
+
+            let data = section.data();
+            let mut cursor = Cursor::new(data);
+            while (cursor.position() as usize) < data.len() {
+                let mut limited =
+                    stellar_xdr::Limited::new(&mut cursor, stellar_xdr::Limits::none());
+                // Break (not `?`) on a decode error, matching
+                // `parse_contract_spec`: entries already decoded are kept and
+                // a malformed tail degrades gracefully to what we have.
+                let Ok(entry) = stellar_xdr::ScMetaEntry::read_xdr(&mut limited) else {
+                    break;
+                };
+                let stellar_xdr::ScMetaEntry::ScMetaV0(v) = entry;
+                let key = String::from_utf8_lossy(v.key.as_slice()).to_string();
+                let val = String::from_utf8_lossy(v.val.as_slice()).to_string();
+                match key.as_str() {
+                    "name" => meta.name = Some(val.clone()),
+                    "version" => meta.version = Some(val.clone()),
+                    "description" | "desc" => meta.description = Some(val.clone()),
+                    _ => {}
+                }
+                meta.entries.push((key, val));
+            }
+        }
+    }
+
+    Ok(meta)
+}
+
+/// Formats the parsed contract metadata for display.
+///
+/// Prints the recognized fields (name/version/description) followed by any
+/// additional custom key/value pairs, so no metadata is hidden. WASMs without
+/// a section produce a single "absent" line.
+#[must_use]
+pub fn format_contract_meta(meta: &ContractMeta) -> String {
+    if meta.entries.is_empty() {
+        return "Contract meta: absent".to_string();
+    }
+
+    let mut lines = vec!["Contract meta: present".to_string()];
+    if let Some(name) = &meta.name {
+        lines.push(format!("  name: {name}"));
+    }
+    if let Some(version) = &meta.version {
+        lines.push(format!("  version: {version}"));
+    }
+    if let Some(description) = &meta.description {
+        lines.push(format!("  description: {description}"));
+    }
+    for (key, val) in &meta.entries {
+        if !matches!(key.as_str(), "name" | "version" | "description" | "desc") {
+            lines.push(format!("  {key}: {val}"));
+        }
+    }
+    lines.join("\n")
+}
+
 /// Human-readable name for a `ScSpecTypeDef`.
 #[must_use]
 fn spec_type_name(t: &stellar_xdr::ScSpecTypeDef) -> &'static str {
@@ -510,6 +619,9 @@ pub struct WasmInfo {
     pub functions: Vec<FunctionInfo>,
     /// Whether the WASM carries a Soroban contract spec (`contractspecv0`).
     pub has_spec: bool,
+    /// Contract metadata parsed from the `contractmetaV0` custom section,
+    /// when present.
+    pub contract_meta: ContractMeta,
     /// Index of the module start function, if one is declared.
     pub start_function: Option<u32>,
     /// Linear memories and their limits.
