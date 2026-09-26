@@ -6,6 +6,7 @@ expression: MarkdownFormatter.format(&empty)
 ## Cost Report: `(wasm upload)`
 
 - **Network:** mainnet (ledger 0)
+- **Ledger age:** unknown
 - **WASM hash:** `0000000000000000`
 - **RPC round-trip:** 0 ms
 
