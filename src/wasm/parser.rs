@@ -1,6 +1,7 @@
 use std::io::Cursor;
 use std::path::Path;
 
+use serde_json::json;
 use stellar_xdr::ReadXdr;
 use tracing::{debug, trace};
 
@@ -29,16 +30,25 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
     validate_wasm(&bytes)?;
     debug!("WASM validated");
 
-    let metadata = enumerate_module_metadata(&bytes)?;
-    let (spec_functions, has_spec) = parse_contract_spec(&bytes).unwrap_or_default();
-    let contract_meta = parse_contract_meta(&bytes).unwrap_or_default();
+    let ModuleMetadata {
+        mut functions,
+        start_function,
+        memories,
+        imports,
+        exports,
+        sections,
+    } = enumerate_module_metadata(&bytes)?;
+    let (spec_entries, has_spec) = parse_contract_spec_entries(&bytes)?;
+    let spec_functions = spec_functions_from_entries(&spec_entries);
+    let contract_meta = parse_contract_meta(&bytes)?;
 
-    let mut functions = metadata.functions;
     if !spec_functions.is_empty() {
         for fn_info in &mut functions {
-            if let Some((_, params)) = spec_functions.iter().find(|(n, _)| n == &fn_info.name) {
-                fn_info.params = params.clone();
-                fn_info.param_count = params.len() as u32;
+            if let Some(spec_fn) = spec_functions.iter().find(|f| f.name == fn_info.name) {
+                fn_info.params = spec_fn.inputs.clone();
+                fn_info.param_count = spec_fn.inputs.len() as u32;
+                fn_info.returns = spec_fn.outputs.clone();
+                fn_info.result_count = spec_fn.outputs.len() as u32;
             }
         }
     }
@@ -48,17 +58,20 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
         bytes,
         functions,
         has_spec,
+        spec_entries,
         contract_meta,
-        start_function: metadata.start_function,
-        memories: metadata.memories,
-        imports: metadata.imports,
-        exports: metadata.exports,
+        start_function,
+        memories,
+        imports,
+        exports,
+        sections,
     })
 }
 
 /// Basic structural validation of a WASM binary.
 pub fn validate_wasm(bytes: &[u8]) -> AppResult<()> {
-    wasmparser::validate(bytes).map_err(|e| AppError::WasmValidation(e.to_string()))?;
+    wasmparser::validate(bytes)
+        .map_err(|e| AppError::WasmValidation(format!("not a valid WebAssembly binary: {e}")))?;
     Ok(())
 }
 
@@ -80,6 +93,8 @@ pub struct ModuleMetadata {
     pub imports: Vec<ImportInfo>,
     /// Exports declared by the module, including non-function exports.
     pub exports: Vec<ExportInfo>,
+    /// Every section found in the binary, with its name and byte size.
+    pub sections: Vec<SectionInfo>,
 }
 
 /// Enumerates exported functions and captures module entry-point metadata:
@@ -100,9 +115,25 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
     let mut memories = Vec::new();
     let mut imports = Vec::new();
     let mut exports = Vec::new();
+    let mut sections = Vec::new();
+    let mut imported_function_count = 0usize;
 
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
         let payload = payload.map_err(|e| AppError::WasmParse(e.to_string()))?;
+        if let Some((id, range)) = payload.as_section() {
+            let name = match &payload {
+                wasmparser::Payload::CustomSection(section) => section.name().to_string(),
+                _ => section_id_name(id).to_string(),
+            };
+            sections.push(SectionInfo {
+                id,
+                name,
+                custom: matches!(&payload, wasmparser::Payload::CustomSection(_)),
+                offset: range.start,
+                end: range.end,
+                size: range.end - range.start,
+            });
+        }
         match payload {
             wasmparser::Payload::TypeSection(section) => {
                 for rec_group in section {
@@ -126,9 +157,10 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
                 for export in section {
                     let export = export.map_err(|e| AppError::WasmParse(e.to_string()))?;
                     if export.kind == wasmparser::ExternalKind::Func {
-                        let idx = export.index as usize;
-                        let (param_count, result_count) = func_to_type
-                            .get(idx)
+                        let defined_idx =
+                            (export.index as usize).checked_sub(imported_function_count);
+                        let (param_count, result_count) = defined_idx
+                            .and_then(|idx| func_to_type.get(idx))
                             .and_then(|&type_idx| type_infos.get(type_idx as usize).copied())
                             .unwrap_or((0, 0));
                         functions.push(FunctionInfo {
@@ -136,6 +168,7 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
                             param_count,
                             result_count,
                             params: Vec::new(),
+                            returns: Vec::new(),
                         });
                     }
                     exports.push(ExportInfo {
@@ -161,6 +194,8 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
                     let group = group.map_err(|e| AppError::WasmParse(e.to_string()))?;
                     match group {
                         wasmparser::Imports::Single(_, imported) => {
+                            imported_function_count +=
+                                usize::from(is_function_type_ref(&imported.ty));
                             imports.push(ImportInfo {
                                 module: imported.module.to_string(),
                                 name: imported.name.to_string(),
@@ -170,6 +205,8 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
                         wasmparser::Imports::Compact1 { module, items } => {
                             for item in items {
                                 let item = item.map_err(|e| AppError::WasmParse(e.to_string()))?;
+                                imported_function_count +=
+                                    usize::from(is_function_type_ref(&item.ty));
                                 imports.push(ImportInfo {
                                     module: module.to_string(),
                                     name: item.name.to_string(),
@@ -178,6 +215,8 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
                             }
                         }
                         wasmparser::Imports::Compact2 { module, ty, names } => {
+                            imported_function_count +=
+                                names.count() as usize * usize::from(is_function_type_ref(&ty));
                             for name in names {
                                 let name = name.map_err(|e| AppError::WasmParse(e.to_string()))?;
                                 imports.push(ImportInfo {
@@ -206,7 +245,37 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
         memories,
         imports,
         exports,
+        sections,
     })
+}
+
+/// Human-readable name for a WebAssembly section id.
+#[must_use]
+pub fn section_id_name(id: u8) -> &'static str {
+    match id {
+        0 => "custom",
+        1 => "type",
+        2 => "import",
+        3 => "function",
+        4 => "table",
+        5 => "memory",
+        6 => "global",
+        7 => "export",
+        8 => "start",
+        9 => "element",
+        10 => "code",
+        11 => "data",
+        12 => "data count",
+        13 => "tag",
+        _ => "unknown",
+    }
+}
+
+fn is_function_type_ref(ty: &wasmparser::TypeRef) -> bool {
+    matches!(
+        ty,
+        wasmparser::TypeRef::Func(_) | wasmparser::TypeRef::FuncExact(_)
+    )
 }
 
 /// Human-readable name for an `ExternalKind`.
@@ -237,59 +306,118 @@ pub fn type_ref_kind_name(ty: &wasmparser::TypeRef) -> &'static str {
 /// Decoded spec function entries: (function name, typed parameter list).
 pub type SpecFunctions = Vec<(String, Vec<ParamInfo>)>;
 
-/// Decodes the Soroban contract spec (`contractspecv0` custom section).
-///
-/// Returns the function entries (name → typed params) and whether the
-/// section was present at all. Function entries carry the typed parameter
-/// list that the bare WASM export section cannot express.
+/// A typed value (function return, or any other spec type) with both its
+/// human-readable name and the raw spec type definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeInfo {
+    /// Human-readable Soroban type, e.g. `i64`, `symbol`, `string`.
+    pub type_name: String,
+    /// The raw spec type definition, used for value validation.
+    pub type_def: stellar_xdr::ScSpecTypeDef,
+}
+
+/// One function entry decoded from a `contractspecv0` custom section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecFunctionInfo {
+    /// Exported contract function name.
+    pub name: String,
+    /// Doc string attached to the function, when present.
+    pub doc: String,
+    /// Typed input parameters.
+    pub inputs: Vec<ParamInfo>,
+    /// Typed return values (a contract function returns at most one value).
+    pub outputs: Vec<TypeInfo>,
+}
+
+/// Decodes the Soroban contract spec (`contractspecv0` custom section) into
+/// the function entries that carry typed parameters.
+pub fn parse_contract_spec(bytes: &[u8]) -> AppResult<(SpecFunctions, bool)> {
+    let (entries, has_spec) = parse_contract_spec_entries(bytes)?;
+    let functions = spec_functions_from_entries(&entries)
+        .into_iter()
+        .map(|f| (f.name, f.inputs))
+        .collect();
+    Ok((functions, has_spec))
+}
+
+/// Decodes the `contractspecv0` custom section into function entries with
+/// typed parameters *and* return types.
+pub fn parse_contract_spec_functions(bytes: &[u8]) -> AppResult<(Vec<SpecFunctionInfo>, bool)> {
+    let (entries, has_spec) = parse_contract_spec_entries(bytes)?;
+    Ok((spec_functions_from_entries(&entries), has_spec))
+}
+
+/// Decodes every `ScSpecEntry` from the `contractspecv0` custom section.
 ///
 /// The section payload is **not** a count-prefixed `VecM<ScSpecEntry>`: it is
 /// a concatenation of raw `ScSpecEntry` XDR values, each starting with its
-/// 4-byte union discriminant (e.g. `00 00 00 00` = FunctionV0). We therefore
-/// decode entries one at a time from a cursor, stopping when the stream is
-/// exhausted.
-pub fn parse_contract_spec(bytes: &[u8]) -> AppResult<(SpecFunctions, bool)> {
-    let mut spec_functions = Vec::new();
+/// 4-byte union discriminant (e.g. `00 00 00 00` = FunctionV0). Entries are
+/// therefore decoded one at a time from a cursor until the section payload is
+/// exhausted. All entry kinds are preserved (functions, UDT structs, unions,
+/// enums, error enums, and events) so callers can render the full spec.
+pub fn parse_contract_spec_entries(
+    bytes: &[u8],
+) -> AppResult<(Vec<stellar_xdr::ScSpecEntry>, bool)> {
+    let mut entries = Vec::new();
     let mut has_spec = false;
 
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
         let payload = payload.map_err(|e| AppError::WasmParse(e.to_string()))?;
-        if let wasmparser::Payload::CustomSection(section) = payload {
-            if section.name() != "contractspecv0" {
-                continue;
-            }
-            has_spec = true;
+        let wasmparser::Payload::CustomSection(section) = payload else {
+            continue;
+        };
+        if section.name() != "contractspecv0" {
+            continue;
+        }
+        has_spec = true;
 
-            let data = section.data();
-            let mut cursor = Cursor::new(data);
-            while (cursor.position() as usize) < data.len() {
-                let mut limited =
-                    stellar_xdr::Limited::new(&mut cursor, stellar_xdr::Limits::none());
-                // Break (not `?`) on a decode error: a trailing byte or a
-                // truncated final entry should not discard the entries already
-                // decoded. If nothing decoded, the caller's `unwrap_or_default`
-                // still degrades gracefully to bare WASM exports.
-                let Ok(entry) = stellar_xdr::ScSpecEntry::read_xdr(&mut limited) else {
-                    break;
-                };
-                if let stellar_xdr::ScSpecEntry::FunctionV0(f) = entry {
-                    let name = String::from_utf8_lossy(f.name.as_slice()).to_string();
-                    let params = f
-                        .inputs
-                        .iter()
-                        .map(|input| ParamInfo {
-                            name: String::from_utf8_lossy(input.name.as_slice()).to_string(),
-                            type_name: spec_type_name(&input.type_).to_string(),
-                            type_def: input.type_.clone(),
-                        })
-                        .collect();
-                    spec_functions.push((name, params));
-                }
-            }
+        let data = section.data();
+        let mut cursor = Cursor::new(data);
+        while (cursor.position() as usize) < data.len() {
+            let mut limited = stellar_xdr::Limited::new(&mut cursor, stellar_xdr::Limits::none());
+            let entry = stellar_xdr::ScSpecEntry::read_xdr(&mut limited).map_err(|e| {
+                AppError::WasmParse(format!(
+                    "failed to decode contractspecv0 entry {}: {e}",
+                    entries.len()
+                ))
+            })?;
+            entries.push(entry);
         }
     }
 
-    Ok((spec_functions, has_spec))
+    Ok((entries, has_spec))
+}
+
+fn spec_functions_from_entries(entries: &[stellar_xdr::ScSpecEntry]) -> Vec<SpecFunctionInfo> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let stellar_xdr::ScSpecEntry::FunctionV0(f) = entry else {
+                return None;
+            };
+            Some(SpecFunctionInfo {
+                name: String::from_utf8_lossy(f.name.as_slice()).to_string(),
+                doc: String::from_utf8_lossy(f.doc.as_slice()).to_string(),
+                inputs: f
+                    .inputs
+                    .iter()
+                    .map(|input| ParamInfo {
+                        name: String::from_utf8_lossy(input.name.as_slice()).to_string(),
+                        type_name: spec_type_name(&input.type_).to_string(),
+                        type_def: input.type_.clone(),
+                    })
+                    .collect(),
+                outputs: f
+                    .outputs
+                    .iter()
+                    .map(|output| TypeInfo {
+                        type_name: spec_type_name(output).to_string(),
+                        type_def: output.clone(),
+                    })
+                    .collect(),
+            })
+        })
+        .collect()
 }
 
 /// Metadata parsed from the Soroban `contractmetaV0` custom section.
@@ -307,6 +435,9 @@ pub struct ContractMeta {
     /// Contract description, when the section carries a `description`
     /// (or `desc`) key.
     pub description: Option<String>,
+    /// Soroban SDK version the contract was built with, when the section
+    /// carries one of the SDK-version keys.
+    pub sdk_version: Option<String>,
     /// Every key/value pair found in the section, in section order —
     /// including the recognized keys above and any custom ones.
     pub entries: Vec<(String, String)>,
@@ -318,52 +449,71 @@ impl ContractMeta {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Looks up a metadata key by name, preserving the original casing.
+    #[must_use]
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
 }
+
+const SDK_VERSION_KEYS: [&str; 5] = [
+    "rssdkver",
+    "sdkver",
+    "sdk_version",
+    "soroban_sdk_version",
+    "soroban-sdk-version",
+];
 
 /// Parses the Soroban contract metadata (`contractmetaV0` custom section).
 ///
-/// Returns the parsed name/version/description plus the full ordered list of
-/// key/value pairs. The section is optional — a WASM without one yields an
-/// empty `ContractMeta`, never an error.
+/// Returns the parsed name/version/description/SDK version plus the full
+/// ordered list of key/value pairs. The section is optional — a WASM without
+/// one yields an empty `ContractMeta`, never an error.
 ///
 /// Like `contractspecv0`, the section payload is **not** a count-prefixed
 /// vector: it is a concatenation of raw `ScMetaEntry` XDR union values, each
 /// starting with its 4-byte union discriminant (`00 00 00 00` = `ScMetaV0`)
 /// followed by the `{ key, val }` struct. Entries are decoded one at a time
-/// from a cursor; a truncated or malformed trailing entry stops the loop
-/// without discarding the entries already decoded.
+/// from a cursor until the payload is exhausted.
 pub fn parse_contract_meta(bytes: &[u8]) -> AppResult<ContractMeta> {
     let mut meta = ContractMeta::default();
 
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
         let payload = payload.map_err(|e| AppError::WasmParse(e.to_string()))?;
-        if let wasmparser::Payload::CustomSection(section) = payload {
-            if section.name() != "contractmetav0" {
-                continue;
-            }
+        let wasmparser::Payload::CustomSection(section) = payload else {
+            continue;
+        };
+        if section.name() != "contractmetav0" {
+            continue;
+        }
 
-            let data = section.data();
-            let mut cursor = Cursor::new(data);
-            while (cursor.position() as usize) < data.len() {
-                let mut limited =
-                    stellar_xdr::Limited::new(&mut cursor, stellar_xdr::Limits::none());
-                // Break (not `?`) on a decode error, matching
-                // `parse_contract_spec`: entries already decoded are kept and
-                // a malformed tail degrades gracefully to what we have.
-                let Ok(entry) = stellar_xdr::ScMetaEntry::read_xdr(&mut limited) else {
-                    break;
-                };
-                let stellar_xdr::ScMetaEntry::ScMetaV0(v) = entry;
-                let key = String::from_utf8_lossy(v.key.as_slice()).to_string();
-                let val = String::from_utf8_lossy(v.val.as_slice()).to_string();
-                match key.as_str() {
-                    "name" => meta.name = Some(val.clone()),
-                    "version" => meta.version = Some(val.clone()),
-                    "description" | "desc" => meta.description = Some(val.clone()),
-                    _ => {}
+        let data = section.data();
+        let mut cursor = Cursor::new(data);
+        while (cursor.position() as usize) < data.len() {
+            let mut limited = stellar_xdr::Limited::new(&mut cursor, stellar_xdr::Limits::none());
+            let entry = stellar_xdr::ScMetaEntry::read_xdr(&mut limited).map_err(|e| {
+                AppError::WasmParse(format!(
+                    "failed to decode contractmetav0 entry {}: {e}",
+                    meta.entries.len()
+                ))
+            })?;
+            let stellar_xdr::ScMetaEntry::ScMetaV0(v) = entry;
+            let key = String::from_utf8_lossy(v.key.as_slice()).to_string();
+            let val = String::from_utf8_lossy(v.val.as_slice()).to_string();
+            match key.as_str() {
+                "name" => meta.name = Some(val.clone()),
+                "version" => meta.version = Some(val.clone()),
+                "description" | "desc" => meta.description = Some(val.clone()),
+                _ if SDK_VERSION_KEYS.contains(&key.as_str()) => {
+                    meta.sdk_version = Some(val.clone());
                 }
-                meta.entries.push((key, val));
+                _ => {}
             }
+            meta.entries.push((key, val));
         }
     }
 
@@ -582,6 +732,23 @@ pub struct ExportInfo {
     pub index: u32,
 }
 
+/// Information about a WebAssembly section found in the binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SectionInfo {
+    /// Raw section id from the binary (`0` = custom).
+    pub id: u8,
+    /// Canonical section name, or the custom section's own name.
+    pub name: String,
+    /// Whether this is a custom section (id `0`).
+    pub custom: bool,
+    /// Byte offset of the section contents in the binary.
+    pub offset: usize,
+    /// Byte offset one past the end of the section contents.
+    pub end: usize,
+    /// Size of the section contents, in bytes.
+    pub size: usize,
+}
+
 /// Information about an exported function.
 #[derive(Debug, Clone)]
 pub struct FunctionInfo {
@@ -593,21 +760,180 @@ pub struct FunctionInfo {
     pub result_count: u32,
     /// Typed parameters from the contract spec, if the WASM has one.
     pub params: Vec<ParamInfo>,
+    /// Typed return values from the contract spec, if the WASM has one.
+    pub returns: Vec<TypeInfo>,
 }
 
-/// Formats a function with its spec-derived signature, e.g. `increment(x: I64)`.
+/// Renders a spec type definition as JSON, preserving the full type tree
+/// (nested `option`/`result`/`vec`/`map`/`tuple`/`bytes_n`/`udt` types keep
+/// their structure instead of collapsing to a flat name).
+#[must_use]
+pub fn spec_type_json(type_def: &stellar_xdr::ScSpecTypeDef) -> serde_json::Value {
+    use stellar_xdr::ScSpecTypeDef as Type;
+    match type_def {
+        Type::Option(inner) => json!({
+            "type": "option",
+            "inner": spec_type_json(&inner.value_type),
+        }),
+        Type::Result(inner) => json!({
+            "type": "result",
+            "ok": spec_type_json(&inner.ok_type),
+            "error": spec_type_json(&inner.error_type),
+        }),
+        Type::Vec(inner) => json!({
+            "type": "vec",
+            "element": spec_type_json(&inner.element_type),
+        }),
+        Type::Map(inner) => json!({
+            "type": "map",
+            "key": spec_type_json(&inner.key_type),
+            "value": spec_type_json(&inner.value_type),
+        }),
+        Type::Tuple(inner) => json!({
+            "type": "tuple",
+            "elements": inner.value_types.iter().map(spec_type_json).collect::<Vec<_>>(),
+        }),
+        Type::BytesN(inner) => json!({
+            "type": "bytes_n",
+            "length": inner.n,
+        }),
+        Type::Udt(inner) => json!({
+            "type": "udt",
+            "name": String::from_utf8_lossy(inner.name.as_slice()),
+        }),
+        other => json!({ "type": spec_type_name(other) }),
+    }
+}
+
+/// Renders a single `contractspecv0` entry as JSON, covering every entry kind
+/// the contract spec can carry (functions, UDTs, enums, error enums, events).
+#[must_use]
+pub fn spec_entry_json(entry: &stellar_xdr::ScSpecEntry) -> serde_json::Value {
+    use stellar_xdr::ScSpecEntry as Entry;
+    match entry {
+        Entry::FunctionV0(f) => json!({
+            "kind": "function",
+            "name": String::from_utf8_lossy(f.name.as_slice()),
+            "doc": String::from_utf8_lossy(f.doc.as_slice()),
+            "inputs": f.inputs.iter().map(|input| json!({
+                "name": String::from_utf8_lossy(input.name.as_slice()),
+                "doc": String::from_utf8_lossy(input.doc.as_slice()),
+                "type": spec_type_name(&input.type_),
+                "type_def": spec_type_json(&input.type_),
+            })).collect::<Vec<_>>(),
+            "outputs": f.outputs.iter().map(|output| json!({
+                "type": spec_type_name(output),
+                "type_def": spec_type_json(output),
+            })).collect::<Vec<_>>(),
+        }),
+        Entry::UdtStructV0(udt) => json!({
+            "kind": "udt_struct",
+            "name": String::from_utf8_lossy(udt.name.as_slice()),
+            "lib": String::from_utf8_lossy(udt.lib.as_slice()),
+            "doc": String::from_utf8_lossy(udt.doc.as_slice()),
+            "fields": udt.fields.iter().map(|field| json!({
+                "name": String::from_utf8_lossy(field.name.as_slice()),
+                "doc": String::from_utf8_lossy(field.doc.as_slice()),
+                "type": spec_type_name(&field.type_),
+                "type_def": spec_type_json(&field.type_),
+            })).collect::<Vec<_>>(),
+        }),
+        Entry::UdtUnionV0(udt) => json!({
+            "kind": "udt_union",
+            "name": String::from_utf8_lossy(udt.name.as_slice()),
+            "lib": String::from_utf8_lossy(udt.lib.as_slice()),
+            "doc": String::from_utf8_lossy(udt.doc.as_slice()),
+            "cases": udt.cases.iter().map(udt_union_case_json).collect::<Vec<_>>(),
+        }),
+        Entry::UdtEnumV0(udt) => json!({
+            "kind": "udt_enum",
+            "name": String::from_utf8_lossy(udt.name.as_slice()),
+            "lib": String::from_utf8_lossy(udt.lib.as_slice()),
+            "doc": String::from_utf8_lossy(udt.doc.as_slice()),
+            "cases": udt.cases.iter().map(|case| json!({
+                "name": String::from_utf8_lossy(case.name.as_slice()),
+                "doc": String::from_utf8_lossy(case.doc.as_slice()),
+                "value": case.value,
+            })).collect::<Vec<_>>(),
+        }),
+        Entry::UdtErrorEnumV0(udt) => json!({
+            "kind": "udt_error_enum",
+            "name": String::from_utf8_lossy(udt.name.as_slice()),
+            "lib": String::from_utf8_lossy(udt.lib.as_slice()),
+            "doc": String::from_utf8_lossy(udt.doc.as_slice()),
+            "cases": udt.cases.iter().map(|case| json!({
+                "name": String::from_utf8_lossy(case.name.as_slice()),
+                "doc": String::from_utf8_lossy(case.doc.as_slice()),
+                "value": case.value,
+            })).collect::<Vec<_>>(),
+        }),
+        Entry::EventV0(event) => json!({
+            "kind": "event",
+            "name": String::from_utf8_lossy(event.name.as_slice()),
+            "lib": String::from_utf8_lossy(event.lib.as_slice()),
+            "doc": String::from_utf8_lossy(event.doc.as_slice()),
+            "prefix_topics": event.prefix_topics.iter()
+                .map(|topic| String::from_utf8_lossy(topic.as_slice()))
+                .collect::<Vec<_>>(),
+            "data_format": match event.data_format {
+                stellar_xdr::ScSpecEventDataFormat::SingleValue => "single_value",
+                stellar_xdr::ScSpecEventDataFormat::Vec => "vec",
+                stellar_xdr::ScSpecEventDataFormat::Map => "map",
+            },
+            "params": event.params.iter().map(|param| json!({
+                "name": String::from_utf8_lossy(param.name.as_slice()),
+                "doc": String::from_utf8_lossy(param.doc.as_slice()),
+                "type": spec_type_name(&param.type_),
+                "type_def": spec_type_json(&param.type_),
+                "location": match param.location {
+                    stellar_xdr::ScSpecEventParamLocationV0::Data => "data",
+                    stellar_xdr::ScSpecEventParamLocationV0::TopicList => "topic",
+                },
+            })).collect::<Vec<_>>(),
+        }),
+    }
+}
+
+fn udt_union_case_json(case: &stellar_xdr::ScSpecUdtUnionCaseV0) -> serde_json::Value {
+    use stellar_xdr::ScSpecUdtUnionCaseV0 as Case;
+    match case {
+        Case::VoidV0(case) => json!({
+            "kind": "void",
+            "name": String::from_utf8_lossy(case.name.as_slice()),
+            "doc": String::from_utf8_lossy(case.doc.as_slice()),
+        }),
+        Case::TupleV0(case) => json!({
+            "kind": "tuple",
+            "name": String::from_utf8_lossy(case.name.as_slice()),
+            "doc": String::from_utf8_lossy(case.doc.as_slice()),
+            "types": case.type_.iter()
+                .map(spec_type_json)
+                .collect::<Vec<_>>(),
+        }),
+    }
+}
+
+/// Formats a function with its spec-derived signature, e.g.
+/// `increment(step: i64) -> i64`.
 #[must_use]
 pub fn format_function(fn_info: &FunctionInfo) -> String {
-    if fn_info.params.is_empty() {
-        return fn_info.name.clone();
-    }
     let params = fn_info
         .params
         .iter()
         .map(|p| format!("{}: {}", p.name, p.type_name))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("{}({params})", fn_info.name)
+    let mut signature = format!("{}({params})", fn_info.name);
+    if !fn_info.returns.is_empty() {
+        let returns = fn_info
+            .returns
+            .iter()
+            .map(|r| r.type_name.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        signature = format!("{signature} -> {returns}");
+    }
+    signature
 }
 
 /// Information extracted from a WASM file.
@@ -619,6 +945,9 @@ pub struct WasmInfo {
     pub functions: Vec<FunctionInfo>,
     /// Whether the WASM carries a Soroban contract spec (`contractspecv0`).
     pub has_spec: bool,
+    /// Every entry decoded from the `contractspecv0` custom section, in
+    /// section order (functions, UDTs, enums, error enums, and events).
+    pub spec_entries: Vec<stellar_xdr::ScSpecEntry>,
     /// Contract metadata parsed from the `contractmetaV0` custom section,
     /// when present.
     pub contract_meta: ContractMeta,
@@ -630,6 +959,8 @@ pub struct WasmInfo {
     pub imports: Vec<ImportInfo>,
     /// Exports declared by the module, including non-function exports.
     pub exports: Vec<ExportInfo>,
+    /// Every section in the binary, with its name and byte size.
+    pub sections: Vec<SectionInfo>,
 }
 
 /// Formats a human-readable diagnostic summary of a loaded module: the start
@@ -678,6 +1009,30 @@ pub fn format_module_metadata(info: &WasmInfo) -> String {
         MAX_LISTED_ENTRIES,
         |ex| format!("{} ({}) index {}", ex.name, ex.kind, ex.index),
     );
+    lines.join("\n")
+}
+
+/// Formats a per-section size summary: every section in binary order with its
+/// name, id, and content size, plus how much of the file the sections
+/// account for.
+#[must_use]
+pub fn format_sections(info: &WasmInfo) -> String {
+    let content_bytes: usize = info.sections.iter().map(|s| s.size).sum();
+    let mut lines = vec![format!(
+        "Sections: {} ({} bytes of section content in a {} byte file)",
+        info.sections.len(),
+        content_bytes,
+        info.bytes.len()
+    )];
+    for (i, section) in info.sections.iter().enumerate() {
+        lines.push(format!(
+            "  [{}] {} (id {}): {} bytes",
+            i + 1,
+            section.name,
+            section.id,
+            section.size
+        ));
+    }
     lines.join("\n")
 }
 
