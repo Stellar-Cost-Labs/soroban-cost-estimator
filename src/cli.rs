@@ -186,6 +186,9 @@ pub enum Command {
         /// Polling interval (e.g. "30m", "1h").
         #[arg(long, default_value = "1h")]
         interval: String,
+        /// Percentage threshold for flagging significant changes (e.g. 10 for 10%).
+        #[arg(long, value_name = "N")]
+        threshold_percent: Option<f64>,
     },
 }
 
@@ -301,6 +304,14 @@ pub enum ConfigAction {
         #[arg(long)]
         against: Option<String>,
 
+        /// Hide non-pricing changes and display only fee-rate adjustments.
+        #[arg(long)]
+        pricing_only: bool,
+
+        /// Percentage threshold for flagging significant changes (e.g. 10 for 10%).
+        #[arg(long, value_name = "N")]
+        threshold_percent: Option<f64>,
+
         /// Print a single-line summary (counts of pricing/non-pricing changes)
         /// instead of the full diff. Useful for CI status lines.
         #[arg(long)]
@@ -330,5 +341,22 @@ pub enum ConfigAction {
         /// Network whose snapshots to validate.
         #[arg(long, default_value = "testnet")]
         network: String,
+    },
+
+    /// Export network snapshots to a bundle file.
+    Export {
+        /// Network to export snapshots for.
+        #[arg(long)]
+        network: Option<String>,
+
+        /// Output file path for the snapshot bundle.
+        #[arg(long)]
+        output: String,
+    },
+
+    /// Import network snapshots from a bundle file.
+    Import {
+        /// Path to the snapshot bundle file.
+        bundle: String,
     },
 }
