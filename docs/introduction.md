@@ -33,8 +33,11 @@ testnet/mainnet. And it does something no other Soroban cost tool does: it
 tracks the network's resource-pricing configuration as a first-class,
 versioned artifact.
 
+If you are migrating from the native Stellar CLI (`stellar contract invoke --cost`), see the [Stellar CLI Migration Guide](migration.md) for flag mappings, output field comparisons, and scripting examples.
+
 > ⚠️ **Disclaimer:** This is unaudited developer tooling. Always verify fee
 > estimates against your target network before mainnet deploy.
+
 
 ## Project layout
 
