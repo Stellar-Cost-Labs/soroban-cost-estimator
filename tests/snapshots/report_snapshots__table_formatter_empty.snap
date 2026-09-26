@@ -1,12 +1,13 @@
 ---
 source: tests/report_snapshots.rs
-assertion_line: 65
 expression: TableFormatter.format(&empty)
 ---
 Function: (wasm upload)
 Network: mainnet (ledger 0)
 RPC round-trip: 0 ms
-WASM hash: 0000000000000000
+WASM hash:  0000000000000000
+WASM size:  0 bytes
+Sections:   0 (custom: none)
 
 +------------------+----------+---------------+
 | Resource         | Consumed | Fee (stroops) |

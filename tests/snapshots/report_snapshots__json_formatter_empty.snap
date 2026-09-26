@@ -1,10 +1,10 @@
 ---
 source: tests/report_snapshots.rs
-assertion_line: 76
 expression: JsonFormatter.format(&empty)
 ---
 {
   "cpu_instructions": 0,
+  "custom_sections": [],
   "fee": {
     "bandwidth_fee_stroops": 0,
     "cpu_fee_stroops": 0,
@@ -21,9 +21,11 @@ expression: JsonFormatter.format(&empty)
   "read_bytes": 0,
   "read_entries": 0,
   "rpc_latency_ms": 0,
+  "section_count": 0,
   "suggestions": [],
   "tx_size": 0,
   "wasm_hash": "0000000000000000",
+  "wasm_size": 0,
   "write_bytes": 0,
   "write_entries": 0
 }
