@@ -1498,12 +1498,13 @@ async fn shutdown_signal() -> error::AppResult<()> {
 async fn watch_poll_once(
     network: &str,
     rpc_fallback_url: Option<&str>,
-    first: &mut bool,
+    first: &std::sync::atomic::AtomicBool,
     rps: Option<u64>,
     timeout: u64,
     max_retries: usize,
     extra_headers: &[String],
 ) -> error::AppResult<()> {
+    use std::sync::atomic::Ordering;
     use tracing::{debug, warn};
 
     let snapshot_result = fetch_config_snapshot(
@@ -1518,7 +1519,7 @@ async fn watch_poll_once(
 
     match snapshot_result {
         Ok(snapshot) => {
-            if !*first {
+            if !first.load(Ordering::SeqCst) {
                 if let Ok(old_snapshot) = config_snapshot::store::load_latest_snapshot(network) {
                     let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &snapshot);
                     if !diff.changes.is_empty() {
@@ -1531,7 +1532,7 @@ async fn watch_poll_once(
             }
 
             let _ = config_snapshot::store::save_snapshot(&snapshot, None);
-            *first = false;
+            first.store(false, Ordering::SeqCst);
         }
         Err(e) => {
             warn!(error = %e, "failed to fetch config");
@@ -1544,8 +1545,8 @@ async fn watch_poll_once(
 /// `watch` command: poll network config and print diffs.
 ///
 /// Polls immediately, then on `interval`, until SIGINT (Ctrl-C) or SIGTERM
-/// is received — then exits cleanly with code 0. The in-flight poll is
-/// cancelled rather than writing a partial snapshot.
+/// is received — then exits cleanly with code 0. A second signal while a
+/// poll is still finishing force-exits with code 130.
 async fn cmd_watch(
     network: &str,
     rpc_fallback_url: Option<&str>,
@@ -1555,6 +1556,8 @@ async fn cmd_watch(
     max_retries: usize,
     extra_headers: &[String],
 ) -> error::AppResult<()> {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
     use tracing::info;
 
     let interval_secs: u64 = parse_interval_secs(interval);
@@ -1565,28 +1568,76 @@ async fn cmd_watch(
         network, interval_secs
     );
 
-    let mut first = true;
+    // The poll runs on its own task so a stop signal can wait for it instead of
+    // cancelling it mid-write. `first` is shared rather than moved because the
+    // task outlives the loop iteration that spawned it.
+    let network = network.to_string();
+    let rpc_fallback = rpc_fallback_url.map(str::to_string);
+    let headers = extra_headers.to_vec();
+    let first = Arc::new(AtomicBool::new(true));
+    let mut poll_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut poll_in_flight = false;
+    let mut shutting_down = false;
+
     loop {
-        tokio::select! {
-            signal = shutdown_signal() => {
-                signal?;
-                info!("received stop signal");
-                println!("Received stop signal — exiting cleanly.");
-                return Ok(());
-            }
-            () = async {
+        if poll_task.is_none() && !shutting_down {
+            let network = network.clone();
+            let rpc_fallback_url = rpc_fallback.clone();
+            let extra_headers = headers.clone();
+            let first = Arc::clone(&first);
+            poll_task = Some(tokio::spawn(async move {
                 let _ = watch_poll_once(
-                    network,
-                    rpc_fallback_url,
-                    &mut first,
+                    &network,
+                    rpc_fallback_url.as_deref(),
+                    &first,
                     rps,
                     timeout,
                     max_retries,
-                    extra_headers,
+                    &extra_headers,
                 )
                 .await;
-                tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
-            } => {}
+            }));
+            poll_in_flight = true;
+        }
+
+        tokio::select! {
+            signal = shutdown_signal() => {
+                signal?;
+                if shutting_down {
+                    eprintln!("Received second stop signal — force exiting.");
+                    std::process::exit(130);
+                }
+                shutting_down = true;
+                info!("received stop signal");
+                println!("Received stop signal — waiting for in-flight poll to finish...");
+                if !poll_in_flight {
+                    return Ok(());
+                }
+            }
+            _ = async {
+                if let Some(task) = poll_task.as_mut() {
+                    let _ = task.await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                poll_task = None;
+                poll_in_flight = false;
+                if shutting_down {
+                    // The stop signal arrived while this poll was running: it has
+                    // now finished, so there is nothing left to wait for.
+                    return Ok(());
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(interval_secs)) => {}
+                    signal = shutdown_signal() => {
+                        signal?;
+                        info!("received stop signal");
+                        println!("Received stop signal — exiting cleanly.");
+                        return Ok(());
+                    }
+                }
+            }
         }
     }
 }
