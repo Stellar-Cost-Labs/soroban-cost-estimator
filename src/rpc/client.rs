@@ -123,6 +123,10 @@ pub struct RpcClient {
     /// exponential backoff.
     max_retries: usize,
     /// Custom HTTP headers attached to every outbound request.
+    ///
+    /// These are already applied to the `reqwest::Client` via
+    /// `default_headers`; this copy is kept so tests can assert the wiring.
+    #[cfg_attr(not(test), allow(dead_code))]
     headers: HeaderMap,
 }
 
