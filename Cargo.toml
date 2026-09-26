@@ -101,6 +101,7 @@ governor = "0.10.4"
 insta = "1.40.0"
 proptest = "1.11.0"
 criterion = "0.5"
+axum = "0.8"
 rusqlite = { version = "0.37", features = ["bundled"] }
 
 [profile.release]
