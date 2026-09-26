@@ -58,11 +58,17 @@ fn temp_home(label: &str) -> PathBuf {
 
 /// A minimal but structurally valid config snapshot, matching `ConfigSnapshot`.
 fn snapshot_json(network: &str, ledger: u32) -> String {
+    snapshot_json_at(network, ledger, "2026-01-01T00:00:00+00:00")
+}
+
+/// As [`snapshot_json`], but with an explicit RFC 3339 timestamp so a test can
+/// lay out several snapshots in a known chronological order.
+fn snapshot_json_at(network: &str, ledger: u32, timestamp: &str) -> String {
     format!(
         r#"{{
   "network": "{network}",
   "ledger": {ledger},
-  "timestamp": "2026-01-01T00:00:00+00:00",
+  "timestamp": "{timestamp}",
   "contract_compute": null,
   "contract_ledger_cost": null,
   "contract_historical_data": null,
@@ -71,6 +77,40 @@ fn snapshot_json(network: &str, ledger: u32) -> String {
   "state_archival": null
 }}"#
     )
+}
+
+/// Writes one snapshot into the isolated home's snapshots directory.
+///
+/// The filename mirrors `save_snapshot`: `{network}-{timestamp}.json` with
+/// `:` replaced by `-`. That naming is what orders snapshots on disk, so a
+/// test has to reproduce it to exercise the real lookup path.
+fn write_snapshot(home: &Path, network: &str, timestamp: &str, ledger: u32) -> PathBuf {
+    let dir = home.join(".soroban-cost-estimator").join("snapshots");
+    std::fs::create_dir_all(&dir).expect("create snapshots dir");
+    let path = dir.join(format!("{network}-{}.json", timestamp.replace(':', "-")));
+    std::fs::write(&path, snapshot_json_at(network, ledger, timestamp)).expect("write snapshot");
+    path
+}
+
+/// Runs the CLI with `HOME` isolated and tracing silenced.
+///
+/// `tracing`'s `info!` lines go to stdout in this binary, so `RUST_LOG=error`
+/// is what makes stdout exactly the command's own output for JSON assertions.
+fn run_cli_quiet(args: &[&str], home: Option<&Path>) -> (String, String, i32) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"));
+    cmd.args(args).env("RUST_LOG", "error");
+    if let Some(home) = home {
+        cmd.env("HOME", home);
+        cmd.env("USERPROFILE", home);
+    }
+
+    let output = cmd.output().expect("failed to run CLI");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let code = output.status.code().unwrap_or(-1);
+
+    (stdout, stderr, code)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -185,7 +225,7 @@ fn test_config_diff_help() {
         code, 0,
         "config diff --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--network", "--against", "--summary"] {
+    for flag in ["--network", "--against", "--against-previous", "--summary"] {
         assert!(
             stdout.contains(flag),
             "diff help should mention {flag}; got: {stdout}"
@@ -1030,6 +1070,158 @@ fn test_config_diff_loads_valid_snapshot_before_network() {
         !stderr.contains("Error: failed to parse snapshot"),
         "a valid snapshot must not be reported as malformed; got: {stderr}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `config diff --against-previous`
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_config_diff_against_previous_no_snapshots_errors() {
+    // Scenario 0: nothing on disk to compare. The network name is
+    // deliberately unresolvable, so if the command reached for the RPC
+    // endpoint at all the failure would name the network instead.
+    let home = temp_home("diff-prev-none");
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against-previous",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "0 snapshots should exit 1");
+    assert!(
+        stderr.contains("need at least 2 for network not-a-network") && stderr.contains("found 0"),
+        "the error should report the snapshot count; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("failed to locate RPC endpoint"),
+        "--against-previous must never contact the network; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_diff_against_previous_one_snapshot_errors() {
+    // Scenario 1: a single point in time has nothing to diff against.
+    let home = temp_home("diff-prev-one");
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:01+00:00", 100);
+
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against-previous",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "1 snapshot should exit 1");
+    assert!(
+        stderr.contains("need at least 2 for network not-a-network") && stderr.contains("found 1"),
+        "the error should report the snapshot count; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("failed to locate RPC endpoint"),
+        "--against-previous must never contact the network; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_diff_against_previous_diffs_two_newest_snapshots() {
+    // Scenario 2+: three snapshots on disk, so the command must compare the
+    // two newest (ledgers 200 → 300) and leave the oldest (100) alone. The
+    // network is unresolvable on purpose: this command is purely local, so a
+    // network failure here would mean it leaked past the snapshot store.
+    let home = temp_home("diff-prev-two");
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:01+00:00", 100);
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:02+00:00", 200);
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:03+00:00", 300);
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against-previous",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(
+        code, 0,
+        "identical consecutive snapshots should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("(ledger 200) → 2026-01-01T00:00:03+00:00 (ledger 300)"),
+        "the two newest snapshots must be the ones compared; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("(ledger 100)"),
+        "the oldest snapshot must not take part in the diff; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("No changes detected"),
+        "identical snapshots should report no changes; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_diff_against_previous_summary_output() {
+    let home = temp_home("diff-prev-summary");
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:01+00:00", 100);
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:02+00:00", 200);
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against-previous",
+            "--summary",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 0, "--summary should exit 0 here; stderr: {stderr}");
+    assert!(
+        stdout.contains("0 pricing changes, 0 non-pricing changes"),
+        "--summary should emit exactly the one-line summary; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_diff_against_previous_json_uses_the_live_envelope() {
+    // Both diff modes emit `{ diff, stale_estimates }`, so a consumer sees one
+    // schema whether the newer side came from the network or from disk.
+    let home = temp_home("diff-prev-json");
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:01+00:00", 100);
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:02+00:00", 200);
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against-previous",
+            "--json",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 0, "--json should exit 0 here; stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("valid JSON; {e}: {stdout}"));
+    assert_eq!(parsed["diff"]["old_snapshot"]["ledger"], 100);
+    assert_eq!(parsed["diff"]["new_snapshot"]["ledger"], 200);
+    assert_eq!(parsed["diff"]["has_pricing_changes"], false);
+    assert_eq!(parsed["stale_estimates"].as_array().map(Vec::len), Some(0));
 }
 
 // ─────────────────────────────────────────────────────────────────────────

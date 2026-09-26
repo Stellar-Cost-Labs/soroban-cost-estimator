@@ -352,6 +352,7 @@ soroban-cost-estimator config diff [OPTIONS]
 |------|----------|---------|-------------|
 | `--network <NETWORK>` | | `testnet` | Network to compare against |
 | `--against <AGAINST>` | | latest snapshot | Explicit snapshot path to compare against |
+| `--against-previous` | | `false` | Diff the two most recent on-disk snapshots against each other instead of the live network (conflicts with `--against`) |
 | `--summary` | | `false` | Print a single-line count summary instead of the full diff (for CI status lines) |
 | `--help` `-h` | | | Print help |
 
@@ -383,6 +384,13 @@ Diff against an explicit snapshot:
 ```bash
 soroban-cost-estimator config diff --network testnet \
   --against ~/.soroban-cost-estimator/snapshots/testnet-2026-08-04T07-15-38.487702259+00-00.json
+```
+
+Diff the two most recent snapshots on disk against each other, without
+contacting the network at all:
+
+```bash
+soroban-cost-estimator config diff --network testnet --against-previous
 ```
 
 **Sample output (no changes)**

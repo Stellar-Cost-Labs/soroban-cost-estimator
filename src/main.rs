@@ -221,6 +221,26 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::Diff {
                 network,
                 against,
+                against_previous,
+                summary,
+                json,
+            } => {
+                if against_previous {
+                    cmd_config_diff_against_previous(&network, summary, json)
+                } else {
+                    cmd_config_diff(
+                        &network,
+                        fallback,
+                        against.as_deref(),
+                        summary,
+                        json,
+                        rps,
+                        timeout,
+                        max_retries,
+                        &headers,
+                    )
+                    .await
+                }
                 pricing_only,
                 threshold_percent,
                 summary,
@@ -1250,6 +1270,23 @@ fn upgrade_detected(diff: &config_snapshot::diff::ConfigDiff) -> bool {
     diff.has_pricing_changes
 }
 
+/// Cached estimates recorded before `ledger`, shaped for the
+/// `config diff --json` payload.
+///
+/// Both diff modes emit the same envelope, so a consumer sees one schema
+/// whether the newer side came from the network or from disk. An unreadable
+/// cache yields an empty list rather than failing the diff.
+fn stale_estimates_for(network: &str, ledger: u32) -> Vec<cache::CachedEstimate> {
+    cache::list_cached_estimates(network)
+        .map(|estimates| {
+            cache::find_stale_estimates(&estimates, ledger)
+                .into_iter()
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// `config diff` command: compare current config against a snapshot.
 async fn cmd_config_diff(
     network: &str,
@@ -1297,18 +1334,9 @@ async fn cmd_config_diff(
             "diff computed"
         );
         if json_flag {
-            // Collect stale estimates for inclusion in JSON output.
-            let stale: Vec<cache::CachedEstimate> = cache::list_cached_estimates(network)
-                .map(|estimates| {
-                    cache::find_stale_estimates(&estimates, new_snapshot.ledger)
-                        .into_iter()
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
             let json_output = serde_json::json!({
                 "diff": diff,
-                "stale_estimates": stale,
+                "stale_estimates": stale_estimates_for(network, new_snapshot.ledger),
             });
             println!("{}", serde_json::to_string_pretty(&json_output)?);
         } else if summary {
@@ -1356,6 +1384,52 @@ async fn cmd_config_diff(
     }
     .instrument(span)
     .await
+}
+
+/// `config diff --against-previous`: compare the two most recent snapshots on
+/// disk against each other, with no network access at all.
+///
+/// Both sides come from stored snapshots, so the network name only selects
+/// which snapshot files to read. Output and exit-code behavior deliberately
+/// match the live mode: `--json` emits the same envelope, `--summary` the same
+/// one-line summary, and a pricing change still exits 1.
+///
+/// Unlike the live mode it never auto-saves, because the newer snapshot is
+/// already the one on disk.
+///
+/// # Network calls
+/// None — pure file I/O.
+fn cmd_config_diff_against_previous(
+    network: &str,
+    summary: bool,
+    json_flag: bool,
+) -> error::AppResult<()> {
+    debug!(network, "diffing the two most recent snapshots");
+    let (old_snapshot, new_snapshot) = config_snapshot::store::load_last_two_snapshots(network)?;
+    let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
+    debug!(
+        change_count = diff.changes.len(),
+        has_pricing = diff.has_pricing_changes,
+        "diff computed"
+    );
+
+    if json_flag {
+        let json_output = serde_json::json!({
+            "diff": diff,
+            "stale_estimates": stale_estimates_for(network, new_snapshot.ledger),
+        });
+        println!("{}", serde_json::to_string_pretty(&json_output)?);
+    } else if summary {
+        println!("{}", config_snapshot::diff::format_diff_summary(&diff));
+    } else {
+        println!("{}", config_snapshot::diff::format_diff(&diff));
+        print_stale_estimates(network, new_snapshot.ledger);
+    }
+
+    if diff.has_pricing_changes {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// `config history` command: print the full chronological change log.

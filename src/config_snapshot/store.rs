@@ -78,6 +78,38 @@ pub fn load_latest_snapshot(network: &str) -> AppResult<ConfigSnapshot> {
     Ok(snapshot)
 }
 
+/// Loads the two most recent snapshots for a network, oldest first.
+///
+/// Returns `(previous, latest)` — the pair that `config diff
+/// --against-previous` compares. [`list_snapshots`] already orders files
+/// oldest → newest, so the last two entries are snapshot N-1 and snapshot N.
+///
+/// # Errors
+/// [`AppError::NotEnoughSnapshots`] when the network has fewer than two
+/// snapshots on disk — a diff needs two points in time to be meaningful.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn load_last_two_snapshots(network: &str) -> AppResult<(ConfigSnapshot, ConfigSnapshot)> {
+    debug!(network, "loading the two most recent snapshots");
+    let paths = list_snapshots(network)?;
+    if paths.len() < 2 {
+        return Err(AppError::NotEnoughSnapshots {
+            network: network.to_string(),
+            found: paths.len(),
+        });
+    }
+
+    let previous = load_snapshot_from_path(&paths[paths.len() - 2].to_string_lossy())?;
+    let latest = load_snapshot_from_path(&paths[paths.len() - 1].to_string_lossy())?;
+    trace!(
+        previous = paths[paths.len() - 2].display().to_string(),
+        latest = paths[paths.len() - 1].display().to_string(),
+        "loaded snapshot pair"
+    );
+    Ok((previous, latest))
+}
+
 /// Loads a specific snapshot from an explicit path.
 ///
 /// # Network calls
