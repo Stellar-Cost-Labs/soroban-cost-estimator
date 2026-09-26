@@ -138,6 +138,7 @@ async fn main() {
 async fn run(args: cli::Cli) -> error::AppResult<()> {
     let rps = args.rps;
     let timeout = args.timeout;
+    let connect_timeout = args.connect_timeout;
     let max_retries = args.max_retries;
     let fallback = args.rpc_fallback_url.as_deref();
     let headers = args.headers;
@@ -171,6 +172,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 &format,
                 rps,
                 timeout,
+                connect_timeout,
                 max_retries,
                 precision,
                 &headers,
@@ -196,6 +198,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 &format,
                 rps,
                 timeout,
+                connect_timeout,
                 max_retries,
                 precision,
                 &headers,
@@ -212,6 +215,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     json,
                     rps,
                     timeout,
+                    connect_timeout,
                     max_retries,
                     &headers,
                 )
@@ -236,6 +240,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     json,
                     rps,
                     timeout,
+                    connect_timeout,
                     max_retries,
                     &headers,
                 )
@@ -267,6 +272,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     json,
                     rps,
                     timeout,
+                    connect_timeout,
                     max_retries,
                     &headers,
                 )
@@ -306,6 +312,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 threshold_percent,
                 rps,
                 timeout,
+                connect_timeout,
                 max_retries,
                 &headers,
             )
@@ -477,6 +484,7 @@ async fn cmd_estimate(
     format: &str,
     rps: Option<u64>,
     timeout: u64,
+    connect_timeout: u64,
     max_retries: usize,
     precision: u32,
     extra_headers: &[String],
@@ -537,10 +545,11 @@ async fn cmd_estimate(
         }
 
         let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
-        let client = rpc::client::RpcClient::with_fallback_headers(
+        let client = rpc::client::RpcClient::with_fallback_headers_connect_timeout(
             &endpoint,
             rpc_fallback_url,
             rps,
+            std::time::Duration::from_secs(connect_timeout),
             std::time::Duration::from_secs(timeout),
             max_retries,
             extra_headers,
@@ -693,6 +702,7 @@ async fn cmd_estimate_all(
     format: &str,
     rps: Option<u64>,
     timeout: u64,
+    connect_timeout: u64,
     max_retries: usize,
     precision: u32,
     extra_headers: &[String],
@@ -742,10 +752,11 @@ async fn cmd_estimate_all(
         }
 
         let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
-        let client = rpc::client::RpcClient::with_fallback_headers(
+        let client = rpc::client::RpcClient::with_fallback_headers_connect_timeout(
             &endpoint,
             rpc_fallback_url,
             rps,
+            std::time::Duration::from_secs(connect_timeout),
             std::time::Duration::from_secs(timeout),
             max_retries,
             extra_headers,
@@ -1112,6 +1123,7 @@ async fn fetch_config_snapshot(
     rpc_fallback_url: Option<&str>,
     rps: Option<u64>,
     timeout: u64,
+    connect_timeout: u64,
     max_retries: usize,
     extra_headers: &[String],
 ) -> error::AppResult<config_snapshot::model::ConfigSnapshot> {
@@ -1121,10 +1133,11 @@ async fn fetch_config_snapshot(
     let span = info_span!("fetch_config_snapshot", network);
     async {
         let endpoint = rpc::client::resolve_endpoint(network, None)?;
-        let client = rpc::client::RpcClient::with_fallback_headers(
+        let client = rpc::client::RpcClient::with_fallback_headers_connect_timeout(
             &endpoint,
             rpc_fallback_url,
             rps,
+            std::time::Duration::from_secs(connect_timeout),
             std::time::Duration::from_secs(timeout),
             max_retries,
             extra_headers,
@@ -1184,6 +1197,7 @@ async fn cmd_config_snapshot(
     json_flag: bool,
     rps: Option<u64>,
     timeout: u64,
+    connect_timeout: u64,
     max_retries: usize,
     extra_headers: &[String],
 ) -> error::AppResult<()> {
@@ -1198,6 +1212,7 @@ async fn cmd_config_snapshot(
             rpc_fallback_url,
             rps,
             timeout,
+            connect_timeout,
             max_retries,
             extra_headers,
         )
@@ -1261,6 +1276,7 @@ async fn cmd_config_diff(
     json_flag: bool,
     rps: Option<u64>,
     timeout: u64,
+    connect_timeout: u64,
     max_retries: usize,
     extra_headers: &[String],
 ) -> error::AppResult<()> {
@@ -1285,6 +1301,7 @@ async fn cmd_config_diff(
             rpc_fallback_url,
             rps,
             timeout,
+            connect_timeout,
             max_retries,
             extra_headers,
         )
@@ -1524,6 +1541,7 @@ async fn watch_poll_once(
     threshold_percent: Option<f64>,
     rps: Option<u64>,
     timeout: u64,
+    connect_timeout: u64,
     max_retries: usize,
     extra_headers: &[String],
 ) -> error::AppResult<()> {
@@ -1534,6 +1552,7 @@ async fn watch_poll_once(
         rpc_fallback_url,
         rps,
         timeout,
+        connect_timeout,
         max_retries,
         extra_headers,
     )
@@ -1579,6 +1598,7 @@ async fn cmd_watch(
     threshold_percent: Option<f64>,
     rps: Option<u64>,
     timeout: u64,
+    connect_timeout: u64,
     max_retries: usize,
     extra_headers: &[String],
 ) -> error::AppResult<()> {
@@ -1609,6 +1629,7 @@ async fn cmd_watch(
                     threshold_percent,
                     rps,
                     timeout,
+                    connect_timeout,
                     max_retries,
                     extra_headers,
                 )
@@ -1829,6 +1850,7 @@ async fn cmd_cache_warm(
     json_flag: bool,
     rps: Option<u64>,
     timeout: u64,
+    connect_timeout: u64,
     max_retries: usize,
     extra_headers: &[String],
 ) -> error::AppResult<()> {
@@ -1842,6 +1864,7 @@ async fn cmd_cache_warm(
         fmt,
         rps,
         timeout,
+        connect_timeout,
         max_retries,
         7,
         extra_headers,
