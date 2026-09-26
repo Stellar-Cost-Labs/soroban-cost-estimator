@@ -282,6 +282,7 @@ soroban-cost-estimator config snapshot [OPTIONS]
 |------|----------|---------|-------------|
 | `--network <NETWORK>` | | `testnet` | Network to fetch config from (`testnet`, `mainnet`, `futurenet`) |
 | `--out <OUT>` | | `~/.soroban-cost-estimator/snapshots/` | Explicit output path |
+| `--retain <N>` | | — | Automatically delete snapshots older than N days |
 | `--json` | | `false` | Print the snapshot as JSON (still saves it) |
 | `--help` | `-h` | | Print help |
 
@@ -296,6 +297,23 @@ soroban-cost-estimator config snapshot [OPTIONS]
   timestamp makes every snapshot a versioned artifact.
 - `--json` also prints the full snapshot as JSON to stdout.
 - `--out` writes to an explicit path instead of the default directory.
+- `--retain <N>` is a retention policy: after saving, any snapshot for this
+  network whose **file modification time** is older than N days is deleted.
+  Useful for long-running `watch`/cron setups where the snapshots directory
+  would otherwise grow without bound. `--retain 0` is rejected, since it
+  would delete every snapshot.
+
+**Examples**
+
+```bash
+soroban-cost-estimator config snapshot --network testnet
+```
+
+Delete testnet snapshots older than 30 days:
+
+```bash
+soroban-cost-estimator config snapshot --network testnet --retain 30
+```
 
 **What you get**
 
@@ -313,12 +331,6 @@ The snapshot JSON contains decoded values for all six settings:
 Take a fresh snapshot after every protocol vote and keep them around:
 [`config diff`](#config-diff) compares the current configuration against your
 most recent snapshot.
-
-**Examples**
-
-```bash
-soroban-cost-estimator config snapshot --network testnet
-```
 
 **Sample output**
 

@@ -101,8 +101,49 @@ pub fn load_snapshot_from_path(path: &str) -> AppResult<ConfigSnapshot> {
 /// None — pure file I/O.
 pub fn list_snapshots(network: &str) -> AppResult<Vec<PathBuf>> {
     let dir = snapshots_dir()?;
+    list_snapshots_in_dir(&dir, network)
+}
+
+/// Deletes snapshots for a network whose files are older than `retain_days`.
+///
+/// Retention is measured against each snapshot file's **modification time**
+/// (`metadata.modified()`), so a snapshot counts as expired once its file has
+/// not been touched for `retain_days` days. Returns the number of snapshots
+/// deleted.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn clean_old_snapshots(network: &str, retain_days: u64) -> AppResult<usize> {
+    let dir = snapshots_dir()?;
+    clean_old_snapshots_in_dir(&dir, network, retain_days)
+}
+
+/// Core retention logic over an explicit snapshots directory, so tests can
+/// point it at a temporary directory without touching the real data dir.
+fn clean_old_snapshots_in_dir(
+    dir: &std::path::Path,
+    network: &str,
+    retain_days: u64,
+) -> AppResult<usize> {
+    let cutoff =
+        chrono::Utc::now() - chrono::Duration::days(i64::try_from(retain_days).unwrap_or(i64::MAX));
+    let mut removed = 0;
+    for path in list_snapshots_in_dir(dir, network)? {
+        let modified = std::fs::metadata(&path)?.modified()?;
+        let modified_utc: chrono::DateTime<chrono::Utc> = modified.into();
+        if modified_utc < cutoff {
+            std::fs::remove_file(&path)?;
+            removed += 1;
+        }
+    }
+    debug!(network, retain_days, removed, "cleaned old snapshots");
+    Ok(removed)
+}
+
+/// Core listing logic over an explicit snapshots directory.
+fn list_snapshots_in_dir(dir: &std::path::Path, network: &str) -> AppResult<Vec<PathBuf>> {
     let mut snapshots = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
+    for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();

@@ -11,6 +11,7 @@ Usage: soroban-cost-estimator config snapshot [OPTIONS]
 Options:
       --network <NETWORK>  Network to fetch config from [default: testnet]
       --out <OUT>          Explicit output path (defaults to ~/.soroban-cost-estimator/snapshots/)
+      --retain <N>         Automatically delete snapshots older than N days
       --json               Print the snapshot as JSON instead of the summary lines
   -h, --help               Print help
 ```
@@ -26,11 +27,22 @@ Options:
   timestamp makes every snapshot a versioned artifact.
 - `--json` also prints the full snapshot as JSON (it still saves it).
 - `--out` writes to an explicit path instead of the default directory.
+- `--retain <N>` is a retention policy: after saving, any snapshot for this
+  network whose **file modification time** is older than N days is deleted.
+  Useful for long-running `watch`/cron setups where the snapshots directory
+  would otherwise grow without bound. `--retain 0` is rejected, since it
+  would delete every snapshot.
 
 ## Example
 
 ```bash
 soroban-cost-estimator config snapshot --network testnet
+```
+
+Delete testnet snapshots older than 30 days:
+
+```bash
+soroban-cost-estimator config snapshot --network testnet --retain 30
 ```
 
 Actual output from a live testnet run:
