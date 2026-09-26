@@ -51,6 +51,10 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "N", default_value_t = 3)]
     pub max_retries: usize,
 
+    /// Print WASM structure information to stderr.
+    #[arg(long, global = true)]
+    pub wasm_info: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }

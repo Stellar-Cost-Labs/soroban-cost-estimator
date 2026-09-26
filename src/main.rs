@@ -148,7 +148,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             rpc_url,
             r#fn,
             id,
-            args,
+            args: contract_args,
             cache_ttl,
             clear_cache,
             json,
@@ -165,7 +165,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 fallback,
                 id.as_deref(),
                 r#fn.as_deref(),
-                &args,
+                &contract_args,
                 cache_ttl.as_deref(),
                 clear_cache,
                 &format,
@@ -174,6 +174,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 max_retries,
                 precision,
                 &headers,
+                args.wasm_info,
+                args.verbose,
             )
             .await
         }
@@ -199,6 +201,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 max_retries,
                 precision,
                 &headers,
+                args.wasm_info,
+                args.verbose,
             )
             .await
         }
@@ -457,6 +461,40 @@ async fn fetch_fee_rates(client: &rpc::client::RpcClient) -> report::fee_calc::F
     rates
 }
 
+/// Emits the WASM structure summary (entry points, memory, host imports)
+/// for `--verbose` / `--wasm-info` modes and warns when initial memory
+/// exceeds the standard Soroban limit.
+///
+/// In JSON mode the summary goes to stderr so stdout stays machine-readable;
+/// otherwise it goes to stdout. Memory-limit warnings always go to stderr
+/// (and `tracing::warn!`) so high initialization costs are never silent.
+fn emit_wasm_structure(
+    wasm_info: &wasm::parser::WasmInfo,
+    verbose: bool,
+    wasm_info_flag: bool,
+    json_flag: bool,
+) {
+    if (verbose || wasm_info_flag) && wasm_info.summary.initial_pages > 16 {
+        warn!(
+            initial_pages = wasm_info.summary.initial_pages,
+            "WASM memory exceeds Soroban limit"
+        );
+        eprintln!(
+            "Warning: WASM initial memory pages ({}) exceeds 16. This may lead to higher memory costs.",
+            wasm_info.summary.initial_pages
+        );
+    }
+    if wasm_info_flag {
+        if let Ok(j) = serde_json::to_string(&wasm_info.summary) {
+            if json_flag {
+                eprintln!("{j}");
+            } else {
+                println!("{j}");
+            }
+        }
+    }
+}
+
 /// `estimate` command: simulate a single invocation and print cost report.
 ///
 /// All RPC traffic (simulation and fee-rate fetches) goes through one
@@ -480,6 +518,8 @@ async fn cmd_estimate(
     max_retries: usize,
     precision: u32,
     extra_headers: &[String],
+    wasm_info_flag: bool,
+    verbose: bool,
 ) -> error::AppResult<()> {
     let json_flag = format == "json";
     let table_mode = format == "table";
@@ -512,6 +552,7 @@ async fn cmd_estimate(
         info!("loading WASM");
         let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
         debug!(functions = wasm_info.functions.len(), has_spec = wasm_info.has_spec, "WASM loaded");
+        emit_wasm_structure(&wasm_info, verbose, wasm_info_flag, json_flag);
 
         let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
         let function_name = fn_name.unwrap_or("(wasm upload)");
@@ -696,6 +737,8 @@ async fn cmd_estimate_all(
     max_retries: usize,
     precision: u32,
     extra_headers: &[String],
+    wasm_info_flag: bool,
+    verbose: bool,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -703,6 +746,8 @@ async fn cmd_estimate_all(
     let span = info_span!("cmd_estimate_all", wasm_path, network);
     async {
         let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
+        let json_flag = format == "json";
+        emit_wasm_structure(&wasm_info, verbose, wasm_info_flag, json_flag);
 
         // Confirm the exact file being estimated up front — printed before any
         // endpoint resolution or simulation, so the hash is visible even when
@@ -1845,6 +1890,8 @@ async fn cmd_cache_warm(
         max_retries,
         7,
         extra_headers,
+        false,
+        false,
     )
     .await
 }
@@ -2004,6 +2051,14 @@ mod tests {
             memories: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
+            summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
+                initial_pages: 0,
+                max_pages: None,
+                imports_count: 0,
+                exports_count: 0,
+                has_start_function: false,
+                tables_count: 0,
+            },
         };
         let value = wasm_info_json("/tmp/contract.wasm", &info, "deadbeef");
 
