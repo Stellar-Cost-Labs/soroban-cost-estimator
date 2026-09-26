@@ -2,6 +2,7 @@ use crate::config_snapshot::model::{
     ConfigSnapshot, ContractBandwidthV0, ContractComputeV0, ContractEventsV0,
     ContractHistoricalDataV0, ContractLedgerCostV0, StateArchivalV0,
 };
+use std::fmt;
 
 /// Returns a human-readable explanation for a given config setting field path.
 ///
@@ -177,6 +178,19 @@ pub struct FieldDiff {
     pub explanation: Option<&'static str>,
 }
 
+impl fmt::Display for FieldDiff {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}: {} -> {}{}",
+            self.field_path,
+            self.old_value,
+            self.new_value,
+            if self.is_pricing_change { " (pricing)" } else { "" }
+        )
+    }
+}
+
 /// The result of comparing two config snapshots.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConfigDiff {
@@ -212,6 +226,16 @@ pub struct SnapshotInfo {
     pub network: String,
     pub timestamp: String,
     pub ledger: u32,
+}
+
+impl fmt::Display for SnapshotInfo {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} (ledger {}, {})",
+            self.timestamp, self.ledger, self.network
+        )
+    }
 }
 
 /// Compares two config snapshots and returns a detailed diff.

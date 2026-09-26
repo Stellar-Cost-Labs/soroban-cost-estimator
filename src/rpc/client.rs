@@ -126,6 +126,12 @@ pub struct RpcClient {
     headers: HeaderMap,
 }
 
+impl fmt::Display for RpcClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "RPC client ({})", self.url)
+    }
+}
+
 impl RpcClient {
     /// Create a new RPC client pointing at the given URL, without rate
     /// limiting and with the default request timeout.

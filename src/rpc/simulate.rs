@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use stellar_xdr::ReadXdr;
 use tracing::{debug, trace};
 
@@ -184,6 +185,47 @@ pub struct SimulationResources {
     pub read_bytes: u64,
     /// Bytes written.
     pub write_bytes: u64,
+}
+
+impl fmt::Display for SimulateTransactionParams {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Simulation transaction ({} bytes)", self.transaction.len())
+    }
+}
+
+impl fmt::Display for CostResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} CPU instructions, {} memory bytes", self.cpu_insns, self.mem_bytes)
+    }
+}
+
+impl fmt::Display for SimulationResources {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} CPU instructions, {} read entries, {} write entries, {} read bytes, {} write bytes",
+            self.cpu_insns,
+            self.read_entries,
+            self.write_entries,
+            self.read_bytes,
+            self.write_bytes
+        )
+    }
+}
+
+impl fmt::Display for SimulateTransactionResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Simulation response: ledger {:?}, cost {}, error {:?}",
+            self.latest_ledger,
+            self.cost
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "unavailable".to_string()),
+            self.error
+        )
+    }
 }
 
 /// Extracts resource consumption from the `transactionData` field of a

@@ -1,4 +1,19 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
+
+macro_rules! display_as_debug {
+    ($($type:ty),+ $(,)?) => {
+        $(
+            impl fmt::Display for $type {
+                fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    formatter.write_str(
+                        &serde_json::to_string(self).map_err(|_| fmt::Error)?,
+                    )
+                }
+            }
+        )+
+    };
+}
 
 /// A complete snapshot of the network's Soroban resource-pricing configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
