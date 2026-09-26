@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI build matrix running fmt, clippy, build, and tests on Linux, macOS, and
   Windows for cross-platform compatibility.
 
+### Fixed
+
+- Restore the WebSocket RPC client (`rpc::ws`) after the merge of `main`
+  dropped its `AppError` variants and `resolve_ws_endpoint`, which broke
+  compilation and red-flagged every CI job.
+
 ## [0.1.0] - 2026-08-13
 
 Initial release. Everything below landed in the run-up to `0.1.0`; the list is
