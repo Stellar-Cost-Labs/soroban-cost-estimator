@@ -170,6 +170,11 @@ pub enum Command {
         /// Polling interval (e.g. "30m", "1h").
         #[arg(long, default_value = "1h")]
         interval: String,
+
+        /// Minimum relative change (in percent) for a pricing change to be
+        /// treated as significant in printed diffs. 0 reports all changes.
+        #[arg(long, value_name = "PCT", default_value_t = 0.0)]
+        min_change_pct: f64,
     },
 }
 
@@ -284,6 +289,12 @@ pub enum ConfigAction {
         /// Explicit snapshot path to compare against (defaults to latest).
         #[arg(long)]
         against: Option<String>,
+
+        /// Minimum relative change (in percent) for a pricing change to be
+        /// treated as significant and trigger a non-zero exit. 0 reports all
+        /// pricing changes (e.g. `--min-change-pct 10` ignores a 5% bump).
+        #[arg(long, value_name = "PCT", default_value_t = 0.0)]
+        min_change_pct: f64,
 
         /// Print a single-line summary (counts of pricing/non-pricing changes)
         /// instead of the full diff. Useful for CI status lines.

@@ -221,6 +221,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::Diff {
                 network,
                 against,
+                min_change_pct,
                 summary,
                 json,
             } => {
@@ -228,6 +229,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     &network,
                     fallback,
                     against.as_deref(),
+                    min_change_pct,
                     summary,
                     json,
                     rps,
@@ -286,11 +288,16 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 json,
             ),
         },
-        cli::Command::Watch { network, interval } => {
+        cli::Command::Watch {
+            network,
+            interval,
+            min_change_pct,
+        } => {
             cmd_watch(
                 &network,
                 fallback,
                 &interval,
+                min_change_pct,
                 rps,
                 timeout,
                 max_retries,
@@ -1242,6 +1249,7 @@ async fn cmd_config_diff(
     network: &str,
     rpc_fallback_url: Option<&str>,
     against_path: Option<&str>,
+    min_change_pct: f64,
     summary: bool,
     json_flag: bool,
     rps: Option<u64>,
@@ -1300,7 +1308,10 @@ async fn cmd_config_diff(
         } else if summary {
             println!("{}", config_snapshot::diff::format_diff_summary(&diff));
         } else {
-            println!("{}", config_snapshot::diff::format_diff(&diff));
+            println!(
+                "{}",
+                config_snapshot::diff::format_diff_with_threshold(&diff, min_change_pct)
+            );
         }
 
         if upgrade_detected(&diff) {
@@ -1327,7 +1338,7 @@ async fn cmd_config_diff(
             print_stale_estimates(network, new_snapshot.ledger);
         }
 
-        if diff.has_pricing_changes {
+        if diff.has_significant_pricing_changes(min_change_pct) {
             std::process::exit(1);
         }
         Ok(())
@@ -1493,12 +1504,16 @@ async fn shutdown_signal() -> error::AppResult<()> {
 /// the previous snapshot, print changes and stale-estimate info, then save
 /// the new snapshot.
 ///
+/// `min_change_pct` is the notification threshold applied to printed diffs;
+/// pricing changes below it are annotated as informational.
+///
 /// # Network calls
 /// Makes one batched `getLedgerEntries` RPC call.
 async fn watch_poll_once(
     network: &str,
     rpc_fallback_url: Option<&str>,
     first: &mut bool,
+    min_change_pct: f64,
     rps: Option<u64>,
     timeout: u64,
     max_retries: usize,
@@ -1523,7 +1538,13 @@ async fn watch_poll_once(
                     let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &snapshot);
                     if !diff.changes.is_empty() {
                         debug!(change_count = diff.changes.len(), "config changes detected");
-                        println!("{}", config_snapshot::diff::format_diff(&diff));
+                        println!(
+                            "{}",
+                            config_snapshot::diff::format_diff_with_threshold(
+                                &diff,
+                                min_change_pct
+                            )
+                        );
                     }
 
                     print_stale_estimates(network, snapshot.ledger);
@@ -1550,6 +1571,7 @@ async fn cmd_watch(
     network: &str,
     rpc_fallback_url: Option<&str>,
     interval: &str,
+    min_change_pct: f64,
     rps: Option<u64>,
     timeout: u64,
     max_retries: usize,
@@ -1561,8 +1583,8 @@ async fn cmd_watch(
 
     info!(interval_secs, "starting watch");
     println!(
-        "Watching {} for config changes every {}s... (Ctrl-C to stop)",
-        network, interval_secs
+        "Watching {} for config changes every {}s (notification threshold: {:.1}%)... (Ctrl-C to stop)",
+        network, interval_secs, min_change_pct
     );
 
     let mut first = true;
@@ -1579,6 +1601,7 @@ async fn cmd_watch(
                     network,
                     rpc_fallback_url,
                     &mut first,
+                    min_change_pct,
                     rps,
                     timeout,
                     max_retries,
