@@ -154,6 +154,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             json,
             format,
             precision,
+            auto_snapshot,
         } => {
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
@@ -174,6 +175,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 max_retries,
                 precision,
                 &headers,
+                auto_snapshot,
             )
             .await
         }
@@ -185,6 +187,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             json,
             format,
             precision,
+            auto_snapshot,
         } => {
             let format = format.unwrap_or_else(|| if json { "json" } else { "table" }.to_string());
             cmd_estimate_all(
@@ -199,6 +202,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 max_retries,
                 precision,
                 &headers,
+                auto_snapshot,
             )
             .await
         }
@@ -480,6 +484,7 @@ async fn cmd_estimate(
     max_retries: usize,
     precision: u32,
     extra_headers: &[String],
+    auto_snapshot: bool,
 ) -> error::AppResult<()> {
     let json_flag = format == "json";
     let table_mode = format == "table";
@@ -640,6 +645,22 @@ async fn cmd_estimate(
         );
         info!(total_stroops = fee.total_stroops, total_xlm = %fee.total_xlm, "estimate complete");
 
+        if auto_snapshot {
+            if let Err(e) = auto_snapshot_if_changed(
+                network,
+                rpc_fallback_url,
+                rps,
+                timeout,
+                max_retries,
+                extra_headers,
+            )
+            .await
+            {
+                warn!(error = %e, "auto-snapshot failed");
+                eprintln!("Warning: auto-snapshot failed: {e}");
+            }
+        }
+
         match formatter_by_name(format) {
             Some(formatter) => println!("{}", formatter.format(&report)),
             None => println!("{}", TableFormatter.format(&report)),
@@ -696,6 +717,7 @@ async fn cmd_estimate_all(
     max_retries: usize,
     precision: u32,
     extra_headers: &[String],
+    auto_snapshot: bool,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -814,6 +836,22 @@ async fn cmd_estimate_all(
                 println!();
             } else {
                 json_results.push(result);
+            }
+        }
+
+        if auto_snapshot {
+            if let Err(e) = auto_snapshot_if_changed(
+                network,
+                rpc_fallback_url,
+                rps,
+                timeout,
+                max_retries,
+                extra_headers,
+            )
+            .await
+            {
+                warn!(error = %e, "auto-snapshot failed");
+                eprintln!("Warning: auto-snapshot failed: {e}");
             }
         }
 
@@ -1489,6 +1527,65 @@ fn parse_interval_secs(interval: &str) -> u64 {
     num_part.parse::<u64>().unwrap_or(3600).saturating_mul(mult)
 }
 
+/// Checks if network config has changed since the last snapshot and
+/// automatically saves a new snapshot if so.
+///
+/// # Network calls
+/// Makes one batched `getLedgerEntries` RPC call to fetch current config.
+async fn auto_snapshot_if_changed(
+    network: &str,
+    rpc_fallback_url: Option<&str>,
+    rps: Option<u64>,
+    timeout: u64,
+    max_retries: usize,
+    extra_headers: &[String],
+) -> error::AppResult<()> {
+    use tracing::{debug, info};
+
+    // Try to load the latest snapshot; if none exists, save a new one.
+    let old_snapshot = match config_snapshot::store::load_latest_snapshot(network) {
+        Ok(snap) => Some(snap),
+        Err(_) => None,
+    };
+
+    let new_snapshot = fetch_config_snapshot(
+        network,
+        rpc_fallback_url,
+        rps,
+        timeout,
+        max_retries,
+        extra_headers,
+    )
+    .await?;
+
+    let has_changes = match &old_snapshot {
+        Some(old) => {
+            let diff = config_snapshot::diff::diff_snapshots(old, &new_snapshot);
+            debug!(
+                change_count = diff.changes.len(),
+                has_pricing = diff.has_pricing_changes,
+                "auto-snapshot diff computed"
+            );
+            !diff.changes.is_empty()
+        }
+        None => {
+            debug!("no existing snapshot found; will save new snapshot");
+            true
+        }
+    };
+
+    if has_changes {
+        let path = config_snapshot::store::save_snapshot(&new_snapshot, None)?;
+        info!(path = %path.display(), ledger = new_snapshot.ledger, "auto-snapshot saved");
+        println!(
+            "Network configuration updated: saved snapshot {}",
+            path.display()
+        );
+    }
+
+    Ok(())
+}
+
 /// Resolves when the process receives SIGINT (Ctrl-C) or SIGTERM, so a
 /// long-running command can stop gracefully.
 ///
@@ -1845,6 +1942,7 @@ async fn cmd_cache_warm(
         max_retries,
         7,
         extra_headers,
+        false,
     )
     .await
 }
