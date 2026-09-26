@@ -125,6 +125,11 @@ pub enum Command {
         #[arg(long)]
         id: Option<String>,
 
+        /// Restrict estimation to these function names (repeatable). When
+        /// omitted, every exported function is estimated.
+        #[arg(long = "fn", value_name = "NAME")]
+        fn_names: Vec<String>,
+
         /// Output as JSON instead of a human-readable list.
         #[arg(long)]
         json: bool,
