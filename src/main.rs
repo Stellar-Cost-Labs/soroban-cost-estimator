@@ -148,7 +148,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             rpc_url,
             r#fn,
             id,
-            args,
+            args: contract_args,
             cache_ttl,
             clear_cache,
             json,
@@ -165,7 +165,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 fallback,
                 id.as_deref(),
                 r#fn.as_deref(),
-                &args,
+                &contract_args,
                 cache_ttl.as_deref(),
                 clear_cache,
                 &format,
@@ -174,6 +174,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 max_retries,
                 precision,
                 &headers,
+                args.wasm_info,
+                args.verbose,
             )
             .await
         }
@@ -199,6 +201,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 max_retries,
                 precision,
                 &headers,
+                args.wasm_info,
+                args.verbose,
             )
             .await
         }
@@ -457,17 +461,23 @@ fn emit_wasm_structure(
     wasm_info_flag: bool,
     json_flag: bool,
 ) {
-    let warnings = report::cost_report::wasm_memory_warnings(&wasm_info.structure);
-    for warning in &warnings {
-        warn!(warning = %warning, "WASM memory exceeds Soroban limit");
-        eprintln!("Warning: {warning}");
+    if (verbose || wasm_info_flag) && wasm_info.summary.initial_pages > 16 {
+        warn!(
+            initial_pages = wasm_info.summary.initial_pages,
+            "WASM memory exceeds Soroban limit"
+        );
+        eprintln!(
+            "Warning: WASM initial memory pages ({}) exceeds 16. This may lead to higher memory costs.",
+            wasm_info.summary.initial_pages
+        );
     }
-    if verbose || wasm_info_flag {
-        let summary = report::cost_report::format_wasm_memory_config(&wasm_info.structure);
-        if json_flag {
-            eprintln!("{summary}");
-        } else {
-            println!("{summary}");
+    if wasm_info_flag {
+        if let Ok(j) = serde_json::to_string(&wasm_info.summary) {
+            if json_flag {
+                eprintln!("{j}");
+            } else {
+                println!("{j}");
+            }
         }
     }
 }
@@ -495,6 +505,8 @@ async fn cmd_estimate(
     max_retries: usize,
     precision: u32,
     extra_headers: &[String],
+    wasm_info_flag: bool,
+    verbose: bool,
 ) -> error::AppResult<()> {
     let json_flag = format == "json";
     let table_mode = format == "table";
@@ -712,6 +724,8 @@ async fn cmd_estimate_all(
     max_retries: usize,
     precision: u32,
     extra_headers: &[String],
+    wasm_info_flag: bool,
+    verbose: bool,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -719,6 +733,8 @@ async fn cmd_estimate_all(
     let span = info_span!("cmd_estimate_all", wasm_path, network);
     async {
         let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
+        let json_flag = format == "json";
+        emit_wasm_structure(&wasm_info, verbose, wasm_info_flag, json_flag);
 
         // Confirm the exact file being estimated up front — printed before any
         // endpoint resolution or simulation, so the hash is visible even when
@@ -1846,6 +1862,8 @@ async fn cmd_cache_warm(
         max_retries,
         7,
         extra_headers,
+        false,
+        false,
     )
     .await
 }
