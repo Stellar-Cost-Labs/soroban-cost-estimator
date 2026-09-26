@@ -273,6 +273,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 .await
             }
             cli::CacheAction::Verify => cmd_cache_verify(),
+            cli::CacheAction::List { network, json } => cmd_cache_list(&network, json),
             cli::CacheAction::Clear { network } => cmd_cache_clear(&network),
             cli::CacheAction::Query {
                 network,
@@ -1716,6 +1717,58 @@ fn cmd_cache_verify() -> error::AppResult<()> {
     }
 
     Ok(())
+}
+
+/// `cache list` command: list every cached estimate for a network.
+///
+/// Prints a table (or the full records as a JSON array when `--json` is
+/// passed), newest estimate first. An empty cache prints a friendly message.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+fn cmd_cache_list(network: &str, json: bool) -> error::AppResult<()> {
+    let estimates = cache::list_cached_estimates(network)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&estimates)?);
+        return Ok(());
+    }
+
+    if estimates.is_empty() {
+        println!("No cached estimates for {network}.");
+        return Ok(());
+    }
+
+    let mut table = Table::new();
+    table.set_header(vec![
+        "Function",
+        "WASM Hash",
+        "Fee (stroops)",
+        "Ledger",
+        "Timestamp",
+    ]);
+    for e in &estimates {
+        table.add_row(vec![
+            Cell::new(e.function.as_str()),
+            Cell::new(truncate_hash(&e.wasm_hash)),
+            Cell::new(e.total_stroops),
+            Cell::new(e.ledger),
+            Cell::new(e.timestamp.as_str()),
+        ]);
+    }
+    println!("{table}");
+    println!("{} cached estimate(s) for {network}.", estimates.len());
+    Ok(())
+}
+
+/// Truncate a WASM hash to its first 12 characters for compact table display.
+fn truncate_hash(hash: &str) -> String {
+    if hash.chars().count() > 12 {
+        let prefix: String = hash.chars().take(12).collect();
+        format!("{prefix}…")
+    } else {
+        hash.to_string()
+    }
 }
 
 /// `cache clear` command: delete every cached estimate for a network.

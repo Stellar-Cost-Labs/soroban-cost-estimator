@@ -1654,3 +1654,119 @@ fn test_estimate_minimal_wasm_upload_zero_footprint() {
     assert_eq!(parsed["read_bytes"], 0);
     assert_eq!(parsed["write_bytes"], 0);
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// `cache list` (Issue #26)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_cache_list_help() {
+    let (stdout, stderr, code) = run_cli(&["cache", "list", "--help"]);
+    assert_eq!(code, 0, "cache list --help should exit 0; stderr: {stderr}");
+    for flag in ["--network", "--json"] {
+        assert!(
+            stdout.contains(flag),
+            "cache list help should mention {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_cache_list_empty_cache() {
+    let home = temp_home("cache-list-empty");
+    let (stdout, stderr, code) = run_cli_in_home(&["cache", "list"], Some(&home));
+    assert_eq!(
+        code, 0,
+        "cache list on empty cache should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("No cached estimates for testnet."),
+        "empty cache should say so; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_list_empty_json_is_array() {
+    let home = temp_home("cache-list-empty-json");
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(["cache", "list", "--json"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run cache list");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "[]", "empty JSON should be []; got: {stdout}");
+}
+
+#[test]
+fn test_cache_list_shows_entries_and_summary() {
+    let home = temp_home("cache-list-entries");
+    let now = chrono::Utc::now().to_rfc3339();
+    seed_cache_entry_for(&home, "testnet", "(wasm upload)", 42, &now);
+
+    let (stdout, stderr, code) = run_cli_in_home(&["cache", "list"], Some(&home));
+    assert_eq!(code, 0, "cache list should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("(wasm upload)"),
+        "table should list the cached function; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("1 cached estimate(s) for testnet."),
+        "summary line should report the count; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_list_network_filter() {
+    let home = temp_home("cache-list-network");
+    let now = chrono::Utc::now().to_rfc3339();
+    seed_cache_entry_for(&home, "testnet", "(wasm upload)", 42, &now);
+    seed_cache_entry_for(&home, "mainnet", "mainnet_fn", 77, &now);
+
+    let (stdout, stderr, code) =
+        run_cli_in_home(&["cache", "list", "--network", "mainnet"], Some(&home));
+    assert_eq!(
+        code, 0,
+        "cache list --network mainnet should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("mainnet_fn"),
+        "mainnet entry should appear; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("(wasm upload)"),
+        "testnet entry must not appear when filtering mainnet; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("1 cached estimate(s) for mainnet."),
+        "summary should count mainnet only; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_list_json_contains_full_records() {
+    let home = temp_home("cache-list-json");
+    let now = chrono::Utc::now().to_rfc3339();
+    seed_cache_entry_for(&home, "testnet", "(wasm upload)", 42, &now);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(["cache", "list", "--json"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run cache list --json");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .expect("cache list --json should emit valid JSON");
+    let arr = parsed.as_array().expect("JSON output should be an array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["function"], "(wasm upload)");
+    assert_eq!(arr[0]["network"], "testnet");
+    assert_eq!(arr[0]["total_stroops"], 1_000);
+    // The full, untruncated hash is kept in JSON mode.
+    assert_eq!(arr[0]["wasm_hash"].as_str().unwrap().len(), 64);
+}
