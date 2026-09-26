@@ -239,7 +239,6 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     max_retries,
                     &headers,
                 )
-                )
                 .await
             }
             cli::ConfigAction::History { network } => cmd_config_history(&network),

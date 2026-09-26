@@ -194,7 +194,10 @@ impl ConfigDiff {
             if !change.is_pricing_change {
                 return false;
             }
-            let (Ok(old), Ok(new)) = (change.old_value.parse::<f64>(), change.new_value.parse::<f64>()) else {
+            let (Ok(old), Ok(new)) = (
+                change.old_value.parse::<f64>(),
+                change.new_value.parse::<f64>(),
+            ) else {
                 return true;
             };
             let denominator = old.abs().max(f64::EPSILON);
@@ -690,7 +693,11 @@ pub fn pricing_change_color(old_value: &str, new_value: &str) -> &'static str {
 /// Pricing changes are colored red/yellow/green by the magnitude of the
 /// value change (see [`pricing_change_color`]); non-pricing changes are
 /// left uncolored.
-pub fn format_diff(diff: &ConfigDiff, pricing_only: bool, threshold_percent: Option<f64>) -> String {
+pub fn format_diff(
+    diff: &ConfigDiff,
+    pricing_only: bool,
+    threshold_percent: Option<f64>,
+) -> String {
     let mut output = String::new();
 
     output.push_str(&format!(
@@ -715,7 +722,10 @@ pub fn format_diff(diff: &ConfigDiff, pricing_only: bool, threshold_percent: Opt
 
     if visible_changes.is_empty() {
         if omitted_count > 0 {
-            output.push_str(&format!("  (... omitted {} non-pricing changes)\n", omitted_count));
+            output.push_str(&format!(
+                "  (... omitted {} non-pricing changes)\n",
+                omitted_count
+            ));
         } else {
             output.push_str("✅ No changes detected.\n");
         }
@@ -730,7 +740,10 @@ pub fn format_diff(diff: &ConfigDiff, pricing_only: bool, threshold_percent: Opt
     for change in visible_changes {
         let is_exceeding = match threshold_percent {
             Some(t) if change.is_pricing_change => {
-                if let (Ok(old), Ok(new)) = (change.old_value.parse::<f64>(), change.new_value.parse::<f64>()) {
+                if let (Ok(old), Ok(new)) = (
+                    change.old_value.parse::<f64>(),
+                    change.new_value.parse::<f64>(),
+                ) {
                     let denominator = old.abs().max(f64::EPSILON);
                     let ratio = (new - old).abs() / denominator;
                     ratio * 100.0 >= t
@@ -868,7 +881,7 @@ mod tests {
         let old = make_snapshot(100, 5);
         let new = make_snapshot(200, 5);
         let diff = diff_snapshots(&old, &new);
-        let output = format_diff(&diff);
+        let output = format_diff(&diff, false, None);
         // Should show human-readable setting name, not raw prefix
         assert!(output.contains("Contract Compute V0"));
         assert!(
@@ -910,7 +923,7 @@ mod tests {
         let old = make_snapshot(100, 5);
         let new = make_snapshot(200, 10);
         let diff = diff_snapshots(&old, &new);
-        let output = format_diff(&diff);
+        let output = format_diff(&diff, false, None);
         assert!(output.contains("Contract Compute V0"));
         assert!(output.contains("Contract Bandwidth V0"));
     }
@@ -963,7 +976,7 @@ mod tests {
         let old = make_snapshot(100, 5);
         let new = make_snapshot(160, 5); // +60% compute fee → red
         let diff = diff_snapshots(&old, &new);
-        let output = format_diff(&diff);
+        let output = format_diff(&diff, false, None);
         assert!(
             output.contains(ANSI_RED),
             "large pricing change should be red: {output}"
@@ -979,7 +992,7 @@ mod tests {
         let old = make_snapshot(100, 5);
         let new = make_snapshot(105, 5); // +5% compute fee → green
         let diff = diff_snapshots(&old, &new);
-        let output = format_diff(&diff);
+        let output = format_diff(&diff, false, None);
         assert!(
             output.contains(ANSI_GREEN),
             "small pricing change should be green: {output}"
@@ -995,7 +1008,7 @@ mod tests {
             compute.ledger_max_instructions = 2_000_000;
         }
         let diff = diff_snapshots(&old, &new);
-        let output = format_diff(&diff);
+        let output = format_diff(&diff, false, None);
         assert!(
             !output.contains(ANSI_RED)
                 && !output.contains(ANSI_GREEN)
@@ -1008,7 +1021,7 @@ mod tests {
     fn test_format_diff_no_changes_no_ansi() {
         let snap = make_snapshot(100, 5);
         let diff = diff_snapshots(&snap, &snap);
-        let output = format_diff(&diff);
+        let output = format_diff(&diff, false, None);
         assert!(
             !output.contains("\u{1b}["),
             "no-change output should have no ANSI codes: {output}"
