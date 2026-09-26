@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::Parser;
 use comfy_table::Cell;
 use comfy_table::Table;
@@ -204,23 +206,60 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
         }
         cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(&wasm, json),
         cli::Command::Config { action } => match action {
-            cli::ConfigAction::Snapshot { network, out, json } => {
-                cmd_config_snapshot(
-                    &network,
-                    fallback,
-                    out.as_deref(),
+            cli::ConfigAction::Snapshot {
+                network,
+                out,
+                json,
+                retain,
+                action,
+            } => match action {
+                // A subcommand manages snapshots already on disk, so it cannot
+                // be combined with this command's fetching flags (enforced by
+                // `args_conflicts_with_subcommands` in the CLI definition).
+                Some(cli::SnapshotAction::Prune {
+                    network,
+                    older_than,
                     json,
-                    rps,
-                    timeout,
-                    max_retries,
-                    &headers,
-                )
-                .await
-            }
+                }) => cmd_config_snapshot_prune(&network, older_than, json),
+                None => {
+                    cmd_config_snapshot(
+                        &network,
+                        fallback,
+                        out.as_deref(),
+                        json,
+                        retain,
+                        rps,
+                        timeout,
+                        max_retries,
+                        &headers,
+                    )
+                    .await
+                }
+            },
             cli::ConfigAction::List { network } => cmd_config_snapshot_list(&network),
             cli::ConfigAction::Diff {
                 network,
                 against,
+                against_previous,
+                summary,
+                json,
+            } => {
+                if against_previous {
+                    cmd_config_diff_against_previous(&network, summary, json)
+                } else {
+                    cmd_config_diff(
+                        &network,
+                        fallback,
+                        against.as_deref(),
+                        summary,
+                        json,
+                        rps,
+                        timeout,
+                        max_retries,
+                        &headers,
+                    )
+                    .await
+                }
                 pricing_only,
                 threshold_percent,
                 summary,
@@ -1176,12 +1215,88 @@ fn print_stale_estimates(network: &str, ledger: u32) {
     }
 }
 
+/// One-line wording for a retention policy, shared by the human-readable
+/// summary and the `--json` payload.
+fn retention_policy(retain_count: Option<usize>, retain_days: Option<u32>) -> String {
+    match (retain_count, retain_days) {
+        (Some(count), Some(days)) => format!("--retain {count} and --older-than {days}d"),
+        (Some(count), None) => format!("--retain {count}"),
+        (None, Some(days)) => format!("--older-than {days}d"),
+        (None, None) => "no policy".to_string(),
+    }
+}
+
+/// Human-readable summary line for a retention run.
+fn retention_summary(
+    network: &str,
+    retain_count: Option<usize>,
+    retain_days: Option<u32>,
+    pruned: &[PathBuf],
+) -> String {
+    format!(
+        "Pruned {} snapshot(s) for {network} ({}).",
+        pruned.len(),
+        retention_policy(retain_count, retain_days)
+    )
+}
+
+/// Lists the files a retention run deleted, one per line.
+fn print_pruned_paths(pruned: &[PathBuf]) {
+    for path in pruned {
+        println!("  - {}", path.display());
+    }
+}
+
+/// JSON payload describing a retention run.
+#[derive(serde::Serialize)]
+struct PruneOutput<'a> {
+    network: &'a str,
+    /// Human-readable form of the policy that was applied.
+    policy: String,
+    /// `--retain <COUNT>`'s value, when a count policy applied.
+    retain_count: Option<usize>,
+    /// `--older-than <DAYS>`'s value, when an age policy applied.
+    retain_days: Option<u32>,
+    /// Number of snapshot files deleted.
+    pruned_count: usize,
+    /// Paths of the deleted files, oldest first.
+    pruned: Vec<String>,
+    /// Snapshots still on disk for the network afterwards.
+    remaining: usize,
+}
+
+/// Builds the `--json` payload for a retention run.
+fn prune_output<'a>(
+    network: &'a str,
+    retain_count: Option<usize>,
+    retain_days: Option<u32>,
+    pruned: &[PathBuf],
+) -> error::AppResult<PruneOutput<'a>> {
+    Ok(PruneOutput {
+        network,
+        policy: retention_policy(retain_count, retain_days),
+        retain_count,
+        retain_days,
+        pruned_count: pruned.len(),
+        pruned: pruned
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        remaining: config_snapshot::store::list_snapshots(network)?.len(),
+    })
+}
+
 /// `config snapshot` command: fetch config settings and save snapshot.
+///
+/// With `--retain <N>`, a retention pass runs *after* the new snapshot is
+/// safely on disk, so a failed fetch or write never costs the user the older
+/// snapshots it would have pruned.
 async fn cmd_config_snapshot(
     network: &str,
     rpc_fallback_url: Option<&str>,
     out_path: Option<&str>,
     json_flag: bool,
+    retain: Option<usize>,
     rps: Option<u64>,
     timeout: u64,
     max_retries: usize,
@@ -1206,7 +1321,21 @@ async fn cmd_config_snapshot(
         let path = config_snapshot::store::save_snapshot(&snapshot, out_path)?;
         info!(path = %path.display(), ledger = snapshot.ledger, "snapshot saved");
 
+        // Retention runs *after* the save, so a failed fetch or write never
+        // costs the older snapshots it would have pruned. It manages the
+        // snapshots directory, so a snapshot redirected with `--out` lives
+        // elsewhere and is neither counted nor deleted here.
+        let pruned = match retain {
+            Some(count) => config_snapshot::store::prune_snapshots(network, Some(count), None)?,
+            None => Vec::new(),
+        };
+
         if json_flag {
+            // stdout stays a single parseable document, so the retention log
+            // goes to stderr, where logs belong.
+            if retain.is_some() {
+                eprintln!("{}", retention_summary(network, retain, None, &pruned));
+            }
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
             return Ok(());
         }
@@ -1214,10 +1343,40 @@ async fn cmd_config_snapshot(
         println!("Network: {}", snapshot.network);
         println!("Ledger:  {}", snapshot.ledger);
         println!("Time:    {}", snapshot.timestamp);
+        if retain.is_some() {
+            println!("{}", retention_summary(network, retain, None, &pruned));
+            print_pruned_paths(&pruned);
+        }
         Ok(())
     }
     .instrument(span)
     .await
+}
+
+/// `config snapshot prune` command: delete snapshots recorded more than
+/// `older_than_days` days ago, always keeping the newest one.
+///
+/// # Network calls
+/// None — pure file I/O, so it is safe to run offline and in a cron job.
+fn cmd_config_snapshot_prune(
+    network: &str,
+    older_than_days: u32,
+    json_flag: bool,
+) -> error::AppResult<()> {
+    let pruned = config_snapshot::store::prune_snapshots(network, None, Some(older_than_days))?;
+
+    if json_flag {
+        let output = prune_output(network, None, Some(older_than_days), &pruned)?;
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+
+    println!(
+        "{}",
+        retention_summary(network, None, Some(older_than_days), &pruned)
+    );
+    print_pruned_paths(&pruned);
+    Ok(())
 }
 
 /// `config snapshot list` command: list all saved snapshots for a network.
@@ -1248,6 +1407,23 @@ fn cmd_config_snapshot_list(network: &str) -> error::AppResult<()> {
 /// produces — so they trigger the automatic post-upgrade snapshot.
 fn upgrade_detected(diff: &config_snapshot::diff::ConfigDiff) -> bool {
     diff.has_pricing_changes
+}
+
+/// Cached estimates recorded before `ledger`, shaped for the
+/// `config diff --json` payload.
+///
+/// Both diff modes emit the same envelope, so a consumer sees one schema
+/// whether the newer side came from the network or from disk. An unreadable
+/// cache yields an empty list rather than failing the diff.
+fn stale_estimates_for(network: &str, ledger: u32) -> Vec<cache::CachedEstimate> {
+    cache::list_cached_estimates(network)
+        .map(|estimates| {
+            cache::find_stale_estimates(&estimates, ledger)
+                .into_iter()
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `config diff` command: compare current config against a snapshot.
@@ -1297,18 +1473,9 @@ async fn cmd_config_diff(
             "diff computed"
         );
         if json_flag {
-            // Collect stale estimates for inclusion in JSON output.
-            let stale: Vec<cache::CachedEstimate> = cache::list_cached_estimates(network)
-                .map(|estimates| {
-                    cache::find_stale_estimates(&estimates, new_snapshot.ledger)
-                        .into_iter()
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
             let json_output = serde_json::json!({
                 "diff": diff,
-                "stale_estimates": stale,
+                "stale_estimates": stale_estimates_for(network, new_snapshot.ledger),
             });
             println!("{}", serde_json::to_string_pretty(&json_output)?);
         } else if summary {
@@ -1356,6 +1523,52 @@ async fn cmd_config_diff(
     }
     .instrument(span)
     .await
+}
+
+/// `config diff --against-previous`: compare the two most recent snapshots on
+/// disk against each other, with no network access at all.
+///
+/// Both sides come from stored snapshots, so the network name only selects
+/// which snapshot files to read. Output and exit-code behavior deliberately
+/// match the live mode: `--json` emits the same envelope, `--summary` the same
+/// one-line summary, and a pricing change still exits 1.
+///
+/// Unlike the live mode it never auto-saves, because the newer snapshot is
+/// already the one on disk.
+///
+/// # Network calls
+/// None — pure file I/O.
+fn cmd_config_diff_against_previous(
+    network: &str,
+    summary: bool,
+    json_flag: bool,
+) -> error::AppResult<()> {
+    debug!(network, "diffing the two most recent snapshots");
+    let (old_snapshot, new_snapshot) = config_snapshot::store::load_last_two_snapshots(network)?;
+    let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
+    debug!(
+        change_count = diff.changes.len(),
+        has_pricing = diff.has_pricing_changes,
+        "diff computed"
+    );
+
+    if json_flag {
+        let json_output = serde_json::json!({
+            "diff": diff,
+            "stale_estimates": stale_estimates_for(network, new_snapshot.ledger),
+        });
+        println!("{}", serde_json::to_string_pretty(&json_output)?);
+    } else if summary {
+        println!("{}", config_snapshot::diff::format_diff_summary(&diff));
+    } else {
+        println!("{}", config_snapshot::diff::format_diff(&diff));
+        print_stale_estimates(network, new_snapshot.ledger);
+    }
+
+    if diff.has_pricing_changes {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// `config history` command: print the full chronological change log.

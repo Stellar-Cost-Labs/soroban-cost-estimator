@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `config diff --against-previous` — diff the two most recent on-disk
+  snapshots against each other without contacting the live network. Works
+  offline, honors `--summary` and `--json`, and errors with the snapshot count
+  when fewer than two exist for the network.
+- `config snapshot --retain <N>` — keep only the N most recent snapshots for a
+  network, pruning older ones after the new snapshot is safely on disk.
+- `config snapshot prune --older-than <DAYS>` — delete snapshots recorded more
+  than D days ago. Pure file I/O, so it is safe offline and in a cron job.
+
+### Fixed
+
+- Snapshot retention never deletes the newest snapshot for a network, however
+  old it is or however small `--retain` is, so a `config diff` always has a
+  pair left to compare.
 - `--timeout` global flag — configurable HTTP request timeout for RPC calls
   in seconds (default 30).
 - `config diff --summary` — print a single-line summary

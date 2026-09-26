@@ -58,11 +58,17 @@ fn temp_home(label: &str) -> PathBuf {
 
 /// A minimal but structurally valid config snapshot, matching `ConfigSnapshot`.
 fn snapshot_json(network: &str, ledger: u32) -> String {
+    snapshot_json_at(network, ledger, "2026-01-01T00:00:00+00:00")
+}
+
+/// As [`snapshot_json`], but with an explicit RFC 3339 timestamp so a test can
+/// lay out several snapshots in a known chronological order.
+fn snapshot_json_at(network: &str, ledger: u32, timestamp: &str) -> String {
     format!(
         r#"{{
   "network": "{network}",
   "ledger": {ledger},
-  "timestamp": "2026-01-01T00:00:00+00:00",
+  "timestamp": "{timestamp}",
   "contract_compute": null,
   "contract_ledger_cost": null,
   "contract_historical_data": null,
@@ -71,6 +77,61 @@ fn snapshot_json(network: &str, ledger: u32) -> String {
   "state_archival": null
 }}"#
     )
+}
+
+/// Writes one snapshot into the isolated home's snapshots directory.
+///
+/// The filename mirrors `save_snapshot`: `{network}-{timestamp}.json` with
+/// `:` replaced by `-`. That naming is what orders snapshots on disk, so a
+/// test has to reproduce it to exercise the real lookup path.
+fn write_snapshot(home: &Path, network: &str, timestamp: &str, ledger: u32) -> PathBuf {
+    let dir = home.join(".soroban-cost-estimator").join("snapshots");
+    std::fs::create_dir_all(&dir).expect("create snapshots dir");
+    let path = dir.join(format!("{network}-{}.json", timestamp.replace(':', "-")));
+    std::fs::write(&path, snapshot_json_at(network, ledger, timestamp)).expect("write snapshot");
+    path
+}
+
+/// An RFC 3339 timestamp `days` in the past, in the same shape
+/// `begin_snapshot` records.
+fn days_ago(days: i64) -> String {
+    (chrono::Utc::now() - chrono::TimeDelta::days(days)).to_rfc3339()
+}
+
+/// Snapshot filenames on disk for `network` under `home`, oldest first.
+fn snapshot_files(home: &Path, network: &str) -> Vec<String> {
+    let dir = home.join(".soroban-cost-estimator").join("snapshots");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with(&format!("{network}-")) && name.ends_with(".json"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// Runs the CLI with `HOME` isolated and tracing silenced.
+///
+/// `tracing`'s `info!` lines go to stdout in this binary, so `RUST_LOG=error`
+/// is what makes stdout exactly the command's own output for JSON assertions.
+fn run_cli_quiet(args: &[&str], home: Option<&Path>) -> (String, String, i32) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"));
+    cmd.args(args).env("RUST_LOG", "error");
+    if let Some(home) = home {
+        cmd.env("HOME", home);
+        cmd.env("USERPROFILE", home);
+    }
+
+    let output = cmd.output().expect("failed to run CLI");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let code = output.status.code().unwrap_or(-1);
+
+    (stdout, stderr, code)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -170,7 +231,7 @@ fn test_config_snapshot_help() {
         code, 0,
         "config snapshot --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--network", "--out", "--json"] {
+    for flag in ["--network", "--out", "--json", "--retain", "prune"] {
         assert!(
             stdout.contains(flag),
             "snapshot help should mention {flag}; got: {stdout}"
@@ -185,7 +246,7 @@ fn test_config_diff_help() {
         code, 0,
         "config diff --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--network", "--against", "--summary"] {
+    for flag in ["--network", "--against", "--against-previous", "--summary"] {
         assert!(
             stdout.contains(flag),
             "diff help should mention {flag}; got: {stdout}"
@@ -842,6 +903,246 @@ fn test_config_snapshot_unknown_network() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// `config snapshot` retention
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_config_snapshot_retain_flag_is_accepted() {
+    // `--retain` must parse; the failure should come from the unresolvable
+    // network, not from clap rejecting the flag.
+    let home = temp_home("snapshot-retain-flag");
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "snapshot",
+            "--retain",
+            "3",
+            "--network",
+            "not-a-network",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "the unknown network should exit 1");
+    assert!(
+        stderr.contains("failed to locate RPC endpoint"),
+        "the failure should come from the network, not the flag; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--retain must not be rejected by the parser; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_prune_help() {
+    let (stdout, stderr, code) = run_cli(&["config", "snapshot", "prune", "--help"]);
+    assert_eq!(code, 0, "prune --help should exit 0; stderr: {stderr}");
+    for flag in ["--network", "--older-than", "--json"] {
+        assert!(
+            stdout.contains(flag),
+            "prune help should mention {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_config_snapshot_prune_requires_older_than() {
+    let (_, stderr, code) = run_cli(&["config", "snapshot", "prune"]);
+    assert_ne!(code, 0, "prune without --older-than must be rejected");
+    assert!(
+        stderr.contains("--older-than"),
+        "the error should name the missing flag; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_prune_rejects_fetch_flags() {
+    // Pruning never fetches a snapshot, so combining it with the fetching
+    // flags would silently ignore them. It must be an explicit error instead.
+    let (_, stderr, code) = run_cli(&[
+        "config",
+        "snapshot",
+        "--retain",
+        "3",
+        "prune",
+        "--older-than",
+        "1",
+    ]);
+    assert_ne!(code, 0, "--retain with prune should be rejected");
+    assert!(
+        stderr.contains("--retain") && stderr.contains("prune"),
+        "the error should name both the flag and the subcommand; got: {stderr}"
+    );
+
+    let (_, stderr, code) = run_cli(&[
+        "config",
+        "snapshot",
+        "--out",
+        "/tmp/x.json",
+        "prune",
+        "--older-than",
+        "1",
+    ]);
+    assert_ne!(code, 0, "--out with prune should be rejected");
+    assert!(
+        stderr.contains("--out") && stderr.contains("prune"),
+        "the error should name both the flag and the subcommand; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_prune_deletes_only_stale_snapshots() {
+    let home = temp_home("prune-stale");
+    write_snapshot(&home, "testnet", &days_ago(40), 1);
+    write_snapshot(&home, "testnet", &days_ago(10), 2);
+    write_snapshot(&home, "testnet", &days_ago(1), 3);
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "snapshot",
+            "prune",
+            "--network",
+            "testnet",
+            "--older-than",
+            "30",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 0, "pruning should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("Pruned 1 snapshot(s)"),
+        "the count of pruned snapshots must be logged; got: {stdout}"
+    );
+    assert_eq!(
+        snapshot_files(&home, "testnet").len(),
+        2,
+        "only the 40-day-old snapshot should be gone; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_prune_keeps_latest_however_old_it_is() {
+    // Every snapshot is older than the threshold, but the newest one is the
+    // only thing left to diff against, so it has to survive.
+    let home = temp_home("prune-latest");
+    write_snapshot(&home, "testnet", &days_ago(300), 1);
+    write_snapshot(&home, "testnet", &days_ago(200), 2);
+    write_snapshot(&home, "testnet", &days_ago(100), 3);
+    let newest = snapshot_files(&home, "testnet")
+        .pop()
+        .expect("three snapshots were written");
+
+    let (stdout, _, code) = run_cli_in_home(
+        &[
+            "config",
+            "snapshot",
+            "prune",
+            "--network",
+            "testnet",
+            "--older-than",
+            "0",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 0, "pruning should exit 0");
+    assert!(
+        stdout.contains("Pruned 2 snapshot(s)"),
+        "only the two older snapshots should go; got: {stdout}"
+    );
+    assert_eq!(
+        snapshot_files(&home, "testnet"),
+        vec![newest],
+        "the newest snapshot must survive any age threshold"
+    );
+}
+
+#[test]
+fn test_config_snapshot_prune_without_snapshots_is_a_noop() {
+    let home = temp_home("prune-empty");
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "snapshot",
+            "prune",
+            "--network",
+            "testnet",
+            "--older-than",
+            "1",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 0,
+        "an empty snapshots dir is not an error; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Pruned 0 snapshot(s)"),
+        "a no-op run should still report its count; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_prune_json_reports_the_run() {
+    let home = temp_home("prune-json");
+    write_snapshot(&home, "testnet", &days_ago(90), 1);
+    write_snapshot(&home, "testnet", &days_ago(30), 2);
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "config",
+            "snapshot",
+            "prune",
+            "--network",
+            "testnet",
+            "--older-than",
+            "60",
+            "--json",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 0, "prune --json should exit 0; stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("valid JSON; {e}: {stdout}"));
+    assert_eq!(parsed["network"], "testnet");
+    assert_eq!(parsed["retain_days"], 60);
+    assert_eq!(parsed["pruned_count"], 1);
+    assert_eq!(parsed["remaining"], 1);
+    assert_eq!(parsed["pruned"].as_array().map(Vec::len), Some(1));
+}
+
+#[test]
+fn test_config_snapshot_prune_leaves_other_networks_alone() {
+    let home = temp_home("prune-network");
+    write_snapshot(&home, "testnet", &days_ago(90), 1);
+    write_snapshot(&home, "testnet", &days_ago(1), 2);
+    write_snapshot(&home, "mainnet", &days_ago(90), 9);
+
+    let (_, _, code) = run_cli_in_home(
+        &[
+            "config",
+            "snapshot",
+            "prune",
+            "--network",
+            "testnet",
+            "--older-than",
+            "30",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 0);
+    assert_eq!(
+        snapshot_files(&home, "mainnet").len(),
+        1,
+        "another network's snapshots must be untouched"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // `config diff`
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -1030,6 +1331,158 @@ fn test_config_diff_loads_valid_snapshot_before_network() {
         !stderr.contains("Error: failed to parse snapshot"),
         "a valid snapshot must not be reported as malformed; got: {stderr}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `config diff --against-previous`
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_config_diff_against_previous_no_snapshots_errors() {
+    // Scenario 0: nothing on disk to compare. The network name is
+    // deliberately unresolvable, so if the command reached for the RPC
+    // endpoint at all the failure would name the network instead.
+    let home = temp_home("diff-prev-none");
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against-previous",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "0 snapshots should exit 1");
+    assert!(
+        stderr.contains("need at least 2 for network not-a-network") && stderr.contains("found 0"),
+        "the error should report the snapshot count; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("failed to locate RPC endpoint"),
+        "--against-previous must never contact the network; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_diff_against_previous_one_snapshot_errors() {
+    // Scenario 1: a single point in time has nothing to diff against.
+    let home = temp_home("diff-prev-one");
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:01+00:00", 100);
+
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against-previous",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "1 snapshot should exit 1");
+    assert!(
+        stderr.contains("need at least 2 for network not-a-network") && stderr.contains("found 1"),
+        "the error should report the snapshot count; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("failed to locate RPC endpoint"),
+        "--against-previous must never contact the network; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_diff_against_previous_diffs_two_newest_snapshots() {
+    // Scenario 2+: three snapshots on disk, so the command must compare the
+    // two newest (ledgers 200 → 300) and leave the oldest (100) alone. The
+    // network is unresolvable on purpose: this command is purely local, so a
+    // network failure here would mean it leaked past the snapshot store.
+    let home = temp_home("diff-prev-two");
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:01+00:00", 100);
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:02+00:00", 200);
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:03+00:00", 300);
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against-previous",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(
+        code, 0,
+        "identical consecutive snapshots should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("(ledger 200) → 2026-01-01T00:00:03+00:00 (ledger 300)"),
+        "the two newest snapshots must be the ones compared; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("(ledger 100)"),
+        "the oldest snapshot must not take part in the diff; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("No changes detected"),
+        "identical snapshots should report no changes; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_diff_against_previous_summary_output() {
+    let home = temp_home("diff-prev-summary");
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:01+00:00", 100);
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:02+00:00", 200);
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against-previous",
+            "--summary",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 0, "--summary should exit 0 here; stderr: {stderr}");
+    assert!(
+        stdout.contains("0 pricing changes, 0 non-pricing changes"),
+        "--summary should emit exactly the one-line summary; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_diff_against_previous_json_uses_the_live_envelope() {
+    // Both diff modes emit `{ diff, stale_estimates }`, so a consumer sees one
+    // schema whether the newer side came from the network or from disk.
+    let home = temp_home("diff-prev-json");
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:01+00:00", 100);
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:02+00:00", 200);
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against-previous",
+            "--json",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 0, "--json should exit 0 here; stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("valid JSON; {e}: {stdout}"));
+    assert_eq!(parsed["diff"]["old_snapshot"]["ledger"], 100);
+    assert_eq!(parsed["diff"]["new_snapshot"]["ledger"], 200);
+    assert_eq!(parsed["diff"]["has_pricing_changes"], false);
+    assert_eq!(parsed["stale_estimates"].as_array().map(Vec::len), Some(0));
 }
 
 // ─────────────────────────────────────────────────────────────────────────
