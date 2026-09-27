@@ -200,6 +200,25 @@ impl ConfigDiff {
     pub fn has_pricing_changes(&self) -> bool {
         self.has_pricing_changes
     }
+
+    /// Returns true if any pricing change exceeds the given percentage threshold.
+    /// Non-numeric changes are considered significant.
+    pub fn has_significant_pricing_changes(&self, threshold_percent: f64) -> bool {
+        self.changes.iter().any(|change| {
+            if !change.is_pricing_change {
+                return false;
+            }
+            let (Ok(old), Ok(new)) = (
+                change.old_value.parse::<f64>(),
+                change.new_value.parse::<f64>(),
+            ) else {
+                return true;
+            };
+            let denominator = old.abs().max(f64::EPSILON);
+            let ratio = (new - old).abs() / denominator;
+            ratio * 100.0 >= threshold_percent
+        })
+    }
 }
 
 /// Resolve the process exit code for `config diff` from the diff and the
@@ -207,6 +226,8 @@ impl ConfigDiff {
 ///
 /// Semantics (for CI drift detection):
 /// - default: `0` when no pricing changes, `1` when pricing changes detected.
+///   When `threshold_percent` is `Some(t)`, only pricing changes of at least
+///   `t` percent count.
 /// - `ignore_pricing_exit`: always `0`, even when pricing changed. Takes
 ///   precedence over `fail_on_any_change` for informative reports that must
 ///   not fail the build.
@@ -218,6 +239,7 @@ pub fn resolve_exit_code(
     diff: &ConfigDiff,
     ignore_pricing_exit: bool,
     fail_on_any_change: bool,
+    threshold_percent: Option<f64>,
 ) -> i32 {
     if ignore_pricing_exit {
         return 0;
@@ -225,7 +247,11 @@ pub fn resolve_exit_code(
     if fail_on_any_change {
         return i32::from(diff.has_any_changes());
     }
-    i32::from(diff.has_pricing_changes())
+    let pricing_changed = match threshold_percent {
+        Some(t) => diff.has_significant_pricing_changes(t),
+        None => diff.has_pricing_changes(),
+    };
+    i32::from(pricing_changed)
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -714,7 +740,11 @@ pub fn pricing_change_color(old_value: &str, new_value: &str) -> &'static str {
 /// Pricing changes are colored red/yellow/green by the magnitude of the
 /// value change (see [`pricing_change_color`]); non-pricing changes are
 /// left uncolored.
-pub fn format_diff(diff: &ConfigDiff) -> String {
+pub fn format_diff(
+    diff: &ConfigDiff,
+    pricing_only: bool,
+    threshold_percent: Option<f64>,
+) -> String {
     let mut output = String::new();
 
     output.push_str(&format!(
@@ -726,8 +756,26 @@ pub fn format_diff(diff: &ConfigDiff) -> String {
     ));
     output.push_str(&format!("Network: {}\n\n", diff.new_snapshot.network));
 
-    if diff.changes.is_empty() {
-        output.push_str("✅ No changes detected.\n");
+    let mut omitted_count = 0;
+    let mut visible_changes: Vec<&FieldDiff> = Vec::new();
+
+    for change in &diff.changes {
+        if pricing_only && !change.is_pricing_change {
+            omitted_count += 1;
+        } else {
+            visible_changes.push(change);
+        }
+    }
+
+    if visible_changes.is_empty() {
+        if omitted_count > 0 {
+            output.push_str(&format!(
+                "  (... omitted {} non-pricing changes)\n",
+                omitted_count
+            ));
+        } else {
+            output.push_str("✅ No changes detected.\n");
+        }
         return output;
     }
 
@@ -736,15 +784,35 @@ pub fn format_diff(diff: &ConfigDiff) -> String {
         diff.changes.len()
     ));
 
-    for change in &diff.changes {
+    for change in visible_changes {
+        let is_exceeding = match threshold_percent {
+            Some(t) if change.is_pricing_change => {
+                if let (Ok(old), Ok(new)) = (
+                    change.old_value.parse::<f64>(),
+                    change.new_value.parse::<f64>(),
+                ) {
+                    let denominator = old.abs().max(f64::EPSILON);
+                    let ratio = (new - old).abs() / denominator;
+                    ratio * 100.0 >= t
+                } else {
+                    true
+                }
+            }
+            _ => false,
+        };
+
         let icon = if change.is_pricing_change {
-            "💰"
+            "📈"
         } else {
-            "📋"
+            "🔄"
         };
         let display = field_display_name(&change.field_path);
         if change.is_pricing_change {
-            let color = pricing_change_color(&change.old_value, &change.new_value);
+            let color = if is_exceeding {
+                ANSI_RED
+            } else {
+                pricing_change_color(&change.old_value, &change.new_value)
+            };
             output.push_str(&format!("  {color}{icon} {display}{ANSI_RESET}\n"));
             if let Some(explanation) = change.explanation {
                 output.push_str(&format!("      ℹ️  {explanation}\n"));
@@ -860,7 +928,7 @@ mod tests {
         let old = make_snapshot(100, 5);
         let new = make_snapshot(200, 5);
         let diff = diff_snapshots(&old, &new);
-        let output = format_diff(&diff);
+        let output = format_diff(&diff, false, None);
         // Should show human-readable setting name, not raw prefix
         assert!(output.contains("Contract Compute V0"));
         assert!(
@@ -902,7 +970,7 @@ mod tests {
         let old = make_snapshot(100, 5);
         let new = make_snapshot(200, 10);
         let diff = diff_snapshots(&old, &new);
-        let output = format_diff(&diff);
+        let output = format_diff(&diff, false, None);
         assert!(output.contains("Contract Compute V0"));
         assert!(output.contains("Contract Bandwidth V0"));
     }
@@ -955,7 +1023,7 @@ mod tests {
         let old = make_snapshot(100, 5);
         let new = make_snapshot(160, 5); // +60% compute fee → red
         let diff = diff_snapshots(&old, &new);
-        let output = format_diff(&diff);
+        let output = format_diff(&diff, false, None);
         assert!(
             output.contains(ANSI_RED),
             "large pricing change should be red: {output}"
@@ -971,7 +1039,7 @@ mod tests {
         let old = make_snapshot(100, 5);
         let new = make_snapshot(105, 5); // +5% compute fee → green
         let diff = diff_snapshots(&old, &new);
-        let output = format_diff(&diff);
+        let output = format_diff(&diff, false, None);
         assert!(
             output.contains(ANSI_GREEN),
             "small pricing change should be green: {output}"
@@ -987,7 +1055,7 @@ mod tests {
             compute.ledger_max_instructions = 2_000_000;
         }
         let diff = diff_snapshots(&old, &new);
-        let output = format_diff(&diff);
+        let output = format_diff(&diff, false, None);
         assert!(
             !output.contains(ANSI_RED)
                 && !output.contains(ANSI_GREEN)
@@ -1000,7 +1068,7 @@ mod tests {
     fn test_format_diff_no_changes_no_ansi() {
         let snap = make_snapshot(100, 5);
         let diff = diff_snapshots(&snap, &snap);
-        let output = format_diff(&diff);
+        let output = format_diff(&diff, false, None);
         assert!(
             !output.contains("\u{1b}["),
             "no-change output should have no ANSI codes: {output}"
@@ -1024,7 +1092,7 @@ mod tests {
         let diff = diff_snapshots(&snap, &snap);
         assert!(!diff.has_any_changes());
         assert!(!diff.has_pricing_changes());
-        assert_eq!(resolve_exit_code(&diff, false, false), 0);
+        assert_eq!(resolve_exit_code(&diff, false, false, None), 0);
     }
 
     #[test]
@@ -1033,7 +1101,7 @@ mod tests {
         let new = make_snapshot(200, 5);
         let diff = diff_snapshots(&old, &new);
         assert!(diff.has_pricing_changes());
-        assert_eq!(resolve_exit_code(&diff, false, false), 1);
+        assert_eq!(resolve_exit_code(&diff, false, false, None), 1);
     }
 
     #[test]
@@ -1041,7 +1109,7 @@ mod tests {
         let diff = non_pricing_only_diff();
         assert!(diff.has_any_changes());
         assert!(!diff.has_pricing_changes());
-        assert_eq!(resolve_exit_code(&diff, false, false), 0);
+        assert_eq!(resolve_exit_code(&diff, false, false, None), 0);
     }
 
     #[test]
@@ -1049,20 +1117,20 @@ mod tests {
         let old = make_snapshot(100, 5);
         let new = make_snapshot(200, 5);
         let diff = diff_snapshots(&old, &new);
-        assert_eq!(resolve_exit_code(&diff, true, false), 0);
+        assert_eq!(resolve_exit_code(&diff, true, false, None), 0);
     }
 
     #[test]
     fn test_resolve_exit_code_fail_on_any_change_catches_non_pricing() {
         let diff = non_pricing_only_diff();
-        assert_eq!(resolve_exit_code(&diff, false, true), 1);
+        assert_eq!(resolve_exit_code(&diff, false, true, None), 1);
     }
 
     #[test]
     fn test_resolve_exit_code_fail_on_any_change_no_changes_is_zero() {
         let snap = make_snapshot(100, 5);
         let diff = diff_snapshots(&snap, &snap);
-        assert_eq!(resolve_exit_code(&diff, false, true), 0);
+        assert_eq!(resolve_exit_code(&diff, false, true, None), 0);
     }
 
     #[test]
@@ -1070,6 +1138,32 @@ mod tests {
         let old = make_snapshot(100, 5);
         let new = make_snapshot(200, 5);
         let diff = diff_snapshots(&old, &new);
-        assert_eq!(resolve_exit_code(&diff, true, true), 0);
+        assert_eq!(resolve_exit_code(&diff, true, true, None), 0);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_threshold_below_significance_is_zero() {
+        // 100 → 200 is a 100% jump; a 500% threshold must not trigger exit 1.
+        let old = make_snapshot(100, 5);
+        let new = make_snapshot(200, 5);
+        let diff = diff_snapshots(&old, &new);
+        assert!(diff.has_pricing_changes());
+        assert_eq!(resolve_exit_code(&diff, false, false, Some(500.0)), 0);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_threshold_above_significance_is_one() {
+        let old = make_snapshot(100, 5);
+        let new = make_snapshot(200, 5);
+        let diff = diff_snapshots(&old, &new);
+        assert_eq!(resolve_exit_code(&diff, false, false, Some(10.0)), 1);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_ignore_wins_over_threshold() {
+        let old = make_snapshot(100, 5);
+        let new = make_snapshot(200, 5);
+        let diff = diff_snapshots(&old, &new);
+        assert_eq!(resolve_exit_code(&diff, true, false, Some(10.0)), 0);
     }
 }

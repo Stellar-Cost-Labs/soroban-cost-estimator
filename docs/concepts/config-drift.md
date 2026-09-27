@@ -55,6 +55,8 @@ The exit code is meaningful for scripts: **0** when no pricing changes,
 reports that must not fail the build), while `--fail-on-any-change` exits 1
 when *any* setting changed, even non-pricing caps or limits.
 `--ignore-pricing-exit` takes precedence when both flags are passed.
+`--threshold-percent <N>` narrows the default exit-1 decision to pricing
+changes of at least `N` percent.
 
 ```
 $ soroban-cost-estimator config diff --network testnet

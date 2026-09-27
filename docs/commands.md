@@ -357,6 +357,8 @@ soroban-cost-estimator config diff [OPTIONS]
 |------|----------|---------|-------------|
 | `--network <NETWORK>` | | `testnet` | Network to compare against |
 | `--against <AGAINST>` | | latest snapshot | Explicit snapshot path to compare against |
+| `--pricing-only` | | `false` | Hide non-pricing changes and display only fee-rate adjustments |
+| `--threshold-percent <N>` | | none | Percentage threshold for flagging significant changes (e.g. 10 for 10%) |
 | `--summary` | | `false` | Print a single-line count summary instead of the full diff (for CI status lines) |
 | `--ignore-pricing-exit` | | `false` | Force exit code 0 even when pricing changes are detected |
 | `--fail-on-any-change` | | `false` | Exit 1 when any setting changed, even non-pricing settings |
@@ -375,7 +377,9 @@ soroban-cost-estimator config diff [OPTIONS]
 - **CI exit code semantics:** `--ignore-pricing-exit` forces exit 0 even when
   pricing changed (informative reports); `--fail-on-any-change` exits 1 when
   *any* setting changed, even non-pricing caps/limits. `--ignore-pricing-exit`
-  takes precedence when both are passed.
+  takes precedence when both are passed. When `--threshold-percent <N>` is
+  given, only pricing changes of at least `N` percent count toward the default
+  exit-1 decision.
 - When a pricing change (protocol/config upgrade) is detected, the new config
   is **automatically saved** as a snapshot, so it becomes the baseline for the
   next diff. A failed save is reported as a warning and does not change the

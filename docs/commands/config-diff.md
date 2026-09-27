@@ -11,6 +11,8 @@ Usage: soroban-cost-estimator config diff [OPTIONS]
 Options:
       --network <NETWORK>   Network to compare against [default: testnet]
       --against <AGAINST>   Explicit snapshot path to compare against (defaults to latest)
+      --pricing-only          Hide non-pricing changes and display only fee-rate adjustments
+      --threshold-percent <N> Percentage threshold for flagging significant changes (e.g. 10 for 10%)
       --summary             Print a single-line count summary instead of the full diff
       --ignore-pricing-exit Force exit code 0 even when pricing changes are detected
       --fail-on-any-change  Exit 1 when any setting changed, even non-pricing settings
@@ -31,7 +33,8 @@ Options:
   when pricing changed (informative reports that must not fail the build);
   `--fail-on-any-change` exits 1 when *any* setting changed, even non-pricing
   caps/limits. `--ignore-pricing-exit` takes precedence when both are passed.
-  Examples:
+  When `--threshold-percent <N>` is given, only pricing changes of at least
+  `N` percent count toward the default exit-1 decision. Examples:
 
   ```bash
   # Fail the build on pricing drift (default).
