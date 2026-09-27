@@ -469,6 +469,32 @@ async fn fetch_fee_rates(client: &rpc::client::RpcClient) -> report::fee_calc::F
     rates
 }
 
+/// Fetch the network's resource-limit configuration for the 80% warnings
+/// (#322).
+///
+/// Pulls `ConfigSettingContractComputeV0`, `ContractLedgerCostV0`, and
+/// `ContractBandwidthV0` — the same entries `fetch_fee_rates` already reads.
+/// The RPC client deduplicates identical `(method, params)` requests, so on
+/// the `estimate` path this adds no additional network round-trips. Missing
+/// entries leave the corresponding limits as `None` and are simply skipped.
+async fn fetch_network_config(
+    client: &rpc::client::RpcClient,
+) -> report::cost_report::NetworkConfig {
+    let mut snapshot = xdr_helper::begin_snapshot("", 0);
+    for setting in [
+        rpc::config::ConfigSettingId::ContractComputeV0,
+        rpc::config::ConfigSettingId::ContractLedgerCostV0,
+        rpc::config::ConfigSettingId::ContractBandwidthV0,
+    ] {
+        if let Ok(raw) = rpc::config::fetch_config_setting(client, setting).await {
+            if let Ok(entry) = xdr_helper::decode_config_entry_xdr(&raw.config_xdr) {
+                xdr_helper::apply_config_entry(&mut snapshot, entry);
+            }
+        }
+    }
+    report::cost_report::NetworkConfig::from_snapshot(&snapshot)
+}
+
 /// Emits the WASM structure summary (entry points, memory, host imports)
 /// for `--verbose` / `--wasm-info` modes and warns when initial memory
 /// exceeds the standard Soroban limit.
