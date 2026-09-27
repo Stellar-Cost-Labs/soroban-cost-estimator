@@ -189,6 +189,7 @@ pub struct CostReport {
     pub fee: FeeBreakdown,
     /// The ledger sequence the simulation ran against.
     pub ledger: u32,
+    pub ledger_age: Option<u32>,
     /// Network the simulation ran on.
     pub network: String,
     /// RPC round-trip time of the `simulateTransaction` call, in
@@ -436,6 +437,7 @@ mod tests {
                 total_xlm: "0.0015427".to_string(),
             },
             ledger: 3_894_195,
+            ledger_age: None,
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
             rates: Some(rates),
@@ -549,6 +551,7 @@ mod tests {
                 total_xlm: "0.0000000".to_string(),
             },
             ledger: 0,
+            ledger_age: None,
             network: "testnet".to_string(),
             rpc_latency_ms: 0,
             rates: None,

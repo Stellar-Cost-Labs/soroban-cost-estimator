@@ -628,6 +628,8 @@ async fn cmd_estimate(
             .and_then(|l| u32::try_from(l).ok())
             .unwrap_or(0);
 
+        let ledger_age = fetch_ledger_age(&client, latest_ledger).await;
+
         let total_fee_stroops = rpc::simulate::parse_resource_fee(&response.min_resource_fee)
             .unwrap_or(None)
             .or(rpc::simulate::parse_transaction_data_resource_fee(
@@ -662,6 +664,7 @@ async fn cmd_estimate(
             write_bytes,
             fee: fee.clone(),
             ledger: latest_ledger,
+            ledger_age,
             network: network.to_string(),
             rpc_latency_ms,
             rates: Some(fee_rates),

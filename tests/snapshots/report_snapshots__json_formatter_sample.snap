@@ -1,6 +1,5 @@
 ---
 source: tests/report_snapshots.rs
-assertion_line: 75
 expression: JsonFormatter.format(&report)
 ---
 {
@@ -16,6 +15,7 @@ expression: JsonFormatter.format(&report)
   },
   "function": "increment",
   "ledger": 3894195,
+  "ledger_age": 1,
   "memory_bytes": 0,
   "network": "testnet",
   "read_bytes": 0,

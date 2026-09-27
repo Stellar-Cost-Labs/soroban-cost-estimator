@@ -1,6 +1,5 @@
 ---
 source: tests/report_snapshots.rs
-assertion_line: 76
 expression: JsonFormatter.format(&empty)
 ---
 {
@@ -16,6 +15,7 @@ expression: JsonFormatter.format(&empty)
   },
   "function": "(wasm upload)",
   "ledger": 0,
+  "ledger_age": null,
   "memory_bytes": 0,
   "network": "mainnet",
   "read_bytes": 0,

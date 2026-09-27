@@ -1,6 +1,5 @@
 ---
 source: tests/report_snapshots.rs
-assertion_line: 91
 expression: MarkdownFormatter.format(&report)
 ---
 ## Cost Report: `increment`

@@ -263,6 +263,16 @@ impl RpcClient {
     ///
     /// # Network calls
     /// Makes at most one `getHealth` RPC call to the configured endpoint.
+    pub async fn get_latest_ledger(&self) -> crate::error::AppResult<Option<u32>> {
+        #[derive(serde::Deserialize)]
+        struct LatestLedgerResponse {
+            sequence: u32,
+        }
+        let resp: LatestLedgerResponse =
+            self.call("getLatestLedger", serde_json::json!({})).await?;
+        Ok(Some(resp.sequence))
+    }
+
     pub async fn health_check(&self) -> AppResult<()> {
         let health: HealthResponse = self
             .call("getHealth", serde_json::json!({}))

@@ -1,6 +1,5 @@
 ---
 source: tests/report_snapshots.rs
-assertion_line: 95
 expression: MarkdownFormatter.format(&empty)
 ---
 ## Cost Report: `(wasm upload)`
