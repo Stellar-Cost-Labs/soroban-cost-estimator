@@ -133,6 +133,7 @@ pub struct RpcClient {
     #[cfg_attr(not(test), allow(dead_code))]
     connect_timeout: Duration,
     /// Custom HTTP headers attached to every outbound request.
+    #[allow(dead_code)]
     headers: HeaderMap,
 }
 

@@ -58,6 +58,10 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "N", default_value_t = 3)]
     pub max_retries: usize,
 
+    /// Print WASM structure information to stderr.
+    #[arg(long, global = true)]
+    pub wasm_info: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -177,6 +181,9 @@ pub enum Command {
         /// Polling interval (e.g. "30m", "1h").
         #[arg(long, default_value = "1h")]
         interval: String,
+        /// Percentage threshold for flagging significant changes (e.g. 10 for 10%).
+        #[arg(long, value_name = "N")]
+        threshold_percent: Option<f64>,
     },
 }
 
@@ -292,6 +299,14 @@ pub enum ConfigAction {
         #[arg(long)]
         against: Option<String>,
 
+        /// Hide non-pricing changes and display only fee-rate adjustments.
+        #[arg(long)]
+        pricing_only: bool,
+
+        /// Percentage threshold for flagging significant changes (e.g. 10 for 10%).
+        #[arg(long, value_name = "N")]
+        threshold_percent: Option<f64>,
+
         /// Print a single-line summary (counts of pricing/non-pricing changes)
         /// instead of the full diff. Useful for CI status lines.
         #[arg(long)]
@@ -321,5 +336,22 @@ pub enum ConfigAction {
         /// Network whose snapshots to validate.
         #[arg(long, default_value = "testnet")]
         network: String,
+    },
+
+    /// Export network snapshots to a bundle file.
+    Export {
+        /// Network to export snapshots for.
+        #[arg(long)]
+        network: Option<String>,
+
+        /// Output file path for the snapshot bundle.
+        #[arg(long)]
+        output: String,
+    },
+
+    /// Import network snapshots from a bundle file.
+    Import {
+        /// Path to the snapshot bundle file.
+        bundle: String,
     },
 }
