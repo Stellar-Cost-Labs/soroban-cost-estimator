@@ -58,13 +58,18 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
     }
 
     trace!(functions = functions.len(), has_spec, "WASM parsed");
+    let initial_pages = match metadata.memories.first() {
+        Some(m) => m.initial_pages,
+        None => 0,
+    };
+    let max_pages = match metadata.memories.first() {
+        Some(m) => m.maximum_pages,
+        None => None,
+    };
+
     let summary = WasmStructureSummary {
-        initial_pages: metadata
-            .memories
-            .first()
-            .map(|m| m.initial_pages)
-            .unwrap_or(0),
-        max_pages: metadata.memories.first().and_then(|m| m.maximum_pages),
+        initial_pages,
+        max_pages,
         imports_count: metadata.imports.len(),
         exports_count: metadata.exports.len(),
         has_start_function: metadata.start_function.is_some(),
