@@ -536,6 +536,7 @@ fn emit_wasm_structure(
 /// the same params — so a repeated WASM-upload envelope (when `--fn` is
 /// omitted) or identical fee-rate fetches transmit at most once.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::fn_params_excessive_bools)]
 async fn cmd_estimate(
     wasm_path: &str,
     network: &str,
