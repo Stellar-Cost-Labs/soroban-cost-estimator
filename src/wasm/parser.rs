@@ -7,6 +7,20 @@ use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
 
+/// Maximum initial linear memory, in WASM pages, expected for Soroban
+/// contracts.
+///
+/// Contracts declaring more than this warn in `--verbose` / `--wasm-info`
+/// output because excess initial memory drives up memory fees and
+/// initialization costs.
+pub const SOROBAN_MAX_MEMORY_PAGES: u64 = 16;
+
+/// Size of one WASM linear-memory page in bytes (64 KiB).
+pub const WASM_PAGE_SIZE_BYTES: u64 = 65_536;
+
+/// Import module used by Soroban contracts for host functions (`env._` imports).
+pub const HOST_IMPORT_MODULE: &str = "env";
+
 /// Loads a compiled Soroban contract `.wasm` file from disk.
 ///
 /// Reads the file bytes, performs basic structural validation via
@@ -54,17 +68,34 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
     }
 
     trace!(functions = functions.len(), has_spec, "WASM parsed");
+    let initial_pages = match metadata.memories.first() {
+        Some(m) => m.initial_pages,
+        None => 0,
+    };
+    let max_pages = match metadata.memories.first() {
+        Some(m) => m.maximum_pages,
+        None => None,
+    };
+
+    let summary = WasmStructureSummary {
+        initial_pages,
+        max_pages,
+        imports_count: metadata.imports.len(),
+        exports_count: metadata.exports.len(),
+        has_start_function: metadata.start_function.is_some(),
+        tables_count: metadata.tables_count,
+    };
     Ok(WasmInfo {
         bytes,
         functions,
         has_spec,
         spec_entries,
         contract_meta,
-        start_function,
-        memories,
-        imports,
-        exports,
-        sections,
+        start_function: metadata.start_function,
+        memories: metadata.memories,
+        imports: metadata.imports,
+        exports: metadata.exports,
+        summary,
     })
 }
 
@@ -93,8 +124,8 @@ pub struct ModuleMetadata {
     pub imports: Vec<ImportInfo>,
     /// Exports declared by the module, including non-function exports.
     pub exports: Vec<ExportInfo>,
-    /// Every section found in the binary, with its name and byte size.
-    pub sections: Vec<SectionInfo>,
+    /// Number of tables declared by the module.
+    pub tables_count: usize,
 }
 
 /// Enumerates exported functions and captures module entry-point metadata:
@@ -115,8 +146,7 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
     let mut memories = Vec::new();
     let mut imports = Vec::new();
     let mut exports = Vec::new();
-    let mut sections = Vec::new();
-    let mut imported_function_count = 0usize;
+    let mut tables_count = 0;
 
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
         let payload = payload.map_err(|e| AppError::WasmParse(e.to_string()))?;
@@ -229,6 +259,9 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
                     }
                 }
             }
+            wasmparser::Payload::TableSection(s) => {
+                tables_count += s.into_iter().count();
+            }
             _ => {}
         }
     }
@@ -245,7 +278,7 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
         memories,
         imports,
         exports,
-        sections,
+        tables_count,
     })
 }
 
@@ -936,6 +969,16 @@ pub fn format_function(fn_info: &FunctionInfo) -> String {
     signature
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WasmStructureSummary {
+    pub initial_pages: u64,
+    pub max_pages: Option<u64>,
+    pub imports_count: usize,
+    pub exports_count: usize,
+    pub has_start_function: bool,
+    pub tables_count: usize,
+}
+
 /// Information extracted from a WASM file.
 #[derive(Debug, Clone)]
 pub struct WasmInfo {
@@ -959,8 +1002,8 @@ pub struct WasmInfo {
     pub imports: Vec<ImportInfo>,
     /// Exports declared by the module, including non-function exports.
     pub exports: Vec<ExportInfo>,
-    /// Every section in the binary, with its name and byte size.
-    pub sections: Vec<SectionInfo>,
+    /// WASM structure summary.
+    pub summary: WasmStructureSummary,
 }
 
 /// Formats a human-readable diagnostic summary of a loaded module: the start
