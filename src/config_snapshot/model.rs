@@ -78,3 +78,22 @@ pub struct StateArchivalV0 {
     pub eviction_scan_size: u32,
     pub starting_eviction_scan_level: u32,
 }
+
+pub fn setting_unit_description(field_path: &str) -> Option<&'static str> {
+    match field_path {
+        "contract_compute.fee_rate_per_instructions_increment" => {
+            Some("stroops per 10,000 CPU instructions")
+        }
+        "contract_ledger_cost.fee_disk_read_ledger_entry"
+        | "contract_ledger_cost.fee_write_ledger_entry" => Some("stroops per entry"),
+        "contract_ledger_cost.fee_disk_read1_kb"
+        | "contract_ledger_cost.rent_fee1_kb_soroban_state_size_low"
+        | "contract_ledger_cost.rent_fee1_kb_soroban_state_size_high"
+        | "contract_historical_data.fee_historical1_kb"
+        | "contract_events.fee_contract_events1_kb"
+        | "contract_bandwidth.fee_tx_size1_kb" => Some("stroops per 1KB"),
+        "state_archival.persistent_rent_rate_denominator"
+        | "state_archival.temp_rent_rate_denominator" => Some("fractional fee scaling"),
+        _ => None,
+    }
+}
