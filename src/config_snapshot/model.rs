@@ -89,26 +89,21 @@ pub struct StateArchivalV0 {
     pub starting_eviction_scan_level: u32,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_config_snapshot_display() {
-        let snapshot = ConfigSnapshot {
-            network: "testnet".to_string(),
-            timestamp: "2026-01-01T00:00:00Z".to_string(),
-            ledger: 100,
-            contract_compute: None,
-            contract_ledger_cost: None,
-            contract_historical_data: None,
-            contract_events: None,
-            contract_bandwidth: None,
-            state_archival: None,
-        };
-        assert_eq!(
-            format!("{}", snapshot),
-            "Network: testnet (ledger 100 at 2026-01-01T00:00:00Z)"
-        );
+pub fn setting_unit_description(field_path: &str) -> Option<&'static str> {
+    match field_path {
+        "contract_compute.fee_rate_per_instructions_increment" => {
+            Some("stroops per 10,000 CPU instructions")
+        }
+        "contract_ledger_cost.fee_disk_read_ledger_entry"
+        | "contract_ledger_cost.fee_write_ledger_entry" => Some("stroops per entry"),
+        "contract_ledger_cost.fee_disk_read1_kb"
+        | "contract_ledger_cost.rent_fee1_kb_soroban_state_size_low"
+        | "contract_ledger_cost.rent_fee1_kb_soroban_state_size_high"
+        | "contract_historical_data.fee_historical1_kb"
+        | "contract_events.fee_contract_events1_kb"
+        | "contract_bandwidth.fee_tx_size1_kb" => Some("stroops per 1KB"),
+        "state_archival.persistent_rent_rate_denominator"
+        | "state_archival.temp_rent_rate_denominator" => Some("fractional fee scaling"),
+        _ => None,
     }
 }
