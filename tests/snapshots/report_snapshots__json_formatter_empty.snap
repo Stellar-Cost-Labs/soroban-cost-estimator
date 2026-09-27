@@ -1,6 +1,6 @@
 ---
 source: tests/report_snapshots.rs
-assertion_line: 76
+assertion_line: 80
 expression: JsonFormatter.format(&empty)
 ---
 {
@@ -18,12 +18,14 @@ expression: JsonFormatter.format(&empty)
   "ledger": 0,
   "memory_bytes": 0,
   "network": "mainnet",
+  "optimization_suggestions": [],
   "read_bytes": 0,
   "read_entries": 0,
   "rpc_latency_ms": 0,
   "suggestions": [],
   "tx_size": 0,
   "wasm_hash": "0000000000000000",
+  "wasm_size_bytes": 0,
   "write_bytes": 0,
   "write_entries": 0
 }
