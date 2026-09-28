@@ -572,6 +572,8 @@ mod tests {
         assert_eq!(count_snapshots(&dir, "testnet"), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
 /// A bundle of config snapshots for export/import.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotBundle {

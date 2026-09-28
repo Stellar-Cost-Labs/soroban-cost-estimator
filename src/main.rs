@@ -241,16 +241,26 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 network,
                 against,
                 against_previous,
+                pricing_only,
+                threshold_percent,
                 summary,
                 json,
             } => {
                 if against_previous {
-                    cmd_config_diff_against_previous(&network, summary, json)
+                    cmd_config_diff_against_previous(
+                        &network,
+                        pricing_only,
+                        threshold_percent,
+                        summary,
+                        json,
+                    )
                 } else {
                     cmd_config_diff(
                         &network,
                         fallback,
                         against.as_deref(),
+                        pricing_only,
+                        threshold_percent,
                         summary,
                         json,
                         rps,
@@ -260,25 +270,6 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     )
                     .await
                 }
-                pricing_only,
-                threshold_percent,
-                summary,
-                json,
-            } => {
-                cmd_config_diff(
-                    &network,
-                    fallback,
-                    against.as_deref(),
-                    pricing_only,
-                    threshold_percent,
-                    summary,
-                    json,
-                    rps,
-                    timeout,
-                    max_retries,
-                    &headers,
-                )
-                .await
             }
             cli::ConfigAction::History { network } => cmd_config_history(&network),
             cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network),
@@ -1540,6 +1531,8 @@ async fn cmd_config_diff(
 /// None — pure file I/O.
 fn cmd_config_diff_against_previous(
     network: &str,
+    pricing_only: bool,
+    threshold_percent: Option<f64>,
     summary: bool,
     json_flag: bool,
 ) -> error::AppResult<()> {
@@ -1561,11 +1554,19 @@ fn cmd_config_diff_against_previous(
     } else if summary {
         println!("{}", config_snapshot::diff::format_diff_summary(&diff));
     } else {
-        println!("{}", config_snapshot::diff::format_diff(&diff));
+        println!(
+            "{}",
+            config_snapshot::diff::format_diff(&diff, pricing_only, threshold_percent)
+        );
         print_stale_estimates(network, new_snapshot.ledger);
     }
 
-    if diff.has_pricing_changes {
+    let should_exit = match threshold_percent {
+        Some(t) => diff.has_significant_pricing_changes(t),
+        None => diff.has_pricing_changes,
+    };
+
+    if should_exit {
         std::process::exit(1);
     }
     Ok(())
