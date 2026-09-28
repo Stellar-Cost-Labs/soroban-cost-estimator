@@ -398,7 +398,7 @@ fn test_validate_wasm_limits_valid() {
         }],
         imports: vec![],
         exports: vec![],
-    summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
+        summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
             initial_pages: 0,
             max_pages: None,
             imports_count: 0,
@@ -421,7 +421,7 @@ fn test_validate_wasm_limits_size_exceeded() {
         memories: vec![],
         imports: vec![],
         exports: vec![],
-    summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
+        summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
             initial_pages: 0,
             max_pages: None,
             imports_count: 0,
@@ -454,7 +454,7 @@ fn test_validate_wasm_limits_initial_memory_exceeded() {
         }],
         imports: vec![],
         exports: vec![],
-    summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
+        summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
             initial_pages: 0,
             max_pages: None,
             imports_count: 0,
@@ -487,7 +487,7 @@ fn test_validate_wasm_limits_max_memory_exceeded() {
         }],
         imports: vec![],
         exports: vec![],
-    summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
+        summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
             initial_pages: 0,
             max_pages: None,
             imports_count: 0,
@@ -520,7 +520,7 @@ fn test_validate_wasm_limits_unbounded_memory_allowed() {
         }],
         imports: vec![],
         exports: vec![],
-    summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
+        summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
             initial_pages: 0,
             max_pages: None,
             imports_count: 0,
