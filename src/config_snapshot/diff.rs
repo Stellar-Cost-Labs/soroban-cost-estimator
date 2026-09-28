@@ -186,6 +186,27 @@ pub struct ConfigDiff {
     pub has_pricing_changes: bool,
 }
 
+impl ConfigDiff {
+    /// Returns true if any pricing change exceeds the given percentage threshold.
+    /// Non-numeric changes are considered significant.
+    pub fn has_significant_pricing_changes(&self, threshold_percent: f64) -> bool {
+        self.changes.iter().any(|change| {
+            if !change.is_pricing_change {
+                return false;
+            }
+            let (Ok(old), Ok(new)) = (
+                change.old_value.parse::<f64>(),
+                change.new_value.parse::<f64>(),
+            ) else {
+                return true;
+            };
+            let denominator = old.abs().max(f64::EPSILON);
+            let ratio = (new - old).abs() / denominator;
+            ratio * 100.0 >= threshold_percent
+        })
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SnapshotInfo {
     pub network: String,
@@ -677,6 +698,11 @@ pub fn pricing_change_color(old_value: &str, new_value: &str, colorize: bool) ->
 /// left uncolored.
 pub fn format_diff(diff: &ConfigDiff, colorize: bool) -> String {
     let reset_code = if colorize { ANSI_RESET } else { "" };
+pub fn format_diff(
+    diff: &ConfigDiff,
+    pricing_only: bool,
+    threshold_percent: Option<f64>,
+) -> String {
     let mut output = String::new();
 
     output.push_str(&format!(
@@ -688,8 +714,26 @@ pub fn format_diff(diff: &ConfigDiff, colorize: bool) -> String {
     ));
     output.push_str(&format!("Network: {}\n\n", diff.new_snapshot.network));
 
-    if diff.changes.is_empty() {
-        output.push_str("✅ No changes detected.\n");
+    let mut omitted_count = 0;
+    let mut visible_changes: Vec<&FieldDiff> = Vec::new();
+
+    for change in &diff.changes {
+        if pricing_only && !change.is_pricing_change {
+            omitted_count += 1;
+        } else {
+            visible_changes.push(change);
+        }
+    }
+
+    if visible_changes.is_empty() {
+        if omitted_count > 0 {
+            output.push_str(&format!(
+                "  (... omitted {} non-pricing changes)\n",
+                omitted_count
+            ));
+        } else {
+            output.push_str("✅ No changes detected.\n");
+        }
         return output;
     }
 
@@ -698,16 +742,38 @@ pub fn format_diff(diff: &ConfigDiff, colorize: bool) -> String {
         diff.changes.len()
     ));
 
-    for change in &diff.changes {
+    for change in visible_changes {
+        let is_exceeding = match threshold_percent {
+            Some(t) if change.is_pricing_change => {
+                if let (Ok(old), Ok(new)) = (
+                    change.old_value.parse::<f64>(),
+                    change.new_value.parse::<f64>(),
+                ) {
+                    let denominator = old.abs().max(f64::EPSILON);
+                    let ratio = (new - old).abs() / denominator;
+                    ratio * 100.0 >= t
+                } else {
+                    true
+                }
+            }
+            _ => false,
+        };
+
         let icon = if change.is_pricing_change {
-            "💰"
+            "📈"
         } else {
-            "📋"
+            "🔄"
         };
         let display = field_display_name(&change.field_path);
         if change.is_pricing_change {
             let color = pricing_change_color(&change.old_value, &change.new_value, colorize);
             output.push_str(&format!("  {color}{icon} {display}{reset_code}\n"));
+            let color = if is_exceeding {
+                ANSI_RED
+            } else {
+                pricing_change_color(&change.old_value, &change.new_value)
+            };
+            output.push_str(&format!("  {color}{icon} {display}{ANSI_RESET}\n"));
             if let Some(explanation) = change.explanation {
                 output.push_str(&format!("      ℹ️  {explanation}\n"));
             }
@@ -823,6 +889,7 @@ mod tests {
         let new = make_snapshot(200, 5);
         let diff = diff_snapshots(&old, &new);
         let output = format_diff(&diff, true);
+        let output = format_diff(&diff, false, None);
         // Should show human-readable setting name, not raw prefix
         assert!(output.contains("Contract Compute V0"));
         assert!(
@@ -865,6 +932,7 @@ mod tests {
         let new = make_snapshot(200, 10);
         let diff = diff_snapshots(&old, &new);
         let output = format_diff(&diff, true);
+        let output = format_diff(&diff, false, None);
         assert!(output.contains("Contract Compute V0"));
         assert!(output.contains("Contract Bandwidth V0"));
     }
@@ -924,6 +992,7 @@ mod tests {
         let new = make_snapshot(160, 5); // +60% compute fee → red
         let diff = diff_snapshots(&old, &new);
         let output = format_diff(&diff, true);
+        let output = format_diff(&diff, false, None);
         assert!(
             output.contains(ANSI_RED),
             "large pricing change should be red: {output}"
@@ -940,6 +1009,7 @@ mod tests {
         let new = make_snapshot(105, 5); // +5% compute fee → green
         let diff = diff_snapshots(&old, &new);
         let output = format_diff(&diff, true);
+        let output = format_diff(&diff, false, None);
         assert!(
             output.contains(ANSI_GREEN),
             "small pricing change should be green: {output}"
@@ -956,6 +1026,7 @@ mod tests {
         }
         let diff = diff_snapshots(&old, &new);
         let output = format_diff(&diff, true);
+        let output = format_diff(&diff, false, None);
         assert!(
             !output.contains(ANSI_RED)
                 && !output.contains(ANSI_GREEN)
@@ -969,6 +1040,7 @@ mod tests {
         let snap = make_snapshot(100, 5);
         let diff = diff_snapshots(&snap, &snap);
         let output = format_diff(&diff, true);
+        let output = format_diff(&diff, false, None);
         assert!(
             !output.contains("\u{1b}["),
             "no-change output should have no ANSI codes: {output}"
