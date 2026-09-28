@@ -14,6 +14,14 @@ use crate::error::{AppError, AppResult};
 /// initialization costs.
 pub const SOROBAN_MAX_MEMORY_PAGES: u64 = 16;
 
+/// Soroban network memory limit per transaction in bytes.
+/// Currently 40 MB (40,000,000 bytes).
+const SOROBAN_TX_MEMORY_LIMIT_BYTES: u64 = 40_000_000;
+
+/// Maximum number of WASM pages allowed by Soroban.
+/// Calculated as SOROBAN_TX_MEMORY_LIMIT_BYTES / WASM_PAGE_SIZE_BYTES.
+const SOROBAN_MAX_WASM_PAGES: u64 = SOROBAN_TX_MEMORY_LIMIT_BYTES / WASM_PAGE_SIZE_BYTES;
+
 /// Size of one WASM linear-memory page in bytes (64 KiB).
 pub const WASM_PAGE_SIZE_BYTES: u64 = 65_536;
 
@@ -113,7 +121,7 @@ pub fn validate_wasm_memory_limits(bytes: &[u8]) -> Option<String> {
 
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
         if let Ok(wasmparser::Payload::MemorySection(section)) = payload {
-            for memory in section.flatten() {
+            for memory in section.into_iter().flatten() {
                 memories.push(MemoryInfo {
                     initial_pages: memory.initial,
                     maximum_pages: memory.maximum,
@@ -838,10 +846,7 @@ fn validate_wasm_memory_limit_for_memory(memory: &MemoryInfo) -> Option<String> 
             let max_bytes = max_pages * WASM_PAGE_SIZE_BYTES;
             warnings.push(format!(
                 "maximum size {} pages ({} bytes) exceeds Soroban limit of {} pages ({} bytes)",
-                max_pages,
-                max_bytes,
-                SOROBAN_MAX_WASM_PAGES,
-                SOROBAN_TX_MEMORY_LIMIT_BYTES
+                max_pages, max_bytes, SOROBAN_MAX_WASM_PAGES, SOROBAN_TX_MEMORY_LIMIT_BYTES
             ));
         }
     }

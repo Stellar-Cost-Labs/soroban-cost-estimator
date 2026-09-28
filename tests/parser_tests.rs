@@ -490,8 +490,8 @@ fn test_validate_wasm_memory_limits_warning_format() {
 #[test]
 fn test_format_module_metadata_includes_memory_warnings() {
     let path = Path::new("tests/fixtures/minimal.wasm");
-    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(path)
-        .expect("failed to load test WASM");
+    let wasm_info =
+        soroban_cost_estimator::wasm::parser::load_wasm(path).expect("failed to load test WASM");
 
     let summary = soroban_cost_estimator::wasm::parser::format_module_metadata(&wasm_info);
     assert!(
