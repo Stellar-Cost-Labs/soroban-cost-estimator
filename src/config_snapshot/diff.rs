@@ -696,13 +696,13 @@ pub fn pricing_change_color(old_value: &str, new_value: &str, colorize: bool) ->
 /// Pricing changes are colored red/yellow/green by the magnitude of the
 /// value change (see [`pricing_change_color`]); non-pricing changes are
 /// left uncolored.
-pub fn format_diff(diff: &ConfigDiff, colorize: bool) -> String {
-    let reset_code = if colorize { ANSI_RESET } else { "" };
 pub fn format_diff(
     diff: &ConfigDiff,
+    colorize: bool,
     pricing_only: bool,
     threshold_percent: Option<f64>,
 ) -> String {
+    let reset_code = if colorize { ANSI_RESET } else { "" };
     let mut output = String::new();
 
     output.push_str(&format!(
@@ -766,14 +766,12 @@ pub fn format_diff(
         };
         let display = field_display_name(&change.field_path);
         if change.is_pricing_change {
-            let color = pricing_change_color(&change.old_value, &change.new_value, colorize);
-            output.push_str(&format!("  {color}{icon} {display}{reset_code}\n"));
             let color = if is_exceeding {
-                ANSI_RED
+                if colorize { ANSI_RED } else { "" }
             } else {
-                pricing_change_color(&change.old_value, &change.new_value)
+                pricing_change_color(&change.old_value, &change.new_value, colorize)
             };
-            output.push_str(&format!("  {color}{icon} {display}{ANSI_RESET}\n"));
+            output.push_str(&format!("  {color}{icon} {display}{reset_code}\n"));
             if let Some(explanation) = change.explanation {
                 output.push_str(&format!("      ℹ️  {explanation}\n"));
             }
@@ -888,8 +886,7 @@ mod tests {
         let old = make_snapshot(100, 5);
         let new = make_snapshot(200, 5);
         let diff = diff_snapshots(&old, &new);
-        let output = format_diff(&diff, true);
-        let output = format_diff(&diff, false, None);
+        let output = format_diff(&diff, false, false, None);
         // Should show human-readable setting name, not raw prefix
         assert!(output.contains("Contract Compute V0"));
         assert!(
@@ -931,8 +928,7 @@ mod tests {
         let old = make_snapshot(100, 5);
         let new = make_snapshot(200, 10);
         let diff = diff_snapshots(&old, &new);
-        let output = format_diff(&diff, true);
-        let output = format_diff(&diff, false, None);
+        let output = format_diff(&diff, false, false, None);
         assert!(output.contains("Contract Compute V0"));
         assert!(output.contains("Contract Bandwidth V0"));
     }
@@ -991,8 +987,7 @@ mod tests {
         let old = make_snapshot(100, 5);
         let new = make_snapshot(160, 5); // +60% compute fee → red
         let diff = diff_snapshots(&old, &new);
-        let output = format_diff(&diff, true);
-        let output = format_diff(&diff, false, None);
+        let output = format_diff(&diff, true, false, None);
         assert!(
             output.contains(ANSI_RED),
             "large pricing change should be red: {output}"
@@ -1008,8 +1003,7 @@ mod tests {
         let old = make_snapshot(100, 5);
         let new = make_snapshot(105, 5); // +5% compute fee → green
         let diff = diff_snapshots(&old, &new);
-        let output = format_diff(&diff, true);
-        let output = format_diff(&diff, false, None);
+        let output = format_diff(&diff, true, false, None);
         assert!(
             output.contains(ANSI_GREEN),
             "small pricing change should be green: {output}"
@@ -1025,8 +1019,7 @@ mod tests {
             compute.ledger_max_instructions = 2_000_000;
         }
         let diff = diff_snapshots(&old, &new);
-        let output = format_diff(&diff, true);
-        let output = format_diff(&diff, false, None);
+        let output = format_diff(&diff, false, false, None);
         assert!(
             !output.contains(ANSI_RED)
                 && !output.contains(ANSI_GREEN)
@@ -1039,8 +1032,7 @@ mod tests {
     fn test_format_diff_no_changes_no_ansi() {
         let snap = make_snapshot(100, 5);
         let diff = diff_snapshots(&snap, &snap);
-        let output = format_diff(&diff, true);
-        let output = format_diff(&diff, false, None);
+        let output = format_diff(&diff, false, false, None);
         assert!(
             !output.contains("\u{1b}["),
             "no-change output should have no ANSI codes: {output}"

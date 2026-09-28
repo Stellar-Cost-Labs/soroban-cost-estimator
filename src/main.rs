@@ -1363,8 +1363,12 @@ async fn cmd_config_diff(
         } else {
             println!(
                 "{}",
-                config_snapshot::diff::format_diff(&diff, cli::should_colorize())
-                config_snapshot::diff::format_diff(&diff, pricing_only, threshold_percent)
+                config_snapshot::diff::format_diff(
+                    &diff,
+                    cli::should_colorize(),
+                    pricing_only,
+                    threshold_percent
+                )
             );
         }
 
@@ -1596,8 +1600,12 @@ async fn watch_poll_once(
                         debug!(change_count = diff.changes.len(), "config changes detected");
                         println!(
                             "{}",
-                            config_snapshot::diff::format_diff(&diff, cli::should_colorize())
-                            config_snapshot::diff::format_diff(&diff, false, threshold_percent)
+                            config_snapshot::diff::format_diff(
+                                &diff,
+                                cli::should_colorize(),
+                                false,
+                                threshold_percent
+                            )
                         );
                     }
 
@@ -1677,7 +1685,6 @@ async fn cmd_watch(
 ///
 /// # Network calls
 /// None — pure SQLite I/O.
-pub fn _cmd_cache_stats() -> error::AppResult<()> {
 #[allow(dead_code)]
 fn cmd_cache_stats() -> error::AppResult<()> {
     let stats = cache::cache_stats()?;
@@ -1714,7 +1721,6 @@ fn cmd_cache_stats() -> error::AppResult<()> {
 }
 
 /// Format a byte count as a human-readable string (KB, MB, GB).
-pub fn _format_bytes(bytes: u64) -> String {
 #[allow(dead_code)]
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
