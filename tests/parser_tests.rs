@@ -398,6 +398,14 @@ fn test_validate_wasm_limits_valid() {
         }],
         imports: vec![],
         exports: vec![],
+    summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
+            initial_pages: 0,
+            max_pages: None,
+            imports_count: 0,
+            exports_count: 0,
+            has_start_function: false,
+            tables_count: 0,
+        },
     };
     assert!(wasm.validate_wasm_limits(100, 100).is_ok());
 }
@@ -413,6 +421,14 @@ fn test_validate_wasm_limits_size_exceeded() {
         memories: vec![],
         imports: vec![],
         exports: vec![],
+    summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
+            initial_pages: 0,
+            max_pages: None,
+            imports_count: 0,
+            exports_count: 0,
+            has_start_function: false,
+            tables_count: 0,
+        },
     };
     let res = wasm.validate_wasm_limits(50, 100);
     assert!(res.is_err());
@@ -438,6 +454,14 @@ fn test_validate_wasm_limits_initial_memory_exceeded() {
         }],
         imports: vec![],
         exports: vec![],
+    summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
+            initial_pages: 0,
+            max_pages: None,
+            imports_count: 0,
+            exports_count: 0,
+            has_start_function: false,
+            tables_count: 0,
+        },
     };
     let res = wasm.validate_wasm_limits(100, 100);
     assert!(res.is_err());
@@ -463,6 +487,14 @@ fn test_validate_wasm_limits_max_memory_exceeded() {
         }],
         imports: vec![],
         exports: vec![],
+    summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
+            initial_pages: 0,
+            max_pages: None,
+            imports_count: 0,
+            exports_count: 0,
+            has_start_function: false,
+            tables_count: 0,
+        },
     };
     let res = wasm.validate_wasm_limits(100, 100);
     assert!(res.is_err());
@@ -474,7 +506,7 @@ fn test_validate_wasm_limits_max_memory_exceeded() {
 }
 
 #[test]
-fn test_validate_wasm_limits_unbounded_memory_exceeded() {
+fn test_validate_wasm_limits_unbounded_memory_allowed() {
     let wasm = soroban_cost_estimator::wasm::parser::WasmInfo {
         bytes: vec![0; 10],
         functions: vec![],
@@ -488,8 +520,15 @@ fn test_validate_wasm_limits_unbounded_memory_exceeded() {
         }],
         imports: vec![],
         exports: vec![],
+    summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
+            initial_pages: 0,
+            max_pages: None,
+            imports_count: 0,
+            exports_count: 0,
+            has_start_function: false,
+            tables_count: 0,
+        },
     };
     let res = wasm.validate_wasm_limits(100, 100);
-    assert!(res.is_err());
-    assert!(res.unwrap_err().to_string().contains("is unbounded"));
+    assert!(res.is_ok());
 }

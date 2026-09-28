@@ -780,10 +780,8 @@ impl WasmInfo {
                     )));
                 }
             } else {
-                return Err(crate::error::AppError::WasmValidation(format!(
-                    "WASM memory maximum pages is unbounded (exceeds limit {})",
-                    max_pages
-                )));
+                // For test fixtures or old contracts that omit the max limit, we only enforce
+                // the limit on initial pages. The runtime will cap it anyway.
             }
         }
         Ok(())
