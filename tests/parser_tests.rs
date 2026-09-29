@@ -380,127 +380,155 @@ fn test_parse_contract_meta_real_fixture() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// WASM memory limit validation tests
+// validate_wasm_limits
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Tests that WASM with memory within Soroban limits does not produce warnings.
 #[test]
-fn test_validate_wasm_memory_limits_within_limits() {
-    let path = Path::new("tests/fixtures/minimal.wasm");
-    let bytes = std::fs::read(path).expect("read fixture");
+fn test_validate_wasm_limits_valid() {
+    let wasm = soroban_cost_estimator::wasm::parser::WasmInfo {
+        bytes: vec![0; 50],
+        functions: vec![],
+        has_spec: false,
+        contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
+        start_function: None,
+        memories: vec![soroban_cost_estimator::wasm::parser::MemoryInfo {
+            initial_pages: 50,
+            maximum_pages: Some(100),
+            memory64: false,
+        }],
+        imports: vec![],
+        exports: vec![],
+        summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
+            initial_pages: 0,
+            max_pages: None,
+            imports_count: 0,
+            exports_count: 0,
+            has_start_function: false,
+            tables_count: 0,
+        },
+    };
+    assert!(wasm.validate_wasm_limits(100, 100).is_ok());
+}
 
-    let warning = soroban_cost_estimator::wasm::parser::validate_wasm_memory_limits(&bytes);
+#[test]
+fn test_validate_wasm_limits_size_exceeded() {
+    let wasm = soroban_cost_estimator::wasm::parser::WasmInfo {
+        bytes: vec![0; 100],
+        functions: vec![],
+        has_spec: false,
+        contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
+        start_function: None,
+        memories: vec![],
+        imports: vec![],
+        exports: vec![],
+        summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
+            initial_pages: 0,
+            max_pages: None,
+            imports_count: 0,
+            exports_count: 0,
+            has_start_function: false,
+            tables_count: 0,
+        },
+    };
+    let res = wasm.validate_wasm_limits(50, 100);
+    assert!(res.is_err());
     assert!(
-        warning.is_none(),
-        "WASM within limits should not produce warning, got: {:?}",
-        warning
+        res.unwrap_err()
+            .to_string()
+            .contains("exceeds maximum deployable size")
     );
 }
 
-/// Tests that WASM with no memory section does not produce warnings.
 #[test]
-fn test_validate_wasm_memory_limits_no_memory() {
-    // Create a minimal valid WASM with no memory section
-    let bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]; // magic + version only
-    let warning = soroban_cost_estimator::wasm::parser::validate_wasm_memory_limits(&bytes);
+fn test_validate_wasm_limits_initial_memory_exceeded() {
+    let wasm = soroban_cost_estimator::wasm::parser::WasmInfo {
+        bytes: vec![0; 10],
+        functions: vec![],
+        has_spec: false,
+        contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
+        start_function: None,
+        memories: vec![soroban_cost_estimator::wasm::parser::MemoryInfo {
+            initial_pages: 200,
+            maximum_pages: Some(200),
+            memory64: false,
+        }],
+        imports: vec![],
+        exports: vec![],
+        summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
+            initial_pages: 0,
+            max_pages: None,
+            imports_count: 0,
+            exports_count: 0,
+            has_start_function: false,
+            tables_count: 0,
+        },
+    };
+    let res = wasm.validate_wasm_limits(100, 100);
+    assert!(res.is_err());
     assert!(
-        warning.is_none(),
-        "WASM with no memory should not produce warning, got: {:?}",
-        warning
+        res.unwrap_err()
+            .to_string()
+            .contains("initial pages 200 exceeds limit 100")
     );
 }
 
-/// Tests that WASM with memory exceeding Soroban limits produces a warning.
 #[test]
-fn test_validate_wasm_memory_limits_exceeds_limits() {
-    // Create a WASM binary with a memory section that declares 1000 pages
-    // (exceeds the 610-page limit)
-    let mut bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]; // magic + version
-
-    // Memory section with 1000 initial pages (exceeds limit)
-    let memory_section = vec![0x05, 0x04, 0x01, 0x00, 0xe8, 0x07]; // section id, size, count, flags, initial (1000)
-    bytes.extend_from_slice(&memory_section);
-
-    let warning = soroban_cost_estimator::wasm::parser::validate_wasm_memory_limits(&bytes);
+fn test_validate_wasm_limits_max_memory_exceeded() {
+    let wasm = soroban_cost_estimator::wasm::parser::WasmInfo {
+        bytes: vec![0; 10],
+        functions: vec![],
+        has_spec: false,
+        contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
+        start_function: None,
+        memories: vec![soroban_cost_estimator::wasm::parser::MemoryInfo {
+            initial_pages: 50,
+            maximum_pages: Some(200),
+            memory64: false,
+        }],
+        imports: vec![],
+        exports: vec![],
+        summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
+            initial_pages: 0,
+            max_pages: None,
+            imports_count: 0,
+            exports_count: 0,
+            has_start_function: false,
+            tables_count: 0,
+        },
+    };
+    let res = wasm.validate_wasm_limits(100, 100);
+    assert!(res.is_err());
     assert!(
-        warning.is_some(),
-        "WASM exceeding limits should produce warning"
-    );
-    let warning_text = warning.unwrap();
-    assert!(
-        warning_text.contains("exceeds Soroban limit"),
-        "Warning should mention exceeding limit, got: {warning_text}"
-    );
-    assert!(
-        warning_text.contains("1000 pages"),
-        "Warning should mention the actual page count, got: {warning_text}"
+        res.unwrap_err()
+            .to_string()
+            .contains("maximum pages 200 exceeds limit 100")
     );
 }
 
-/// Tests that WASM with memory maximum exceeding Soroban limits produces a warning.
 #[test]
-fn test_validate_wasm_memory_limits_maximum_exceeds_limits() {
-    // Create a WASM binary with a memory section that declares initial=10, maximum=1000
-    let mut bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]; // magic + version
-
-    // Memory section with flags=0x03 (has maximum), initial=10, maximum=1000
-    let memory_section = vec![0x05, 0x05, 0x01, 0x03, 0x0a, 0xe8, 0x07]; // section id, size, count, flags, initial (10), maximum (1000)
-    bytes.extend_from_slice(&memory_section);
-
-    let warning = soroban_cost_estimator::wasm::parser::validate_wasm_memory_limits(&bytes);
-    assert!(
-        warning.is_some(),
-        "WASM exceeding limits should produce warning"
-    );
-    let warning_text = warning.unwrap();
-    assert!(
-        warning_text.contains("maximum size 1000 pages"),
-        "Warning should mention maximum size, got: {warning_text}"
-    );
-}
-
-/// Tests that the warning message includes both page count and byte size.
-#[test]
-fn test_validate_wasm_memory_limits_warning_format() {
-    // Create a WASM binary with a memory section that declares 700 pages
-    let mut bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]; // magic + version
-
-    // Memory section with 700 initial pages (exceeds 610-page limit)
-    let memory_section = vec![0x05, 0x04, 0x01, 0x00, 0xbc, 0x05]; // section id, size, count, flags, initial (700)
-    bytes.extend_from_slice(&memory_section);
-
-    let warning = soroban_cost_estimator::wasm::parser::validate_wasm_memory_limits(&bytes);
-    assert!(warning.is_some());
-    let warning_text = warning.unwrap();
-    assert!(
-        warning_text.contains("45875200 bytes"), // 700 * 65536
-        "Warning should include byte size, got: {warning_text}"
-    );
-    assert!(
-        warning_text.contains("610 pages"),
-        "Warning should include limit in pages, got: {warning_text}"
-    );
-    assert!(
-        warning_text.contains("40000000 bytes"),
-        "Warning should include limit in bytes, got: {warning_text}"
-    );
-}
-
-/// Tests that the format_module_metadata includes memory limit warnings.
-#[test]
-fn test_format_module_metadata_includes_memory_warnings() {
-    let path = Path::new("tests/fixtures/minimal.wasm");
-    let wasm_info =
-        soroban_cost_estimator::wasm::parser::load_wasm(path).expect("failed to load test WASM");
-
-    let summary = soroban_cost_estimator::wasm::parser::format_module_metadata(&wasm_info);
-    assert!(
-        summary.contains("memories:"),
-        "summary should list memories, got: {summary}"
-    );
-    // Minimal fixture should not have memory warnings
-    assert!(
-        !summary.contains("WARNING"),
-        "minimal fixture should not have memory warnings, got: {summary}"
-    );
+fn test_validate_wasm_limits_unbounded_memory_allowed() {
+    let wasm = soroban_cost_estimator::wasm::parser::WasmInfo {
+        bytes: vec![0; 10],
+        functions: vec![],
+        has_spec: false,
+        contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
+        start_function: None,
+        memories: vec![soroban_cost_estimator::wasm::parser::MemoryInfo {
+            initial_pages: 50,
+            maximum_pages: None,
+            memory64: false,
+        }],
+        imports: vec![],
+        exports: vec![],
+        summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
+            initial_pages: 0,
+            max_pages: None,
+            imports_count: 0,
+            exports_count: 0,
+            has_start_function: false,
+            tables_count: 0,
+        },
+    };
+    let res = wasm.validate_wasm_limits(100, 100);
+    assert!(res.is_ok());
 }
