@@ -341,7 +341,9 @@ pub fn format_report_table(report: &CostReport) -> String {
         &format!(
             "{} stroops ({})",
             report.fee.cpu_fee_stroops,
-            pct.get("cpu_instructions").unwrap_or(&"".to_string())
+            pct.get("cpu_instructions")
+                .map(String::as_str)
+                .unwrap_or("")
         ),
     ]);
     fee_table.add_row(vec![
@@ -349,7 +351,9 @@ pub fn format_report_table(report: &CostReport) -> String {
         &format!(
             "{} stroops ({})",
             report.fee.storage_fee_stroops,
-            pct.get("storage_read_write").unwrap_or(&"".to_string())
+            pct.get("storage_read_write")
+                .map(String::as_str)
+                .unwrap_or("")
         ),
     ]);
     fee_table.add_row(vec![
@@ -357,7 +361,9 @@ pub fn format_report_table(report: &CostReport) -> String {
         &format!(
             "{} stroops ({})",
             report.fee.bandwidth_fee_stroops,
-            pct.get("transaction_size").unwrap_or(&"".to_string())
+            pct.get("transaction_size")
+                .map(String::as_str)
+                .unwrap_or("")
         ),
     ]);
     fee_table.add_row(vec![
@@ -365,7 +371,7 @@ pub fn format_report_table(report: &CostReport) -> String {
         &format!(
             "{} stroops ({})",
             report.fee.base_fee_stroops,
-            pct.get("base_fee").unwrap_or(&"".to_string())
+            pct.get("base_fee").map(String::as_str).unwrap_or("")
         ),
     ]);
     fee_table.add_row(vec![
@@ -373,7 +379,7 @@ pub fn format_report_table(report: &CostReport) -> String {
         &format!(
             "{} stroops ({})",
             report.fee.refundable_stroops,
-            pct.get("rent").unwrap_or(&"".to_string())
+            pct.get("rent").map(String::as_str).unwrap_or("")
         ),
     ]);
     fee_table.add_row(vec![

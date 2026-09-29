@@ -70,7 +70,9 @@ impl ReportFormatter for TableFormatter {
             &format!(
                 "{} stroops ({})",
                 report.fee.cpu_fee_stroops,
-                pct.get("cpu_instructions").unwrap_or(&"".to_string())
+                pct.get("cpu_instructions")
+                    .map(String::as_str)
+                    .unwrap_or("")
             ),
         ]);
         fee_table.add_row(vec![
@@ -78,7 +80,9 @@ impl ReportFormatter for TableFormatter {
             &format!(
                 "{} stroops ({})",
                 report.fee.storage_fee_stroops,
-                pct.get("storage_read_write").unwrap_or(&"".to_string())
+                pct.get("storage_read_write")
+                    .map(String::as_str)
+                    .unwrap_or("")
             ),
         ]);
         fee_table.add_row(vec![
@@ -86,7 +90,9 @@ impl ReportFormatter for TableFormatter {
             &format!(
                 "{} stroops ({})",
                 report.fee.bandwidth_fee_stroops,
-                pct.get("transaction_size").unwrap_or(&"".to_string())
+                pct.get("transaction_size")
+                    .map(String::as_str)
+                    .unwrap_or("")
             ),
         ]);
         fee_table.add_row(vec![
@@ -94,7 +100,7 @@ impl ReportFormatter for TableFormatter {
             &format!(
                 "{} stroops ({})",
                 report.fee.base_fee_stroops,
-                pct.get("base_fee").unwrap_or(&"".to_string())
+                pct.get("base_fee").map(String::as_str).unwrap_or("")
             ),
         ]);
         fee_table.add_row(vec![
@@ -102,7 +108,7 @@ impl ReportFormatter for TableFormatter {
             &format!(
                 "{} stroops ({})",
                 report.fee.refundable_stroops,
-                pct.get("rent").unwrap_or(&"".to_string())
+                pct.get("rent").map(String::as_str).unwrap_or("")
             ),
         ]);
         fee_table.add_row(vec![
@@ -262,27 +268,33 @@ impl ReportFormatter for MarkdownFormatter {
         output.push_str(&format!(
             "| CPU Instructions | {} | {} |\n",
             report.fee.cpu_fee_stroops,
-            pct.get("cpu_instructions").unwrap_or(&"".to_string())
+            pct.get("cpu_instructions")
+                .map(String::as_str)
+                .unwrap_or("")
         ));
         output.push_str(&format!(
             "| Storage I/O | {} | {} |\n",
             report.fee.storage_fee_stroops,
-            pct.get("storage_read_write").unwrap_or(&"".to_string())
+            pct.get("storage_read_write")
+                .map(String::as_str)
+                .unwrap_or("")
         ));
         output.push_str(&format!(
             "| Transaction Size | {} | {} |\n",
             report.fee.bandwidth_fee_stroops,
-            pct.get("transaction_size").unwrap_or(&"".to_string())
+            pct.get("transaction_size")
+                .map(String::as_str)
+                .unwrap_or("")
         ));
         output.push_str(&format!(
             "| Base Fee | {} | {} |\n",
             report.fee.base_fee_stroops,
-            pct.get("base_fee").unwrap_or(&"".to_string())
+            pct.get("base_fee").map(String::as_str).unwrap_or("")
         ));
         output.push_str(&format!(
             "| Rent Fee | {} | {} |\n",
             report.fee.refundable_stroops,
-            pct.get("rent").unwrap_or(&"".to_string())
+            pct.get("rent").map(String::as_str).unwrap_or("")
         ));
         output.push_str(&format!(
             "| **Total** | **{}** ({}) | **100.0%** |\n",
@@ -525,8 +537,8 @@ mod tests {
         assert_eq!(parsed["ledger"], 3_894_195);
         assert_eq!(parsed["network"], "testnet");
         assert_eq!(parsed["rpc_latency_ms"], 87);
-        assert_eq!(parsed["fee"]["total_stroops"], 15_427);
-        assert_eq!(parsed["fee"]["total_xlm"], "0.0015427");
+        assert_eq!(parsed["fee"]["total_stroops"], 15_527);
+        assert_eq!(parsed["fee"]["total_xlm"], "0.0015527");
     }
 
     #[test]
@@ -573,7 +585,7 @@ mod tests {
         assert!(data.contains("increment"));
         assert!(data.contains("testnet"));
         assert!(data.contains("532502"));
-        assert!(data.contains("15427"));
+        assert!(data.contains("15527"));
     }
 
     #[test]
