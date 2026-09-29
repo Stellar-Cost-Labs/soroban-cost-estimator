@@ -206,14 +206,25 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             )
             .await
         }
-        cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(&wasm, if json { cli::OutputFormat::Json } else { cli::OutputFormat::Table }),
+        cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(
+            &wasm,
+            if json {
+                cli::OutputFormat::Json
+            } else {
+                cli::OutputFormat::Table
+            },
+        ),
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot { network, out, json } => {
                 cmd_config_snapshot(
                     &network,
                     fallback,
                     out.as_deref(),
-                    if json { cli::OutputFormat::Json } else { cli::OutputFormat::Table },
+                    if json {
+                        cli::OutputFormat::Json
+                    } else {
+                        cli::OutputFormat::Table
+                    },
                     rps,
                     timeout,
                     max_retries,
@@ -268,7 +279,11 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     rpc_url.as_deref(),
                     fallback,
                     id.as_deref(),
-                    if json { cli::OutputFormat::Json } else { cli::OutputFormat::Table },
+                    if json {
+                        cli::OutputFormat::Json
+                    } else {
+                        cli::OutputFormat::Table
+                    },
                     rps,
                     timeout,
                     max_retries,
@@ -1908,7 +1923,10 @@ async fn cmd_cache_warm(
     max_retries: usize,
     extra_headers: &[String],
 ) -> error::AppResult<()> {
-    let fmt = match format { cli::OutputFormat::Json => "json", _ => "table" };
+    let fmt = match format {
+        cli::OutputFormat::Json => "json",
+        _ => "table",
+    };
     cmd_estimate_all(
         wasm_path,
         network,
