@@ -1,6 +1,5 @@
 ---
 source: tests/report_snapshots.rs
-assertion_line: 95
 expression: MarkdownFormatter.format(&empty)
 ---
 ## Cost Report: `(wasm upload)`
@@ -25,11 +24,11 @@ expression: MarkdownFormatter.format(&empty)
 
 | Component | Stroops | % of Total |
 | --- | --- | --- |
-| Non-refundable | 0 | 0.0% |
-| Refundable | 0 | 0.0% |
-| CPU | 0 | 0.0% |
-| Storage | 0 | 0.0% |
-| Bandwidth | 0 | 0.0% |
+| CPU Instructions | 0 |  |
+| Storage I/O | 0 |  |
+| Transaction Size | 0 |  |
+| Base Fee | 0 |  |
+| Rent Fee | 0 |  |
 | **Total** | **0** (0.0000000) | **100.0%** |
 
 ### Optimization Suggestions
