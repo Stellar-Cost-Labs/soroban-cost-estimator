@@ -72,7 +72,8 @@ pub struct Cli {
     #[arg(long = "header", value_name = "KEY: VALUE", global = true)]
     pub headers: Vec<String>,
 
-    /// Fallback RPC URL used when the primary endpoint is unreachable.
+    /// Fallback RPC URL used when the primary endpoint is unreachable or
+    /// returns a transient gateway error (HTTP 502/503/504).
     #[arg(long, global = true, value_name = "URL")]
     pub rpc_fallback_url: Option<String>,
 
@@ -166,6 +167,13 @@ pub enum Command {
         /// Percentage threshold for flagging significant changes (e.g. 10 for 10%).
         #[arg(long, value_name = "N")]
         threshold_percent: Option<f64>,
+    },
+
+    /// Generate shell completion scripts for Bash, Zsh, Fish, and PowerShell.
+    Completions {
+        /// Target shell for completion script generation.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
 }
 
