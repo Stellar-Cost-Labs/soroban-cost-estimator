@@ -117,8 +117,15 @@ async fn main() {
     let args = cli::Cli::parse();
 
     cli::init_color(args.color);
+    cli::init_quiet(args.quiet);
 
-    let default_level = if args.verbose { "debug" } else { "info" };
+    let default_level = if args.quiet {
+        "warn"
+    } else if args.verbose {
+        "debug"
+    } else {
+        "info"
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level)),
@@ -140,6 +147,9 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
     let timeout = args.timeout;
     let max_retries = args.max_retries;
     let verbose = args.verbose;
+    // `--precision` is a single global flag; read it once so every command
+    // reads the same value.
+    let precision = args.precision;
     let fallback = args.rpc_fallback_url.as_deref();
     let headers = args.headers;
     match args.command {
@@ -153,9 +163,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cache_ttl,
             clear_cache,
             json,
-            precision,
-            watch,
             auto_snapshot,
+            dry_run,
         } => {
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
@@ -184,6 +193,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 args.wasm_info,
                 args.verbose,
                 auto_snapshot,
+                dry_run,
             )
             .await
         }
@@ -193,7 +203,6 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             rpc_url,
             id,
             json,
-            precision,
             auto_snapshot,
         } => {
             let format = match (args.format, json) {
@@ -584,6 +593,7 @@ async fn cmd_estimate(
     wasm_info_flag: bool,
     verbose: bool,
     auto_snapshot: bool,
+    dry_run: bool,
 ) -> error::AppResult<()> {
     if watch {
         return cmd_estimate_watch(
@@ -772,6 +782,47 @@ async fn estimate_once(
 
         let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
         debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
+
+        // In dry-run mode, print the planned simulation payload and exit
+        // without contacting the network. Useful for air-gapped environments
+        // or local contract verification.
+        if dry_run {
+            let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
+            println!("Dry run — planned simulation payload (no network calls):");
+            println!();
+            println!("  Resolved RPC endpoint: {endpoint}");
+            println!(
+                "  Contract ID:           {}",
+                contract_id.unwrap_or("(wasm upload)")
+            );
+            println!(
+                "  Function name:         {}",
+                fn_name.unwrap_or("(wasm upload)")
+            );
+            println!("  Network:               {network}");
+            println!();
+            println!("  WASM SHA-256:          {wasm_hash}");
+            println!("  WASM size:             {} bytes", wasm_info.bytes.len());
+            println!(
+                "  Contract spec:         {}",
+                if wasm_info.has_spec {
+                    "present"
+                } else {
+                    "absent"
+                }
+            );
+            println!();
+            println!("  Arguments ({}):", args.len());
+            for (i, (arg, sc_val)) in args.iter().zip(&sc_vals).enumerate() {
+                println!("    [{i}] {arg} → {sc_val:?}");
+            }
+            println!();
+            println!("  Transaction envelope:");
+            println!("    XDR size:   {} bytes", tx_xdr.len());
+            println!("    Base64 size: {} bytes", tx_b64.len());
+            println!("    Base64 data: {tx_b64}");
+            return Ok(());
+        }
 
         // Fail fast on a misconfigured --rpc-url or down node (#55): validate
         // the endpoint is reachable and healthy before running any simulation.
@@ -1197,8 +1248,41 @@ async fn cmd_estimate_watch(
             )
             .await;
         }
-        Ok(None) => {
-            watch_say(human, format!("Waiting for {wasm_path} to appear..."));
+
+        // The table formatter is the only one that renders the fee bar chart,
+        // and only when the terminal has room for it (>= MIN_CHART_WIDTH
+        // columns), stdout is a TTY, and `--quiet` was not passed. Machine
+        // formats never grow a human-only chart.
+        if format == "table" {
+            match cli::chart_width() {
+                Some(width) => {
+                    println!("{}", TableFormatter.format_with_options(&report, true, width));
+                }
+                None => {
+                    println!(
+                        "{}",
+                        TableFormatter.format_with_options(
+                            &report,
+                            false,
+                            report::cost_report::DEFAULT_CHART_WIDTH,
+                        )
+                    );
+                }
+            }
+        } else {
+            match formatter_by_name(format) {
+                Some(formatter) => println!("{}", formatter.format(&report)),
+                None => {
+                    println!(
+                        "{}",
+                        TableFormatter.format_with_options(
+                            &report,
+                            false,
+                            report::cost_report::DEFAULT_CHART_WIDTH,
+                        )
+                    );
+                }
+            }
         }
         Err(e) => {
             watch_say(
