@@ -1028,6 +1028,7 @@ mod tests {
                 None,
                 Duration::from_secs(30),
                 0,
+                false,
             );
 
             let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
@@ -1061,6 +1062,7 @@ mod tests {
             None,
             Duration::from_secs(30),
             0,
+            false,
         );
 
         let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;

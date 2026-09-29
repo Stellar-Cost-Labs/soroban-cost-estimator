@@ -71,6 +71,7 @@ async fn fails_over_to_fallback_when_primary_host_is_invalid() {
         // No retries: the primary is unreachable, so retrying it would only
         // lengthen the test without exercising a different code path.
         0,
+        false,
     );
 
     let result: AppResult<Value> = client.call("getHealth", serde_json::json!({})).await;
