@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use comfy_table::Cell;
 use comfy_table::Table;
 use soroban_cost_estimator::cache;
@@ -153,13 +153,16 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cache_ttl,
             clear_cache,
             json,
-            format,
             precision,
             watch,
         } => {
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
-            let format = format.unwrap_or_else(|| if json { "json" } else { "table" }.to_string());
+            let format = match (args.format, json) {
+                (Some(fmt), _) => fmt,
+                (None, true) => cli::OutputFormat::Json,
+                (None, false) => cli::OutputFormat::Table,
+            };
             cmd_estimate(
                 &wasm,
                 &network,
@@ -170,7 +173,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 &contract_args,
                 cache_ttl.as_deref(),
                 clear_cache,
-                &format,
+                format.as_str(),
                 rps,
                 timeout,
                 max_retries,
@@ -187,17 +190,20 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             rpc_url,
             id,
             json,
-            format,
             precision,
         } => {
-            let format = format.unwrap_or_else(|| if json { "json" } else { "table" }.to_string());
+            let format = match (args.format, json) {
+                (Some(fmt), _) => fmt,
+                (None, true) => cli::OutputFormat::Json,
+                (None, false) => cli::OutputFormat::Table,
+            };
             cmd_estimate_all(
                 &wasm,
                 &network,
                 rpc_url.as_deref(),
                 fallback,
                 id.as_deref(),
-                &format,
+                format.as_str(),
                 rps,
                 timeout,
                 max_retries,
@@ -208,14 +214,26 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             )
             .await
         }
-        cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(&wasm, json),
+        cli::Command::WasmInfo { wasm, json } => {
+            let format = match (args.format, json) {
+                (Some(fmt), _) => fmt,
+                (None, true) => cli::OutputFormat::Json,
+                (None, false) => cli::OutputFormat::Table,
+            };
+            cmd_wasm_info(&wasm, format)
+        }
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot { network, out, json } => {
+                let format = match (args.format, json) {
+                    (Some(fmt), _) => fmt,
+                    (None, true) => cli::OutputFormat::Json,
+                    (None, false) => cli::OutputFormat::Table,
+                };
                 cmd_config_snapshot(
                     &network,
                     fallback,
                     out.as_deref(),
-                    json,
+                    format,
                     rps,
                     timeout,
                     max_retries,
@@ -266,13 +284,18 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 id,
                 json,
             } => {
+                let format = match (args.format, json) {
+                    (Some(fmt), _) => fmt,
+                    (None, true) => cli::OutputFormat::Json,
+                    (None, false) => cli::OutputFormat::Table,
+                };
                 cmd_cache_warm(
                     &wasm,
                     &network,
                     rpc_url.as_deref(),
                     fallback,
                     id.as_deref(),
-                    json,
+                    format,
                     rps,
                     timeout,
                     max_retries,
@@ -302,6 +325,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 to.as_deref(),
                 json,
             ),
+            cli::CacheAction::Stats { json } => cmd_cache_stats(json),
         },
         cli::Command::Watch {
             network,
@@ -321,7 +345,18 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             )
             .await
         }
+        cli::Command::Completions { shell } => {
+            cmd_completions(shell);
+            Ok(())
+        }
     }
+}
+
+/// `completions` command: generate shell completion script to stdout.
+fn cmd_completions(shell: clap_complete::Shell) {
+    let mut cmd = cli::Cli::command();
+    let bin_name = cmd.get_name().to_string();
+    clap_complete::generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
 }
 
 /// True when a simulation response carried neither cost data, nor
@@ -1552,16 +1587,36 @@ async fn estimate_all_function(
 ///
 /// # Network calls
 /// None — pure file I/O + parsing.
-fn cmd_wasm_info(wasm_path: &str, json_flag: bool) -> error::AppResult<()> {
+fn cmd_wasm_info(wasm_path: &str, format: cli::OutputFormat) -> error::AppResult<()> {
     use sha2::Digest;
 
     let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
     let hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
 
-    if json_flag {
+    if format == cli::OutputFormat::Json {
         println!(
             "{}",
             serde_json::to_string_pretty(&wasm_info_json(wasm_path, &wasm_info, &hash))?
+        );
+        return Ok(());
+    }
+    if format == cli::OutputFormat::Csv {
+        println!("path,size,sha256,has_spec,function_count");
+        println!(
+            "{wasm_path},{},{},{},{}",
+            wasm_info.bytes.len(),
+            hash,
+            wasm_info.has_spec,
+            wasm_info.functions.len()
+        );
+        return Ok(());
+    }
+    if format == cli::OutputFormat::Markdown {
+        println!(
+            "# WASM Info\n\n| Field | Value |\n| --- | --- |\n| Path | `{wasm_path}` |\n| Size | {} bytes |\n| SHA-256 | `{hash}` |\n| Contract spec | {} |\n| Functions | {} |",
+            wasm_info.bytes.len(),
+            wasm_info.has_spec,
+            wasm_info.functions.len()
         );
         return Ok(());
     }
@@ -1702,7 +1757,7 @@ async fn cmd_config_snapshot(
     network: &str,
     rpc_fallback_url: Option<&str>,
     out_path: Option<&str>,
-    json_flag: bool,
+    format: cli::OutputFormat,
     rps: Option<u64>,
     timeout: u64,
     max_retries: usize,
@@ -1729,8 +1784,17 @@ async fn cmd_config_snapshot(
         let path = config_snapshot::store::save_snapshot(&snapshot, out_path)?;
         info!(path = %path.display(), ledger = snapshot.ledger, "snapshot saved");
 
-        if json_flag {
+        if format == cli::OutputFormat::Json {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            return Ok(());
+        }
+        if format == cli::OutputFormat::Csv {
+            println!("network,ledger,timestamp,path");
+            println!("{},{},{},{}", snapshot.network, snapshot.ledger, snapshot.timestamp, path.display());
+            return Ok(());
+        }
+        if format == cli::OutputFormat::Markdown {
+            println!("# Config Snapshot\n\n| Field | Value |\n| --- | --- |\n| Network | {} |\n| Ledger | {} |\n| Timestamp | {} |\n| Path | `{}` |", snapshot.network, snapshot.ledger, snapshot.timestamp, path.display());
             return Ok(());
         }
         println!("Config snapshot saved to: {}", path.display());
@@ -2170,11 +2234,16 @@ async fn cmd_watch(
 /// None — pure SQLite I/O.
 #[allow(dead_code)] // wired once the `config cache stats` subcommand (#41) lands
 #[allow(dead_code)]
-fn cmd_cache_stats() -> error::AppResult<()> {
+fn cmd_cache_stats(json: bool) -> error::AppResult<()> {
     let stats = cache::cache_stats()?;
 
+    if json {
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+        return Ok(());
+    }
+
     if stats.total_entries == 0 {
-        println!("Cache is empty — no cached estimates.");
+        println!("Cache is empty (0 entries, 0 bytes)");
         return Ok(());
     }
 
@@ -2375,14 +2444,17 @@ async fn cmd_cache_warm(
     rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     contract_id: Option<&str>,
-    json_flag: bool,
+    format: cli::OutputFormat,
     rps: Option<u64>,
     timeout: u64,
     max_retries: usize,
     extra_headers: &[String],
     verbose: bool,
 ) -> error::AppResult<()> {
-    let fmt = if json_flag { "json" } else { "table" };
+    let fmt = match format {
+        cli::OutputFormat::Json => "json",
+        _ => "table",
+    };
     cmd_estimate_all(
         wasm_path,
         network,
