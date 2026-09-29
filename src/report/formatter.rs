@@ -31,6 +31,95 @@ pub trait ReportFormatter {
 /// This is the default output format used by the CLI.
 pub struct TableFormatter;
 
+/// Builds the per-resource consumption table, honouring the TTY-aware
+/// colorization decision.
+fn resource_table(report: &CostReport) -> String {
+    let mut table = comfy_table::Table::new();
+    if crate::cli::should_colorize() {
+        table.enforce_styling();
+    } else {
+        table.force_no_tty();
+    }
+    table.set_header(vec!["Resource", "Consumed", "Fee (stroops)"]);
+
+    table.add_row(vec![
+        "CPU Instructions",
+        &report.cpu_instructions.to_string(),
+        "",
+    ]);
+    table.add_row(vec!["Memory Bytes", &report.memory_bytes.to_string(), ""]);
+    table.add_row(vec!["Read Entries", &report.read_entries.to_string(), ""]);
+    table.add_row(vec!["Write Entries", &report.write_entries.to_string(), ""]);
+    table.add_row(vec!["Read Bytes", &report.read_bytes.to_string(), ""]);
+    table.add_row(vec!["Write Bytes", &report.write_bytes.to_string(), ""]);
+    table.add_row(vec!["Transaction Size", &report.tx_size.to_string(), ""]);
+
+    table.to_string()
+}
+
+/// Builds the "Fee Breakdown" table, pairing each fee component with its
+/// share of the total.
+fn fee_table(report: &CostReport) -> String {
+    let pct = &report.fee.fee_percentages;
+    let mut fee_table = comfy_table::Table::new();
+    fee_table.set_header(vec!["Component", "Fee"]);
+    fee_table.add_row(vec![
+        "CPU Instructions",
+        &format!(
+            "{} stroops ({})",
+            report.fee.cpu_fee_stroops,
+            pct.get("cpu_instructions")
+                .map(String::as_str)
+                .unwrap_or("")
+        ),
+    ]);
+    fee_table.add_row(vec![
+        "Storage I/O",
+        &format!(
+            "{} stroops ({})",
+            report.fee.storage_fee_stroops,
+            pct.get("storage_read_write")
+                .map(String::as_str)
+                .unwrap_or("")
+        ),
+    ]);
+    fee_table.add_row(vec![
+        "Transaction Size",
+        &format!(
+            "{} stroops ({})",
+            report.fee.bandwidth_fee_stroops,
+            pct.get("transaction_size")
+                .map(String::as_str)
+                .unwrap_or("")
+        ),
+    ]);
+    fee_table.add_row(vec![
+        "Base Fee",
+        &format!(
+            "{} stroops ({})",
+            report.fee.base_fee_stroops,
+            pct.get("base_fee").map(String::as_str).unwrap_or("")
+        ),
+    ]);
+    fee_table.add_row(vec![
+        "Rent Fee",
+        &format!(
+            "{} stroops ({})",
+            report.fee.refundable_stroops,
+            pct.get("rent").map(String::as_str).unwrap_or("")
+        ),
+    ]);
+    fee_table.add_row(vec![
+        "Total",
+        &format!(
+            "{} stroops ({})",
+            report.fee.total_stroops, report.fee.total_xlm
+        ),
+    ]);
+
+    fee_table.to_string()
+}
+
 impl TableFormatter {
     /// Format a report as a human-readable table, choosing whether to append
     /// the fee-distribution bar chart.
@@ -57,88 +146,11 @@ impl TableFormatter {
         output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
         output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
 
-        let mut table = comfy_table::Table::new();
-        if crate::cli::should_colorize() {
-            table.enforce_styling();
-        } else {
-            table.force_no_tty();
-        }
-        table.set_header(vec!["Resource", "Consumed", "Fee (stroops)"]);
-
-        table.add_row(vec![
-            "CPU Instructions",
-            &report.cpu_instructions.to_string(),
-            "",
-        ]);
-        table.add_row(vec!["Memory Bytes", &report.memory_bytes.to_string(), ""]);
-        table.add_row(vec!["Read Entries", &report.read_entries.to_string(), ""]);
-        table.add_row(vec!["Write Entries", &report.write_entries.to_string(), ""]);
-        table.add_row(vec!["Read Bytes", &report.read_bytes.to_string(), ""]);
-        table.add_row(vec!["Write Bytes", &report.write_bytes.to_string(), ""]);
-        table.add_row(vec!["Transaction Size", &report.tx_size.to_string(), ""]);
-
-        output.push_str(&table.to_string());
+        output.push_str(&resource_table(report));
         output.push('\n');
 
         output.push_str("\nFee Breakdown:\n\n");
-        let pct = &report.fee.fee_percentages;
-        let mut fee_table = comfy_table::Table::new();
-        fee_table.set_header(vec!["Component", "Fee"]);
-        fee_table.add_row(vec![
-            "CPU Instructions",
-            &format!(
-                "{} stroops ({})",
-                report.fee.cpu_fee_stroops,
-                pct.get("cpu_instructions")
-                    .map(String::as_str)
-                    .unwrap_or("")
-            ),
-        ]);
-        fee_table.add_row(vec![
-            "Storage I/O",
-            &format!(
-                "{} stroops ({})",
-                report.fee.storage_fee_stroops,
-                pct.get("storage_read_write")
-                    .map(String::as_str)
-                    .unwrap_or("")
-            ),
-        ]);
-        fee_table.add_row(vec![
-            "Transaction Size",
-            &format!(
-                "{} stroops ({})",
-                report.fee.bandwidth_fee_stroops,
-                pct.get("transaction_size")
-                    .map(String::as_str)
-                    .unwrap_or("")
-            ),
-        ]);
-        fee_table.add_row(vec![
-            "Base Fee",
-            &format!(
-                "{} stroops ({})",
-                report.fee.base_fee_stroops,
-                pct.get("base_fee").map(String::as_str).unwrap_or("")
-            ),
-        ]);
-        fee_table.add_row(vec![
-            "Rent Fee",
-            &format!(
-                "{} stroops ({})",
-                report.fee.refundable_stroops,
-                pct.get("rent").map(String::as_str).unwrap_or("")
-            ),
-        ]);
-        fee_table.add_row(vec![
-            "Total",
-            &format!(
-                "{} stroops ({})",
-                report.fee.total_stroops, report.fee.total_xlm
-            ),
-        ]);
-
-        output.push_str(&fee_table.to_string());
+        output.push_str(&fee_table(report));
         output.push('\n');
 
         // The fee bar chart is a human-only visual; the CLI omits it for
@@ -880,6 +892,7 @@ mod tests {
     #[test]
     fn test_table_formatter_renders_history() {
         let mut report = sample_report();
+        const PREVIOUS_TOTAL_STROOPS: i64 = 20_000;
         report.history = Some(crate::report::cost_report::build_history_entries(
             report.fee.total_stroops,
             7,
@@ -887,12 +900,17 @@ mod tests {
                 timestamp: "2026-01-01T00:00:00Z".to_string(),
                 ledger: 100,
                 cpu_instructions: 1_000,
-                total_stroops: 20_000,
+                total_stroops: PREVIOUS_TOTAL_STROOPS,
             }],
         ));
         let output = TableFormatter.format(&report);
         assert!(output.contains("Cost history (previous runs, newest first):"));
-        assert!(output.contains("+4573"));
+        // The previous run cost more than the current one, so it renders as a
+        // regression with an explicit `+` prefix. Derive the expected value
+        // from the fixture so changing `sample_report`'s fee does not break it.
+        let delta = PREVIOUS_TOTAL_STROOPS - report.fee.total_stroops;
+        assert!(delta > 0, "fixture must be a regression");
+        assert!(output.contains(&format!("+{delta}")));
     }
 
     #[test]

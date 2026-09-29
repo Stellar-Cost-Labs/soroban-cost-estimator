@@ -248,6 +248,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 &contract_args,
                 cache_ttl.as_deref(),
                 clear_cache,
+                history,
                 format.as_str(),
                 rps,
                 timeout,
@@ -604,7 +605,8 @@ async fn fetch_network_config(
         rpc::config::ConfigSettingId::ContractBandwidthV0,
     ] {
         if let Ok(raw) = rpc::config::fetch_config_setting(client, setting).await {
-            if let Ok(entry) = xdr_helper::decode_config_entry_xdr(&raw.config_xdr) {
+            if let Ok(entry) = xdr_helper::decode_config_entry_xdr(&raw.config_xdr, client.verbose)
+            {
                 xdr_helper::apply_config_entry(&mut snapshot, entry);
             }
         }
@@ -2810,8 +2812,10 @@ mod tests {
                     cpu_fee_stroops: 1,
                     storage_fee_stroops: 0,
                     bandwidth_fee_stroops: 0,
+                    base_fee_stroops: 0,
                     total_stroops: 3,
                     total_xlm: "0.0000003".to_string(),
+                    fee_percentages: std::collections::BTreeMap::new(),
                 }),
                 warnings: Vec::new(),
             },
