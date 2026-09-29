@@ -172,6 +172,8 @@ const fn output_format_name(format: cli::OutputFormat) -> &'static str {
 async fn main() {
     let args = cli::Cli::parse();
 
+    cli::init_color(args.color);
+
     let default_level = if args.verbose { "debug" } else { "info" };
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -663,6 +665,9 @@ async fn cmd_estimate(
         let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
         debug!(functions = wasm_info.functions.len(), has_spec = wasm_info.has_spec, "WASM loaded");
         emit_wasm_structure(&wasm_info, verbose, wasm_info_flag, json_flag);
+
+        // Validate WASM memory and table constraints against network limits (defaults: 64KB max size, 2048 pages)
+        wasm_info.validate_wasm_limits(65536, 2048)?;
 
         let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
         let function_name = fn_name.unwrap_or("(wasm upload)");
@@ -1511,7 +1516,12 @@ async fn cmd_config_diff(
         } else {
             println!(
                 "{}",
-                config_snapshot::diff::format_diff(&diff, pricing_only, threshold_percent)
+                config_snapshot::diff::format_diff(
+                    &diff,
+                    cli::should_colorize(),
+                    pricing_only,
+                    threshold_percent
+                )
             );
         }
 
@@ -1745,7 +1755,12 @@ async fn watch_poll_once(
                         debug!(change_count = diff.changes.len(), "config changes detected");
                         println!(
                             "{}",
-                            config_snapshot::diff::format_diff(&diff, false, threshold_percent)
+                            config_snapshot::diff::format_diff(
+                                &diff,
+                                cli::should_colorize(),
+                                false,
+                                threshold_percent
+                            )
                         );
                     }
 
@@ -1977,6 +1992,11 @@ fn cmd_cache_query(
     }
 
     let mut table = Table::new();
+    if crate::cli::should_colorize() {
+        table.enforce_styling();
+    } else {
+        table.force_no_tty();
+    }
     table.set_header(vec![
         "Function",
         "Network",
