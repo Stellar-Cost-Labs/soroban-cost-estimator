@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `estimate --history` — compare the current run against up to 5 previous
+  cached runs of the same contract function, rendered as a trend table
+  (regressions in red, improvements in green) with a `history` array in
+  `--json` output (#321).
+- Resource-limit warnings — `estimate` and `estimate-all` now warn when CPU
+  instructions, ledger read/write entries or bytes, or transaction size reach
+  80% of the network's protocol limits, with a `warnings` array in JSON output
+  (#322).
+- `estimate-all --format csv` — RFC 4180-compliant CSV export with one row per
+  function (`Function,Status,CPU_Instructions,...`, #324).
+- `estimate-all --format markdown` — GitHub-flavored Markdown summary table,
+  fee statistics, and collapsible per-function detail sections for CI PR
+  comments (#325).
 - `--timeout` global flag — configurable HTTP request timeout for RPC calls
   in seconds (default 30).
 - `config diff --summary` — print a single-line summary
