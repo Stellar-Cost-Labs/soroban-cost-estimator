@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d36ae88b96242f604edbf962772c19e27e1c44efadae821224062f956784f738 # shrinks to total_resource_fee = 1, quantities = (0, 0, 0, 0, 0), rates = FeeRates { fee_per_10k_insns: 0, fee_per_read_entry: 0, fee_per_write_entry: 0, fee_per_read_1kb: 0, fee_per_1kb: 0 }
+cc 12ee99f617644cd6c9ca971c77fead125b42d8743aff5b4e958807e32070e08a # shrinks to total_resource_fee = 1, quantities = (0, 0, 0, 0, 0), rates = FeeRates { fee_per_10k_insns: 0, fee_per_read_entry: 0, fee_per_write_entry: 0, fee_per_read_1kb: 0, fee_per_1kb: 0 }
