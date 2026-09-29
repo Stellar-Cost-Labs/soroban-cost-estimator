@@ -124,8 +124,6 @@ pub struct RpcClient {
     max_retries: usize,
     /// Custom HTTP headers attached to every outbound request.
     pub headers: HeaderMap,
-    #[allow(dead_code)]
-    headers: HeaderMap,
     /// Whether to print verbose RPC request/response diagnostics to stderr.
     pub verbose: bool,
 }
