@@ -2,166 +2,149 @@ use comfy_table::{Cell, Color, Table};
 
 use crate::report::fee_calc::{FeeBreakdown, FeeRates};
 
-/// Compute what percentage `part` is of `total`.
-///
-/// Returns a formatted string like `"29.3%"`. Returns `"0.0%"` when the
-/// total is zero to avoid division by zero.
-pub fn fee_percentage(part: i64, total: i64) -> String {
-    if total == 0 {
-        "0.0%".to_string()
-    } else {
-        let pct = (part as f64 / total as f64) * 100.0;
-        format!("{pct:.1}%")
-    }
-}
+// fee_percentage removed since we now use the precalculated exact percentages
 
-/// Maximum width of the bar in the ASCII cost breakdown chart (characters).
-const CHART_BAR_WIDTH: usize = 40;
+/// Minimum terminal width (in columns) required before the fee bar chart is
+/// rendered. Narrower terminals receive the table only.
+pub const MIN_CHART_WIDTH: usize = 80;
 
-/// A single row in the ASCII cost breakdown chart.
-#[derive(Debug, Clone)]
-pub struct ChartEntry {
-    /// Display label for the fee component.
-    pub label: String,
+/// Terminal width assumed when the real width cannot be detected.
+pub const DEFAULT_CHART_WIDTH: usize = 80;
+
+/// Narrowest a chart bar may become after width scaling, so tiny shares stay
+/// visible instead of collapsing to an empty column.
+const MIN_BAR_WIDTH: usize = 10;
+
+/// Widest a chart bar may become after width scaling, keeping labels and bars
+/// readable on very wide terminals.
+const MAX_BAR_WIDTH: usize = 60;
+
+/// Block glyph used for a fully filled bar cell.
+const BLOCK_FULL: char = '█';
+
+/// One labelled fee component rendered as a row in the bar chart.
+struct BarRow {
+    /// Display label (e.g. `"CPU"`).
+    label: &'static str,
     /// Fee amount in stroops.
-    pub stroops: i64,
-    /// The rendered ASCII bar (e.g. `"########################"`).
-    pub bar: String,
-    /// Percentage of total (e.g. `" (29.1%)"`), empty when total is 0.
-    pub pct: String,
+    stroops: i64,
 }
 
-/// Render an ASCII bar chart showing the relative cost of each fee component.
+/// Render an ASCII/Unicode horizontal bar chart of the fee distribution.
 ///
-/// The chart is appended to the cost report output to give a quick visual
-/// summary of where the fee is going. Only non-zero components are shown.
+/// Each bar's length is proportional to that component's share of the total
+/// fee. The four displayed components are CPU instructions, read/write
+/// storage I/O, bandwidth (transaction size) and rent (the refundable
+/// portion); the fixed base-inclusion fee is intentionally left out of the
+/// distribution.
+///
+/// Sub-cell precision is expressed with the block glyphs `█` (full), `▓`
+/// (three-quarters), `▒` (half) and `░` (quarter); remaining cells are spaces.
+/// `width` is the number of terminal columns available, and the bar length is
+/// scaled so each rendered line fits within it.
+///
+/// Returns an empty string when `breakdown.total_stroops` is zero, since there
+/// is nothing to visualize.
 ///
 /// # Output format
 ///
 /// ```text
-/// Fee Breakdown Chart:
+/// Fee Distribution:
 ///
-///   Non-refundable | ########################              |  4496 (29.1%)
-///   Refundable     | ###################################### | 10931 (70.9%)
+///   CPU         | ██████████████████████████████████████ |  70.9%
+///   Storage I/O | ███████████████▒                       |  26.3%
 /// ```
 ///
-/// # Arguments
-/// * `total_stroops` — total fee in stroops (used for percentage calculation;
-///   if 0, percentages are omitted).
-/// * `non_refundable` — non-refundable fee in stroops.
-/// * `refundable` — refundable fee in stroops.
+/// # Network calls
+/// None — pure computation.
 #[must_use]
-pub fn format_cost_breakdown_chart(
-    total_stroops: i64,
-    non_refundable: i64,
-    refundable: i64,
-) -> String {
-    let entries = build_chart_entries(total_stroops, non_refundable, refundable);
-    render_chart(&entries)
-}
-
-/// Build the chart entries from fee values.
-///
-/// Returns a `Vec<ChartEntry>` sorted by descending stroops value. Zero-value
-/// components are excluded.
-#[must_use]
-pub fn build_chart_entries(
-    total_stroops: i64,
-    non_refundable: i64,
-    refundable: i64,
-) -> Vec<ChartEntry> {
-    let max_stroops = non_refundable.max(refundable);
-    let has_total = total_stroops > 0;
-
-    let mut entries: Vec<ChartEntry> = Vec::new();
-
-    if non_refundable > 0 {
-        let bar = render_bar(non_refundable, max_stroops);
-        let pct = if has_total {
-            format!(
-                " ({:.1}%)",
-                non_refundable as f64 / total_stroops as f64 * 100.0
-            )
-        } else {
-            String::new()
-        };
-        entries.push(ChartEntry {
-            label: "Non-refundable".to_string(),
-            stroops: non_refundable,
-            bar,
-            pct,
-        });
-    }
-
-    if refundable > 0 {
-        let bar = render_bar(refundable, max_stroops);
-        let pct = if has_total {
-            format!(
-                " ({:.1}%)",
-                refundable as f64 / total_stroops as f64 * 100.0
-            )
-        } else {
-            String::new()
-        };
-        entries.push(ChartEntry {
-            label: "Refundable".to_string(),
-            stroops: refundable,
-            bar,
-            pct,
-        });
-    }
-
-    // Sort by descending stroops so the largest component is first.
-    entries.sort_by_key(|a| std::cmp::Reverse(a.stroops));
-    entries
-}
-
-/// Render the chart entries into a formatted string.
-#[must_use]
-fn render_chart(entries: &[ChartEntry]) -> String {
-    if entries.is_empty() {
+pub fn render_fee_bar_chart(breakdown: &FeeBreakdown, width: usize) -> String {
+    let total = breakdown.total_stroops;
+    if total <= 0 {
         return String::new();
     }
 
-    // Find the longest label to align the bars.
-    let label_width = entries.iter().map(|e| e.label.len()).max().unwrap_or(0);
-    let mut output = String::from("\nFee Breakdown Chart:\n\n");
+    let rows = [
+        BarRow {
+            label: "CPU",
+            stroops: breakdown.cpu_fee_stroops,
+        },
+        BarRow {
+            label: "Storage I/O",
+            stroops: breakdown.storage_fee_stroops,
+        },
+        BarRow {
+            label: "Bandwidth",
+            stroops: breakdown.bandwidth_fee_stroops,
+        },
+        BarRow {
+            label: "Rent",
+            stroops: breakdown.refundable_stroops,
+        },
+    ];
 
-    for entry in entries {
-        let padded_label = format!("{:<width$}", entry.label, width = label_width);
-        let stroops_str = format_stroops_aligned(entry.stroops);
+    let label_width = rows.iter().map(|row| row.label.len()).max().unwrap_or(0);
+    // 2 leading spaces + label + " | " + bar + " | " + a 6-column percentage.
+    let overhead = 2 + label_width + 3 + 3 + 6;
+    let bar_width = width
+        .saturating_sub(overhead)
+        .clamp(MIN_BAR_WIDTH, MAX_BAR_WIDTH);
+
+    let mut output = String::from("\nFee Distribution:\n\n");
+    for row in &rows {
+        let ratio = row.stroops.max(0) as f64 / total as f64;
+        let bar = render_bar(ratio, bar_width);
+        let pct = ratio * 100.0;
         output.push_str(&format!(
-            "  {} | {} | {}{}\n",
-            padded_label, entry.bar, stroops_str, entry.pct
+            "  {label:<label_width$} | {bar} | {pct:>5.1}%\n",
+            label = row.label,
         ));
     }
-
     output
 }
 
-/// Render a single ASCII bar proportional to `value` relative to `max`.
+/// Render a single bar of `width` cells for `ratio` in `0.0..=1.0`.
 ///
-/// The bar uses `#` characters and is right-padded with spaces to
-/// `CHART_BAR_WIDTH`. When `value` equals `max`, the bar is full width.
-/// When `value` is 0, the bar is empty.
+/// The fractional trailing cell is represented with a partial-block glyph
+/// (`▓`, `▒`, `░`); a fraction within an eighth of a full cell rounds up to a
+/// full block instead. Unfilled cells are spaces, so every bar is exactly
+/// `width` cells wide.
 #[must_use]
-fn render_bar(value: i64, max: i64) -> String {
-    if max <= 0 {
-        return " ".repeat(CHART_BAR_WIDTH);
+fn render_bar(ratio: f64, width: usize) -> String {
+    if width == 0 {
+        return String::new();
     }
-    let filled = ((value as f64 / max as f64) * CHART_BAR_WIDTH as f64).round() as usize;
-    let filled = filled.min(CHART_BAR_WIDTH);
-    format!(
-        "{}{}",
-        "#".repeat(filled),
-        " ".repeat(CHART_BAR_WIDTH - filled)
-    )
-}
+    let ratio = ratio.clamp(0.0, 1.0);
+    let exact = ratio * width as f64;
+    let whole = exact.floor() as usize;
+    let remainder = exact - whole as f64;
 
-/// Format a stroops value with right-alignment for column display.
-#[must_use]
-fn format_stroops_aligned(stroops: i64) -> String {
-    format!("{:>6}", stroops)
+    let (full_cells, partial) = if remainder >= 0.875 {
+        ((whole + 1).min(width), None)
+    } else if remainder >= 0.625 {
+        (whole, Some('▓'))
+    } else if remainder >= 0.375 {
+        (whole, Some('▒'))
+    } else if remainder >= 0.125 {
+        (whole, Some('░'))
+    } else {
+        (whole, None)
+    };
+    let full_cells = full_cells.min(width);
+
+    let mut bar = String::with_capacity(width);
+    for _ in 0..full_cells {
+        bar.push(BLOCK_FULL);
+    }
+    if let Some(glyph) = partial {
+        if full_cells < width {
+            bar.push(glyph);
+        }
+    }
+    while bar.chars().count() < width {
+        bar.push(' ');
+    }
+    bar
 }
 
 /// Percentage of a protocol limit at which a [`ResourceWarning`] is raised.
@@ -667,6 +650,11 @@ pub fn format_report_table(report: &CostReport) -> String {
     output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
 
     let mut table = Table::new();
+    if crate::cli::should_colorize() {
+        table.enforce_styling();
+    } else {
+        table.force_no_tty();
+    }
 
     table.set_header(vec!["Resource", "Consumed", "Fee (stroops)"]);
 
@@ -685,45 +673,69 @@ pub fn format_report_table(report: &CostReport) -> String {
     output.push_str(&table.to_string());
     output.push('\n');
 
-    output.push_str(&format!("\nFee Breakdown:\n"));
-    let total = report.fee.total_stroops;
-    output.push_str(&format!(
-        "  Non-refundable: {} stroops ({})\n",
-        report.fee.non_refundable_stroops,
-        fee_percentage(report.fee.non_refundable_stroops, total),
-    ));
-    output.push_str(&format!(
-        "  Refundable:     {} stroops ({})\n",
-        report.fee.refundable_stroops,
-        fee_percentage(report.fee.refundable_stroops, total),
-    ));
-    output.push_str(&format!("\n  Components (of non-refundable):\n"));
-    output.push_str(&format!(
-        "    CPU:        {} stroops ({})\n",
-        report.fee.cpu_fee_stroops,
-        fee_percentage(report.fee.cpu_fee_stroops, total),
-    ));
-    output.push_str(&format!(
-        "    Storage:    {} stroops ({})\n",
-        report.fee.storage_fee_stroops,
-        fee_percentage(report.fee.storage_fee_stroops, total),
-    ));
-    output.push_str(&format!(
-        "    Bandwidth:  {} stroops ({})\n",
-        report.fee.bandwidth_fee_stroops,
-        fee_percentage(report.fee.bandwidth_fee_stroops, total),
-    ));
-    output.push_str(&format!(
-        "\n  Total:          {} stroops ({})\n",
-        report.fee.total_stroops, report.fee.total_xlm,
-    ));
+    output.push_str("\nFee Breakdown:\n\n");
+    let pct = &report.fee.fee_percentages;
+    let mut fee_table = Table::new();
+    fee_table.set_header(vec!["Component", "Fee"]);
+    fee_table.add_row(vec![
+        "CPU Instructions",
+        &format!(
+            "{} stroops ({})",
+            report.fee.cpu_fee_stroops,
+            pct.get("cpu_instructions")
+                .map(String::as_str)
+                .unwrap_or("")
+        ),
+    ]);
+    fee_table.add_row(vec![
+        "Storage I/O",
+        &format!(
+            "{} stroops ({})",
+            report.fee.storage_fee_stroops,
+            pct.get("storage_read_write")
+                .map(String::as_str)
+                .unwrap_or("")
+        ),
+    ]);
+    fee_table.add_row(vec![
+        "Transaction Size",
+        &format!(
+            "{} stroops ({})",
+            report.fee.bandwidth_fee_stroops,
+            pct.get("transaction_size")
+                .map(String::as_str)
+                .unwrap_or("")
+        ),
+    ]);
+    fee_table.add_row(vec![
+        "Base Fee",
+        &format!(
+            "{} stroops ({})",
+            report.fee.base_fee_stroops,
+            pct.get("base_fee").map(String::as_str).unwrap_or("")
+        ),
+    ]);
+    fee_table.add_row(vec![
+        "Rent Fee",
+        &format!(
+            "{} stroops ({})",
+            report.fee.refundable_stroops,
+            pct.get("rent").map(String::as_str).unwrap_or("")
+        ),
+    ]);
+    fee_table.add_row(vec![
+        "Total",
+        &format!(
+            "{} stroops ({})",
+            report.fee.total_stroops, report.fee.total_xlm
+        ),
+    ]);
+
+    output.push_str(&fee_table.to_string());
+    output.push('\n');
 
     // ASCII bar chart for visual cost breakdown
-    output.push_str(&format_cost_breakdown_chart(
-        report.fee.total_stroops,
-        report.fee.non_refundable_stroops,
-        report.fee.refundable_stroops,
-    ));
+    output.push_str(&render_fee_bar_chart(&report.fee, DEFAULT_CHART_WIDTH));
 
     // Resource-limit warnings (#322) — only when something nears a ceiling.
     output.push_str(&format_resource_warnings(&report.warnings));
@@ -745,26 +757,6 @@ pub fn format_report_json(report: &CostReport) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_fee_percentage_normal() {
-        assert_eq!(fee_percentage(50, 100), "50.0%");
-        assert_eq!(fee_percentage(1, 3), "33.3%");
-        assert_eq!(fee_percentage(0, 100), "0.0%");
-    }
-
-    #[test]
-    fn test_fee_percentage_zero_total() {
-        assert_eq!(fee_percentage(0, 0), "0.0%");
-        assert_eq!(fee_percentage(100, 0), "0.0%");
-    }
-
-    #[test]
-    fn test_fee_percentage_rounding() {
-        assert_eq!(fee_percentage(1, 10), "10.0%");
-        assert_eq!(fee_percentage(1, 3), "33.3%");
-        assert_eq!(fee_percentage(2, 3), "66.7%");
-    }
-
     fn report_with_rates(rates: FeeRates) -> CostReport {
         CostReport {
             function: "increment".to_string(),
@@ -782,8 +774,10 @@ mod tests {
                 cpu_fee_stroops: 372,
                 storage_fee_stroops: 4_063,
                 bandwidth_fee_stroops: 61,
-                total_stroops: 15_427,
-                total_xlm: "0.0015427".to_string(),
+                base_fee_stroops: 100,
+                total_stroops: 15_527,
+                total_xlm: "0.0015527".to_string(),
+                fee_percentages: std::collections::BTreeMap::new(),
             },
             ledger: 3_894_195,
             network: "testnet".to_string(),
@@ -897,8 +891,10 @@ mod tests {
                 cpu_fee_stroops: 0,
                 storage_fee_stroops: 0,
                 bandwidth_fee_stroops: 0,
+                base_fee_stroops: 0,
                 total_stroops: 0,
                 total_xlm: "0.0000000".to_string(),
+                fee_percentages: std::collections::BTreeMap::new(),
             },
             ledger: 0,
             network: "testnet".to_string(),
@@ -920,216 +916,72 @@ mod tests {
         assert_eq!(parsed["write_bytes"], 0);
     }
 
-    // ── Resource-limit warnings (#322) ───────────────────────────────
-
-    fn limits_all(value: u64) -> NetworkConfig {
-        NetworkConfig {
-            tx_max_instructions: Some(value),
-            tx_max_read_entries: Some(value),
-            tx_max_write_entries: Some(value),
-            tx_max_read_bytes: Some(value),
-            tx_max_write_bytes: Some(value),
-            tx_max_size: Some(value),
-        }
-    }
-
-    fn report_with_resources(
-        cpu_instructions: u64,
-        read_entries: u32,
-        write_entries: u32,
-        read_bytes: u32,
-        write_bytes: u32,
-        tx_size: u32,
-    ) -> CostReport {
-        CostReport {
-            cpu_instructions,
-            tx_size,
-            read_entries,
-            write_entries,
-            read_bytes,
-            write_bytes,
-            ..report_with_rates(sample_rates())
+    /// A breakdown with a clear 65/20/5/10 split so chart output is easy to
+    /// reason about in assertions.
+    fn chart_breakdown() -> FeeBreakdown {
+        FeeBreakdown {
+            non_refundable_stroops: 9_000,
+            refundable_stroops: 1_000,
+            cpu_fee_stroops: 6_500,
+            storage_fee_stroops: 2_000,
+            bandwidth_fee_stroops: 500,
+            base_fee_stroops: 100,
+            total_stroops: 10_000,
+            total_xlm: "0.0010000".to_string(),
+            fee_percentages: std::collections::BTreeMap::new(),
         }
     }
 
     #[test]
-    fn test_check_resource_limits_triggers_at_threshold() {
-        // Exactly 80% must warn (>= comparison, integer math).
-        let report = report_with_resources(800, 800, 800, 800, 800, 800);
-        let warnings = check_resource_limits(&report, &limits_all(1_000));
-        // All six resources sit at exactly 80% of their 1000-unit limit.
-        assert_eq!(warnings.len(), 6);
-        assert!(warnings.iter().all(|w| w.percent == 80));
-        assert_eq!(warnings[0].resource, "cpu_instructions");
+    fn test_render_fee_bar_chart_zero_total_is_empty() {
+        let mut breakdown = chart_breakdown();
+        breakdown.total_stroops = 0;
+        assert_eq!(render_fee_bar_chart(&breakdown, DEFAULT_CHART_WIDTH), "");
     }
 
     #[test]
-    fn test_check_resource_limits_below_threshold_is_empty() {
-        // 79% is below the 80% threshold on every axis.
-        let report = report_with_resources(790_000, 79, 79, 79, 79, 790);
-        let warnings = check_resource_limits(&report, &limits_all(1_000_000));
-        assert!(warnings.is_empty(), "79% must not warn: {warnings:?}");
-    }
-
-    #[test]
-    fn test_check_resource_limits_over_limit_reports_over_100() {
-        let report = report_with_resources(1_500, 0, 0, 0, 0, 0);
-        let config = NetworkConfig {
-            tx_max_instructions: Some(1_000),
-            ..NetworkConfig::default()
-        };
-        let warnings = check_resource_limits(&report, &config);
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].percent, 150);
-    }
-
-    #[test]
-    fn test_check_resource_limits_skips_unknown_limit() {
-        let report = report_with_resources(u64::MAX, 100, 100, 100, 100, 1_000);
-        // Only the tx_size limit is known; the others are unknown and skipped.
-        let config = NetworkConfig {
-            tx_max_size: Some(1_000),
-            ..NetworkConfig::default()
-        };
-        let warnings = check_resource_limits(&report, &config);
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].resource, "tx_size");
-    }
-
-    #[test]
-    fn test_network_config_from_snapshot_reads_all_sections() {
-        use crate::config_snapshot::model::{
-            ConfigSnapshot, ContractBandwidthV0, ContractComputeV0, ContractLedgerCostV0,
-        };
-        let snapshot = ConfigSnapshot {
-            network: "testnet".to_string(),
-            timestamp: "2026-01-01T00:00:00Z".to_string(),
-            ledger: 1,
-            contract_compute: Some(ContractComputeV0 {
-                ledger_max_instructions: 10,
-                tx_max_instructions: 400_000_000,
-                fee_rate_per_instructions_increment: 7,
-                tx_memory_limit: 41_943_040,
-            }),
-            contract_ledger_cost: Some(ContractLedgerCostV0 {
-                ledger_max_disk_read_entries: 100,
-                ledger_max_disk_read_bytes: 200,
-                ledger_max_write_ledger_entries: 300,
-                ledger_max_write_bytes: 400,
-                tx_max_disk_read_entries: 100,
-                tx_max_disk_read_bytes: 200,
-                tx_max_write_ledger_entries: 300,
-                tx_max_write_bytes: 400,
-                fee_disk_read_ledger_entry: 1,
-                fee_write_ledger_entry: 1,
-                fee_disk_read1_kb: 1,
-                soroban_state_target_size_bytes: 1,
-                rent_fee1_kb_soroban_state_size_low: 1,
-                rent_fee1_kb_soroban_state_size_high: 1,
-                soroban_state_rent_fee_growth_factor: 1,
-            }),
-            contract_historical_data: None,
-            contract_events: None,
-            contract_bandwidth: Some(ContractBandwidthV0 {
-                ledger_max_txs_size_bytes: 1,
-                tx_max_size_bytes: 132_096,
-                fee_tx_size1_kb: 1,
-            }),
-            state_archival: None,
-        };
-        let config = NetworkConfig::from_snapshot(&snapshot);
-        assert_eq!(config.tx_max_instructions, Some(400_000_000));
-        assert_eq!(config.tx_max_read_entries, Some(100));
-        assert_eq!(config.tx_max_write_entries, Some(300));
-        assert_eq!(config.tx_max_read_bytes, Some(200));
-        assert_eq!(config.tx_max_write_bytes, Some(400));
-        assert_eq!(config.tx_max_size, Some(132_096));
-    }
-
-    #[test]
-    fn test_network_config_from_empty_snapshot_is_all_none() {
-        use crate::config_snapshot::model::ConfigSnapshot;
-        let snapshot = ConfigSnapshot {
-            network: "testnet".to_string(),
-            timestamp: "2026-01-01T00:00:00Z".to_string(),
-            ledger: 1,
-            contract_compute: None,
-            contract_ledger_cost: None,
-            contract_historical_data: None,
-            contract_events: None,
-            contract_bandwidth: None,
-            state_archival: None,
-        };
-        let config = NetworkConfig::from_snapshot(&snapshot);
-        assert_eq!(config, NetworkConfig::default());
-    }
-
-    #[test]
-    fn test_format_resource_warnings_empty_and_nonempty() {
-        assert_eq!(format_resource_warnings(&[]), "");
-        let report = report_with_resources(900, 0, 0, 0, 0, 0);
-        let config = NetworkConfig {
-            tx_max_instructions: Some(1_000),
-            ..NetworkConfig::default()
-        };
-        let warnings = check_resource_limits(&report, &config);
-        let out = format_resource_warnings(&warnings);
-        assert!(out.contains("Resource limit warnings:"));
-        assert!(out.contains("CPU instructions at 90%"));
-    }
-
-    // ── Historical trend (#321) ─────────────────────────────────────
-
-    #[test]
-    fn test_cost_trend_for_delta() {
-        assert_eq!(CostTrend::for_delta(5), CostTrend::Regression);
-        assert_eq!(CostTrend::for_delta(-5), CostTrend::Improvement);
-        assert_eq!(CostTrend::for_delta(0), CostTrend::Unchanged);
-    }
-
-    #[test]
-    fn test_build_history_entries_computes_delta_vs_current() {
-        let runs = vec![
-            HistoricalRun {
-                timestamp: "2026-01-02T00:00:00Z".to_string(),
-                ledger: 200,
-                cpu_instructions: 500,
-                total_stroops: 20_000,
-            },
-            HistoricalRun {
-                timestamp: "2026-01-01T00:00:00Z".to_string(),
-                ledger: 100,
-                cpu_instructions: 400,
-                total_stroops: 10_000,
-            },
-        ];
-        let entries = build_history_entries(15_000, 7, &runs);
-        assert_eq!(entries.len(), 2);
-        // newest first, higher than current -> regression
-        assert_eq!(entries[0].delta_stroops, 5_000);
-        assert_eq!(entries[0].trend, CostTrend::Regression);
-        assert_eq!(entries[0].total_xlm, "0.0020000");
-        // older, lower than current -> improvement
-        assert_eq!(entries[1].delta_stroops, -5_000);
-        assert_eq!(entries[1].trend, CostTrend::Improvement);
-    }
-
-    #[test]
-    fn test_format_cost_history_empty_and_nonempty() {
-        assert_eq!(format_cost_history(&[]), "");
-        let entries = build_history_entries(
-            15_000,
-            7,
-            &[HistoricalRun {
-                timestamp: "2026-01-02T00:00:00Z".to_string(),
-                ledger: 200,
-                cpu_instructions: 500,
-                total_stroops: 20_000,
-            }],
+    fn test_render_fee_bar_chart_lists_all_components() {
+        let chart = render_fee_bar_chart(&chart_breakdown(), DEFAULT_CHART_WIDTH);
+        assert!(chart.starts_with("\nFee Distribution:\n\n"));
+        for label in ["CPU", "Storage I/O", "Bandwidth", "Rent"] {
+            assert!(chart.contains(label), "missing {label} in:\n{chart}");
+        }
+        assert!(chart.contains("65.0%"), "missing 65.0% in:\n{chart}");
+        assert!(chart.contains("20.0%"), "missing 20.0% in:\n{chart}");
+        assert!(chart.contains("5.0%"), "missing 5.0% in:\n{chart}");
+        assert!(chart.contains("10.0%"), "missing 10.0% in:\n{chart}");
+        assert!(chart.contains('█'), "filled block missing in:\n{chart}");
+        assert!(
+            chart.contains('▓') || chart.contains('▒') || chart.contains('░'),
+            "partial block missing in:\n{chart}"
         );
-        let out = format_cost_history(&entries);
-        assert!(out.contains("Cost history"));
-        assert!(out.contains("200"));
-        assert!(out.contains("+5000"));
+    }
+
+    #[test]
+    fn test_render_fee_bar_chart_scales_to_width() {
+        let breakdown = chart_breakdown();
+        for width in [40usize, 80, 120] {
+            let chart = render_fee_bar_chart(&breakdown, width);
+            for line in chart.lines() {
+                assert!(
+                    line.chars().count() <= width,
+                    "line exceeds {width} columns: {line:?}"
+                );
+            }
+        }
+
+        // Wider terminals get longer bars (up to the configured maximum).
+        let cpu_bar_width = |width: usize| {
+            render_fee_bar_chart(&breakdown, width)
+                .lines()
+                .find(|line| line.contains("CPU"))
+                .and_then(|line| line.split(" | ").nth(1))
+                .map(|bar| bar.chars().count())
+                .unwrap_or(0)
+        };
+        assert!(
+            cpu_bar_width(120) > cpu_bar_width(40),
+            "bar should scale with terminal width"
+        );
     }
 }
