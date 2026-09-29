@@ -29,6 +29,20 @@ Options:
   almost certainly fail the "no cost data / no latest ledger" guard; the tool
   prints a note telling you to pass `--id` for real numbers.
 
+## Network cost
+
+The network's config settings (`ConfigSettingContractComputeV0`,
+`ConfigSettingContractLedgerCostV0`, …) are the same for every function in a
+run, so they are fetched **once** — in a single batched `getLedgerEntries`
+call — and reused for every function's fee calculation. Over N functions a run
+costs `N` simulations plus `1` config fetch.
+
+The cache lives only for the duration of the command. It is never written to
+disk, so a later invocation always re-reads the network and reflects any
+pricing change since. See [Caching](../concepts/caching.md).
+
+Table output does not itemize fees, so it skips the config fetch entirely.
+
 ## Example
 
 ```bash

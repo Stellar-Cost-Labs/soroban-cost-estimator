@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- In-memory caching of network config settings for the duration of a single
+  command run (`rpc::config::ConfigCache` / `rpc::config::NetworkConfig`).
+  `estimate-all` now fetches the six `ConfigSetting*` entries once — in one
+  batched `getLedgerEntries` call — and shares them by reference with every
+  function fee evaluation, taking a run over N functions from `2 * N` network
+  round trips down to `N + 1`. The cache is per-run and never persisted, so a
+  later command still re-reads the network and picks up config drift.
 - `--timeout` global flag — configurable HTTP request timeout for RPC calls
   in seconds (default 30).
 - `config diff --summary` — print a single-line summary

@@ -5,6 +5,13 @@ result to a local cache. The cache is what lets `config diff` tell you
 *which* of your past estimates are now stale after a network pricing change —
 without it, a changed rate is just a curiosity.
 
+There are two distinct kinds of caching here, and they are easy to confuse:
+
+- **On-disk estimate cache** — persists between runs, and is the subject of
+  most of this page.
+- **In-memory config cache** — lives only for one command run, and is
+  described in [In-memory config cache](#in-memory-config-cache) below.
+
 ## Where results live
 
 All data lives in your home directory — no database required:
@@ -48,6 +55,36 @@ exactly.
 
 The `ledger` field is the sequence number the simulation ran against — that
 is the key to staleness detection.
+
+## In-memory config cache
+
+Within a single command run, the network's config settings are cached in
+memory. This is not a durability feature — nothing is written to disk, and
+nothing survives the process.
+
+`estimate-all` needs the same `ConfigSettingContract*` entries to price every
+function it evaluates. Fetching them per function would mean repeating the
+same `getLedgerEntries` work N times over. Instead the six settings are fetched
+once, in a single batched call, and shared by reference with every fee
+evaluation in that run:
+
+| Functions evaluated | Config fetches before | Config fetches now |
+|---|---|---|
+| 1 | 1 | 1 |
+| N | N | 1 |
+
+Two consequences worth being explicit about:
+
+- **A fresh command still sees fresh prices.** Because the cache is per-run,
+  re-running the command after a protocol upgrade re-reads the network and
+  picks up the new rates. This is deliberate — a fee estimate that silently
+  reused a stale rate from an earlier run would be misleading, which is the
+  exact problem the on-disk snapshot/diff tooling exists to surface.
+- **A failed fetch is not cached.** A transient RPC error is retried by the
+  next caller rather than pinning the run to a missing config. If the config
+  genuinely cannot be read, the affected rates fall back to 0 and the tool
+  warns on stderr — a silent zero rate would understate the non-refundable
+  fee.
 
 ## The stale-estimate cross-reference
 

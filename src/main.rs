@@ -361,50 +361,71 @@ fn response_resources(
     ))
 }
 
-/// Fetch fee rates from the network config (compute + ledger cost + bandwidth).
+/// Fetch the network config once for this command run and cache it in memory.
+///
+/// Every function a command prices reads the same `ConfigSetting*` entries, so
+/// they are fetched exactly once and reused by reference from there on. The
+/// cache lives only for the duration of the run — a later command re-reads the
+/// network, which is what keeps a fee estimate honest about config drift.
+///
+/// # Network calls
+/// Makes 1 `getLedgerEntries` RPC call (all 6 settings batched) on the first
+/// call for the returned cache; zero on any later call sharing that cache.
+async fn fetch_network_config(client: &rpc::client::RpcClient) -> rpc::config::ConfigCache {
+    let cache = rpc::config::ConfigCache::new();
+    if let Err(e) = cache.get_or_fetch(client).await {
+        // Not fatal: callers fall back to zero rates with a warning, exactly
+        // as they did when each setting was fetched independently.
+        debug!(error = %e, "network config unavailable");
+    }
+    cache
+}
+
+/// Fee rates derived from an already-fetched [`rpc::config::NetworkConfig`].
+///
+/// Pure CPU work — the config settings were fetched once for the whole command
+/// run (see [`fetch_network_config`]), so pricing every function against them
+/// costs no additional network round trips. This is what takes `estimate-all`
+/// from `2 * N` round trips down to `N + 1`.
 ///
 /// Returns a `FeeRates` struct with raw config rates. These are passed to
 /// `compute_fee_breakdown` which does the proper `(units * rate) / scale`
 /// math to preserve precision.
 ///
-/// If any of the three `ConfigSetting*` sources cannot be fetched or
-/// decoded, its rate(s) fall back to 0 and a warning is printed to stderr
-/// — a silent zero rate would understate the non-refundable fee, so it must
-/// never pass unannounced.
-async fn fetch_fee_rates(client: &rpc::client::RpcClient) -> report::fee_calc::FeeRates {
+/// `config` is `None` when the batched fetch failed. Any of the three
+/// `ConfigSetting*` sources that is missing or cannot be decoded falls back to
+/// 0, with a warning printed to stderr — a silent zero rate would understate
+/// the non-refundable fee, so it must never pass unannounced.
+fn fee_rates_from_config(
+    config: Option<&rpc::config::NetworkConfig>,
+    verbose: bool,
+) -> report::fee_calc::FeeRates {
     use tracing::{debug, warn};
+
+    use rpc::config::ConfigSettingId;
 
     let mut degraded: Vec<&'static str> = Vec::new();
 
-    let raw_compute =
-        rpc::config::fetch_config_setting(client, rpc::config::ConfigSettingId::ContractComputeV0)
-            .await;
-
-    let raw_ledger_cost = rpc::config::fetch_config_setting(
-        client,
-        rpc::config::ConfigSettingId::ContractLedgerCostV0,
-    )
-    .await;
-
-    let raw_bandwidth = rpc::config::fetch_config_setting(
-        client,
-        rpc::config::ConfigSettingId::ContractBandwidthV0,
-    )
-    .await;
+    // Decode one config setting, recording it as degraded when the config is
+    // absent, the setting is missing, or its XDR does not decode.
+    let decode = |id: ConfigSettingId| -> Option<stellar_xdr::ConfigSettingEntry> {
+        let raw = config?.get(id).ok()?;
+        match xdr_helper::decode_config_entry_xdr(&raw.config_xdr, verbose) {
+            Ok(entry) => Some(entry),
+            Err(e) => {
+                debug!(setting = id.human_name(), error = %e, "config entry decode failed");
+                None
+            }
+        }
+    };
 
     // ConfigSettingContractComputeV0.fee_rate_per_instructions_increment
     // is stroops per 10,000 instructions (not per instruction).
-    let compute_per_10k = match raw_compute {
-        Ok(raw) => match xdr_helper::decode_config_entry_xdr(&raw.config_xdr, client.verbose) {
-            Ok(stellar_xdr::ConfigSettingEntry::ContractComputeV0(s)) => {
-                s.fee_rate_per_instructions_increment
-            }
-            _ => {
-                degraded.push("ContractComputeV0");
-                0
-            }
-        },
-        Err(_) => {
+    let compute_per_10k = match decode(ConfigSettingId::ContractComputeV0) {
+        Some(stellar_xdr::ConfigSettingEntry::ContractComputeV0(s)) => {
+            s.fee_rate_per_instructions_increment
+        }
+        _ => {
             degraded.push("ContractComputeV0");
             0
         }
@@ -413,19 +434,13 @@ async fn fetch_fee_rates(client: &rpc::client::RpcClient) -> report::fee_calc::F
     // ConfigSettingContractLedgerCostV0: per-entry read/write fees and the
     // per-KB disk read fee — all part of the non-refundable fee in
     // stellar-core's resource fee model.
-    let (read_entry, write_entry, read_1kb) = match raw_ledger_cost {
-        Ok(raw) => match xdr_helper::decode_config_entry_xdr(&raw.config_xdr, client.verbose) {
-            Ok(stellar_xdr::ConfigSettingEntry::ContractLedgerCostV0(s)) => (
-                s.fee_disk_read_ledger_entry,
-                s.fee_write_ledger_entry,
-                s.fee_disk_read1_kb,
-            ),
-            _ => {
-                degraded.push("ContractLedgerCostV0");
-                (0, 0, 0)
-            }
-        },
-        Err(_) => {
+    let (read_entry, write_entry, read_1kb) = match decode(ConfigSettingId::ContractLedgerCostV0) {
+        Some(stellar_xdr::ConfigSettingEntry::ContractLedgerCostV0(s)) => (
+            s.fee_disk_read_ledger_entry,
+            s.fee_write_ledger_entry,
+            s.fee_disk_read1_kb,
+        ),
+        _ => {
             degraded.push("ContractLedgerCostV0");
             (0, 0, 0)
         }
@@ -433,15 +448,9 @@ async fn fetch_fee_rates(client: &rpc::client::RpcClient) -> report::fee_calc::F
 
     // ConfigSettingContractBandwidthV0.fee_tx_size1_kb
     // is stroops per 1KB of tx size (not per byte).
-    let bandwidth_per_kb = match raw_bandwidth {
-        Ok(raw) => match xdr_helper::decode_config_entry_xdr(&raw.config_xdr, client.verbose) {
-            Ok(stellar_xdr::ConfigSettingEntry::ContractBandwidthV0(s)) => s.fee_tx_size1_kb,
-            _ => {
-                degraded.push("ContractBandwidthV0");
-                0
-            }
-        },
-        Err(_) => {
+    let bandwidth_per_kb = match decode(ConfigSettingId::ContractBandwidthV0) {
+        Some(stellar_xdr::ConfigSettingEntry::ContractBandwidthV0(s)) => s.fee_tx_size1_kb,
+        _ => {
             degraded.push("ContractBandwidthV0");
             0
         }
@@ -646,7 +655,10 @@ async fn cmd_estimate(
 
         debug!(cpu_instructions, memory_bytes, latest_ledger, total_fee_stroops, "simulation complete");
 
-        let fee_rates = fetch_fee_rates(&client).await;
+        // One batched config fetch for the whole run, reused by every fee
+        // evaluation below.
+        let config_cache = fetch_network_config(&client).await;
+        let fee_rates = fee_rates_from_config(config_cache.peek(), client.verbose);
 
         let fee = report::fee_calc::compute_fee_breakdown(
             total_fee_stroops,
@@ -812,12 +824,18 @@ async fn cmd_estimate_all(
         client.health_check().await?;
 
         // Fee rates are only needed to itemize the per-function fee breakdown
-        // in JSON output; skip the extra RPC calls in table mode.
-        let fee_rates = if json_flag {
-            Some(fetch_fee_rates(&client).await)
+        // in JSON output; skip the extra RPC call in table mode. Either way
+        // they are fetched once, before the loop, and shared by reference with
+        // every function evaluation — an `estimate-all` over N functions used
+        // to cost 2 * N round trips and now costs N + 1.
+        let config_cache = if json_flag {
+            Some(fetch_network_config(&client).await)
         } else {
             None
         };
+        let fee_rates = config_cache
+            .as_ref()
+            .map(|cache| fee_rates_from_config(cache.peek(), verbose));
 
         let mut csv_rows: Vec<String> = Vec::new();
 

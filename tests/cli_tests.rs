@@ -13,6 +13,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use sha2::Digest;
 use soroban_cost_estimator::cache;
@@ -1614,6 +1615,342 @@ fn test_estimate_fn_contract_fixture_populates_footprint_table() {
     assert!(
         stdout.contains("15527"),
         "table should display total fee 15527"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Config-setting cache tests (Issue #302)
+//
+// `estimate-all` needs the same network config settings to price every
+// function it evaluates. These tests pin the in-memory cache: the settings
+// are fetched once per command run and reused for all N functions, so an
+// `estimate-all` costs N simulations + 1 config fetch instead of 2 * N
+// round trips.
+/// Spawns a mock JSON-RPC server that counts requests per method.
+///
+/// Unlike `start_mock_rpc_server`, this one tallies each method separately so a
+/// test can assert how many times config settings were fetched, and it answers
+/// `getLedgerEntries` by echoing the requested keys back so the client can
+/// match entries to config setting IDs the way a real node would.
+#[allow(clippy::too_many_lines)]
+fn start_counting_mock_rpc_server() -> (String, std::sync::mpsc::Sender<()>, Arc<Counts>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+    let addr = listener.local_addr().expect("local addr");
+    let (tx_stop, rx_stop) = std::sync::mpsc::channel::<()>();
+
+    let counts = Arc::new(Counts {
+        get_ledger_entries: AtomicUsize::new(0),
+        simulate_transaction: AtomicUsize::new(0),
+    });
+    let server_counts = Arc::clone(&counts);
+
+    std::thread::spawn(move || {
+        listener.set_nonblocking(true).expect("set nonblocking");
+        loop {
+            if rx_stop.try_recv().is_ok() {
+                break;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buf = [0u8; 8192];
+                    let mut req_str = String::new();
+                    loop {
+                        match stream.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                req_str.push_str(&String::from_utf8_lossy(&buf[..n]));
+                                if req_str.contains("\r\n\r\n") {
+                                    // Read until the announced body length has arrived.
+                                    let cl = req_str
+                                        .split("Content-Length: ")
+                                        .nth(1)
+                                        .and_then(|v| {
+                                            v.split("\r\n")
+                                                .next()
+                                                .and_then(|c| c.trim().parse::<usize>().ok())
+                                        })
+                                        .unwrap_or(0);
+                                    let body_start = req_str.find("\r\n\r\n").unwrap_or(0) + 4;
+                                    if req_str.len() - body_start >= cl {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+
+                    let body = req_str
+                        .split_once("\r\n\r\n")
+                        .map(|(_, b)| b.to_string())
+                        .unwrap_or_default();
+
+                    let resp_body = if req_str.contains("simulateTransaction") {
+                        server_counts
+                            .simulate_transaction
+                            .fetch_add(1, Ordering::SeqCst);
+                        format!(
+                            r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":"3894195","minResourceFee":"15427","transactionData":"{LIVE_INCREMENT_TX_DATA}"}}}}"#
+                        )
+                    } else if req_str.contains("getHealth") {
+                        r#"{"jsonrpc":"2.0","id":1,"result":{"status":"healthy","latestLedger":3894195}}"#
+                            .to_string()
+                    } else if req_str.contains("getLedgerEntries") {
+                        server_counts
+                            .get_ledger_entries
+                            .fetch_add(1, Ordering::SeqCst);
+                        // Echo every requested key back with a dummy payload so
+                        // the client can complete its key→setting-ID matching.
+                        let entries: Vec<String> = serde_json::from_str::<serde_json::Value>(&body)
+                            .ok()
+                            .and_then(|v| v["params"]["keys"].as_array().cloned())
+                            .unwrap_or_default()
+                            .iter()
+                            .filter_map(|k| k.as_str().map(|s| s.to_string()))
+                            .map(|key| {
+                                format!(
+                                    r#"{{"key":"{key}","xdr":"AAAAAAAAAAEAAAAH","lastModifiedLedgerSeq":3894195}}"#
+                                )
+                            })
+                            .collect();
+                        format!(
+                            r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":3894195,"entries":[{}]}}}}"#,
+                            entries.join(",")
+                        )
+                    } else {
+                        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#
+                            .to_string()
+                    };
+
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        resp_body.len(),
+                        resp_body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    (format!("http://127.0.0.1:{}", addr.port()), tx_stop, counts)
+}
+
+/// Per-method request tallies from `start_counting_mock_rpc_server`.
+struct Counts {
+    get_ledger_entries: std::sync::atomic::AtomicUsize,
+    simulate_transaction: std::sync::atomic::AtomicUsize,
+}
+
+/// Writes LEB128-encoded `value` into `wasm`.
+fn write_leb_u32(wasm: &mut Vec<u8>, mut value: u32) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        wasm.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+/// Builds a minimal but valid WASM module exporting `count` zero-argument
+/// functions named `fn_0` … `fn_{count-1}`.
+///
+/// The checked-in fixtures each export a single function, which cannot
+/// distinguish "fetched once" from "fetched once per function". This module
+/// gives the caching tests a real N > 1 to run against.
+///
+/// Each function has a distinct body (`i32.const <i>`) so the resulting
+/// simulation envelopes differ, meaning the client does not collapse them into
+/// one deduplicated request — otherwise the round-trip counts below would be
+/// measuring deduplication rather than the config cache.
+fn multi_function_wasm(count: usize) -> Vec<u8> {
+    let mut wasm = Vec::new();
+
+    // Magic + version 1
+    wasm.extend_from_slice(b"\0asm");
+    wasm.extend_from_slice(&1u32.to_le_bytes());
+
+    // Type section: 1 type, () -> i32
+    wasm.push(0x01);
+    write_leb_u32(&mut wasm, 5);
+    wasm.push(0x01); // one type
+    wasm.push(0x60); // functype
+    wasm.push(0x00); // no params
+    wasm.push(0x01); // one result
+    wasm.push(0x7f); // i32
+
+    // Function section: `count` functions, all of type 0
+    wasm.push(0x03);
+    write_leb_u32(&mut wasm, 1 + count as u32);
+    write_leb_u32(&mut wasm, count as u32);
+    wasm.extend(std::iter::repeat_n(0x00, count));
+
+    // Export section: each function exported as `fn_<i>`
+    let mut exports: Vec<u8> = Vec::new();
+    for i in 0..count {
+        let name = format!("fn_{i}");
+        write_leb_u32(&mut exports, name.len() as u32);
+        exports.extend_from_slice(name.as_bytes());
+        exports.push(0x00); // func kind
+        exports.push(i as u8); // function index
+    }
+    wasm.push(0x07);
+    write_leb_u32(&mut wasm, 1 + exports.len() as u32);
+    write_leb_u32(&mut wasm, count as u32);
+    wasm.extend_from_slice(&exports);
+
+    // Code section: each body is `(0 locals) i32.const <i>; end`
+    let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(count);
+    let mut code_len = 0usize;
+    for i in 0..count {
+        let mut body = Vec::new();
+        body.push(0x00); // locals declaration vector: no locals
+        body.push(0x41); // i32.const
+        write_leb_u32(&mut body, i as u32);
+        body.push(0x0b); // end
+        // Each entry is prefixed with its own LEB128 length.
+        let mut len_bytes = Vec::new();
+        write_leb_u32(&mut len_bytes, body.len() as u32);
+        code_len += len_bytes.len() + body.len();
+        bodies.push(body);
+    }
+    wasm.push(0x0a);
+    // Section payload = function count (LEB) + every length-prefixed body.
+    write_leb_u32(&mut wasm, 1 + code_len as u32);
+    write_leb_u32(&mut wasm, count as u32);
+    for body in &bodies {
+        write_leb_u32(&mut wasm, body.len() as u32);
+        wasm.extend_from_slice(body);
+    }
+
+    wasm
+}
+
+/// Writes a multi-function WASM module to a temp file and returns its path.
+fn write_multi_function_wasm(home: &Path, count: usize) -> PathBuf {
+    let path = home.join("multi_fn.wasm");
+    std::fs::write(&path, multi_function_wasm(count)).expect("write multi-function wasm");
+    path
+}
+
+#[test]
+fn test_estimate_all_fetches_config_settings_exactly_once() {
+    const FUNCTIONS: usize = 4;
+
+    let (rpc_url, _stop, counts) = start_counting_mock_rpc_server();
+    let home = temp_home("estimate-all-config-cache");
+    let wasm = write_multi_function_wasm(&home, FUNCTIONS);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate-all",
+            "--wasm",
+            wasm.to_str().expect("utf-8 path"),
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rpc-url",
+            &rpc_url,
+            "--json",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate-all");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate-all should succeed; stderr: {stderr}"
+    );
+
+    let config_fetches = counts
+        .get_ledger_entries
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let simulations = counts
+        .simulate_transaction
+        .load(std::sync::atomic::Ordering::SeqCst);
+
+    assert_eq!(
+        simulations, FUNCTIONS,
+        "every exported function should be simulated"
+    );
+    assert_eq!(
+        config_fetches, 1,
+        "config settings must be fetched exactly once per command run, not once per function \
+         (got {config_fetches} fetch(es) for {simulations} function(s))"
+    );
+    assert_eq!(
+        config_fetches + simulations,
+        simulations + 1,
+        "an estimate-all run should cost N simulations + 1 config fetch, not 2 * N round trips"
+    );
+
+    // Sanity check that the run really did produce per-function results.
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    let results = parsed.as_array().expect("estimate-all JSON is an array");
+    assert_eq!(results.len(), FUNCTIONS);
+    for result in results {
+        assert_eq!(result["status"], "ok", "function result: {result}");
+    }
+}
+
+#[test]
+fn test_estimate_all_table_mode_skips_config_fetch_entirely() {
+    // Table output does not itemize fees, so it needs no config settings at
+    // all — and must not pay for them.
+    let (rpc_url, _stop, counts) = start_counting_mock_rpc_server();
+    let home = temp_home("estimate-all-no-config");
+    let wasm = write_multi_function_wasm(&home, 3);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate-all",
+            "--wasm",
+            wasm.to_str().expect("utf-8 path"),
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rpc-url",
+            &rpc_url,
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate-all");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate-all should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        counts
+            .get_ledger_entries
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "table mode needs no fee rates, so it should send no getLedgerEntries call"
     );
 }
 
