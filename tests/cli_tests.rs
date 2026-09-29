@@ -479,17 +479,62 @@ fn test_timeout_flag_accepted_before_subcommand() {
 
 #[test]
 fn test_help_lists_global_flags() {
-    // Global flags (--rps, --timeout) must appear in subcommand help.
+    // Global flags (--rps, --timeout, --precision, --quiet) must appear in
+    // subcommand help.
     let (stdout, stderr, code) = run_cli(&["estimate", "--help"]);
     assert_eq!(code, 0, "estimate --help should exit 0; stderr: {stderr}");
+    for flag in ["--timeout", "--rps", "--precision", "--quiet"] {
+        assert!(
+            stdout.contains(flag),
+            "help should list {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_precision_flag_accepted() {
+    // `--precision` is a global flag, so it must parse both before and after
+    // the subcommand; failure here is a missing file, not a bad argument.
+    for args in [
+        vec!["estimate", "--wasm", "test.wasm", "--precision", "2"],
+        vec!["--precision", "4", "estimate", "--wasm", "test.wasm"],
+    ] {
+        let (_, stderr, code) = run_cli(&args);
+        assert_ne!(code, 0, "should error on missing file");
+        assert!(
+            !stderr.contains("unrecognized") && !stderr.contains("invalid value"),
+            "--precision should be a recognized argument; stderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_precision_out_of_range_rejected() {
+    // The flag is documented as 0..=7; clap must reject 8 with a clear error.
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--precision", "8"]);
+    assert_ne!(code, 0, "out-of-range precision should error");
     assert!(
-        stdout.contains("--timeout"),
-        "help should list --timeout; got: {stdout}"
+        stderr.to_lowercase().contains("invalid value")
+            || stderr.contains("not in")
+            || stderr.to_lowercase().contains("range"),
+        "clap should reject precision 8; stderr: {stderr}"
     );
-    assert!(
-        stdout.contains("--rps"),
-        "help should list --rps; got: {stdout}"
-    );
+}
+
+#[test]
+fn test_quiet_flag_accepted() {
+    // `--quiet` / `-q` is a global flag used to suppress the fee bar chart.
+    for args in [
+        vec!["estimate", "--wasm", "test.wasm", "--quiet"],
+        vec!["estimate", "--wasm", "test.wasm", "-q"],
+    ] {
+        let (_, stderr, code) = run_cli(&args);
+        assert_ne!(code, 0, "should error on missing file");
+        assert!(
+            !stderr.contains("unrecognized") && !stderr.contains("unexpected argument"),
+            "--quiet should be a recognized argument; stderr: {stderr}"
+        );
+    }
 }
 
 #[test]
