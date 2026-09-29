@@ -1,6 +1,5 @@
 ---
 source: tests/report_snapshots.rs
-assertion_line: 71
 expression: TableFormatter.format(&empty)
 ---
 Function: (wasm upload)
@@ -28,15 +27,22 @@ WASM size: 0 bytes
 +------------------+----------+---------------+
 
 Fee Breakdown:
-  Non-refundable: 0 stroops (0.0%)
-  Refundable:     0 stroops (0.0%)
 
-  Components (of non-refundable):
-    CPU:        0 stroops (0.0%)
-    Storage:    0 stroops (0.0%)
-    Bandwidth:  0 stroops (0.0%)
-
-  Total:          0 stroops (0.0000000)
++------------------+-----------------------+
+| Component        | Fee                   |
++==========================================+
+| CPU Instructions | 0 stroops ()          |
+|------------------+-----------------------|
+| Storage I/O      | 0 stroops ()          |
+|------------------+-----------------------|
+| Transaction Size | 0 stroops ()          |
+|------------------+-----------------------|
+| Base Fee         | 0 stroops ()          |
+|------------------+-----------------------|
+| Rent Fee         | 0 stroops ()          |
+|------------------+-----------------------|
+| Total            | 0 stroops (0.0000000) |
++------------------+-----------------------+
 
 Optimization Suggestions:
   No cost optimizations identified (fee rates unavailable or no reducible resources).

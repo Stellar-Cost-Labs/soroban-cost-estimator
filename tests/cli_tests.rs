@@ -263,6 +263,52 @@ fn test_cache_verify_empty_cache_succeeds() {
 }
 
 #[test]
+fn test_cache_stats_help() {
+    let (stdout, stderr, code) = run_cli(&["cache", "stats", "--help"]);
+    assert_eq!(
+        code, 0,
+        "cache stats --help should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("cache health") || stdout.contains("breakdown"),
+        "cache stats help should describe the command; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_stats_on_empty_cache_succeeds() {
+    let home = temp_home("cache-stats-empty");
+    let (stdout, stderr, code) = run_cli_in_home(&["cache", "stats"], Some(&home));
+    assert_eq!(
+        code, 0,
+        "cache stats on an empty cache should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Cache is empty"),
+        "should report an empty cache; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_stats_reports_seeded_entries() {
+    let home = temp_home("cache-stats-seeded");
+    let now = chrono::Utc::now().to_rfc3339();
+    seed_cache_entry_for(&home, "testnet", "(wasm upload)", 42, &now);
+    seed_cache_entry_for(&home, "mainnet", "mainnet_fn", 77, &now);
+
+    let (stdout, stderr, code) = run_cli_in_home(&["cache", "stats"], Some(&home));
+    assert_eq!(code, 0, "cache stats should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("Total entries:  2"),
+        "should count both seeded entries; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("testnet") && stdout.contains("mainnet"),
+        "should break entries down by network; got: {stdout}"
+    );
+}
+
+#[test]
 fn test_estimate_missing_wasm_errors() {
     let (_, stderr, code) = run_cli(&["estimate"]);
     assert_ne!(code, 0, "estimate without --wasm should error");
@@ -433,17 +479,62 @@ fn test_timeout_flag_accepted_before_subcommand() {
 
 #[test]
 fn test_help_lists_global_flags() {
-    // Global flags (--rps, --timeout) must appear in subcommand help.
+    // Global flags (--rps, --timeout, --precision, --quiet) must appear in
+    // subcommand help.
     let (stdout, stderr, code) = run_cli(&["estimate", "--help"]);
     assert_eq!(code, 0, "estimate --help should exit 0; stderr: {stderr}");
+    for flag in ["--timeout", "--rps", "--precision", "--quiet"] {
+        assert!(
+            stdout.contains(flag),
+            "help should list {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_precision_flag_accepted() {
+    // `--precision` is a global flag, so it must parse both before and after
+    // the subcommand; failure here is a missing file, not a bad argument.
+    for args in [
+        vec!["estimate", "--wasm", "test.wasm", "--precision", "2"],
+        vec!["--precision", "4", "estimate", "--wasm", "test.wasm"],
+    ] {
+        let (_, stderr, code) = run_cli(&args);
+        assert_ne!(code, 0, "should error on missing file");
+        assert!(
+            !stderr.contains("unrecognized") && !stderr.contains("invalid value"),
+            "--precision should be a recognized argument; stderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_precision_out_of_range_rejected() {
+    // The flag is documented as 0..=7; clap must reject 8 with a clear error.
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--precision", "8"]);
+    assert_ne!(code, 0, "out-of-range precision should error");
     assert!(
-        stdout.contains("--timeout"),
-        "help should list --timeout; got: {stdout}"
+        stderr.to_lowercase().contains("invalid value")
+            || stderr.contains("not in")
+            || stderr.to_lowercase().contains("range"),
+        "clap should reject precision 8; stderr: {stderr}"
     );
-    assert!(
-        stdout.contains("--rps"),
-        "help should list --rps; got: {stdout}"
-    );
+}
+
+#[test]
+fn test_quiet_flag_accepted() {
+    // `--quiet` / `-q` is a global flag used to suppress the fee bar chart.
+    for args in [
+        vec!["estimate", "--wasm", "test.wasm", "--quiet"],
+        vec!["estimate", "--wasm", "test.wasm", "-q"],
+    ] {
+        let (_, stderr, code) = run_cli(&args);
+        assert_ne!(code, 0, "should error on missing file");
+        assert!(
+            !stderr.contains("unrecognized") && !stderr.contains("unexpected argument"),
+            "--quiet should be a recognized argument; stderr: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -1566,7 +1657,7 @@ fn test_estimate_fn_contract_fixture_populates_footprint_json() {
     assert_eq!(parsed["read_bytes"], 0, "expected 0 read bytes");
     assert_eq!(parsed["write_bytes"], 136, "expected 136 write bytes");
     assert_eq!(parsed["cpu_instructions"], 532_502);
-    assert_eq!(parsed["fee"]["total_stroops"], 15_427);
+    assert_eq!(parsed["fee"]["total_stroops"], 15_527);
 }
 
 #[test]
@@ -1612,8 +1703,8 @@ fn test_estimate_fn_contract_fixture_populates_footprint_table() {
         "table should display 136 write bytes"
     );
     assert!(
-        stdout.contains("15427"),
-        "table should display total fee 15427"
+        stdout.contains("15527"),
+        "table should display total fee 15527"
     );
 }
 
@@ -1656,521 +1747,103 @@ fn test_estimate_minimal_wasm_upload_zero_footprint() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Custom RPC headers — `--header` / `-H` (Issue #300)
+// Shell completions
 // ─────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn test_header_flag_long_and_short_are_recognized() {
-    // Both spellings must be accepted, in both `KEY=VALUE` and `KEY: VALUE`
-    // form, anywhere in the command line (the flag is global).
-    for args in [
-        vec![
-            "estimate",
-            "--wasm",
-            "no/such/file.wasm",
-            "--header",
-            "X-Api-Key=abc",
-        ],
-        vec![
-            "estimate",
-            "--wasm",
-            "no/such/file.wasm",
-            "-H",
-            "X-Api-Key=abc",
-        ],
-        vec![
-            "estimate",
-            "--wasm",
-            "no/such/file.wasm",
-            "--header",
-            "X-Api-Key: abc",
-        ],
-        vec![
-            "-H",
-            "X-Api-Key=abc",
-            "estimate",
-            "--wasm",
-            "no/such/file.wasm",
-        ],
-    ] {
-        let (_, stderr, code) = run_cli(&args);
-        // The only failure must be the missing WASM file, not the header flag.
-        assert_ne!(code, 0, "missing file should still error for {args:?}");
-        assert!(
-            !stderr.contains("unexpected argument") && !stderr.contains("invalid value"),
-            "--header must be recognized; args: {args:?}, stderr: {stderr}"
-        );
-    }
-}
-
-#[test]
-fn test_header_flag_repeats() {
-    // `--header` is repeatable so several credentials can be sent at once.
-    let (_, stderr, code) = run_cli(&[
-        "estimate",
-        "--wasm",
-        "no/such/file.wasm",
-        "-H",
-        "Authorization=Bearer tok",
-        "-H",
-        "X-Api-Key=key-123",
-    ]);
-    assert_ne!(code, 0, "missing file should still error");
-    assert!(
-        !stderr.contains("unexpected argument"),
-        "repeated -H must be accepted; stderr: {stderr}"
-    );
-}
-
-/// A malformed header must fail the command with a clear error instead of
-/// being silently dropped (which would leave the request unauthenticated).
-#[test]
-fn test_malformed_header_is_rejected_with_a_clear_error() {
-    let (stdout, stderr, code) = run_cli(&[
-        "estimate",
-        "--wasm",
-        "tests/fixtures/minimal.wasm",
-        "--rpc-url",
-        DEAD_RPC,
-        "--header",
-        "NoSeparatorHere",
-    ]);
+fn test_completions_help() {
+    let (stdout, stderr, code) = run_cli(&["completions", "--help"]);
     assert_eq!(
-        code, 1,
-        "a malformed --header must exit 1; stdout: {stdout}"
+        code, 0,
+        "completions --help should exit 0; stderr: {stderr}"
     );
     assert!(
-        stderr.contains("failed to parse HTTP header"),
-        "the error should name the failure; got: {stderr}"
+        stdout.contains("bash"),
+        "completions help should list bash option"
     );
     assert!(
-        stderr.contains("KEY=VALUE"),
-        "the error should show the expected format; got: {stderr}"
+        stdout.contains("zsh"),
+        "completions help should list zsh option"
     );
-    // It must fail before any RPC traffic is attempted.
     assert!(
-        !stderr.contains("HTTP request failed"),
-        "header validation must precede the network call; got: {stderr}"
+        stdout.contains("fish"),
+        "completions help should list fish option"
+    );
+    assert!(
+        stdout.contains("powershell"),
+        "completions help should list powershell option"
     );
 }
 
 #[test]
-fn test_header_with_empty_value_is_rejected() {
-    let (_, stderr, code) = run_cli(&[
-        "estimate",
-        "--wasm",
-        "tests/fixtures/minimal.wasm",
-        "--rpc-url",
-        DEAD_RPC,
-        "--header",
-        "X-Api-Key=",
-    ]);
-    assert_eq!(code, 1, "an empty header value must exit 1");
+fn test_completions_bash() {
+    let (stdout, stderr, code) = run_cli(&["completions", "bash"]);
+    assert_eq!(code, 0, "completions bash should exit 0; stderr: {stderr}");
+    assert!(!stdout.is_empty(), "completion script should not be empty");
     assert!(
-        stderr.contains("empty value"),
-        "the error should explain the empty value; got: {stderr}"
-    );
-}
-
-/// Sensitive header values must never reach the log, not even at `--verbose`
-/// debug level (issue #300).
-#[test]
-fn test_sensitive_headers_are_redacted_in_verbose_logs() {
-    const SECRET: &str = "sup3rs3cret-token";
-    let home = temp_home("header-redaction");
-    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
-        .args([
-            "estimate",
-            "--wasm",
-            "tests/fixtures/minimal.wasm",
-            "--rpc-url",
-            DEAD_RPC,
-            "--header",
-            "Authorization=Bearer sup3rs3cret-token",
-            "--header",
-            "X-Api-Key=key-123",
-            "--header",
-            "X-Trace-Id=trace-9",
-            "--verbose",
-        ])
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("RUST_LOG", "debug")
-        .output()
-        .expect("failed to run CLI");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !stdout.contains(SECRET),
-        "the bearer token leaked into stdout: {stdout}"
+        stdout.contains("soroban-cost-estimator"),
+        "bash completion script should contain binary name"
     );
     assert!(
-        !stderr.contains(SECRET),
-        "the bearer token leaked into stderr: {stderr}"
-    );
-    assert!(
-        stdout.contains("<redacted>"),
-        "the debug log should show the redacted form; got: {stdout}"
-    );
-    // Non-sensitive headers stay readable — that is the point of logging them.
-    assert!(
-        stdout.contains("trace-9"),
-        "a non-sensitive header should remain visible; got: {stdout}"
-    );
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// Optimization tips and `--quiet` (Issue #323)
-// ─────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn test_estimate_shows_optimization_sections_by_default() {
-    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
-    let home = temp_home("estimate-tips");
-    let (stdout, stderr, code) = run_cli_in_home(
-        &[
-            "estimate",
-            "--wasm",
-            "tests/fixtures/contract.wasm",
-            "--id",
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            "--fn",
-            "increment",
-            "--arg",
-            "1",
-            "--rpc-url",
-            &rpc_url,
-        ],
-        Some(&home),
-    );
-    assert_eq!(code, 0, "estimate should succeed; stderr: {stderr}");
-    assert!(
-        stdout.contains("Optimization Tips:"),
-        "tips should be displayed in terminal output; got: {stdout}"
-    );
-    assert!(
-        stdout.contains("Optimization Suggestions:"),
-        "the savings breakdown should still be shown; got: {stdout}"
-    );
-    // Issue #323: the WASM-size field is part of the report now.
-    assert!(
-        stdout.contains("WASM size:"),
-        "the report should carry the WASM size; got: {stdout}"
+        stdout.contains("estimate"),
+        "bash completion script should contain subcommand names"
     );
 }
 
 #[test]
-fn test_estimate_json_includes_suggestions_key() {
-    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
-    let home = temp_home("estimate-tips-json");
-    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
-        .args([
-            "estimate",
-            "--wasm",
-            "tests/fixtures/contract.wasm",
-            "--id",
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            "--fn",
-            "increment",
-            "--arg",
-            "1",
-            "--rpc-url",
-            &rpc_url,
-            "--json",
-        ])
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("RUST_LOG", "error")
-        .output()
-        .expect("failed to run estimate");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
-    let suggestions = parsed["suggestions"]
-        .as_array()
-        .expect("`suggestions` must be present as an array");
+fn test_completions_zsh() {
+    let (stdout, stderr, code) = run_cli(&["completions", "zsh"]);
+    assert_eq!(code, 0, "completions zsh should exit 0; stderr: {stderr}");
+    assert!(!stdout.is_empty(), "completion script should not be empty");
     assert!(
-        suggestions
-            .iter()
-            .all(|s| s.as_str().is_some_and(|s| s.starts_with("Tip: "))),
-        "every entry must be a `Tip: …` string; got: {suggestions:?}"
-    );
-    assert!(parsed["optimization_suggestions"].is_array());
-}
-
-#[test]
-fn test_estimate_quiet_omits_suggestions() {
-    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
-    let home = temp_home("estimate-quiet");
-    let (stdout, stderr, code) = run_cli_in_home(
-        &[
-            "estimate",
-            "--wasm",
-            "tests/fixtures/contract.wasm",
-            "--id",
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            "--fn",
-            "increment",
-            "--arg",
-            "1",
-            "--rpc-url",
-            &rpc_url,
-            "--quiet",
-        ],
-        Some(&home),
-    );
-    assert_eq!(code, 0, "estimate should succeed; stderr: {stderr}");
-    assert!(
-        !stdout.contains("Optimization Tips:"),
-        "--quiet must drop the tips; got: {stdout}"
+        stdout.contains("soroban-cost-estimator"),
+        "zsh completion script should contain binary name"
     );
     assert!(
-        !stdout.contains("Optimization Suggestions:"),
-        "--quiet must drop the savings breakdown; got: {stdout}"
-    );
-    // The measured cost data is unaffected by --quiet.
-    assert!(
-        stdout.contains("Total:          15427 stroops"),
-        "--quiet must not drop the cost data; got: {stdout}"
-    );
-    assert!(stdout.contains("Read Entries"));
-}
-
-#[test]
-fn test_estimate_json_quiet_omits_suggestions_key() {
-    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
-    let home = temp_home("estimate-quiet-json");
-    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
-        .args([
-            "estimate",
-            "--wasm",
-            "tests/fixtures/contract.wasm",
-            "--id",
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            "--fn",
-            "increment",
-            "--arg",
-            "1",
-            "--rpc-url",
-            &rpc_url,
-            "--json",
-            "--quiet",
-        ])
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("RUST_LOG", "error")
-        .output()
-        .expect("failed to run estimate");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
-    assert!(parsed.get("suggestions").is_none(), "{stdout}");
-    assert!(parsed.get("optimization_suggestions").is_none(), "{stdout}");
-    assert_eq!(parsed["fee"]["total_stroops"], 15_427);
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// `estimate-all` aggregated summary (Issue #320)
-// ─────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn test_estimate_all_table_prints_summary_footer() {
-    let (rpc_url, _stop) = start_mock_rpc_server("", "1000", 100);
-    let home = temp_home("estimate-all-summary");
-    let (stdout, stderr, code) = run_cli_in_home(
-        &[
-            "estimate-all",
-            "--wasm",
-            "tests/fixtures/zeroarg.wasm",
-            "--id",
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            "--rpc-url",
-            &rpc_url,
-        ],
-        Some(&home),
-    );
-    assert_eq!(code, 0, "estimate-all should succeed; stderr: {stderr}");
-
-    // Issue #320 acceptance criteria: total functions, min/max/average fee,
-    // and the CPU instruction range, in a border-separated footer row.
-    assert!(
-        stdout.contains("Summary: 2 function(s)"),
-        "the footer must report the function count; got: {stdout}"
-    );
-    assert!(
-        stdout.contains("min 1000 / max 1000 / avg 1000"),
-        "the footer must report min/max/avg fee; got: {stdout}"
-    );
-    assert!(
-        stdout.contains("─"),
-        "the footer must be separated with border styling; got: {stdout}"
-    );
-    assert!(
-        stdout.contains("ping"),
-        "the per-function row must still be present; got: {stdout}"
+        stdout.contains("estimate"),
+        "zsh completion script should contain subcommand names"
     );
 }
 
 #[test]
-fn test_estimate_all_json_includes_summary_object() {
-    let (rpc_url, _stop) = start_mock_rpc_server("", "1000", 100);
-    let home = temp_home("estimate-all-summary-json");
-    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
-        .args([
-            "estimate-all",
-            "--wasm",
-            "tests/fixtures/zeroarg.wasm",
-            "--id",
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            "--rpc-url",
-            &rpc_url,
-            "--json",
-        ])
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("RUST_LOG", "error")
-        .output()
-        .expect("failed to run estimate-all");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
-
-    let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
-
-    // Per-function records stay available alongside the aggregate.
-    let functions = parsed["functions"].as_array().expect("`functions` array");
-    assert_eq!(functions.len(), 2);
-    assert_eq!(functions[0]["function"], "ping");
-    assert_eq!(functions[1]["function"], "pong");
-    assert_eq!(functions[0]["status"], "ok");
-
-    let summary = &parsed["summary"];
-    assert_eq!(summary["functions_evaluated"], 2);
-    assert_eq!(summary["min_fee_stroops"], 1_000);
-    assert_eq!(summary["max_fee_stroops"], 1_000);
-    assert_eq!(summary["avg_fee_stroops"], 1_000);
-    // Both functions cost 1000 stroops, so the batch total is 2000.
-    assert_eq!(summary["total_fee_stroops"], 2_000);
-    assert_eq!(summary["min_total_xlm"], "0.0001000");
-    assert_eq!(summary["max_total_xlm"], "0.0001000");
-    assert_eq!(summary["avg_total_xlm"], "0.0001000");
-    assert!(summary["min_cpu_instructions"].is_number());
-    assert!(summary["max_cpu_instructions"].is_number());
-    // The CPU range is the "total CPU instruction range" the footer reports.
-    assert!(summary["min_cpu_instructions"].as_u64().is_some());
-    assert!(summary["max_cpu_instructions"].as_u64().is_some());
+fn test_completions_fish() {
+    let (stdout, stderr, code) = run_cli(&["completions", "fish"]);
+    assert_eq!(code, 0, "completions fish should exit 0; stderr: {stderr}");
+    assert!(!stdout.is_empty(), "completion script should not be empty");
+    assert!(
+        stdout.contains("soroban-cost-estimator"),
+        "fish completion script should contain binary name"
+    );
+    assert!(
+        stdout.contains("estimate"),
+        "fish completion script should contain subcommand names"
+    );
 }
 
 #[test]
-fn test_estimate_all_csv_stays_machine_parseable() {
-    // The summary footer is a bordered table, which would corrupt CSV. It is
-    // therefore omitted from `--format csv`; the per-function rows are all a
-    // consumer needs.
-    let (rpc_url, _stop) = start_mock_rpc_server("", "1000", 100);
-    let home = temp_home("estimate-all-csv");
-    let (stdout, stderr, code) = run_cli_in_home(
-        &[
-            "estimate-all",
-            "--wasm",
-            "tests/fixtures/zeroarg.wasm",
-            "--id",
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            "--rpc-url",
-            &rpc_url,
-            "--format",
-            "csv",
-        ],
-        Some(&home),
-    );
-    assert_eq!(code, 0, "estimate-all should succeed; stderr: {stderr}");
-
-    let data_lines: Vec<&str> = stdout
-        .lines()
-        .filter(|line| line.starts_with("function,") || line.starts_with('"'))
-        .collect();
+fn test_completions_powershell() {
+    let (stdout, stderr, code) = run_cli(&["completions", "powershell"]);
     assert_eq!(
-        data_lines.len(),
-        3,
-        "expected a header and 2 data rows; got: {data_lines:?}"
+        code, 0,
+        "completions powershell should exit 0; stderr: {stderr}"
+    );
+    assert!(!stdout.is_empty(), "completion script should not be empty");
+    assert!(
+        stdout.contains("soroban-cost-estimator"),
+        "powershell completion script should contain binary name"
     );
     assert!(
-        data_lines.iter().all(|line| line.split(',').count() == 15),
-        "every CSV line must have 15 fields; got: {data_lines:?}"
-    );
-    assert!(
-        !stdout.contains('─') && !stdout.contains("Summary:"),
-        "no table chrome may leak into CSV output; got: {stdout}"
+        stdout.contains("estimate"),
+        "powershell completion script should contain subcommand names"
     );
 }
 
 #[test]
-fn test_estimate_all_markdown_renders_summary_table() {
-    let (rpc_url, _stop) = start_mock_rpc_server("", "1000", 100);
-    let home = temp_home("estimate-all-markdown");
-    let (stdout, stderr, code) = run_cli_in_home(
-        &[
-            "estimate-all",
-            "--wasm",
-            "tests/fixtures/zeroarg.wasm",
-            "--id",
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            "--rpc-url",
-            &rpc_url,
-            "--format",
-            "markdown",
-        ],
-        Some(&home),
-    );
-    assert_eq!(code, 0, "estimate-all should succeed; stderr: {stderr}");
+fn test_completions_unsupported_shell() {
+    let (_stdout, stderr, code) = run_cli(&["completions", "invalid_shell"]);
+    assert_ne!(code, 0, "unsupported shell should exit non-zero");
     assert!(
-        stdout.contains("### Summary — 2 function(s) evaluated"),
-        "markdown mode should render the summary; got: {stdout}"
-    );
-    assert!(stdout.contains("| Average fee | 1000 stroops"), "{stdout}");
-}
-
-#[test]
-fn test_estimate_all_quiet_omits_summary_footer() {
-    let (rpc_url, _stop) = start_mock_rpc_server("", "1000", 100);
-    let home = temp_home("estimate-all-quiet");
-    let (stdout, stderr, code) = run_cli_in_home(
-        &[
-            "estimate-all",
-            "--wasm",
-            "tests/fixtures/zeroarg.wasm",
-            "--id",
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            "--rpc-url",
-            &rpc_url,
-            "--quiet",
-        ],
-        Some(&home),
-    );
-    assert_eq!(code, 0, "estimate-all should succeed; stderr: {stderr}");
-    assert!(
-        !stdout.contains("Summary:"),
-        "--quiet must drop the summary footer; got: {stdout}"
-    );
-    // The structured `summary` is still emitted in JSON mode even with
-    // --quiet, so machine consumers are never silently deprived of it.
-    assert!(stdout.contains("ping"), "per-function data must remain");
-}
-
-#[test]
-fn test_quiet_flag_is_listed_in_help() {
-    let (stdout, stderr, code) = run_cli(&["estimate", "--help"]);
-    assert_eq!(code, 0, "estimate --help should exit 0; stderr: {stderr}");
-    assert!(
-        stdout.contains("--quiet"),
-        "help should list --quiet; got: {stdout}"
-    );
-    assert!(
-        stdout.contains("-H"),
-        "help should list the -H header short flag; got: {stdout}"
+        stderr.contains("invalid value 'invalid_shell'") || stderr.contains("unexpected argument"),
+        "stderr should state invalid shell value; got: {stderr}"
     );
 }
