@@ -124,9 +124,8 @@ pub struct RpcClient {
     max_retries: usize,
     #[allow(dead_code)]
     /// Custom HTTP headers attached to every outbound request.
-    headers: reqwest::header::HeaderMap,
-    /// Whether to print debug-level logging to stderr.
-    pub verbose: bool,
+    #[allow(dead_code)]
+    headers: HeaderMap,
 }
 
 impl RpcClient {
