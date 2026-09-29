@@ -1,6 +1,3 @@
-use std::path::PathBuf;
-
-use clap::Parser;
 use clap::{CommandFactory, Parser};
 use comfy_table::Cell;
 use comfy_table::Table;
@@ -13,6 +10,7 @@ use soroban_cost_estimator::report::formatter::{TableFormatter, formatter_by_nam
 use soroban_cost_estimator::rpc;
 use soroban_cost_estimator::wasm;
 use soroban_cost_estimator::xdr_helper;
+use std::path::PathBuf;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -311,41 +309,32 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     network,
                     older_than,
                     json,
-                }) => cmd_config_snapshot_prune(&network, older_than, json),
+                }) => cmd_config_snapshot_prune(
+                    &env_string(network, &default_network, "SOROBAN_NETWORK"),
+                    older_than,
+                    json,
+                ),
                 None => {
+                    let format = match (args.format, json) {
+                        (Some(fmt), _) => fmt,
+                        (None, true) => cli::OutputFormat::Json,
+                        (None, false) => cli::OutputFormat::Table,
+                    };
                     cmd_config_snapshot(
-                        &network,
+                        &env_string(network, &default_network, "SOROBAN_NETWORK"),
                         fallback,
                         out.as_deref(),
-                        json,
+                        format,
                         retain,
                         rps,
                         timeout,
                         max_retries,
                         &headers,
+                        verbose,
                     )
                     .await
                 }
             },
-            cli::ConfigAction::Snapshot { network, out, json } => {
-                let format = match (args.format, json) {
-                    (Some(fmt), _) => fmt,
-                    (None, true) => cli::OutputFormat::Json,
-                    (None, false) => cli::OutputFormat::Table,
-                };
-                cmd_config_snapshot(
-                    &env_string(network, &default_network, "SOROBAN_NETWORK"),
-                    fallback,
-                    out.as_deref(),
-                    format,
-                    rps,
-                    timeout,
-                    max_retries,
-                    &headers,
-                    verbose,
-                )
-                .await
-            }
             cli::ConfigAction::List { network } => cmd_config_snapshot_list(&network),
             cli::ConfigAction::Diff {
                 network,
@@ -356,50 +345,36 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 summary,
                 json,
             } => {
-                if against_previous {
-                    cmd_config_diff_against_previous(
-                        &network,
-                        pricing_only,
-                        threshold_percent,
-                        summary,
-                        json,
-                    )
-                } else {
-                    cmd_config_diff(
-                        &network,
-                        fallback,
-                        against.as_deref(),
-                        pricing_only,
-                        threshold_percent,
-                        summary,
-                        json,
-                        rps,
-                        timeout,
-                        max_retries,
-                        &headers,
-                    )
-                    .await
-                }
                 let json_flag = if args.format.is_some() {
                     format == cli::OutputFormat::Json
                 } else {
                     json || format == cli::OutputFormat::Json
                 };
-                cmd_config_diff(
-                    &env_string(network, &default_network, "SOROBAN_NETWORK"),
-                    fallback,
-                    against.as_deref(),
-                    pricing_only,
-                    threshold_percent,
-                    summary,
-                    json_flag,
-                    rps,
-                    timeout,
-                    max_retries,
-                    &headers,
-                    verbose,
-                )
-                .await
+                if against_previous {
+                    cmd_config_diff_against_previous(
+                        &env_string(network, &default_network, "SOROBAN_NETWORK"),
+                        pricing_only,
+                        threshold_percent,
+                        summary,
+                        json_flag,
+                    )
+                } else {
+                    cmd_config_diff(
+                        &env_string(network, &default_network, "SOROBAN_NETWORK"),
+                        fallback,
+                        against.as_deref(),
+                        pricing_only,
+                        threshold_percent,
+                        summary,
+                        json_flag,
+                        rps,
+                        timeout,
+                        max_retries,
+                        &headers,
+                        verbose,
+                    )
+                    .await
+                }
             }
             cli::ConfigAction::History { network } => cmd_config_history(&network),
             cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network),
@@ -1616,7 +1591,7 @@ async fn cmd_config_snapshot(
     network: &str,
     rpc_fallback_url: Option<&str>,
     out_path: Option<&str>,
-    json_flag: bool,
+    format: cli::OutputFormat,
     retain: Option<usize>,
     rps: Option<u64>,
     timeout: u64,
@@ -1653,12 +1628,7 @@ async fn cmd_config_snapshot(
             None => Vec::new(),
         };
 
-        if json_flag {
-            // stdout stays a single parseable document, so the retention log
-            // goes to stderr, where logs belong.
-            if retain.is_some() {
-                eprintln!("{}", retention_summary(network, retain, None, &pruned));
-            }
+        if format == cli::OutputFormat::Json {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
             return Ok(());
         }
@@ -1905,7 +1875,12 @@ fn cmd_config_diff_against_previous(
     } else {
         println!(
             "{}",
-            config_snapshot::diff::format_diff(&diff, pricing_only, threshold_percent)
+            config_snapshot::diff::format_diff(
+                &diff,
+                cli::should_colorize(),
+                pricing_only,
+                threshold_percent,
+            )
         );
         print_stale_estimates(network, new_snapshot.ledger);
     }

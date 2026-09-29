@@ -387,7 +387,6 @@ pub enum ConfigAction {
         bundle: String,
     },
 }
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// Retention sub-actions under `config snapshot`.
 ///
@@ -407,6 +406,16 @@ pub enum SnapshotAction {
         /// Delete snapshots recorded more than this many days ago.
         #[arg(long, value_name = "DAYS")]
         older_than: u32,
+
+        /// Output as JSON instead of a human-readable summary.
+        #[arg(long)]
+        json: bool,
+    },
+}
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+pub static COLOR_CHOICE: AtomicU8 = AtomicU8::new(0);
+
 /// Global `--quiet` state, mirroring [`COLOR_CHOICE`]. Set once from the
 /// parsed CLI so deeply nested helpers (e.g. chart rendering) can consult it
 /// without threading a flag through every call site.
@@ -470,10 +479,15 @@ pub fn init_color(choice: clap::ColorChoice) {
     COLOR_CHOICE.store(val, Ordering::Relaxed);
 }
 
-        /// Output as JSON instead of a human-readable summary.
-        #[arg(long)]
-        json: bool,
-    },
+pub fn should_colorize() -> bool {
+    match COLOR_CHOICE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            use std::io::IsTerminal;
+            std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
+        }
+    }
 }
 
 #[cfg(test)]
