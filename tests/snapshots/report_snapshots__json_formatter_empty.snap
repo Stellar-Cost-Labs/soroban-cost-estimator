@@ -1,13 +1,14 @@
 ---
 source: tests/report_snapshots.rs
-assertion_line: 76
 expression: JsonFormatter.format(&empty)
 ---
 {
   "cpu_instructions": 0,
   "fee": {
     "bandwidth_fee_stroops": 0,
+    "base_fee_stroops": 0,
     "cpu_fee_stroops": 0,
+    "fee_percentages": {},
     "non_refundable_stroops": 0,
     "refundable_stroops": 0,
     "storage_fee_stroops": 0,
