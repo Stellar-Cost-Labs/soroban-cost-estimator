@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use comfy_table::Cell;
 use comfy_table::Table;
 use soroban_cost_estimator::cache;
@@ -156,6 +156,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             clear_cache,
             json,
             precision,
+            auto_snapshot,
         } => {
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
@@ -182,6 +183,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 &headers,
                 args.wasm_info,
                 args.verbose,
+                auto_snapshot,
             )
             .await
         }
@@ -192,6 +194,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             id,
             json,
             precision,
+            auto_snapshot,
         } => {
             let format = match (args.format, json) {
                 (Some(fmt), _) => fmt,
@@ -212,6 +215,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 &headers,
                 args.wasm_info,
                 args.verbose,
+                auto_snapshot,
             )
             .await
         }
@@ -326,6 +330,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 to.as_deref(),
                 json,
             ),
+            cli::CacheAction::Stats { json } => cmd_cache_stats(json),
         },
         cli::Command::Watch {
             network,
@@ -346,7 +351,18 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             )
             .await
         }
+        cli::Command::Completions { shell } => {
+            cmd_completions(shell);
+            Ok(())
+        }
     }
+}
+
+/// `completions` command: generate shell completion script to stdout.
+fn cmd_completions(shell: clap_complete::Shell) {
+    let mut cmd = cli::Cli::command();
+    let bin_name = cmd.get_name().to_string();
+    clap_complete::generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
 }
 
 /// True when a simulation response carried neither cost data, nor
@@ -533,6 +549,7 @@ fn emit_wasm_structure(
 /// the same params — so a repeated WASM-upload envelope (when `--fn` is
 /// omitted) or identical fee-rate fetches transmit at most once.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::fn_params_excessive_bools)]
 async fn cmd_estimate(
     wasm_path: &str,
     network: &str,
@@ -551,6 +568,7 @@ async fn cmd_estimate(
     extra_headers: &[String],
     wasm_info_flag: bool,
     verbose: bool,
+    auto_snapshot: bool,
 ) -> error::AppResult<()> {
     let json_flag = format == "json";
     let table_mode = format == "table";
@@ -716,6 +734,23 @@ async fn cmd_estimate(
         );
         info!(total_stroops = fee.total_stroops, total_xlm = %fee.total_xlm, "estimate complete");
 
+        if auto_snapshot {
+            if let Err(e) = auto_snapshot_if_changed(
+                network,
+                rpc_fallback_url,
+                rps,
+                timeout,
+                max_retries,
+                extra_headers,
+                verbose,
+            )
+            .await
+            {
+                warn!(error = %e, "auto-snapshot failed");
+                eprintln!("Warning: auto-snapshot failed: {e}");
+            }
+        }
+
         match formatter_by_name(format) {
             Some(formatter) => println!("{}", formatter.format(&report)),
             None => println!("{}", TableFormatter.format(&report)),
@@ -774,6 +809,7 @@ async fn cmd_estimate_all(
     extra_headers: &[String],
     wasm_info_flag: bool,
     verbose: bool,
+    auto_snapshot: bool,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -895,6 +931,23 @@ async fn cmd_estimate_all(
                 println!();
             } else {
                 json_results.push(result);
+            }
+        }
+
+        if auto_snapshot {
+            if let Err(e) = auto_snapshot_if_changed(
+                network,
+                rpc_fallback_url,
+                rps,
+                timeout,
+                max_retries,
+                extra_headers,
+                verbose,
+            )
+            .await
+            {
+                warn!(error = %e, "auto-snapshot failed");
+                eprintln!("Warning: auto-snapshot failed: {e}");
             }
         }
 
@@ -1619,6 +1672,64 @@ fn parse_interval_secs(interval: &str) -> u64 {
     num_part.parse::<u64>().unwrap_or(3600).saturating_mul(mult)
 }
 
+/// Checks if network config has changed since the last snapshot and
+/// automatically saves a new snapshot if so.
+///
+/// # Network calls
+/// Makes one batched `getLedgerEntries` RPC call to fetch current config.
+async fn auto_snapshot_if_changed(
+    network: &str,
+    rpc_fallback_url: Option<&str>,
+    rps: Option<u64>,
+    timeout: u64,
+    max_retries: usize,
+    extra_headers: &[String],
+    verbose: bool,
+) -> error::AppResult<()> {
+    use tracing::{debug, info};
+
+    // Try to load the latest snapshot; if none exists, save a new one.
+    let old_snapshot = config_snapshot::store::load_latest_snapshot(network).ok();
+
+    let new_snapshot = fetch_config_snapshot(
+        network,
+        rpc_fallback_url,
+        rps,
+        timeout,
+        max_retries,
+        extra_headers,
+        verbose,
+    )
+    .await?;
+
+    let has_changes = match &old_snapshot {
+        Some(old) => {
+            let diff = config_snapshot::diff::diff_snapshots(old, &new_snapshot);
+            debug!(
+                change_count = diff.changes.len(),
+                has_pricing = diff.has_pricing_changes,
+                "auto-snapshot diff computed"
+            );
+            !diff.changes.is_empty()
+        }
+        None => {
+            debug!("no existing snapshot found; will save new snapshot");
+            true
+        }
+    };
+
+    if has_changes {
+        let path = config_snapshot::store::save_snapshot(&new_snapshot, None)?;
+        info!(path = %path.display(), ledger = new_snapshot.ledger, "auto-snapshot saved");
+        println!(
+            "Network configuration updated: saved snapshot {}",
+            path.display()
+        );
+    }
+
+    Ok(())
+}
+
 /// Resolves when the process receives SIGINT (Ctrl-C) or SIGTERM, so a
 /// long-running command can stop gracefully.
 ///
@@ -1819,140 +1930,6 @@ async fn poll_watch(
     }
 }
 
-/// Number of times a WebSocket RPC endpoint is tried (with exponential backoff
-/// between attempts) before `watch` gives up on it and falls back to HTTP
-/// polling.
-const WS_MAX_ATTEMPTS: u32 = 5;
-
-/// Watches the network config over a WebSocket subscription.
-///
-/// Connects, baselines a snapshot, then re-checks the config on every
-/// ledger-close notification the node pushes. Dropped connections are
-/// re-established — and resubscribed — with exponential backoff. Returns
-/// `Ok(())` once a stop signal arrives, or `Err` when the endpoint could not
-/// be reached at all, so the caller can fall back to HTTP polling.
-async fn watch_over_websocket(
-    network: &str,
-    rpc_url: Option<&str>,
-    http_rpc_url: Option<&str>,
-    rpc_fallback_url: Option<&str>,
-    rps: Option<u64>,
-    timeout: u64,
-    max_retries: usize,
-    extra_headers: &[String],
-) -> error::AppResult<()> {
-    use tracing::info;
-
-    let ws_url = rpc::client::resolve_ws_endpoint(network, rpc_url)?;
-    let mut client = connect_ws_endpoint(&ws_url).await?;
-
-    // Baseline the first snapshot before subscribing, so the first diff has
-    // something to compare against.
-    let mut first = true;
-    let _ = watch_poll_once(
-        network,
-        http_rpc_url,
-        rpc_fallback_url,
-        &mut first,
-        rps,
-        timeout,
-        max_retries,
-        extra_headers,
-    )
-    .await;
-
-    let mut start_ledger =
-        config_snapshot::store::load_latest_snapshot(network).map_or(0, |s| s.ledger);
-    subscribe_ledger_closes(&mut client, start_ledger).await?;
-
-    loop {
-        let event = tokio::select! {
-            signal = shutdown_signal() => {
-                signal?;
-                info!("received stop signal");
-                println!("Received stop signal — exiting cleanly.");
-                return Ok(());
-            }
-            event = client.next_ledger_close() => event,
-        };
-
-        match event {
-            Ok(Some(close)) => {
-                info!(ledger = close.ledger, "ledger closed — re-checking config");
-                println!("Ledger {} closed — re-checking config.", close.ledger);
-                start_ledger = start_ledger.max(close.ledger);
-                let _ = watch_poll_once(
-                    network,
-                    http_rpc_url,
-                    rpc_fallback_url,
-                    &mut first,
-                    rps,
-                    timeout,
-                    max_retries,
-                    extra_headers,
-                )
-                .await;
-                continue;
-            }
-            Ok(None) => println!("WebSocket connection closed by the server — reconnecting..."),
-            Err(e) => println!("WebSocket error ({e}) — reconnecting..."),
-        }
-
-        client = connect_ws_endpoint(&ws_url).await?;
-        subscribe_ledger_closes(&mut client, start_ledger).await?;
-    }
-}
-
-/// Opens a WebSocket RPC connection, retrying with exponential backoff.
-///
-/// Tries up to [`WS_MAX_ATTEMPTS`] times, sleeping
-/// [`rpc::ws::reconnect_delay_ms`] (1s, then doubling) between attempts. An
-/// `Err` means the endpoint could not be reached at all.
-async fn connect_ws_endpoint(ws_url: &str) -> error::AppResult<rpc::ws::WsRpcClient> {
-    let mut attempt: u32 = 1;
-    loop {
-        match rpc::ws::WsRpcClient::connect(ws_url).await {
-            Ok(client) => {
-                info!(ws_url, attempt, "connected to WebSocket RPC endpoint");
-                return Ok(client);
-            }
-            Err(e) if attempt >= WS_MAX_ATTEMPTS => {
-                return Err(error::AppError::WsConnect(format!(
-                    "could not connect to {ws_url} after {attempt} attempts: {e}"
-                )));
-            }
-            Err(e) => {
-                let delay_ms = rpc::ws::reconnect_delay_ms(attempt);
-                warn!(ws_url, attempt, delay_ms, error = %e, "WebSocket connect failed — retrying");
-                println!(
-                    "WebSocket connect failed ({e}) — retrying in {}s...",
-                    delay_ms / 1_000
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                attempt = attempt.saturating_add(1);
-            }
-        }
-    }
-}
-
-/// Subscribes `client` to ledger-close notifications from `start_ledger`.
-async fn subscribe_ledger_closes(
-    client: &mut rpc::ws::WsRpcClient,
-    start_ledger: u32,
-) -> error::AppResult<()> {
-    let subscription = client.subscribe_ledger_closes(start_ledger).await?;
-    info!(
-        start_ledger = subscription.start_ledger,
-        "subscribed to ledger closes"
-    );
-    println!(
-        "Subscribed to ledger-close notifications from ledger {} — re-checking config on every new ledger.",
-        subscription.start_ledger
-    );
-    Ok(())
-}
-
-/// `cache verify` command: check every cache entry parses as valid JSON.
 /// `cache stats` command: show cache health overview.
 ///
 /// Prints total entries, disk usage, age (oldest/newest), and per-network
@@ -1962,11 +1939,16 @@ async fn subscribe_ledger_closes(
 /// # Network calls
 /// None — pure SQLite I/O.
 #[allow(dead_code)]
-fn cmd_cache_stats() -> error::AppResult<()> {
+fn cmd_cache_stats(json: bool) -> error::AppResult<()> {
     let stats = cache::cache_stats()?;
 
+    if json {
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+        return Ok(());
+    }
+
     if stats.total_entries == 0 {
-        println!("Cache is empty — no cached estimates.");
+        println!("Cache is empty (0 entries, 0 bytes)");
         return Ok(());
     }
 
@@ -2014,6 +1996,7 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// `cache verify` command: check every cache entry parses as valid JSON.
 ///
 /// Prints a summary line per corrupted entry and exits with code 1 when any
 /// entry fails verification, so scripts can treat a corrupt cache as an
@@ -2191,6 +2174,7 @@ async fn cmd_cache_warm(
         extra_headers,
         false,
         verbose,
+        false,
     )
     .await
 }
