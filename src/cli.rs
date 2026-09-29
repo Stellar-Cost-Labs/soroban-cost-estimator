@@ -51,6 +51,13 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "N", default_value_t = 3)]
     pub max_retries: usize,
 
+    /// Control ANSI color formatting in terminal output.
+    #[arg(long, global = true, default_value = "auto")]
+    pub color: clap::ColorChoice,
+    /// Print WASM structure information to stderr.
+    #[arg(long, global = true)]
+    pub wasm_info: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -176,6 +183,9 @@ pub enum Command {
         /// Polling interval (e.g. "30m", "1h").
         #[arg(long, default_value = "1h")]
         interval: String,
+        /// Percentage threshold for flagging significant changes (e.g. 10 for 10%).
+        #[arg(long, value_name = "N")]
+        threshold_percent: Option<f64>,
     },
 }
 
@@ -291,6 +301,14 @@ pub enum ConfigAction {
         #[arg(long)]
         against: Option<String>,
 
+        /// Hide non-pricing changes and display only fee-rate adjustments.
+        #[arg(long)]
+        pricing_only: bool,
+
+        /// Percentage threshold for flagging significant changes (e.g. 10 for 10%).
+        #[arg(long, value_name = "N")]
+        threshold_percent: Option<f64>,
+
         /// Print a single-line summary (counts of pricing/non-pricing changes)
         /// instead of the full diff. Useful for CI status lines.
         #[arg(long)]
@@ -321,4 +339,44 @@ pub enum ConfigAction {
         #[arg(long, default_value = "testnet")]
         network: String,
     },
+
+    /// Export network snapshots to a bundle file.
+    Export {
+        /// Network to export snapshots for.
+        #[arg(long)]
+        network: Option<String>,
+
+        /// Output file path for the snapshot bundle.
+        #[arg(long)]
+        output: String,
+    },
+
+    /// Import network snapshots from a bundle file.
+    Import {
+        /// Path to the snapshot bundle file.
+        bundle: String,
+    },
+}
+use std::sync::atomic::{AtomicU8, Ordering};
+
+pub static COLOR_CHOICE: AtomicU8 = AtomicU8::new(0);
+
+pub fn init_color(choice: clap::ColorChoice) {
+    let val = match choice {
+        clap::ColorChoice::Auto => 0,
+        clap::ColorChoice::Always => 1,
+        clap::ColorChoice::Never => 2,
+    };
+    COLOR_CHOICE.store(val, Ordering::Relaxed);
+}
+
+pub fn should_colorize() -> bool {
+    match COLOR_CHOICE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            use std::io::IsTerminal;
+            std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
+        }
+    }
 }
