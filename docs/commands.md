@@ -713,6 +713,8 @@ All commands accept:
 | `--connect-timeout <SECS>` | TCP connection establishment timeout in seconds (default `5`; `0` disables). A dead or unreachable host fails within this window instead of hanging for the full `--timeout` |
 | `--help` / `-h` | Print command-specific help |
 
+`--format` applies to report-producing commands. The legacy `--json` flag remains supported as an alias for `--format json` where it was previously available.
+
 ## Network Resolution
 
 By default, commands use these RPC endpoints:
