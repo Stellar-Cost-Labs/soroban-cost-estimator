@@ -223,6 +223,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             json,
             auto_snapshot,
             dry_run,
+            project,
         } => {
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
@@ -251,6 +252,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 args.verbose,
                 auto_snapshot,
                 dry_run,
+                project.as_deref(),
             )
             .await
         }
@@ -640,7 +642,13 @@ async fn cmd_estimate(
     verbose: bool,
     auto_snapshot: bool,
     dry_run: bool,
+    project: Option<&str>,
 ) -> error::AppResult<()> {
+    let projection_counts = match project {
+        Some(s) => Some(report::cost_report::parse_projection_counts(s)?),
+        None => None,
+    };
+
     let json_flag = format == "json";
     let table_mode = format == "table";
     use sha2::Digest;
@@ -815,6 +823,16 @@ async fn cmd_estimate(
             precision,
         );
 
+        let projections = match projection_counts {
+            Some(ref counts) => Some(report::cost_report::calculate_projections(
+                fee.total_stroops,
+                counts,
+                precision,
+                None,
+            )?),
+            None => None,
+        };
+
         let report = report::cost_report::CostReport {
             function: function_name.to_string(),
             wasm_hash: wasm_hash.clone(),
@@ -830,6 +848,7 @@ async fn cmd_estimate(
             network: network.to_string(),
             rpc_latency_ms,
             rates: Some(fee_rates),
+            projections,
         };
 
         let _ = cache::save_estimate(

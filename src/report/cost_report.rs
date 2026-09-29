@@ -1,4 +1,4 @@
-use comfy_table::Table;
+use comfy_table::{Cell, CellAlignment, Table};
 
 use crate::report::fee_calc::{FeeBreakdown, FeeRates};
 
@@ -182,6 +182,23 @@ pub struct CostReport {
     /// serialized output; `None` when the rates were unavailable.
     #[serde(skip)]
     pub rates: Option<FeeRates>,
+    /// Optional batch invocation cost projections.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub projections: Option<Vec<CostProjection>>,
+}
+
+/// A cost projection for a specific batch invocation count.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CostProjection {
+    /// Number of simulated contract invocations.
+    pub invocations: u64,
+    /// Projected total fee in stroops (integer arithmetic).
+    pub total_stroops: i64,
+    /// Projected total fee in XLM.
+    pub total_xlm: String,
+    /// Projected fee in USD, if an XLM price was available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usd: Option<f64>,
 }
 
 /// A concrete, actionable cost-optimization suggestion derived from a report.
@@ -395,12 +412,179 @@ pub fn format_report_table(report: &CostReport) -> String {
     // ASCII bar chart for visual cost breakdown
     output.push_str(&render_fee_bar_chart(&report.fee, DEFAULT_CHART_WIDTH));
 
+    if let Some(ref projections) = report.projections {
+        output.push_str(&format_projections_table(projections));
+    }
+
     output
 }
 
 /// Formats a cost report as a JSON string.
 pub fn format_report_json(report: &CostReport) -> String {
     serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Parse a comma-separated list of invocation counts for cost projections.
+///
+/// Ensures each count is non-zero, unique, fits within `i64::MAX` so it can be
+/// multiplied by stroop fees safely, and maintains the order supplied by the user.
+pub fn parse_projection_counts(input: &str) -> crate::error::AppResult<Vec<u64>> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(crate::error::AppError::FeeCalc(
+            "projection counts cannot be empty".to_string(),
+        ));
+    }
+
+    let mut counts = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for raw_part in trimmed.split(',') {
+        let part = raw_part.trim();
+        if part.is_empty() {
+            return Err(crate::error::AppError::FeeCalc(
+                "projection counts contain an empty value".to_string(),
+            ));
+        }
+
+        if part.starts_with('-') {
+            return Err(crate::error::AppError::FeeCalc(format!(
+                "invalid projection count '{part}': count cannot be negative"
+            )));
+        }
+
+        let count: u64 = part.parse().map_err(|_| {
+            crate::error::AppError::FeeCalc(format!(
+                "invalid projection count '{part}': must be a positive integer"
+            ))
+        })?;
+
+        if count == 0 {
+            return Err(crate::error::AppError::FeeCalc(
+                "invalid projection count '0': count must be greater than zero".to_string(),
+            ));
+        }
+
+        if count > i64::MAX as u64 {
+            return Err(crate::error::AppError::FeeCalc(format!(
+                "invalid projection count '{part}': value exceeds maximum supported limit ({})",
+                i64::MAX
+            )));
+        }
+
+        if !seen.insert(count) {
+            return Err(crate::error::AppError::FeeCalc(format!(
+                "duplicate projection count: {count}"
+            )));
+        }
+
+        counts.push(count);
+    }
+
+    Ok(counts)
+}
+
+/// Calculate cost projections for given invocation counts.
+///
+/// Performs checked multiplication (`total_fee_stroops * count`) to prevent
+/// integer overflow. Stroop fees remain pure integers (`i64`), and XLM is
+/// formatted using the standard [`crate::report::fee_calc::stroops_to_xlm`] conversion.
+pub fn calculate_projections(
+    total_fee_stroops: i64,
+    counts: &[u64],
+    precision: u32,
+    xlm_usd_price: Option<f64>,
+) -> crate::error::AppResult<Vec<CostProjection>> {
+    let mut projections = Vec::with_capacity(counts.len());
+
+    for &count in counts {
+        let count_i64 = i64::try_from(count).map_err(|_| {
+            crate::error::AppError::FeeCalc(format!(
+                "projection count {count} exceeds maximum supported integer value"
+            ))
+        })?;
+
+        let projected_stroops = total_fee_stroops
+            .checked_mul(count_i64)
+            .ok_or_else(|| {
+                crate::error::AppError::FeeCalc(format!(
+                    "cost projection overflow: {total_fee_stroops} stroops * {count} invocations exceeds integer bounds"
+                ))
+            })?;
+
+        let total_xlm = crate::report::fee_calc::stroops_to_xlm(projected_stroops, precision);
+
+        let usd = xlm_usd_price.map(|price| (projected_stroops as f64 / 10_000_000.0) * price);
+
+        projections.push(CostProjection {
+            invocations: count,
+            total_stroops: projected_stroops,
+            total_xlm,
+            usd,
+        });
+    }
+
+    Ok(projections)
+}
+
+/// Format an unsigned integer with comma thousands separators.
+#[must_use]
+pub fn format_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(b as char);
+    }
+    out
+}
+
+/// Format a signed 64-bit integer with comma thousands separators.
+#[must_use]
+pub fn format_thousands_i64(n: i64) -> String {
+    if n < 0 {
+        format!("-{}", format_thousands(n.unsigned_abs()))
+    } else {
+        format_thousands(n as u64)
+    }
+}
+
+/// Formats a list of cost projections into a human-readable table.
+#[must_use]
+pub fn format_projections_table(projections: &[CostProjection]) -> String {
+    if projections.is_empty() {
+        return String::new();
+    }
+
+    let mut output = String::from("\nCost Projections:\n\n");
+    let mut table = Table::new();
+    if crate::cli::should_colorize() {
+        table.enforce_styling();
+    } else {
+        table.force_no_tty();
+    }
+
+    table.set_header(vec!["Invocations", "Total Stroops", "Total XLM", "USD"]);
+    for p in projections {
+        let usd_str = p
+            .usd
+            .map(|u| format!("${u:.2}"))
+            .unwrap_or_else(|| "-".to_string());
+        table.add_row(vec![
+            Cell::new(format_thousands(p.invocations)).set_alignment(CellAlignment::Right),
+            Cell::new(format_thousands_i64(p.total_stroops)).set_alignment(CellAlignment::Right),
+            Cell::new(&p.total_xlm).set_alignment(CellAlignment::Right),
+            Cell::new(usd_str).set_alignment(CellAlignment::Right),
+        ]);
+    }
+
+    output.push_str(&table.to_string());
+    output.push('\n');
+    output
 }
 
 #[cfg(test)]
@@ -433,6 +617,7 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
             rates: Some(rates),
+            projections: None,
         }
     }
 
@@ -548,6 +733,7 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 0,
             rates: None,
+            projections: None,
         };
 
         let table_out = format_report_table(&report);
@@ -629,5 +815,169 @@ mod tests {
             cpu_bar_width(120) > cpu_bar_width(40),
             "bar should scale with terminal width"
         );
+    }
+
+    #[test]
+    fn test_parse_projection_counts_valid_and_ordered() {
+        let counts = parse_projection_counts("100, 1000, 10000").expect("valid counts");
+        assert_eq!(counts, vec![100, 1000, 10000]);
+
+        // Order preserved
+        let reversed = parse_projection_counts("10000,100,1000").expect("valid counts");
+        assert_eq!(reversed, vec![10000, 100, 1000]);
+    }
+
+    #[test]
+    fn test_parse_projection_counts_invalid() {
+        assert!(parse_projection_counts("").is_err());
+        assert!(parse_projection_counts("   ").is_err());
+        assert!(parse_projection_counts("100,,1000").is_err());
+        assert!(parse_projection_counts("abc").is_err());
+        assert!(parse_projection_counts("100,abc,1000").is_err());
+        assert!(parse_projection_counts("0").is_err());
+        assert!(parse_projection_counts("100,0").is_err());
+        assert!(parse_projection_counts("-5").is_err());
+        assert!(parse_projection_counts("100,-5").is_err());
+        assert!(parse_projection_counts("100,1000,100").is_err());
+        let overflow_count = format!("{}0", u64::MAX);
+        assert!(parse_projection_counts(&overflow_count).is_err());
+    }
+
+    #[test]
+    fn test_calculate_projections_multiplication() {
+        let per_invocation_fee: i64 = 15_527;
+        let counts = [100, 1_000, 10_000];
+        let projections = calculate_projections(per_invocation_fee, &counts, 7, None)
+            .expect("calculation should succeed");
+
+        assert_eq!(projections.len(), 3);
+        assert_eq!(projections[0].invocations, 100);
+        assert_eq!(projections[0].total_stroops, 1_552_700);
+        assert_eq!(projections[0].total_xlm, "0.1552700");
+        assert_eq!(projections[0].usd, None);
+
+        assert_eq!(projections[1].invocations, 1_000);
+        assert_eq!(projections[1].total_stroops, 15_527_000);
+        assert_eq!(projections[1].total_xlm, "1.5527000");
+
+        assert_eq!(projections[2].invocations, 10_000);
+        assert_eq!(projections[2].total_stroops, 155_270_000);
+        assert_eq!(projections[2].total_xlm, "15.5270000");
+    }
+
+    #[test]
+    fn test_calculate_projections_large_no_overflow() {
+        let fee: i64 = 10_000;
+        let counts = [10_000_000_000u64];
+        let projections =
+            calculate_projections(fee, &counts, 7, None).expect("large multiplication succeeds");
+        assert_eq!(projections[0].total_stroops, 100_000_000_000_000);
+    }
+
+    #[test]
+    fn test_calculate_projections_overflow_error() {
+        let fee: i64 = i64::MAX / 2;
+        let counts = [3u64];
+        let err = calculate_projections(fee, &counts, 7, None).unwrap_err();
+        match err {
+            crate::error::AppError::FeeCalc(msg) => {
+                assert!(msg.contains('3'), "error must identify count: {msg}");
+                assert!(
+                    msg.contains("overflow"),
+                    "error must explain overflow: {msg}"
+                );
+            }
+            other => panic!("expected FeeCalc error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_calculate_projections_usd_available() {
+        let fee: i64 = 10_000_000; // 1 XLM
+        let counts = [100];
+        let projections =
+            calculate_projections(fee, &counts, 7, Some(0.12)).expect("calculation succeeds");
+        assert_eq!(projections[0].usd, Some(12.0));
+    }
+
+    #[test]
+    fn test_calculate_projections_usd_unavailable() {
+        let fee: i64 = 10_000_000;
+        let counts = [100];
+        let projections =
+            calculate_projections(fee, &counts, 7, None).expect("calculation succeeds");
+        assert_eq!(projections[0].usd, None);
+    }
+
+    #[test]
+    fn test_format_thousands() {
+        assert_eq!(format_thousands(0), "0");
+        assert_eq!(format_thousands(999), "999");
+        assert_eq!(format_thousands(1_000), "1,000");
+        assert_eq!(format_thousands(10_000), "10,000");
+        assert_eq!(format_thousands(1_234_567), "1,234,567");
+
+        assert_eq!(format_thousands_i64(-1_234_567), "-1,234,567");
+        assert_eq!(format_thousands_i64(500), "500");
+    }
+
+    #[test]
+    fn test_format_projections_table() {
+        let projections = vec![
+            CostProjection {
+                invocations: 100,
+                total_stroops: 1_552_700,
+                total_xlm: "0.1552700".to_string(),
+                usd: None,
+            },
+            CostProjection {
+                invocations: 1_000,
+                total_stroops: 15_527_000,
+                total_xlm: "1.5527000".to_string(),
+                usd: Some(1.86),
+            },
+        ];
+
+        let table = format_projections_table(&projections);
+        assert!(table.contains("Cost Projections:"));
+        assert!(table.contains("Invocations"));
+        assert!(table.contains("Total Stroops"));
+        assert!(table.contains("Total XLM"));
+        assert!(table.contains("USD"));
+        assert!(table.contains("100"));
+        assert!(table.contains("1,552,700"));
+        assert!(table.contains("0.1552700"));
+        assert!(table.contains('-'));
+        assert!(table.contains("1,000"));
+        assert!(table.contains("15,527,000"));
+        assert!(table.contains("1.5527000"));
+        assert!(table.contains("$1.86"));
+    }
+
+    #[test]
+    fn test_format_report_table_and_json_projections() {
+        let mut report = report_with_rates(sample_rates());
+        assert!(!format_report_table(&report).contains("Cost Projections:"));
+        assert!(!format_report_json(&report).contains("\"projections\""));
+
+        report.projections = Some(vec![CostProjection {
+            invocations: 100,
+            total_stroops: 1_552_700,
+            total_xlm: "0.1552700".to_string(),
+            usd: None,
+        }]);
+
+        let table_out = format_report_table(&report);
+        assert!(table_out.contains("Cost Projections:"));
+        assert!(table_out.contains("100"));
+        assert!(table_out.contains("1,552,700"));
+
+        let json_out = format_report_json(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json_out).expect("valid json");
+        assert!(parsed["projections"].is_array());
+        assert_eq!(parsed["projections"][0]["invocations"], 100);
+        assert_eq!(parsed["projections"][0]["total_stroops"], 1_552_700);
+        assert_eq!(parsed["projections"][0]["total_xlm"], "0.1552700");
+        assert!(parsed["projections"][0].get("usd").is_none());
     }
 }
