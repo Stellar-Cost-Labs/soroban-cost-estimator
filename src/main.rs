@@ -328,21 +328,31 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 } else {
                     json || format == cli::OutputFormat::Json
                 };
-                cmd_config_diff(
-                    &env_string(network, &default_network, "SOROBAN_NETWORK"),
-                    fallback,
-                    against.as_deref(),
-                    pricing_only,
-                    threshold_percent,
-                    summary,
-                    json_flag,
-                    rps,
-                    timeout,
-                    max_retries,
-                    &headers,
-                    verbose,
-                )
-                .await
+                if against_previous {
+                    cmd_config_diff_against_previous(
+                        &env_string(network, &default_network, "SOROBAN_NETWORK"),
+                        pricing_only,
+                        threshold_percent,
+                        summary,
+                        json_flag,
+                    )
+                } else {
+                    cmd_config_diff(
+                        &env_string(network, &default_network, "SOROBAN_NETWORK"),
+                        fallback,
+                        against.as_deref(),
+                        pricing_only,
+                        threshold_percent,
+                        summary,
+                        json_flag,
+                        rps,
+                        timeout,
+                        max_retries,
+                        &headers,
+                        verbose,
+                    )
+                    .await
+                }
             }
             cli::ConfigAction::History { network } => cmd_config_history(&network),
             cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network),
@@ -1728,7 +1738,12 @@ fn cmd_config_diff_against_previous(
     } else {
         println!(
             "{}",
-            config_snapshot::diff::format_diff(&diff, pricing_only, threshold_percent)
+            config_snapshot::diff::format_diff(
+                &diff,
+                cli::should_colorize(),
+                pricing_only,
+                threshold_percent,
+            )
         );
         print_stale_estimates(network, new_snapshot.ledger);
     }
