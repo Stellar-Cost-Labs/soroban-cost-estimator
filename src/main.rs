@@ -157,6 +157,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             json,
             precision,
             auto_snapshot,
+            dry_run,
         } => {
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
@@ -184,6 +185,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 args.wasm_info,
                 args.verbose,
                 auto_snapshot,
+                dry_run,
             )
             .await
         }
@@ -568,6 +570,7 @@ async fn cmd_estimate(
     wasm_info_flag: bool,
     verbose: bool,
     auto_snapshot: bool,
+    dry_run: bool,
 ) -> error::AppResult<()> {
     let json_flag = format == "json";
     let table_mode = format == "table";
