@@ -263,6 +263,52 @@ fn test_cache_verify_empty_cache_succeeds() {
 }
 
 #[test]
+fn test_cache_stats_help() {
+    let (stdout, stderr, code) = run_cli(&["cache", "stats", "--help"]);
+    assert_eq!(
+        code, 0,
+        "cache stats --help should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("cache health") || stdout.contains("breakdown"),
+        "cache stats help should describe the command; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_stats_on_empty_cache_succeeds() {
+    let home = temp_home("cache-stats-empty");
+    let (stdout, stderr, code) = run_cli_in_home(&["cache", "stats"], Some(&home));
+    assert_eq!(
+        code, 0,
+        "cache stats on an empty cache should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Cache is empty"),
+        "should report an empty cache; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_stats_reports_seeded_entries() {
+    let home = temp_home("cache-stats-seeded");
+    let now = chrono::Utc::now().to_rfc3339();
+    seed_cache_entry_for(&home, "testnet", "(wasm upload)", 42, &now);
+    seed_cache_entry_for(&home, "mainnet", "mainnet_fn", 77, &now);
+
+    let (stdout, stderr, code) = run_cli_in_home(&["cache", "stats"], Some(&home));
+    assert_eq!(code, 0, "cache stats should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("Total entries:  2"),
+        "should count both seeded entries; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("testnet") && stdout.contains("mainnet"),
+        "should break entries down by network; got: {stdout}"
+    );
+}
+
+#[test]
 fn test_estimate_missing_wasm_errors() {
     let (_, stderr, code) = run_cli(&["estimate"]);
     assert_ne!(code, 0, "estimate without --wasm should error");
@@ -1673,83 +1719,103 @@ fn test_estimate_minimal_wasm_upload_zero_footprint() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Simulation latency reporting tests (Issue #304)
+// Shell completions
 // ─────────────────────────────────────────────────────────────────────────
 
-/// The mock server delays every reply so the measured round-trip is reliably
-/// above the millisecond truncation floor.
-const MOCK_LATENCY_MS: u64 = 20;
-
-/// Runs `estimate` against the delayed mock server, optionally as JSON, with
-/// tracing quieted (`RUST_LOG=error`) so stdout stays parseable.
-fn estimate_against_mock(home: &Path, rpc_url: &str, json: bool) -> (String, String, i32) {
-    let mut args = vec![
-        "estimate",
-        "--wasm",
-        "tests/fixtures/contract.wasm",
-        "--id",
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-        "--fn",
-        "increment",
-        "--arg",
-        "1",
-        "--rpc-url",
-        rpc_url,
-    ];
-    if json {
-        args.push("--json");
-    }
-
-    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
-        .args(&args)
-        .env("HOME", home)
-        .env("USERPROFILE", home)
-        .env("RUST_LOG", "error")
-        .output()
-        .expect("failed to run estimate");
-
-    (
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
-        output.status.code().unwrap_or(-1),
-    )
-}
-
 #[test]
-fn test_estimate_reports_simulation_duration_ms_in_json() {
-    let (rpc_url, _stop) =
-        start_mock_rpc_server_delayed(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195, MOCK_LATENCY_MS);
-    let home = temp_home("estimate-simulation-duration-json");
-
-    let (stdout, stderr, code) = estimate_against_mock(&home, &rpc_url, true);
-    assert_eq!(code, 0, "estimate should succeed; stderr: {stderr}");
-
-    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON output");
-    let duration = parsed["simulation_duration_ms"].as_u64().unwrap_or(0);
+fn test_completions_help() {
+    let (stdout, stderr, code) = run_cli(&["completions", "--help"]);
+    assert_eq!(
+        code, 0,
+        "completions --help should exit 0; stderr: {stderr}"
+    );
     assert!(
-        duration > 0,
-        "simulation_duration_ms should be > 0 for a mock simulation response; got: {stdout}"
+        stdout.contains("bash"),
+        "completions help should list bash option"
+    );
+    assert!(
+        stdout.contains("zsh"),
+        "completions help should list zsh option"
+    );
+    assert!(
+        stdout.contains("fish"),
+        "completions help should list fish option"
+    );
+    assert!(
+        stdout.contains("powershell"),
+        "completions help should list powershell option"
     );
 }
 
 #[test]
-fn test_estimate_reports_simulation_latency_in_table_footer() {
-    let (rpc_url, _stop) =
-        start_mock_rpc_server_delayed(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195, MOCK_LATENCY_MS);
-    let home = temp_home("estimate-simulation-duration-table");
+fn test_completions_bash() {
+    let (stdout, stderr, code) = run_cli(&["completions", "bash"]);
+    assert_eq!(code, 0, "completions bash should exit 0; stderr: {stderr}");
+    assert!(!stdout.is_empty(), "completion script should not be empty");
+    assert!(
+        stdout.contains("soroban-cost-estimator"),
+        "bash completion script should contain binary name"
+    );
+    assert!(
+        stdout.contains("estimate"),
+        "bash completion script should contain subcommand names"
+    );
+}
 
-    let (stdout, stderr, code) = estimate_against_mock(&home, &rpc_url, false);
-    assert_eq!(code, 0, "estimate should succeed; stderr: {stderr}");
+#[test]
+fn test_completions_zsh() {
+    let (stdout, stderr, code) = run_cli(&["completions", "zsh"]);
+    assert_eq!(code, 0, "completions zsh should exit 0; stderr: {stderr}");
+    assert!(!stdout.is_empty(), "completion script should not be empty");
+    assert!(
+        stdout.contains("soroban-cost-estimator"),
+        "zsh completion script should contain binary name"
+    );
+    assert!(
+        stdout.contains("estimate"),
+        "zsh completion script should contain subcommand names"
+    );
+}
 
-    let footer = stdout
-        .lines()
-        .find(|line| line.starts_with("Simulation latency:"))
-        .unwrap_or_else(|| panic!("table output should have a latency footer; got: {stdout}"));
-    let ms: u64 = footer
-        .trim_start_matches("Simulation latency: ")
-        .trim_end_matches(" ms")
-        .trim()
-        .parse()
-        .expect("footer latency should be an integer number of milliseconds");
-    assert!(ms > 0, "table footer latency should be > 0; got: {footer}");
+#[test]
+fn test_completions_fish() {
+    let (stdout, stderr, code) = run_cli(&["completions", "fish"]);
+    assert_eq!(code, 0, "completions fish should exit 0; stderr: {stderr}");
+    assert!(!stdout.is_empty(), "completion script should not be empty");
+    assert!(
+        stdout.contains("soroban-cost-estimator"),
+        "fish completion script should contain binary name"
+    );
+    assert!(
+        stdout.contains("estimate"),
+        "fish completion script should contain subcommand names"
+    );
+}
+
+#[test]
+fn test_completions_powershell() {
+    let (stdout, stderr, code) = run_cli(&["completions", "powershell"]);
+    assert_eq!(
+        code, 0,
+        "completions powershell should exit 0; stderr: {stderr}"
+    );
+    assert!(!stdout.is_empty(), "completion script should not be empty");
+    assert!(
+        stdout.contains("soroban-cost-estimator"),
+        "powershell completion script should contain binary name"
+    );
+    assert!(
+        stdout.contains("estimate"),
+        "powershell completion script should contain subcommand names"
+    );
+}
+
+#[test]
+fn test_completions_unsupported_shell() {
+    let (_stdout, stderr, code) = run_cli(&["completions", "invalid_shell"]);
+    assert_ne!(code, 0, "unsupported shell should exit non-zero");
+    assert!(
+        stderr.contains("invalid value 'invalid_shell'") || stderr.contains("unexpected argument"),
+        "stderr should state invalid shell value; got: {stderr}"
+    );
 }

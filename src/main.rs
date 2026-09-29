@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use comfy_table::Cell;
 use comfy_table::Table;
 use soroban_cost_estimator::cache;
@@ -156,6 +156,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             clear_cache,
             json,
             precision,
+            auto_snapshot,
         } => {
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
@@ -182,6 +183,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 &headers,
                 args.wasm_info,
                 args.verbose,
+                auto_snapshot,
             )
             .await
         }
@@ -192,6 +194,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             id,
             json,
             precision,
+            auto_snapshot,
         } => {
             let format = match (args.format, json) {
                 (Some(fmt), _) => fmt,
@@ -212,6 +215,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 &headers,
                 args.wasm_info,
                 args.verbose,
+                auto_snapshot,
             )
             .await
         }
@@ -326,6 +330,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 to.as_deref(),
                 json,
             ),
+            cli::CacheAction::Stats { json } => cmd_cache_stats(json),
         },
         cli::Command::Watch {
             network,
@@ -345,7 +350,18 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             )
             .await
         }
+        cli::Command::Completions { shell } => {
+            cmd_completions(shell);
+            Ok(())
+        }
     }
+}
+
+/// `completions` command: generate shell completion script to stdout.
+fn cmd_completions(shell: clap_complete::Shell) {
+    let mut cmd = cli::Cli::command();
+    let bin_name = cmd.get_name().to_string();
+    clap_complete::generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
 }
 
 /// True when a simulation response carried neither cost data, nor
@@ -532,6 +548,7 @@ fn emit_wasm_structure(
 /// the same params — so a repeated WASM-upload envelope (when `--fn` is
 /// omitted) or identical fee-rate fetches transmit at most once.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::fn_params_excessive_bools)]
 async fn cmd_estimate(
     wasm_path: &str,
     network: &str,
@@ -550,6 +567,7 @@ async fn cmd_estimate(
     extra_headers: &[String],
     wasm_info_flag: bool,
     verbose: bool,
+    auto_snapshot: bool,
 ) -> error::AppResult<()> {
     let json_flag = format == "json";
     let table_mode = format == "table";
@@ -716,6 +734,23 @@ async fn cmd_estimate(
         );
         info!(total_stroops = fee.total_stroops, total_xlm = %fee.total_xlm, "estimate complete");
 
+        if auto_snapshot {
+            if let Err(e) = auto_snapshot_if_changed(
+                network,
+                rpc_fallback_url,
+                rps,
+                timeout,
+                max_retries,
+                extra_headers,
+                verbose,
+            )
+            .await
+            {
+                warn!(error = %e, "auto-snapshot failed");
+                eprintln!("Warning: auto-snapshot failed: {e}");
+            }
+        }
+
         match formatter_by_name(format) {
             Some(formatter) => println!("{}", formatter.format(&report)),
             None => println!("{}", TableFormatter.format(&report)),
@@ -774,6 +809,7 @@ async fn cmd_estimate_all(
     extra_headers: &[String],
     wasm_info_flag: bool,
     verbose: bool,
+    auto_snapshot: bool,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -895,6 +931,23 @@ async fn cmd_estimate_all(
                 println!();
             } else {
                 json_results.push(result);
+            }
+        }
+
+        if auto_snapshot {
+            if let Err(e) = auto_snapshot_if_changed(
+                network,
+                rpc_fallback_url,
+                rps,
+                timeout,
+                max_retries,
+                extra_headers,
+                verbose,
+            )
+            .await
+            {
+                warn!(error = %e, "auto-snapshot failed");
+                eprintln!("Warning: auto-snapshot failed: {e}");
             }
         }
 
@@ -1613,6 +1666,64 @@ fn parse_interval_secs(interval: &str) -> u64 {
     num_part.parse::<u64>().unwrap_or(3600).saturating_mul(mult)
 }
 
+/// Checks if network config has changed since the last snapshot and
+/// automatically saves a new snapshot if so.
+///
+/// # Network calls
+/// Makes one batched `getLedgerEntries` RPC call to fetch current config.
+async fn auto_snapshot_if_changed(
+    network: &str,
+    rpc_fallback_url: Option<&str>,
+    rps: Option<u64>,
+    timeout: u64,
+    max_retries: usize,
+    extra_headers: &[String],
+    verbose: bool,
+) -> error::AppResult<()> {
+    use tracing::{debug, info};
+
+    // Try to load the latest snapshot; if none exists, save a new one.
+    let old_snapshot = config_snapshot::store::load_latest_snapshot(network).ok();
+
+    let new_snapshot = fetch_config_snapshot(
+        network,
+        rpc_fallback_url,
+        rps,
+        timeout,
+        max_retries,
+        extra_headers,
+        verbose,
+    )
+    .await?;
+
+    let has_changes = match &old_snapshot {
+        Some(old) => {
+            let diff = config_snapshot::diff::diff_snapshots(old, &new_snapshot);
+            debug!(
+                change_count = diff.changes.len(),
+                has_pricing = diff.has_pricing_changes,
+                "auto-snapshot diff computed"
+            );
+            !diff.changes.is_empty()
+        }
+        None => {
+            debug!("no existing snapshot found; will save new snapshot");
+            true
+        }
+    };
+
+    if has_changes {
+        let path = config_snapshot::store::save_snapshot(&new_snapshot, None)?;
+        info!(path = %path.display(), ledger = new_snapshot.ledger, "auto-snapshot saved");
+        println!(
+            "Network configuration updated: saved snapshot {}",
+            path.display()
+        );
+    }
+
+    Ok(())
+}
+
 /// Resolves when the process receives SIGINT (Ctrl-C) or SIGTERM, so a
 /// long-running command can stop gracefully.
 ///
@@ -1752,7 +1863,6 @@ async fn cmd_watch(
     }
 }
 
-/// `cache verify` command: check every cache entry parses as valid JSON.
 /// `cache stats` command: show cache health overview.
 ///
 /// Prints total entries, disk usage, age (oldest/newest), and per-network
@@ -1762,11 +1872,16 @@ async fn cmd_watch(
 /// # Network calls
 /// None — pure SQLite I/O.
 #[allow(dead_code)]
-fn cmd_cache_stats() -> error::AppResult<()> {
+fn cmd_cache_stats(json: bool) -> error::AppResult<()> {
     let stats = cache::cache_stats()?;
 
+    if json {
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+        return Ok(());
+    }
+
     if stats.total_entries == 0 {
-        println!("Cache is empty — no cached estimates.");
+        println!("Cache is empty (0 entries, 0 bytes)");
         return Ok(());
     }
 
@@ -1814,6 +1929,7 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// `cache verify` command: check every cache entry parses as valid JSON.
 ///
 /// Prints a summary line per corrupted entry and exits with code 1 when any
 /// entry fails verification, so scripts can treat a corrupt cache as an
@@ -1991,6 +2107,7 @@ async fn cmd_cache_warm(
         extra_headers,
         false,
         verbose,
+        false,
     )
     .await
 }
