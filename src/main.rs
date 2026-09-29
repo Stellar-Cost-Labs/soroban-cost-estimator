@@ -222,6 +222,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             clear_cache,
             json,
             auto_snapshot,
+            watch,
             dry_run,
         } => {
             // `--format` wins when both it and the legacy `--json` flag are
@@ -589,6 +590,9 @@ enum EstimateRun {
     /// A still-fresh cached estimate was reused and already printed by
     /// [`estimate_once`]; nothing more to render.
     Cached,
+    /// `--dry-run` printed the planned simulation payload and skipped every
+    /// network call; the caller must not render or snapshot anything.
+    DryRun,
 }
 
 /// Emits the WASM structure summary (entry points, memory, host imports)
@@ -697,12 +701,55 @@ async fn cmd_estimate(
         format == "table",
         wasm_info_flag,
         verbose,
+        dry_run,
     )
     .await?;
 
+    // `--dry-run` promises no network access, so bail before the rendering and
+    // before the auto-snapshot guard (which fetches live pricing config).
+    if matches!(run, EstimateRun::DryRun) {
+        return Ok(());
+    }
+
     if let EstimateRun::Simulated { report, .. } = &run {
-        let formatter = formatter_by_name(format).unwrap_or_else(|| Box::new(TableFormatter));
-        println!("{}", formatter.format(report));
+        // The table formatter is the only one that renders the fee bar chart,
+        // and only when the terminal has room for it (>= MIN_CHART_WIDTH
+        // columns), stdout is a TTY, and `--quiet` was not passed. Machine
+        // formats never grow a human-only chart.
+        if format == "table" {
+            match cli::chart_width() {
+                Some(width) => {
+                    println!(
+                        "{}",
+                        TableFormatter.format_with_options(report, true, width)
+                    );
+                }
+                None => {
+                    println!(
+                        "{}",
+                        TableFormatter.format_with_options(
+                            report,
+                            false,
+                            report::cost_report::DEFAULT_CHART_WIDTH,
+                        )
+                    );
+                }
+            }
+        } else {
+            match formatter_by_name(format) {
+                Some(formatter) => println!("{}", formatter.format(report)),
+                None => {
+                    println!(
+                        "{}",
+                        TableFormatter.format_with_options(
+                            report,
+                            false,
+                            report::cost_report::DEFAULT_CHART_WIDTH,
+                        )
+                    );
+                }
+            }
+        }
     }
 
     // Main's `--auto-snapshot` step belongs here rather than inside
@@ -760,6 +807,7 @@ async fn estimate_once(
     print_wasm_hash: bool,
     wasm_info_flag: bool,
     verbose: bool,
+    dry_run: bool,
 ) -> error::AppResult<EstimateRun> {
     let json_flag = format == "json";
     let table_mode = format == "table";
@@ -884,7 +932,7 @@ async fn estimate_once(
             println!("    XDR size:   {} bytes", tx_xdr.len());
             println!("    Base64 size: {} bytes", tx_b64.len());
             println!("    Base64 data: {tx_b64}");
-            return Ok(());
+            return Ok(EstimateRun::DryRun);
         }
 
         // Fail fast on a misconfigured --rpc-url or down node (#55): validate
@@ -1130,6 +1178,8 @@ async fn emit_watch_estimate(
         // per-build header instead.
         false,
         verbose,
+        // `--watch` wins over `--dry-run`: watching exists to re-simulate.
+        false,
     )
     .await
     {
@@ -1153,10 +1203,11 @@ async fn emit_watch_estimate(
             let formatter = formatter_by_name(format).unwrap_or_else(|| Box::new(TableFormatter));
             println!("{}", formatter.format(&report));
         }
-        Ok(EstimateRun::Cached) => {
+        Ok(EstimateRun::Cached | EstimateRun::DryRun) => {
             // Unreachable in watch mode: the cache store is only consulted
-            // when `--cache-ttl` is supplied, which watch never does.
-            debug!("unexpected cache hit during watch");
+            // when `--cache-ttl` is supplied, and `--dry-run` is suppressed,
+            // which watch never does.
+            debug!("unexpected cached or dry-run estimate during watch");
         }
         Err(e) => {
             warn!(error = %e, "estimate failed");
@@ -1311,41 +1362,8 @@ async fn cmd_estimate_watch(
             )
             .await;
         }
-
-        // The table formatter is the only one that renders the fee bar chart,
-        // and only when the terminal has room for it (>= MIN_CHART_WIDTH
-        // columns), stdout is a TTY, and `--quiet` was not passed. Machine
-        // formats never grow a human-only chart.
-        if format == "table" {
-            match cli::chart_width() {
-                Some(width) => {
-                    println!("{}", TableFormatter.format_with_options(&report, true, width));
-                }
-                None => {
-                    println!(
-                        "{}",
-                        TableFormatter.format_with_options(
-                            &report,
-                            false,
-                            report::cost_report::DEFAULT_CHART_WIDTH,
-                        )
-                    );
-                }
-            }
-        } else {
-            match formatter_by_name(format) {
-                Some(formatter) => println!("{}", formatter.format(&report)),
-                None => {
-                    println!(
-                        "{}",
-                        TableFormatter.format_with_options(
-                            &report,
-                            false,
-                            report::cost_report::DEFAULT_CHART_WIDTH,
-                        )
-                    );
-                }
-            }
+        Ok(None) => {
+            watch_say(human, format!("Waiting for {wasm_path} to appear..."));
         }
         Err(e) => {
             watch_say(
