@@ -10,6 +10,24 @@ pub enum OutputFormat {
     Markdown,
 }
 
+impl OutputFormat {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Json => "json",
+            Self::Csv => "csv",
+            Self::Markdown => "markdown",
+        }
+    }
+}
+
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Build version string with metadata from build.rs
 fn build_version() -> &'static str {
     concat!(
@@ -31,11 +49,7 @@ fn build_version() -> &'static str {
 #[command(version = build_version())]
 #[command(about = "Estimate Soroban contract costs & track network pricing changes", long_about = None)]
 pub struct Cli {
-    /// Optional TOML config file path. Defaults to ~/.config/soroban-cost-estimator/config.toml.
-    #[arg(long, global = true, value_name = "PATH")]
-    pub config: Option<String>,
-
-    /// Select output format for commands that produce structured output.
+    /// Select output format for commands that produce structured output (table, json, csv, markdown).
     #[arg(long, global = true, value_enum)]
     pub format: Option<OutputFormat>,
 

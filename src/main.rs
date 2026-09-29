@@ -226,12 +226,10 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
         } => {
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
-            let format_str = if args.format.is_some() {
-                output_format_name(format)
-            } else if json {
-                "json"
-            } else {
-                output_format_name(format)
+            let format = match (args.format, json) {
+                (Some(fmt), _) => fmt,
+                (None, true) => cli::OutputFormat::Json,
+                (None, false) => cli::OutputFormat::Table,
             };
             cmd_estimate(
                 &wasm,
@@ -243,7 +241,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 &contract_args,
                 cache_ttl.as_deref(),
                 clear_cache,
-                format_str,
+                format.as_str(),
                 rps,
                 timeout,
                 max_retries,
@@ -262,12 +260,10 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             json,
             precision,
         } => {
-            let format_str = if args.format.is_some() {
-                output_format_name(format)
-            } else if json {
-                "json"
-            } else {
-                output_format_name(format)
+            let format = match (args.format, json) {
+                (Some(fmt), _) => fmt,
+                (None, true) => cli::OutputFormat::Json,
+                (None, false) => cli::OutputFormat::Table,
             };
             cmd_estimate_all(
                 &wasm,
@@ -275,7 +271,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 rpc_url.as_deref().or(default_rpc_url.as_deref()),
                 fallback,
                 id.as_deref(),
-                format_str,
+                format.as_str(),
                 rps,
                 timeout,
                 max_retries,
@@ -287,29 +283,25 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             .await
         }
         cli::Command::WasmInfo { wasm, json } => {
-            let effective_format = if args.format.is_some() {
-                format
-            } else if json {
-                cli::OutputFormat::Json
-            } else {
-                format
+            let format = match (args.format, json) {
+                (Some(fmt), _) => fmt,
+                (None, true) => cli::OutputFormat::Json,
+                (None, false) => cli::OutputFormat::Table,
             };
-            cmd_wasm_info(&wasm, effective_format)
+            cmd_wasm_info(&wasm, format)
         }
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot { network, out, json } => {
-                let effective_format = if args.format.is_some() {
-                    format
-                } else if json {
-                    cli::OutputFormat::Json
-                } else {
-                    format
+                let format = match (args.format, json) {
+                    (Some(fmt), _) => fmt,
+                    (None, true) => cli::OutputFormat::Json,
+                    (None, false) => cli::OutputFormat::Table,
                 };
                 cmd_config_snapshot(
                     &env_string(network, &default_network, "SOROBAN_NETWORK"),
                     fallback,
                     out.as_deref(),
-                    effective_format,
+                    format,
                     rps,
                     timeout,
                     max_retries,
@@ -365,12 +357,10 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 id,
                 json,
             } => {
-                let effective_format = if args.format.is_some() {
-                    format
-                } else if json {
-                    cli::OutputFormat::Json
-                } else {
-                    format
+                let format = match (args.format, json) {
+                    (Some(fmt), _) => fmt,
+                    (None, true) => cli::OutputFormat::Json,
+                    (None, false) => cli::OutputFormat::Table,
                 };
                 cmd_cache_warm(
                     &wasm,
@@ -378,7 +368,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     rpc_url.as_deref().or(default_rpc_url.as_deref()),
                     fallback,
                     id.as_deref(),
-                    effective_format,
+                    format,
                     rps,
                     timeout,
                     max_retries,
@@ -2054,7 +2044,10 @@ async fn cmd_cache_warm(
     extra_headers: &[String],
     verbose: bool,
 ) -> error::AppResult<()> {
-    let fmt = output_format_name(format);
+    let fmt = match format {
+        cli::OutputFormat::Json => "json",
+        _ => "table",
+    };
     cmd_estimate_all(
         wasm_path,
         network,
