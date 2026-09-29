@@ -471,6 +471,20 @@ mod tests {
         assert_eq!(stroops_to_xlm(-1_234_567, 3), "-0.123");
     }
 
+    /// Issue #330: the `--precision` flag is exposed for 0..=7 decimals; pin
+    /// the formatting at 2, 4 and 7 places explicitly.
+    #[test]
+    fn test_stroops_to_xlm_precision_2_4_7() {
+        assert_eq!(stroops_to_xlm(1_234_567, 2), "0.12");
+        assert_eq!(stroops_to_xlm(1_234_567, 4), "0.1235");
+        assert_eq!(stroops_to_xlm(1_234_567, 7), "0.1234567");
+        // Round half-up at the requested precision.
+        assert_eq!(stroops_to_xlm(1_260_000, 2), "0.13");
+        assert_eq!(stroops_to_xlm(1_265_000, 4), "0.1265");
+        // Default precision preserves full stroop fidelity.
+        assert_eq!(stroops_to_xlm(1, DEFAULT_PRECISION), "0.0000001");
+    }
+
     #[test]
     fn test_compute_fee_breakdown() {
         // CPU fee = (100_000 * 1024) / 10_000 = 10_240
