@@ -154,6 +154,12 @@ pub enum Command {
         #[arg(long)]
         auto_snapshot: bool,
 
+        /// Watch the WASM file for rebuilds and re-estimate on every change,
+        /// printing a header with the timestamp and the fee change versus the
+        /// previous build (Ctrl-C stops watching and exits with code 0).
+        #[arg(long)]
+        watch: bool,
+
         /// Parse WASM, validate arguments, and print the planned simulation
         /// payload without contacting the network. Useful for air-gapped
         /// environments or local contract verification.
