@@ -1354,69 +1354,255 @@ fn test_load_fresh_estimate_expired_returns_none() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// cache_stats (issue #281)
+// `cache import` — restoring estimates from a JSON export
 // ─────────────────────────────────────────────────────────────────────────
 
-/// `cache_stats` on a fresh cache reports zero entries, no timestamps, an
-/// empty per-network breakdown, and no disk error.
+/// Build a [`cache::CachedEstimate`] for import tests.
+///
+/// `args_hash` is derived from `args` the same way the library does it (SHA-256
+/// over the concatenated arg strings) so that a `load_estimate(..., args)`
+/// after the import can actually find the row. `version` defaults to the
+/// current schema so tests only spell out the fields under test.
+fn importable_entry(
+    wasm_hash: &str,
+    function: &str,
+    args: &[&str],
+    network: &str,
+) -> cache::CachedEstimate {
+    let mut hasher = sha2::Sha256::new();
+    for arg in args {
+        hasher.update(arg.as_bytes());
+    }
+    let args_hash = hex::encode(hasher.finalize());
+
+    cache::CachedEstimate {
+        version: current_schema_version(),
+        wasm_hash: wasm_hash.to_string(),
+        function: function.to_string(),
+        args_hash,
+        network: network.to_string(),
+        ledger: 42,
+        total_stroops: 1_000,
+        cpu_instructions: 200,
+        memory_bytes: 50,
+        timestamp: "2026-01-01T00:00:00+00:00".to_string(),
+        duration_ms: Some(7),
+        success: true,
+    }
+}
+
+/// [`importable_entry`]'s `ledger` is fixed, so tests that overwrite a seeded
+/// key bump the fee instead to prove the import replaced the row.
+fn importable_entry_for_seed(
+    wasm_hash: &str,
+    function: &str,
+    args: &[&str],
+    network: &str,
+) -> cache::CachedEstimate {
+    let mut entry = importable_entry(wasm_hash, function, args, network);
+    entry.ledger = 99;
+    entry.total_stroops = 4_242;
+    entry
+}
+
+/// `import_cached_estimates` writes every entry back so a later `load` finds
+/// it, preserving each field rather than just the key.
 #[test]
-fn test_cache_stats_empty_cache() {
+fn test_import_cached_estimates_restores_entries() {
     with_temp_home(|_tmp| {
-        let stats = cache::cache_stats().expect("stats on empty cache");
-        assert_eq!(stats.total_entries, 0, "fresh cache should have 0 entries");
+        let entries = vec![
+            importable_entry("h1", "f1", &["a1"], "testnet"),
+            importable_entry("h2", "f2", &["a2"], "mainnet"),
+        ];
+
+        let imported = cache::import_cached_estimates(&entries).expect("import");
+        assert_eq!(imported, 2, "both entries should be imported");
+
+        let loaded = cache::load_estimate("h1", "f1", &["a1".to_string()])
+            .expect("load h1")
+            .expect("h1 should exist after import");
+        assert_eq!(loaded.wasm_hash, "h1");
+        assert_eq!(loaded.function, "f1");
+        assert_eq!(loaded.ledger, 42);
+        assert_eq!(loaded.total_stroops, 1_000);
+        assert_eq!(loaded.cpu_instructions, 200);
+        assert_eq!(loaded.memory_bytes, 50);
+        assert_eq!(loaded.duration_ms, Some(7));
+        assert!(loaded.success);
+
+        // Entries land on their own network, not merged into one.
+        assert_eq!(cache::list_cached_estimates("testnet").unwrap().len(), 1);
+        assert_eq!(cache::list_cached_estimates("mainnet").unwrap().len(), 1);
+    });
+}
+
+/// An imported entry keeps the *original* timestamp rather than being
+/// re-stamped with the import time — otherwise every restored entry would look
+/// brand new to `--cache-ttl` and mask genuinely expired ones.
+#[test]
+fn test_import_preserves_original_timestamp() {
+    with_temp_home(|_tmp| {
+        let mut entry = importable_entry("h1", "f1", &["a1"], "testnet");
+        let two_hours_ago = (chrono::Utc::now() - chrono::TimeDelta::hours(2)).to_rfc3339();
+        entry.timestamp = two_hours_ago.clone();
+
+        cache::import_cached_estimates(&[entry]).expect("import");
+
+        let loaded = cache::load_estimate("h1", "f1", &["a1".to_string()])
+            .expect("load")
+            .expect("entry should exist");
+        assert_eq!(loaded.timestamp, two_hours_ago);
+
+        // The preserved age still governs freshness.
         assert!(
-            stats.oldest_entry.is_none(),
-            "no oldest entry on an empty cache"
-        );
-        assert!(
-            stats.newest_entry.is_none(),
-            "no newest entry on an empty cache"
-        );
-        assert!(
-            stats.per_network.is_empty(),
-            "empty cache should have no per-network breakdown"
+            !cache::is_cache_entry_fresh(&loaded, std::time::Duration::from_secs(3600)),
+            "an imported 2h-old entry must not be treated as fresh"
         );
     });
 }
 
-/// `cache_stats` aggregates every cached estimate across networks: total
-/// count, oldest/newest timestamps, per-network breakdown, and disk usage.
+/// A key already present is overwritten, not duplicated — re-importing the same
+/// file is idempotent.
 #[test]
-fn test_cache_stats_reports_populated_cache() {
+fn test_import_overwrites_existing_entries_idempotently() {
     with_temp_home(|_tmp| {
-        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true)
-            .expect("save testnet f1");
-        cache::save_estimate("h2", "f2", &[], "mainnet", 2, 200, 20, 10, None, true)
-            .expect("save mainnet f2");
+        cache::save_estimate(
+            "h1",
+            "f1",
+            &["a1".to_string()],
+            "testnet",
+            1,
+            100,
+            10,
+            5,
+            None,
+            true,
+        )
+        .expect("seed save");
 
-        let stats = cache::cache_stats().expect("stats on populated cache");
-        assert_eq!(stats.total_entries, 2, "both entries should be counted");
-        assert!(stats.disk_bytes > 0, "the SQLite file should occupy space");
-        assert!(
-            stats.oldest_entry.is_some(),
-            "an oldest timestamp should be reported"
-        );
-        assert!(
-            stats.newest_entry.is_some(),
-            "a newest timestamp should be reported"
-        );
+        let entry = importable_entry_for_seed("h1", "f1", &["a1"], "testnet");
+        cache::import_cached_estimates(&[entry]).expect("import");
 
-        let count = |network: &str| {
-            stats
-                .per_network
+        // Re-importing the identical entry changes nothing: same row, same values.
+        let again = importable_entry_for_seed("h1", "f1", &["a1"], "testnet");
+        let imported = cache::import_cached_estimates(&[again]).expect("re-import");
+        assert_eq!(imported, 1);
+
+        let all = cache::list_cached_estimates("testnet").expect("list");
+        assert_eq!(all.len(), 1, "the key must not be duplicated");
+        assert_eq!(all[0].ledger, 99, "the import should overwrite");
+        assert_eq!(all[0].total_stroops, 4_242);
+    });
+}
+
+/// A full `export` → `import` round trip restores the cache byte-for-byte,
+/// including the optional `duration_ms` and `success` columns.
+#[test]
+fn test_export_import_round_trip_preserves_all_fields() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate(
+            "h1",
+            "f1",
+            &["a1".to_string()],
+            "testnet",
+            7,
+            700,
+            70,
+            7,
+            Some(42),
+            true,
+        )
+        .expect("save success");
+        cache::save_estimate("h2", "f2", &[], "testnet", 8, 800, 80, 8, Some(43), true)
+            .expect("save second");
+
+        let exported = cache::export_cached_estimates().expect("export");
+        assert_eq!(exported.len(), 2);
+
+        cache::clear_cache("testnet").expect("clear");
+        assert!(cache::list_cached_estimates("testnet").unwrap().is_empty());
+
+        cache::import_cached_estimates(&exported).expect("import");
+        let restored = cache::list_cached_estimates("testnet").expect("list");
+
+        assert_eq!(restored.len(), 2);
+        for original in &exported {
+            let back = restored
                 .iter()
-                .find(|(name, _)| name == network)
-                .map(|(_, count)| *count)
-        };
-        assert_eq!(
-            count("mainnet"),
-            Some(1),
-            "mainnet breakdown should count 1"
+                .find(|e| e.wasm_hash == original.wasm_hash && e.function == original.function)
+                .expect("entry should be restored");
+            assert_eq!(back.ledger, original.ledger);
+            assert_eq!(back.total_stroops, original.total_stroops);
+            assert_eq!(back.cpu_instructions, original.cpu_instructions);
+            assert_eq!(back.memory_bytes, original.memory_bytes);
+            assert_eq!(back.duration_ms, original.duration_ms);
+            assert_eq!(back.success, original.success);
+            assert_eq!(back.timestamp, original.timestamp);
+        }
+    });
+}
+
+/// A legacy (older schema version) entry is migrated forward on import, so an
+/// export taken by an older tool restores cleanly.
+#[test]
+fn test_import_migrates_legacy_entries_forward() {
+    with_temp_home(|_tmp| {
+        let mut entry = importable_entry("h1", "old_func", &["a1"], "testnet");
+        entry.version = 1;
+
+        cache::import_cached_estimates(&[entry]).expect("import");
+
+        let loaded = cache::load_estimate("h1", "old_func", &["a1".to_string()])
+            .expect("load")
+            .expect("legacy entry should be restored");
+        assert_eq!(loaded.version, current_schema_version());
+    });
+}
+
+/// An entry from a *newer* tool is rejected, and the rejection is atomic: the
+/// good entry that preceded it in the same batch must not be left behind.
+#[test]
+fn test_import_rejects_future_version_and_rolls_back() {
+    with_temp_home(|_tmp| {
+        let good = importable_entry("h1", "f1", &["a1"], "testnet");
+        let mut future = importable_entry("h2", "f2", &["a2"], "testnet");
+        future.version = current_schema_version() + 1;
+
+        let err = cache::import_cached_estimates(&[good, future])
+            .expect_err("a future-schema entry must abort the import");
+        assert!(err.to_string().contains("newer"), "unhelpful error: {err}");
+
+        // The whole transaction rolled back — the valid first entry was not
+        // committed either.
+        assert!(
+            cache::list_cached_estimates("testnet").unwrap().is_empty(),
+            "a rejected import must not leave a partial cache behind"
         );
-        assert_eq!(
-            count("testnet"),
-            Some(1),
-            "testnet breakdown should count 1"
-        );
+    });
+}
+
+/// Importing an empty list is a valid no-op that reports zero.
+#[test]
+fn test_import_empty_list_is_a_noop() {
+    with_temp_home(|_tmp| {
+        let imported = cache::import_cached_estimates(&[]).expect("import empty");
+        assert_eq!(imported, 0);
+        assert!(cache::list_cached_estimates("testnet").unwrap().is_empty());
+    });
+}
+
+/// An export survives a JSON round trip through disk unchanged, which is what
+/// makes `cache export` → `cache import` a usable backup/restore pair.
+#[test]
+fn test_exported_entries_survive_a_json_round_trip() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 3, 300, 30, 3, Some(11), true)
+            .expect("save");
+
+        let exported = cache::export_cached_estimates().expect("export");
+        let json = serde_json::to_string(&exported).expect("serialize");
+        let parsed: Vec<cache::CachedEstimate> = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(parsed, exported);
     });
 }

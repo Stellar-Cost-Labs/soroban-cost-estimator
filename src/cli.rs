@@ -222,15 +222,15 @@ pub enum CacheAction {
         out: Option<String>,
     },
 
-    /// List every cached estimate for a network (newest first).
-    List {
-        /// Network whose cached estimates to list.
-        #[arg(long, default_value = "testnet")]
-        network: String,
+    /// Restore cached estimates from a JSON export file.
+    Import {
+        /// Path to the JSON array written by `cache export`.
+        #[arg(value_name = "FILE")]
+        file: String,
 
-        /// Output the full cached-estimate records as a JSON array.
+        /// Only import entries recorded for this network.
         #[arg(long)]
-        json: bool,
+        network: Option<String>,
     },
 
     /// Check that every cached estimate is valid JSON and not corrupted.

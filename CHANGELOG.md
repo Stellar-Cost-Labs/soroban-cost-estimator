@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `cache import <FILE> [--network <NETWORK>]` — restore cached estimates from a
+  JSON array written by `cache export --out`, so a warm cache can be moved
+  between machines or shared. Entries keep their original timestamps (so
+  `estimate --cache-ttl` still re-simulates stale ones), are keyed by
+  `(wasm hash, function, args hash)` and overwrite rather than duplicate,
+  are migrated to the current schema before writing, and are applied in a single
+  transaction so a rejected entry leaves the cache untouched.
 - `--timeout` global flag — configurable HTTP request timeout for RPC calls
   in seconds (default 30).
 - `config diff --summary` — print a single-line summary
@@ -24,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `cache export` — the export query selected 10 columns while the row reader
+  indexes 12, so exporting any non-empty cache failed. The missing
+  `duration_ms` and `success` columns are now selected, which is also what makes
+  a `cache export` → `cache import` round trip lossless.
 - Restore the WebSocket RPC client (`rpc::ws`) after the merge of `main`
   dropped its `AppError` variants and `resolve_ws_endpoint`, which broke
   compilation and red-flagged every CI job.

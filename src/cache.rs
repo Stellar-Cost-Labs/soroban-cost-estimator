@@ -58,7 +58,7 @@ fn default_schema_version() -> u32 {
 }
 
 /// A cached estimate result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CachedEstimate {
     /// Schema version of this entry. Legacy entries default to
     /// [`INITIAL_SCHEMA_VERSION`] when the field is absent.
@@ -261,10 +261,41 @@ pub fn save_estimate(
 ) -> AppResult<()> {
     let args_hash = hash_args(args);
 
+    let entry = CachedEstimate {
+        version: CACHE_SCHEMA_VERSION,
+        wasm_hash: wasm_hash.to_string(),
+        function: function.to_string(),
+        args_hash,
+        network: network.to_string(),
+        ledger,
+        total_stroops,
+        cpu_instructions,
+        memory_bytes,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        duration_ms,
+        success,
+    };
+
     let _guard = WRITE_LOCK
         .lock()
         .map_err(|e| AppError::General(format!("cache write lock poisoned: {e}")))?;
     let conn = open_db()?;
+    upsert_estimate(&conn, &entry)?;
+
+    debug!(function, network, ledger, "estimate cached (sqlite)");
+    Ok(())
+}
+
+/// Insert (or overwrite) a single estimate row.
+///
+/// The cache key is `(wasm_hash, function, args_hash)`, so a conflicting row is
+/// replaced. Every column — `timestamp` included — is taken verbatim from
+/// `entry`; that is what lets a re-imported cache keep the age of the original
+/// simulation instead of re-stamping everything with the import time.
+///
+/// Shared by [`save_estimate`] and [`import_cached_estimates`] so both write
+/// through exactly one statement and cannot drift apart.
+fn upsert_estimate(conn: &Connection, entry: &CachedEstimate) -> AppResult<()> {
     conn.execute(
         "INSERT INTO estimates \
          (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, duration_ms, success) \
@@ -280,22 +311,20 @@ pub fn save_estimate(
             duration_ms = excluded.duration_ms, \
             success = excluded.success",
         rusqlite::params![
-            CACHE_SCHEMA_VERSION as i64,
-            wasm_hash,
-            function,
-            args_hash.as_str(),
-            network,
-            ledger as i64,
-            total_stroops,
-            cpu_instructions as i64,
-            memory_bytes as i64,
-            chrono::Utc::now().to_rfc3339(),
-            duration_ms.map(|v| v as i64),
-            success as i64,
+            entry.version as i64,
+            entry.wasm_hash.as_str(),
+            entry.function.as_str(),
+            entry.args_hash.as_str(),
+            entry.network.as_str(),
+            entry.ledger as i64,
+            entry.total_stroops,
+            entry.cpu_instructions as i64,
+            entry.memory_bytes as i64,
+            entry.timestamp.as_str(),
+            entry.duration_ms.map(|v| v as i64),
+            entry.success as i64,
         ],
     )?;
-
-    debug!(function, network, ledger, "estimate cached (sqlite)");
     Ok(())
 }
 
@@ -561,7 +590,7 @@ pub fn export_cached_estimates() -> AppResult<Vec<CachedEstimate>> {
     let conn = open_db()?;
     let mut stmt = conn.prepare(
         "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-         cpu_instructions, memory_bytes, timestamp \
+         cpu_instructions, memory_bytes, timestamp, duration_ms, success \
          FROM estimates ORDER BY wasm_hash, function, args_hash",
     )?;
 
@@ -575,6 +604,42 @@ pub fn export_cached_estimates() -> AppResult<Vec<CachedEstimate>> {
 
     debug!(count = estimates.len(), "exported cached estimates");
     Ok(estimates)
+}
+
+/// Restore previously-exported estimates into the cache.
+///
+/// This is the inverse of [`export_cached_estimates`]: every entry is written
+/// back under its `(wasm_hash, function, args_hash)` key, so a key already
+/// present locally is overwritten rather than duplicated. Re-importing the same
+/// file is therefore idempotent.
+///
+/// The whole import runs in one transaction: an entry that cannot be written
+/// (e.g. a future schema version, which [`migrate_to_latest`] rejects) rolls
+/// the entire import back rather than leaving a half-restored cache behind.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+pub fn import_cached_estimates(estimates: &[CachedEstimate]) -> AppResult<usize> {
+    // Migrate every entry up front. Doing this before opening the transaction
+    // means a future-version entry is rejected before any row is written, and
+    // it validates the whole file up front rather than stopping at row N.
+    let mut migrated = Vec::with_capacity(estimates.len());
+    for entry in estimates {
+        migrated.push(migrate_to_latest(entry.clone())?);
+    }
+
+    let _guard = WRITE_LOCK
+        .lock()
+        .map_err(|e| AppError::General(format!("cache write lock poisoned: {e}")))?;
+    let mut conn = open_db()?;
+    let tx = conn.transaction()?;
+    for entry in &migrated {
+        upsert_estimate(&tx, entry)?;
+    }
+    tx.commit()?;
+
+    debug!(count = migrated.len(), "imported cached estimates");
+    Ok(migrated.len())
 }
 
 /// Integrity status of a single cache entry file.

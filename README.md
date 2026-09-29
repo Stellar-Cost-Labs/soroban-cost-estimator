@@ -212,6 +212,31 @@ soroban-cost-estimator cache verify
 - Exits **0** if the cache is empty or every entry is valid
 - Exits **1** and lists the corrupted filenames if any entry fails
 
+### `cache import`
+
+Restore a cache from a JSON array previously written by `cache export --out` —
+handy for moving a warm cache between machines, sharing one file across a team,
+or recovering after `cache clear`.
+
+```bash
+soroban-cost-estimator cache export --out backup.json   # on the source machine
+soroban-cost-estimator cache import backup.json          # on the target machine
+soroban-cost-estimator cache import backup.json --network testnet
+```
+
+- Each entry keeps its **original timestamp**, so stale entries are still
+  re-simulated by `estimate --cache-ttl` instead of looking freshly restored
+- Keyed by `(wasm hash, function, args hash)` — an existing entry is
+  **overwritten**, so re-importing a file is idempotent and never duplicates
+- Entries are validated and migrated to the current schema first, so an export
+  from an older version restores cleanly
+- All-or-nothing: the import runs in one transaction, so a rejected entry (e.g.
+  one written by a newer schema) leaves the cache untouched
+- `--network` imports only that network and reports how many entries were
+  skipped
+- An empty JSON array is a valid no-op, not an error
+- No network calls are made — pure local cache I/O
+
 ### `cache clear`
 
 Wipe every cached estimate recorded for a network without hunting through

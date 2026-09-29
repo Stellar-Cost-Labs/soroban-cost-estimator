@@ -18,6 +18,7 @@ management**.
 - [Cache Management](#cache-management)
   - [`cache verify`](#cache-verify) — check cache integrity
   - [`cache warm`](#cache-warm) — pre-populate cache
+  - [`cache import`](#cache-import) — restore estimates from a JSON export
   - [`cache clear`](#cache-clear) — wipe cached estimates for a network
 - [Monitoring](#monitoring)
   - [`watch`](#watch) — poll and diff on interval
@@ -600,6 +601,82 @@ soroban-cost-estimator cache warm \
   --wasm tests/fixtures/contract.wasm \
   --id CC4WIEYYSCFGDJXMLZ73FKUUJNDEOJRNOOBZHI55QR27NW4RCNTHAQ5T \
   --network testnet
+```
+
+---
+
+### `cache import`
+
+Restore cached estimates from a JSON array previously written by
+`cache export --out <FILE>`. Useful for moving a cache between machines, sharing
+one warm-cache file across a team, or restoring a cache after
+`cache clear`.
+
+**Usage**
+
+```
+soroban-cost-estimator cache import <FILE> [OPTIONS]
+```
+
+**Arguments**
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `<FILE>` | yes | Path to the JSON array written by `cache export --out` |
+
+**Flags**
+
+| Flag | Short | Required | Default | Description |
+|------|-------|----------|---------|-------------|
+| `--network <NETWORK>` | | | all | Only import entries recorded for this network |
+| `--help` | `-h` | | | Print help |
+
+**Behavior**
+
+- The file must contain a JSON **array** of cache entries — the exact format
+  `cache export` produces.
+- Each entry keeps its **original timestamp**, so entries restored from an old
+  backup still respect `estimate --cache-ttl` and are re-simulated when stale.
+  The import time is deliberately not used as the timestamp.
+- Entries are keyed by `(wasm hash, function, args hash)`. An imported entry
+  **overwrites** an existing one with the same key, so re-importing a file is
+  idempotent and never creates duplicates.
+- Entries are first validated and **migrated to the current schema** (the same
+  migration `cache load` performs), so an export taken by an older version of
+  the tool restores cleanly.
+- The whole import runs in a **single transaction**. If any entry is rejected —
+  e.g. it was written by a *newer*, unsupported schema version — nothing is
+  committed and the cache is left exactly as it was.
+- With `--network`, entries belonging to other networks are skipped and
+  reported; only the requested network is written.
+- No network calls are made — this is pure local cache I/O.
+
+**Exit codes**
+
+| Code | Meaning |
+|------|---------|
+| `0` | Import succeeded (including a file with nothing to import) |
+| `1` | File missing, unreadable, not valid JSON, or contained a rejected entry |
+
+**Examples**
+
+```bash
+# Restore a full cache backup
+soroban-cost-estimator cache import backup.json
+# → Imported 128 cache entries from backup.json.
+
+# Restore only the testnet half of a shared multi-network export
+soroban-cost-estimator cache import backup.json --network testnet
+# → Imported 64 cache entries from backup.json.
+#   Skipped 64 entries for other networks.
+
+# An empty file is a valid no-op, not an error
+echo '[]' > empty.json && soroban-cost-estimator cache import empty.json
+# → No cached estimates found in empty.json.
+
+# Filtering down to a network the export does not contain is also a no-op
+soroban-cost-estimator cache import backup.json --network futurenet
+# → No cached estimates for futurenet found in backup.json.
 ```
 
 ---

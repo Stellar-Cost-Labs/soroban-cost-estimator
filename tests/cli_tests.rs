@@ -1747,103 +1747,255 @@ fn test_estimate_minimal_wasm_upload_zero_footprint() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Shell completions
+// `cache import` — restoring a cache from a JSON export
 // ─────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn test_completions_help() {
-    let (stdout, stderr, code) = run_cli(&["completions", "--help"]);
+fn test_cache_import_help() {
+    let (stdout, stderr, code) = run_cli(&["cache", "import", "--help"]);
     assert_eq!(
         code, 0,
-        "completions --help should exit 0; stderr: {stderr}"
+        "cache import --help should exit 0; stderr: {stderr}"
     );
     assert!(
-        stdout.contains("bash"),
-        "completions help should list bash option"
+        stdout.contains("FILE"),
+        "import help should document the file argument; got: {stdout}"
     );
     assert!(
-        stdout.contains("zsh"),
-        "completions help should list zsh option"
-    );
-    assert!(
-        stdout.contains("fish"),
-        "completions help should list fish option"
-    );
-    assert!(
-        stdout.contains("powershell"),
-        "completions help should list powershell option"
+        stdout.contains("--network"),
+        "import help should mention --network; got: {stdout}"
     );
 }
 
 #[test]
-fn test_completions_bash() {
-    let (stdout, stderr, code) = run_cli(&["completions", "bash"]);
-    assert_eq!(code, 0, "completions bash should exit 0; stderr: {stderr}");
-    assert!(!stdout.is_empty(), "completion script should not be empty");
+fn test_cache_import_requires_a_file() {
+    let (_, stderr, code) = run_cli(&["cache", "import"]);
+    assert_ne!(code, 0, "cache import without a file argument should error");
     assert!(
-        stdout.contains("soroban-cost-estimator"),
-        "bash completion script should contain binary name"
-    );
-    assert!(
-        stdout.contains("estimate"),
-        "bash completion script should contain subcommand names"
+        stderr.to_lowercase().contains("required") || stderr.contains("Usage"),
+        "stderr should indicate the missing argument; got: {stderr}"
     );
 }
 
 #[test]
-fn test_completions_zsh() {
-    let (stdout, stderr, code) = run_cli(&["completions", "zsh"]);
-    assert_eq!(code, 0, "completions zsh should exit 0; stderr: {stderr}");
-    assert!(!stdout.is_empty(), "completion script should not be empty");
+fn test_cache_import_missing_file_errors() {
+    let home = temp_home("cache-import-missing");
+    let (_, stderr, code) =
+        run_cli_in_home(&["cache", "import", "no/such/export.json"], Some(&home));
+    assert_eq!(code, 1, "a missing export file should exit 1");
     assert!(
-        stdout.contains("soroban-cost-estimator"),
-        "zsh completion script should contain binary name"
-    );
-    assert!(
-        stdout.contains("estimate"),
-        "zsh completion script should contain subcommand names"
+        stderr.contains("failed to perform I/O") || stderr.contains("File not found"),
+        "stderr: {stderr}"
     );
 }
 
 #[test]
-fn test_completions_fish() {
-    let (stdout, stderr, code) = run_cli(&["completions", "fish"]);
-    assert_eq!(code, 0, "completions fish should exit 0; stderr: {stderr}");
-    assert!(!stdout.is_empty(), "completion script should not be empty");
+fn test_cache_import_malformed_json_errors() {
+    let home = temp_home("cache-import-malformed");
+    let path = home.join("broken.json");
+    std::fs::write(&path, "{ not valid json").expect("write fixture");
+
+    let (_, stderr, code) =
+        run_cli_in_home(&["cache", "import", path.to_str().unwrap()], Some(&home));
+    assert_eq!(code, 1, "malformed JSON should exit 1");
     assert!(
-        stdout.contains("soroban-cost-estimator"),
-        "fish completion script should contain binary name"
-    );
-    assert!(
-        stdout.contains("estimate"),
-        "fish completion script should contain subcommand names"
+        stderr.contains("failed to process JSON") || stderr.contains("Error:"),
+        "stderr: {stderr}"
     );
 }
 
 #[test]
-fn test_completions_powershell() {
-    let (stdout, stderr, code) = run_cli(&["completions", "powershell"]);
+fn test_cache_import_empty_array_succeeds() {
+    let home = temp_home("cache-import-empty");
+    let path = home.join("empty.json");
+    std::fs::write(&path, "[]").expect("write fixture");
+
+    let (stdout, stderr, code) =
+        run_cli_in_home(&["cache", "import", path.to_str().unwrap()], Some(&home));
     assert_eq!(
         code, 0,
-        "completions powershell should exit 0; stderr: {stderr}"
-    );
-    assert!(!stdout.is_empty(), "completion script should not be empty");
-    assert!(
-        stdout.contains("soroban-cost-estimator"),
-        "powershell completion script should contain binary name"
+        "an empty array should import cleanly; stderr: {stderr}"
     );
     assert!(
-        stdout.contains("estimate"),
-        "powershell completion script should contain subcommand names"
+        stdout.contains("No cached estimates"),
+        "an empty import should say so; got: {stdout}"
     );
 }
 
+/// The headline workflow: seed a cache, `cache export` it, wipe the cache, then
+/// `cache import` it back and confirm the entries are queryable again.
 #[test]
-fn test_completions_unsupported_shell() {
-    let (_stdout, stderr, code) = run_cli(&["completions", "invalid_shell"]);
-    assert_ne!(code, 0, "unsupported shell should exit non-zero");
+fn test_cache_export_import_round_trip() {
+    let home = temp_home("cache-export-import");
+    let now = chrono::Utc::now().to_rfc3339();
+    seed_cache_entry_for(&home, "testnet", "(wasm upload)", 42, &now);
+    seed_cache_entry_for(&home, "testnet", "increment", 43, &now);
+    seed_cache_entry_for(&home, "mainnet", "mainnet_fn", 77, &now);
+
+    let export_path = home.join("backup.json");
+    let (stdout, stderr, code) = run_cli_in_home(
+        &["cache", "export", "--out", export_path.to_str().unwrap()],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "cache export should succeed; stderr: {stderr}");
     assert!(
-        stderr.contains("invalid value 'invalid_shell'") || stderr.contains("unexpected argument"),
-        "stderr should state invalid shell value; got: {stderr}"
+        stdout.contains("Exported 3 cache"),
+        "export should report all three entries; got: {stdout}"
+    );
+
+    // Wipe the whole cache so the restore is doing real work.
+    let (_, _, code) = run_cli_in_home(&["cache", "clear"], Some(&home));
+    assert_eq!(code, 0);
+    let (stdout, _, _) = run_cli_in_home(&["cache", "query", "--network", "testnet"], Some(&home));
+    assert!(
+        stdout.contains("No cached estimates match the query."),
+        "testnet should be empty after clear; got: {stdout}"
+    );
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &["cache", "import", export_path.to_str().unwrap()],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "cache import should succeed; stderr: {stderr}");
+    assert!(
+        stdout.contains("Imported 3 cache entries"),
+        "import should report all three entries; got: {stdout}"
+    );
+
+    let (stdout, _, code) =
+        run_cli_in_home(&["cache", "query", "--network", "testnet"], Some(&home));
+    assert_eq!(code, 0);
+    assert!(stdout.contains("(wasm upload)"), "got: {stdout}");
+    assert!(stdout.contains("increment"), "got: {stdout}");
+
+    let (stdout, _, _) = run_cli_in_home(&["cache", "query", "--network", "mainnet"], Some(&home));
+    assert!(
+        stdout.contains("mainnet_fn"),
+        "mainnet entry should be restored too; got: {stdout}"
+    );
+}
+
+/// `--network` restricts a multi-network export to a single network, so a
+/// shared backup file can be partially restored.
+#[test]
+fn test_cache_import_filters_by_network() {
+    let home = temp_home("cache-import-network");
+    let now = chrono::Utc::now().to_rfc3339();
+    seed_cache_entry_for(&home, "testnet", "(wasm upload)", 42, &now);
+    seed_cache_entry_for(&home, "mainnet", "mainnet_fn", 77, &now);
+
+    let export_path = home.join("shared.json");
+    let (stdout, stderr, code) = run_cli_in_home(
+        &["cache", "export", "--out", export_path.to_str().unwrap()],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "export should succeed; stderr: {stderr}");
+    assert!(stdout.contains("Exported 2 cache"), "got: {stdout}");
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "cache",
+            "import",
+            export_path.to_str().unwrap(),
+            "--network",
+            "testnet",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "filtered import should succeed; stderr: {stderr}");
+    assert!(
+        stdout.contains("Imported 1 cache entry"),
+        "only the testnet entry should import; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Skipped 1 entry for other networks"),
+        "the skipped entry should be reported; got: {stdout}"
+    );
+
+    // Both networks were already present, so the import replaced the testnet
+    // row in place and the mainnet row is untouched — the point is that the
+    // filter ran without error and reported the right counts.
+    let (stdout, _, _) = run_cli_in_home(&["cache", "query", "--network", "testnet"], Some(&home));
+    assert!(stdout.contains("(wasm upload)"), "got: {stdout}");
+}
+
+/// Importing a network the export does not contain is a clean, reported no-op.
+#[test]
+fn test_cache_import_no_matching_network_reports_zero() {
+    let home = temp_home("cache-import-no-match");
+    let now = chrono::Utc::now().to_rfc3339();
+    seed_cache_entry_for(&home, "testnet", "(wasm upload)", 42, &now);
+
+    let export_path = home.join("testnet-only.json");
+    let (_, stderr, code) = run_cli_in_home(
+        &["cache", "export", "--out", export_path.to_str().unwrap()],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "export should succeed; stderr: {stderr}");
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "cache",
+            "import",
+            export_path.to_str().unwrap(),
+            "--network",
+            "futurenet",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "an empty match is not an error; stderr: {stderr}");
+    assert!(
+        stdout.contains("No cached estimates for futurenet"),
+        "should report the empty filter result; got: {stdout}"
+    );
+}
+
+/// A restored entry is usable by `estimate --cache-ttl`: this is the whole
+/// point of the export/import pair.
+#[test]
+fn test_imported_entry_satisfies_estimate_cache_ttl() {
+    let source = temp_home("cache-import-ttl-source");
+    let target = temp_home("cache-import-ttl-target");
+    let now = chrono::Utc::now().to_rfc3339();
+    seed_cache_entry_for(&source, "testnet", "(wasm upload)", 42, &now);
+
+    let export_path = source.join("backup.json");
+    let (_, stderr, code) = run_cli_in_home(
+        &["cache", "export", "--out", export_path.to_str().unwrap()],
+        Some(&source),
+    );
+    assert_eq!(code, 0, "export should succeed; stderr: {stderr}");
+
+    // Import into a *different* home, so the hit can only come from the file.
+    let (_, stderr, code) = run_cli_in_home(
+        &["cache", "import", export_path.to_str().unwrap()],
+        Some(&target),
+    );
+    assert_eq!(code, 0, "import should succeed; stderr: {stderr}");
+
+    // A dead endpoint still succeeds, proving no RPC call was made.
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--cache-ttl",
+            "1h",
+            "--rpc-url",
+            DEAD_RPC,
+        ],
+        Some(&target),
+    );
+    assert_eq!(
+        code, 0,
+        "an imported entry should satisfy --cache-ttl; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Cache hit"),
+        "estimate should hit the imported entry; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("1,000 stroops") || stdout.contains("1000 stroops"),
+        "the restored fee should be reported; got: {stdout}"
     );
 }

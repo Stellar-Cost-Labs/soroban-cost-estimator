@@ -355,6 +355,9 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
         },
         cli::Command::Cache { action } => match action {
             cli::CacheAction::Export { out } => cmd_cache_export(out.as_deref()),
+            cli::CacheAction::Import { file, network } => {
+                cmd_cache_import(&file, network.as_deref())
+            }
             cli::CacheAction::Warm {
                 wasm,
                 network,
@@ -2769,6 +2772,61 @@ fn cmd_cache_export(out_path: Option<&str>) -> error::AppResult<()> {
         );
     } else {
         println!("{json}");
+    }
+
+    Ok(())
+}
+
+/// `cache import` command: restore cached estimates from a JSON export file.
+///
+/// The inverse of `cache export`. Entries are keyed by
+/// `(wasm_hash, function, args_hash)`, so importing over an existing cache
+/// replaces the matching entries rather than duplicating them, and re-importing
+/// the same file twice is a no-op.
+///
+/// Pass `--network` to import only the entries recorded for one network, which
+/// is what you want when a shared export file holds results from several.
+///
+/// # Network calls
+/// None — pure file + SQLite I/O.
+fn cmd_cache_import(file: &str, network: Option<&str>) -> error::AppResult<()> {
+    let raw = std::fs::read_to_string(file)?;
+    let entries: Vec<cache::CachedEstimate> = serde_json::from_str(&raw)?;
+    let entries_len = entries.len();
+
+    // Filter before importing so the network filter and the write share one
+    // pass over the file, and a file holding only other networks reports zero
+    // imported rather than writing rows the caller did not ask for.
+    let selected: Vec<cache::CachedEstimate> = match network {
+        Some(net) => entries
+            .iter()
+            .filter(|e| e.network == net)
+            .cloned()
+            .collect(),
+        None => entries,
+    };
+
+    let imported = cache::import_cached_estimates(&selected)?;
+    let skipped = entries_len - imported;
+
+    if imported == 0 {
+        match network {
+            Some(net) => println!("No cached estimates for {net} found in {file}."),
+            None => println!("No cached estimates found in {file}."),
+        }
+    } else {
+        println!(
+            "Imported {imported} cache entr{} from {file}.",
+            if imported == 1 { "y" } else { "ies" }
+        );
+    }
+
+    if skipped > 0 {
+        println!(
+            "Skipped {skipped} entr{} for other network{}.",
+            if skipped == 1 { "y" } else { "ies" },
+            if skipped == 1 { "s" } else { "" }
+        );
     }
 
     Ok(())
