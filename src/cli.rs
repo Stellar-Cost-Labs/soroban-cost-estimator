@@ -124,6 +124,11 @@ pub enum Command {
         /// Number of decimal places for XLM fee values (0..=18, default 7).
         #[arg(long, default_value_t = 7)]
         precision: u32,
+
+        /// Automatically save a new config snapshot if network pricing
+        /// configuration has changed since the last snapshot.
+        #[arg(long)]
+        auto_snapshot: bool,
     },
     EstimateAll {
         #[arg(long, short)]
@@ -144,6 +149,11 @@ pub enum Command {
         /// Number of decimal places for XLM fee values (0..=18, default 7).
         #[arg(long, default_value_t = 7)]
         precision: u32,
+
+        /// Automatically save a new config snapshot if network pricing
+        /// configuration has changed since the last snapshot.
+        #[arg(long)]
+        auto_snapshot: bool,
     },
     WasmInfo {
         #[arg(long, short)]
