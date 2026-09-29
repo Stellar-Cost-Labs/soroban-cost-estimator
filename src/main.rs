@@ -157,15 +157,6 @@ fn env_or_file_bool(value: bool, file: Option<bool>) -> bool {
         .unwrap_or(value)
 }
 
-const fn output_format_name(format: cli::OutputFormat) -> &'static str {
-    match format {
-        cli::OutputFormat::Table => "table",
-        cli::OutputFormat::Json => "json",
-        cli::OutputFormat::Csv => "csv",
-        cli::OutputFormat::Markdown => "markdown",
-    }
-}
-
 #[tokio::main]
 async fn main() {
     let args = cli::Cli::parse();

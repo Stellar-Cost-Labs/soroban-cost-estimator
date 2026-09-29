@@ -49,6 +49,10 @@ fn build_version() -> &'static str {
 #[command(version = build_version())]
 #[command(about = "Estimate Soroban contract costs & track network pricing changes", long_about = None)]
 pub struct Cli {
+    /// Optional TOML config file path. Defaults to ~/.config/soroban-cost-estimator/config.toml.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub config: Option<String>,
+
     /// Select output format for commands that produce structured output (table, json, csv, markdown).
     #[arg(long, global = true, value_enum)]
     pub format: Option<OutputFormat>,
