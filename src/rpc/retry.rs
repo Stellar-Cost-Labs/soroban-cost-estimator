@@ -50,8 +50,11 @@ where
 }
 
 /// Returns `true` when `error` represents a transient failure worth retrying.
+///
+/// This covers transport-level failures ([`AppError::Http`]) and transient
+/// gateway statuses ([`AppError::RpcUnavailable`] — HTTP 502/503/504).
 fn is_retryable(error: &AppError) -> bool {
-    matches!(error, AppError::Http(_))
+    matches!(error, AppError::Http(_) | AppError::RpcUnavailable { .. })
 }
 
 #[cfg(test)]
@@ -59,7 +62,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::error::{AppError, AppResult};
-    use crate::rpc::retry::with_retry;
+    use crate::rpc::retry::{is_retryable, with_retry};
 
     /// Returns the URL of an ephemeral `127.0.0.1` port that is guaranteed
     /// closed: a listener is bound to it, its address captured, then the
@@ -141,6 +144,19 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    /// Transient gateway statuses (HTTP 502/503/504) are retryable, while
+    /// RPC-level errors returned in a successful HTTP response are not.
+    #[test]
+    fn gateway_status_errors_are_retryable() {
+        for status in [502u16, 503, 504] {
+            assert!(is_retryable(&AppError::RpcUnavailable { status }));
+        }
+        assert!(!is_retryable(&AppError::Rpc {
+            status: -32000,
+            message: "permanent".to_string(),
+        }));
     }
 
     /// Errors that are not transient must never be retried.
