@@ -55,6 +55,18 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub wasm_info: bool,
 
+    /// Maximum on-disk estimate cache size, in megabytes. When exceeded,
+    /// the least-recently-accessed estimates are evicted down to 90% of the
+    /// limit. 0 disables the byte quota.
+    #[arg(long, global = true, value_name = "MB", default_value_t = 50)]
+    pub max_cache_size_mb: u64,
+
+    /// Maximum number of cached estimates. When exceeded, the
+    /// least-recently-accessed estimates are evicted down to 90% of the
+    /// limit. 0 disables the entry quota.
+    #[arg(long, global = true, value_name = "N", default_value_t = 10_000)]
+    pub max_cache_entries: usize,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -109,6 +121,16 @@ pub enum Command {
         /// Number of decimal places for XLM fee values (0..=18, default 7).
         #[arg(long, default_value_t = 7)]
         precision: u32,
+
+        /// Compare two WASM builds and print a side-by-side cost diff.
+        /// Requires `--wasm-new`.
+        #[arg(long, requires = "wasm_new")]
+        diff: bool,
+
+        /// The "new" WASM build to compare against when `--diff` is set.
+        /// The `--wasm` file is treated as the baseline ("old") build.
+        #[arg(long, value_name = "PATH")]
+        wasm_new: Option<String>,
     },
 
     /// Enumerate all public contract functions and estimate each one.
@@ -221,6 +243,13 @@ pub enum CacheAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Show cache statistics (entries, disk usage, per-network breakdown).
+    Stats,
+
+    /// Evict least-recently-accessed estimates until the cache fits its
+    /// configured quota (`--max-cache-size-mb` / `--max-cache-entries`).
+    Prune,
 
     /// Query cached estimates with optional filters.
     Query {
