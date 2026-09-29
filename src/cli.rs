@@ -10,6 +10,24 @@ pub enum OutputFormat {
     Markdown,
 }
 
+impl OutputFormat {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Json => "json",
+            Self::Csv => "csv",
+            Self::Markdown => "markdown",
+        }
+    }
+}
+
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Build version string with metadata from build.rs
 fn build_version() -> &'static str {
     concat!(
@@ -31,9 +49,9 @@ fn build_version() -> &'static str {
 #[command(version = build_version())]
 #[command(about = "Estimate Soroban contract costs & track network pricing changes", long_about = None)]
 pub struct Cli {
-    /// Select output format for commands that produce structured output.
-    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Table)]
-    pub format: OutputFormat,
+    /// Select output format for commands that produce structured output (table, json, csv, markdown).
+    #[arg(long, global = true, value_enum)]
+    pub format: Option<OutputFormat>,
 
     /// Cap RPC requests at N per second. 0 disables.
     #[arg(long, global = true, value_name = "N")]
@@ -99,11 +117,6 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Output format: table (default), json, csv, or markdown.
-        /// Overrides `--json` when both are supplied.
-        #[arg(long, value_parser = ["table", "json", "csv", "markdown"])]
-        format: Option<String>,
-
         /// Number of decimal places for XLM fee values (0..=18, default 7).
         #[arg(long, default_value_t = 7)]
         precision: u32,
@@ -123,11 +136,6 @@ pub enum Command {
         id: Option<String>,
         #[arg(long)]
         json: bool,
-
-        /// Output format: table (default), json, csv, or markdown.
-        /// Overrides `--json` when both are supplied.
-        #[arg(long, value_parser = ["table", "json", "csv", "markdown"])]
-        format: Option<String>,
 
         /// Number of decimal places for XLM fee values (0..=18, default 7).
         #[arg(long, default_value_t = 7)]
