@@ -118,6 +118,8 @@ impl EstimateAllResult {
 async fn main() {
     let args = cli::Cli::parse();
 
+    cli::init_color(args.color);
+
     let default_level = if args.verbose { "debug" } else { "info" };
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -1380,7 +1382,12 @@ async fn cmd_config_diff(
         } else {
             println!(
                 "{}",
-                config_snapshot::diff::format_diff(&diff, pricing_only, threshold_percent)
+                config_snapshot::diff::format_diff(
+                    &diff,
+                    cli::should_colorize(),
+                    pricing_only,
+                    threshold_percent
+                )
             );
         }
 
@@ -1614,7 +1621,12 @@ async fn watch_poll_once(
                         debug!(change_count = diff.changes.len(), "config changes detected");
                         println!(
                             "{}",
-                            config_snapshot::diff::format_diff(&diff, false, threshold_percent)
+                            config_snapshot::diff::format_diff(
+                                &diff,
+                                cli::should_colorize(),
+                                false,
+                                threshold_percent
+                            )
                         );
                     }
 
@@ -1846,6 +1858,11 @@ fn cmd_cache_query(
     }
 
     let mut table = Table::new();
+    if crate::cli::should_colorize() {
+        table.enforce_styling();
+    } else {
+        table.force_no_tty();
+    }
     table.set_header(vec![
         "Function",
         "Network",
