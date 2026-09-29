@@ -63,65 +63,10 @@ where
 
 /// Returns `true` when `error` represents a transient failure worth retrying.
 ///
-/// Retryable transport failures are connection/timeout/request errors; an
-/// HTTP status error is retryable only for the statuses in
-/// [`TRANSIENT_STATUSES`]. Everything else — RPC-level errors, XDR decode
-/// failures, 4xx client errors — is deterministic and returned as-is.
+/// This covers transport-level failures ([`AppError::Http`]) and transient
+/// gateway statuses ([`AppError::RpcUnavailable`] — HTTP 502/503/504).
 fn is_retryable(error: &AppError) -> bool {
-    match error {
-        AppError::Http(e) => e.is_connect() || e.is_timeout() || e.is_request(),
-        AppError::HttpStatus { status, .. } => TRANSIENT_STATUSES.contains(status),
-        _ => false,
-    }
-}
-
-/// Computes the delay before the retry following `attempt` (0-based).
-///
-/// A `Retry-After` hint, when present, is authoritative. Otherwise the delay
-/// is the exponential backoff `500ms * 2^attempt` plus a random jitter offset
-/// of up to the same magnitude.
-fn retry_delay(error: &AppError, attempt: usize) -> Duration {
-    if let AppError::HttpStatus {
-        retry_after: Some(delay),
-        ..
-    } = error
-    {
-        return *delay;
-    }
-
-    let exponential = BASE_RETRY_DELAY.saturating_mul(1u32 << attempt.min(16));
-    exponential.saturating_add(random_below(exponential))
-}
-
-/// Returns a pseudo-random `Duration` in `[0, max)`.
-///
-/// Uses the current wall-clock sub-second component as entropy so the retry
-/// loop needs no RNG dependency; the jitter only has to decorrelate retries,
-/// not be cryptographically random.
-fn random_below(max: Duration) -> Duration {
-    let nanos = max.as_nanos();
-    if nanos == 0 {
-        return Duration::ZERO;
-    }
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.subsec_nanos())
-        .unwrap_or(0);
-    let jitter_nanos = (u128::from(seed) * nanos / 1_000_000_000).min(u128::from(u64::MAX));
-    Duration::from_nanos(jitter_nanos as u64)
-}
-
-/// Logs a retry attempt to stderr when debug logging is enabled.
-///
-/// Debug logging is turned on by the CLI's `--verbose` flag, so this stays
-/// silent in normal runs while giving operators visibility into retry
-/// behavior (and how long each attempt will wait) when they ask for it.
-fn log_retry(error: &AppError, attempt: usize, max_retries: usize, delay: Duration) {
-    if tracing::enabled!(tracing::Level::DEBUG) {
-        eprintln!(
-            "RPC request failed ({error}); retrying in {delay:?} (attempt {attempt}/{max_retries})"
-        );
-    }
+    matches!(error, AppError::Http(_) | AppError::RpcUnavailable { .. })
 }
 
 #[cfg(test)]
@@ -130,7 +75,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::error::{AppError, AppResult};
-    use crate::rpc::retry::{BASE_RETRY_DELAY, is_retryable, retry_delay, with_retry};
+    use crate::rpc::retry::{is_retryable, with_retry};
 
     /// Returns the URL of an ephemeral `127.0.0.1` port that is guaranteed
     /// closed: a listener is bound to it, its address captured, then the
@@ -212,6 +157,19 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    /// Transient gateway statuses (HTTP 502/503/504) are retryable, while
+    /// RPC-level errors returned in a successful HTTP response are not.
+    #[test]
+    fn gateway_status_errors_are_retryable() {
+        for status in [502u16, 503, 504] {
+            assert!(is_retryable(&AppError::RpcUnavailable { status }));
+        }
+        assert!(!is_retryable(&AppError::Rpc {
+            status: -32000,
+            message: "permanent".to_string(),
+        }));
     }
 
     /// Errors that are not transient must never be retried.
