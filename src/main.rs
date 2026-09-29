@@ -179,6 +179,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 max_retries,
                 precision,
                 &headers,
+                watch,
                 args.wasm_info,
                 args.verbose,
             )
@@ -512,6 +513,8 @@ enum EstimateRun {
     /// A still-fresh cached estimate was reused and already printed by
     /// [`estimate_once`]; nothing more to render.
     Cached,
+}
+
 /// Emits the WASM structure summary (entry points, memory, host imports)
 /// for `--verbose` / `--wasm-info` modes and warns when initial memory
 /// exceeds the standard Soroban limit.
@@ -556,6 +559,7 @@ fn emit_wasm_structure(
 /// With `--watch`, switches to [`cmd_estimate_watch`] instead: poll the WASM
 /// file and re-estimate on every settled rebuild.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::fn_params_excessive_bools)]
 async fn cmd_estimate(
     wasm_path: &str,
     network: &str,
@@ -591,6 +595,7 @@ async fn cmd_estimate(
             max_retries,
             precision,
             extra_headers,
+            verbose,
         )
         .await;
     }
@@ -612,6 +617,8 @@ async fn cmd_estimate(
         timeout,
         max_retries,
         format == "table",
+        wasm_info_flag,
+        verbose,
     )
     .await?;
 
@@ -635,6 +642,7 @@ async fn cmd_estimate(
 /// One `simulateTransaction` RPC call plus (when not served from cache) up
 /// to three configuration-setting fetches for the fee-rate breakdown.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::fn_params_excessive_bools)]
 async fn estimate_once(
     wasm_path: &str,
     network: &str,
@@ -652,6 +660,8 @@ async fn estimate_once(
     timeout: u64,
     max_retries: usize,
     print_wasm_hash: bool,
+    wasm_info_flag: bool,
+    verbose: bool,
 ) -> error::AppResult<EstimateRun> {
     let json_flag = format == "json";
     let table_mode = format == "table";
@@ -958,6 +968,7 @@ async fn emit_watch_estimate(
     precision: u32,
     extra_headers: &[String],
     human: bool,
+    verbose: bool,
 ) {
     match estimate_once(
         wasm_path,
@@ -976,6 +987,10 @@ async fn emit_watch_estimate(
         timeout,
         max_retries,
         false,
+        // `--wasm-info` is a one-shot report; the watcher prints its own
+        // per-build header instead.
+        false,
+        verbose,
     )
     .await
     {
@@ -1034,6 +1049,7 @@ async fn estimate_watch_poll_once(
     precision: u32,
     extra_headers: &[String],
     human: bool,
+    verbose: bool,
 ) -> error::AppResult<()> {
     let path = std::path::Path::new(wasm_path);
     let hash = match wasm_content_hash(path) {
@@ -1075,6 +1091,7 @@ async fn estimate_watch_poll_once(
         precision,
         extra_headers,
         human,
+        verbose,
     )
     .await;
     Ok(())
@@ -1109,6 +1126,7 @@ async fn cmd_estimate_watch(
     max_retries: usize,
     precision: u32,
     extra_headers: &[String],
+    verbose: bool,
 ) -> error::AppResult<()> {
     use tracing::info;
 
@@ -1150,6 +1168,7 @@ async fn cmd_estimate_watch(
                 precision,
                 extra_headers,
                 human,
+                verbose,
             )
             .await;
         }
@@ -1191,6 +1210,7 @@ async fn cmd_estimate_watch(
                     precision,
                     extra_headers,
                     human,
+                    verbose,
                 ).await;
                 tokio::time::sleep(WATCH_POLL_DURATION).await;
             } => {}
@@ -2233,7 +2253,6 @@ async fn cmd_watch(
 /// # Network calls
 /// None — pure SQLite I/O.
 #[allow(dead_code)] // wired once the `config cache stats` subcommand (#41) lands
-#[allow(dead_code)]
 fn cmd_cache_stats(json: bool) -> error::AppResult<()> {
     let stats = cache::cache_stats()?;
 
@@ -2275,7 +2294,6 @@ fn cmd_cache_stats(json: bool) -> error::AppResult<()> {
 
 /// Format a byte count as a human-readable string (KB, MB, GB).
 #[allow(dead_code)] // used by cmd_cache_stats once the `config cache stats` subcommand (#41) lands
-#[allow(dead_code)]
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -2819,8 +2837,10 @@ mod tests {
                 cpu_fee_stroops: 372,
                 storage_fee_stroops: 4_063,
                 bandwidth_fee_stroops: 61,
+                base_fee_stroops: 0,
                 total_stroops: 15_427,
                 total_xlm: "0.0015427".to_string(),
+                fee_percentages: std::collections::BTreeMap::new(),
             },
             ledger: 3_894_195,
             network: "testnet".to_string(),

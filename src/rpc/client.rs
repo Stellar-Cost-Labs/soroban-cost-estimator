@@ -1205,16 +1205,19 @@ mod header_tests {
 
     #[test]
     fn test_parse_headers_empty() {
-        assert!(parse_headers(&[]).is_empty());
+        assert!(parseheaders(&[]).is_empty());
     }
 
     #[test]
     fn test_parse_headers_stores_parsed() {
-        let headers = parse_headers(&[
+        let headers = parseheaders(&[
             "X-API-Key: secret".to_string(),
             "Authorization: Bearer tok".to_string(),
         ]);
         assert_eq!(headers.len(), 2);
+    }
+
+    #[test]
     fn test_with_headers_empty() {
         let client = RpcClient::with_headers("http://localhost", &[], false);
         assert!(client.headers.is_empty());
@@ -1232,18 +1235,23 @@ mod header_tests {
         );
         assert_eq!(client.headers.len(), 2);
         assert_eq!(
-            headers.get("x-api-key").unwrap().to_str().unwrap(),
+            client.headers.get("x-api-key").unwrap().to_str().unwrap(),
             "secret"
         );
         assert_eq!(
-            headers.get("authorization").unwrap().to_str().unwrap(),
+            client
+                .headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "Bearer tok"
         );
     }
 
     #[test]
     fn test_parse_headers_skips_malformed() {
-        let headers = parse_headers(&[
+        let headers = parseheaders(&[
             "Good: ok".to_string(),
             "NoColonHere".to_string(),
             "Also-Bad:".to_string(),
@@ -1251,6 +1259,9 @@ mod header_tests {
         // Only the valid header should be kept.
         assert_eq!(headers.len(), 1);
         assert!(headers.contains_key("good"));
+    }
+
+    #[test]
     fn test_with_headers_skips_malformed() {
         let client = RpcClient::with_headers(
             "http://localhost",
