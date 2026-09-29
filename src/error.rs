@@ -78,6 +78,9 @@ pub enum AppError {
     FeeCalc(String),
 
     // ── Config ──────────────────────────────────────────────────────
+    #[error("failed to process config: {0}")]
+    Config(String),
+
     #[error("failed to fetch config: {0}")]
     ConfigFetch(String),
 
