@@ -72,7 +72,8 @@ pub struct Cli {
     #[arg(long = "header", value_name = "KEY: VALUE", global = true)]
     pub headers: Vec<String>,
 
-    /// Fallback RPC URL used when the primary endpoint is unreachable.
+    /// Fallback RPC URL used when the primary endpoint is unreachable or
+    /// returns a transient gateway error (HTTP 502/503/504).
     #[arg(long, global = true, value_name = "URL")]
     pub rpc_fallback_url: Option<String>,
 
@@ -88,6 +89,24 @@ pub struct Cli {
     /// Print WASM structure information to stderr.
     #[arg(long, global = true)]
     pub wasm_info: bool,
+
+    /// Suppress non-essential output, including the fee-distribution chart.
+    #[arg(long, short, global = true)]
+    pub quiet: bool,
+
+    /// Number of decimal places shown for XLM fee values (0..=7, default 7).
+    ///
+    /// Stellar amounts are denominated in stroops (1 XLM = 10,000,000
+    /// stroops, i.e. 7 decimals). Lower values give shorter, currency-style
+    /// displays; 7 keeps full stroop fidelity.
+    #[arg(
+        long,
+        global = true,
+        value_name = "N",
+        default_value_t = crate::report::fee_calc::DEFAULT_PRECISION,
+        value_parser = clap::value_parser!(u32).range(0..=7),
+    )]
+    pub precision: u32,
 
     #[command(subcommand)]
     pub command: Command,
@@ -120,9 +139,16 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Number of decimal places for XLM fee values (0..=18, default 7).
-        #[arg(long, default_value_t = 7)]
-        precision: u32,
+        /// Automatically save a new config snapshot if network pricing
+        /// configuration has changed since the last snapshot.
+        #[arg(long)]
+        auto_snapshot: bool,
+
+        /// Parse WASM, validate arguments, and print the planned simulation
+        /// payload without contacting the network. Useful for air-gapped
+        /// environments or local contract verification.
+        #[arg(long)]
+        dry_run: bool,
     },
     EstimateAll {
         #[arg(long, short)]
@@ -140,9 +166,10 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Number of decimal places for XLM fee values (0..=18, default 7).
-        #[arg(long, default_value_t = 7)]
-        precision: u32,
+        /// Automatically save a new config snapshot if network pricing
+        /// configuration has changed since the last snapshot.
+        #[arg(long)]
+        auto_snapshot: bool,
     },
     WasmInfo {
         #[arg(long, short)]
@@ -166,6 +193,13 @@ pub enum Command {
         /// Percentage threshold for flagging significant changes (e.g. 10 for 10%).
         #[arg(long, value_name = "N")]
         threshold_percent: Option<f64>,
+    },
+
+    /// Generate shell completion scripts for Bash, Zsh, Fish, and PowerShell.
+    Completions {
+        /// Target shell for completion script generation.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
 }
 
@@ -237,6 +271,13 @@ pub enum CacheAction {
         to: Option<String>,
 
         /// Output as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show cache health overview: total entries, disk usage, and age.
+    Stats {
+        /// Output as JSON instead of human-readable text.
         #[arg(long)]
         json: bool,
     },
@@ -314,9 +355,63 @@ pub enum ConfigAction {
         bundle: String,
     },
 }
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 pub static COLOR_CHOICE: AtomicU8 = AtomicU8::new(0);
+
+/// Global `--quiet` state, mirroring [`COLOR_CHOICE`]. Set once from the
+/// parsed CLI so deeply nested helpers (e.g. chart rendering) can consult it
+/// without threading a flag through every call site.
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+/// Record whether `--quiet` was passed.
+pub fn init_quiet(quiet: bool) {
+    QUIET.store(quiet, Ordering::Relaxed);
+}
+
+/// Whether the user asked for quiet output.
+#[must_use]
+pub fn is_quiet() -> bool {
+    QUIET.load(Ordering::Relaxed)
+}
+
+/// Terminal width to render the fee bar chart at, or `None` when the chart
+/// must be suppressed.
+///
+/// The chart is disabled in `--quiet` mode, when stdout is not a TTY (piped
+/// or redirected output), and when the terminal is narrower than
+/// `crate::report::cost_report::MIN_CHART_WIDTH` columns. Column count is read
+/// from `COLUMNS` when set and otherwise assumed to be
+/// `crate::report::cost_report::DEFAULT_CHART_WIDTH`.
+#[must_use]
+pub fn chart_width() -> Option<usize> {
+    use std::io::IsTerminal;
+
+    let columns = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok());
+    chart_width_for(is_quiet(), std::io::stdout().is_terminal(), columns)
+}
+
+/// Pure decision function behind [`chart_width`]: given the `--quiet` flag,
+/// whether stdout is a TTY, and the reported terminal width, decide whether to
+/// render the fee bar chart and at what width.
+///
+/// Split out from [`chart_width`] so the gating rules (quiet, non-TTY, and
+/// minimum width) can be unit tested without a real terminal.
+#[must_use]
+pub fn chart_width_for(quiet: bool, is_tty: bool, columns: Option<usize>) -> Option<usize> {
+    use crate::report::cost_report::{DEFAULT_CHART_WIDTH, MIN_CHART_WIDTH};
+
+    if quiet || !is_tty {
+        return None;
+    }
+    match columns {
+        Some(width) if width >= MIN_CHART_WIDTH => Some(width),
+        Some(_) => None,
+        None => Some(DEFAULT_CHART_WIDTH),
+    }
+}
 
 pub fn init_color(choice: clap::ColorChoice) {
     let val = match choice {
@@ -335,5 +430,28 @@ pub fn should_colorize() -> bool {
             use std::io::IsTerminal;
             std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::report::cost_report::DEFAULT_CHART_WIDTH;
+
+    #[test]
+    fn test_chart_width_for_gating() {
+        // Suppressed in quiet mode and for piped/non-TTY output.
+        assert_eq!(chart_width_for(true, true, Some(120)), None);
+        assert_eq!(chart_width_for(false, false, Some(120)), None);
+        // Suppressed on terminals narrower than the minimum.
+        assert_eq!(chart_width_for(false, true, Some(79)), None);
+        // Rendered at the minimum width and scaled to the real width.
+        assert_eq!(chart_width_for(false, true, Some(80)), Some(80));
+        assert_eq!(chart_width_for(false, true, Some(120)), Some(120));
+        // Unknown width falls back to the default assumption.
+        assert_eq!(
+            chart_width_for(false, true, None),
+            Some(DEFAULT_CHART_WIDTH)
+        );
     }
 }
