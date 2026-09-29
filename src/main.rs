@@ -154,6 +154,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             clear_cache,
             json,
             precision,
+            watch,
             auto_snapshot,
         } => {
             // `--format` wins when both it and the legacy `--json` flag are
@@ -630,6 +631,26 @@ async fn cmd_estimate(
         let formatter = formatter_by_name(format).unwrap_or_else(|| Box::new(TableFormatter));
         println!("{}", formatter.format(report));
     }
+
+    // Main's `--auto-snapshot` step belongs here rather than inside
+    // `estimate_once`: that helper is shared with watch mode, which re-simulates
+    // on every rebuild and would otherwise re-write a snapshot per build.
+    if auto_snapshot {
+        if let Err(e) = auto_snapshot_if_changed(
+            network,
+            rpc_fallback_url,
+            rps,
+            timeout,
+            max_retries,
+            extra_headers,
+            verbose,
+        )
+        .await
+        {
+            warn!(error = %e, "auto-snapshot failed");
+            eprintln!("Warning: auto-snapshot failed: {e}");
+        }
+    }
     Ok(())
 }
 
@@ -831,29 +852,7 @@ async fn estimate_once(
         );
         info!(total_stroops = fee.total_stroops, total_xlm = %fee.total_xlm, "estimate complete");
 
-        if auto_snapshot {
-            if let Err(e) = auto_snapshot_if_changed(
-                network,
-                rpc_fallback_url,
-                rps,
-                timeout,
-                max_retries,
-                extra_headers,
-                verbose,
-            )
-            .await
-            {
-                warn!(error = %e, "auto-snapshot failed");
-                eprintln!("Warning: auto-snapshot failed: {e}");
-            }
-        }
-
-        match formatter_by_name(format) {
-            Some(formatter) => println!("{}", formatter.format(&report)),
-            None => println!("{}", TableFormatter.format(&report)),
-        }
-
-        Ok(())
+        Ok(EstimateRun::Simulated { report })
     }
     .instrument(span)
     .await

@@ -125,6 +125,12 @@ pub enum Command {
         #[arg(long, default_value_t = 7)]
         precision: u32,
 
+        /// Watch the WASM file for rebuilds and re-estimate on every change,
+        /// printing a header with the timestamp and the fee change versus the
+        /// previous build (Ctrl-C stops watching and exits with code 0).
+        #[arg(long)]
+        watch: bool,
+
         /// Automatically save a new config snapshot if network pricing
         /// configuration has changed since the last snapshot.
         #[arg(long)]
