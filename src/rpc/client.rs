@@ -122,10 +122,11 @@ pub struct RpcClient {
     /// Maximum number of retries on transient (HTTP) failures, with
     /// exponential backoff.
     max_retries: usize,
-    #[allow(dead_code)]
     /// Custom HTTP headers attached to every outbound request.
     #[allow(dead_code)]
     headers: HeaderMap,
+    /// Whether to print verbose RPC request/response diagnostics to stderr.
+    pub verbose: bool,
 }
 
 impl RpcClient {

@@ -169,7 +169,9 @@ pub fn compute_fee_breakdown(
                 } else {
                     (num - half) / tot_128
                 };
-                rounded.try_into().unwrap_or_else(|_| if rounded > 0 { i64::MAX } else { i64::MIN })
+                rounded
+                    .try_into()
+                    .unwrap_or(if rounded > 0 { i64::MAX } else { i64::MIN })
             }
         })
         .collect();

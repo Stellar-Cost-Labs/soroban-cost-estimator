@@ -1309,6 +1309,7 @@ fn upgrade_detected(diff: &config_snapshot::diff::ConfigDiff) -> bool {
 }
 
 /// `config diff` command: compare current config against a snapshot.
+#[allow(clippy::fn_params_excessive_bools)]
 async fn cmd_config_diff(
     network: &str,
     rpc_fallback_url: Option<&str>,
@@ -1913,7 +1914,7 @@ async fn cmd_cache_warm(
         7,
         extra_headers,
         false,
-        false,
+        verbose,
     )
     .await
 }
