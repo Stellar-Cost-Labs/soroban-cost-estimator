@@ -1258,7 +1258,7 @@ mod header_tests {
 
     #[test]
     fn test_with_headers_empty() {
-        let client = RpcClient::with_headers("http://localhost", &[]);
+        let client = RpcClient::with_headers("http://localhost", &[], false);
         assert!(client.custom_headers().is_empty());
         let client = RpcClient::with_headers("http://localhost", &[], false);
         assert!(client.headers.is_empty());
