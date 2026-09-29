@@ -216,6 +216,9 @@ pub enum CacheAction {
         out: Option<String>,
     },
 
+    /// Show a cache health overview: entry counts, disk usage, and staleness.
+    Stats,
+
     /// Check that every cached estimate is valid JSON and not corrupted.
     Verify,
 

@@ -114,15 +114,44 @@ pub async fn simulate_transaction(
     client: &RpcClient,
     transaction_xdr: &str,
 ) -> AppResult<SimulateTransactionResponse> {
-    debug!("calling simulateTransaction");
+    simulate_transaction_inner(client, transaction_xdr, true).await
+}
+
+/// Like [`simulate_transaction`], but bypasses the client's request
+/// deduplication so every call performs a fresh network round-trip.
+///
+/// `estimate --repeat` uses this to benchmark the RPC endpoint: with dedup a
+/// repeated identical `simulateTransaction` would be served from the cache
+/// after the first call, so latency and fee determinism could not be measured.
+///
+/// # Network calls
+/// Makes one (retryable) `simulateTransaction` RPC call per invocation.
+pub async fn simulate_transaction_uncached(
+    client: &RpcClient,
+    transaction_xdr: &str,
+) -> AppResult<SimulateTransactionResponse> {
+    simulate_transaction_inner(client, transaction_xdr, false).await
+}
+
+/// Shared implementation for the cached and uncached `simulateTransaction`
+/// entry points.
+async fn simulate_transaction_inner(
+    client: &RpcClient,
+    transaction_xdr: &str,
+    dedup: bool,
+) -> AppResult<SimulateTransactionResponse> {
+    debug!(dedup, "calling simulateTransaction");
     let params = SimulateTransactionParams {
         transaction: transaction_xdr.to_string(),
         resource_config: None,
     };
+    let params = serde_json::to_value(params)?;
 
-    let response: SimulateTransactionResponse = client
-        .call("simulateTransaction", serde_json::to_value(params)?)
-        .await?;
+    let response: SimulateTransactionResponse = if dedup {
+        client.call("simulateTransaction", params).await?
+    } else {
+        client.call_uncached("simulateTransaction", params).await?
+    };
 
     if let Some(ref error) = response.error {
         debug!(error, "simulation returned error");
@@ -251,10 +280,93 @@ pub fn parse_resource_fee(min_resource_fee: &Option<String>) -> AppResult<Option
     }
 }
 
+/// Aggregate latency statistics over repeated simulation runs.
+///
+/// Produced by [`summarize_latencies`] so the `estimate --repeat` summary is
+/// computed in one place and unit-testable independently of CLI formatting.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LatencyStats {
+    /// Number of latency samples the statistics were computed from.
+    pub count: usize,
+    /// Fastest observed round-trip, in milliseconds.
+    pub min_ms: u64,
+    /// Slowest observed round-trip, in milliseconds.
+    pub max_ms: u64,
+    /// Arithmetic mean round-trip, in whole milliseconds.
+    pub mean_ms: u64,
+    /// Population standard deviation, in milliseconds.
+    pub stddev_ms: f64,
+}
+
+/// Computes [`LatencyStats`] from a slice of per-run latencies (milliseconds).
+///
+/// Returns `None` when `samples` is empty. The mean uses integer-only
+/// arithmetic (`sum / count`) to avoid floating-point drift; the standard
+/// deviation is the population standard deviation
+/// (`sqrt(Σ(x - μ)² / n)`) computed in `f64` for display.
+pub fn summarize_latencies(samples: &[u64]) -> Option<LatencyStats> {
+    if samples.is_empty() {
+        return None;
+    }
+    let count = samples.len();
+    let min_ms = samples.iter().copied().min().unwrap_or(0);
+    let max_ms = samples.iter().copied().max().unwrap_or(0);
+    let sum: u64 = samples.iter().copied().sum();
+    let mean_ms = sum / count as u64;
+    let variance = samples
+        .iter()
+        .map(|&sample| {
+            let delta = sample as f64 - mean_ms as f64;
+            delta * delta
+        })
+        .sum::<f64>()
+        / count as f64;
+    Some(LatencyStats {
+        count,
+        min_ms,
+        max_ms,
+        mean_ms,
+        stddev_ms: variance.sqrt(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use stellar_xdr::WriteXdr;
+
+    #[test]
+    fn test_summarize_latencies_empty_is_none() {
+        assert_eq!(summarize_latencies(&[]), None);
+    }
+
+    #[test]
+    fn test_summarize_latencies_single_sample() {
+        let stats = summarize_latencies(&[42]).expect("one sample");
+        assert_eq!(stats.count, 1);
+        assert_eq!(stats.min_ms, 42);
+        assert_eq!(stats.max_ms, 42);
+        assert_eq!(stats.mean_ms, 42);
+        assert!(stats.stddev_ms.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_summarize_latencies_computes_min_max_mean_stddev() {
+        // Samples: 10, 20, 30, 40 → mean 25, population stddev sqrt(125)≈11.18.
+        let stats = summarize_latencies(&[10, 20, 30, 40]).expect("samples");
+        assert_eq!(stats.count, 4);
+        assert_eq!(stats.min_ms, 10);
+        assert_eq!(stats.max_ms, 40);
+        assert_eq!(stats.mean_ms, 25);
+        assert!((stats.stddev_ms - 11.180_339_887).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_summarize_latencies_uses_integer_mean() {
+        // Integer-only mean: (1 + 2) / 2 == 1, never 1.5.
+        let stats = summarize_latencies(&[1, 2]).expect("samples");
+        assert_eq!(stats.mean_ms, 1);
+    }
 
     /// Regression: Soroban RPC returns camelCase JSON. Without
     /// `rename_all = "camelCase"` every field would deserialize to `None`,

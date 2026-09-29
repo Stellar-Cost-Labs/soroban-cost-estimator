@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::{AppError, AppResult};
 
@@ -8,20 +8,32 @@ use crate::error::{AppError, AppResult};
 pub const DEFAULT_MAX_RETRIES: usize = 3;
 
 /// Base delay applied before the first retry. Each successive retry doubles
-/// this value (exponential backoff): 500ms, 1s, 2s, ... for the default.
+/// this value (exponential backoff): 500ms, 1s, 2s, ... for the default,
+/// plus a random jitter offset drawn from the same range.
 const BASE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+/// HTTP statuses that indicate a transient failure worth retrying: rate
+/// limiting (429) and server-side errors (500/502/503/504). Deterministic
+/// client errors such as 400 are never retried.
+const TRANSIENT_STATUSES: [u16; 5] = [429, 500, 502, 503, 504];
+
 /// Executes an async operation, retrying transient failures up to
-/// `max_retries` times with exponential backoff.
+/// `max_retries` times with exponential backoff and full jitter.
 ///
 /// A `max_retries` of `0` effectively disables retries: the operation runs
 /// once and any failure is returned immediately. Each retry waits
-/// `500ms * 2^(attempt-1)` before the next attempt — 500ms, then 1s, then
-/// 2s, etc. — so transient failures back off progressively rather than
-/// hammering the endpoint.
+/// `base * 2^attempt` (base 500ms) plus a random offset of up to the same
+/// amount — 500–1000ms, then 1000–2000ms, then 2000–4000ms, etc. — so
+/// transient failures back off progressively without synchronizing retries
+/// across concurrent callers.
 ///
 /// Only retryable errors (see [`is_retryable`]) trigger a retry; permanent
-/// errors are returned immediately.
+/// errors, including deterministic client errors and invalid XDR, are
+/// returned immediately. When the failing error carries a `Retry-After`
+/// hint (HTTP 429), that value is honored in place of the computed backoff.
+///
+/// Retry attempts are logged to stderr when debug logging is enabled (i.e.
+/// when the CLI is run with `--verbose`).
 pub async fn with_retry<F, Fut, T>(max_retries: usize, mut operation: F) -> AppResult<T>
 where
     F: FnMut() -> Fut,
@@ -31,7 +43,6 @@ where
     // before any check, so the operation executes once plus up to
     // `max_retries` extra times.
     let mut attempts = 0;
-    let mut next_delay = BASE_RETRY_DELAY;
 
     loop {
         match operation().await {
@@ -41,9 +52,10 @@ where
                     return Err(error);
                 }
 
+                let delay = retry_delay(&error, attempts);
+                log_retry(&error, attempts + 1, max_retries, delay);
+                tokio::time::sleep(delay).await;
                 attempts += 1;
-                tokio::time::sleep(next_delay).await;
-                next_delay = next_delay.saturating_mul(2);
             }
         }
     }
@@ -60,6 +72,7 @@ fn is_retryable(error: &AppError) -> bool {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use crate::error::{AppError, AppResult};
     use crate::rpc::retry::{is_retryable, with_retry};
@@ -177,5 +190,72 @@ mod tests {
 
         assert!(matches!(result, Err(AppError::Rpc { .. })));
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn transient_statuses_are_retryable() {
+        for status in [429u16, 500, 502, 503, 504] {
+            let error = AppError::HttpStatus {
+                status,
+                retry_after: None,
+                message: String::new(),
+            };
+            assert!(is_retryable(&error), "{status} must be retryable");
+        }
+    }
+
+    #[test]
+    fn deterministic_client_statuses_are_not_retryable() {
+        for status in [400u16, 401, 403, 404, 422] {
+            let error = AppError::HttpStatus {
+                status,
+                retry_after: None,
+                message: String::new(),
+            };
+            assert!(!is_retryable(&error), "{status} must not be retryable");
+        }
+    }
+
+    #[test]
+    fn rpc_and_xdr_errors_are_not_retryable() {
+        assert!(!is_retryable(&AppError::Rpc {
+            status: -1,
+            message: "nope".to_string(),
+        }));
+        assert!(!is_retryable(&AppError::XdrDecode("bad".to_string())));
+    }
+
+    /// `Retry-After` overrides the computed exponential backoff entirely.
+    #[test]
+    fn retry_after_hint_overrides_backoff() {
+        let error = AppError::HttpStatus {
+            status: 429,
+            retry_after: Some(Duration::from_secs(7)),
+            message: String::new(),
+        };
+        assert_eq!(retry_delay(&error, 2), Duration::from_secs(7));
+    }
+
+    /// Without a hint, the delay is `base * 2^attempt` plus jitter of up to
+    /// the same magnitude, so it always lands in
+    /// `[exponential, 2 * exponential)`.
+    #[test]
+    fn backoff_is_exponential_with_bounded_jitter() {
+        for attempt in 0..4usize {
+            let exponential = BASE_RETRY_DELAY.saturating_mul(1u32 << attempt);
+            let error = AppError::HttpStatus {
+                status: 503,
+                retry_after: None,
+                message: String::new(),
+            };
+            for _ in 0..25 {
+                let delay = retry_delay(&error, attempt);
+                assert!(
+                    delay >= exponential && delay < exponential.saturating_mul(2),
+                    "attempt {attempt}: delay {delay:?} outside [{exponential:?}, {:?})",
+                    exponential.saturating_mul(2)
+                );
+            }
+        }
     }
 }

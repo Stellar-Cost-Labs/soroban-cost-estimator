@@ -129,10 +129,38 @@ fn test_estimate_help() {
         "--cache-ttl",
         "--clear-cache",
         "--json",
+        "--repeat",
     ] {
         assert!(
             stdout.contains(flag),
             "estimate help should mention {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_estimate_repeat_flag_accepted() {
+    // `--repeat` must be a recognized estimate flag (the run fails on the
+    // missing WASM file, not on the argument).
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--repeat", "3"]);
+    assert_ne!(code, 0, "missing WASM file should still error");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--repeat should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_repeat_out_of_range_rejected() {
+    // The accepted range is 1..=100; clap must reject 0 and 101 up front.
+    for bad in ["0", "101"] {
+        let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--repeat", bad]);
+        assert_ne!(code, 0, "--repeat {bad} should be rejected");
+        assert!(
+            stderr.contains("invalid value")
+                || stderr.contains("not in")
+                || stderr.contains("range"),
+            "clap should reject --repeat {bad}; stderr: {stderr}"
         );
     }
 }
