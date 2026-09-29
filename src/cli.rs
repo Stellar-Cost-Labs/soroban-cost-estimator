@@ -141,6 +141,16 @@ pub enum Command {
         /// configuration has changed since the last snapshot.
         #[arg(long)]
         auto_snapshot: bool,
+
+        /// Compare two WASM builds and print a side-by-side cost diff.
+        /// Requires `--wasm-new`.
+        #[arg(long, requires = "wasm_new")]
+        diff: bool,
+
+        /// The "new" WASM build to compare against when `--diff` is set.
+        /// The `--wasm` file is treated as the baseline ("old") build.
+        #[arg(long, value_name = "PATH")]
+        wasm_new: Option<String>,
     },
     EstimateAll {
         #[arg(long, short)]
@@ -235,9 +245,6 @@ pub enum CacheAction {
         #[arg(long)]
         json: bool,
     },
-
-    /// Show cache statistics (entries, disk usage, per-network breakdown).
-    Stats,
 
     /// Evict least-recently-accessed estimates until the cache fits its
     /// configured quota (`--max-cache-size-mb` / `--max-cache-entries`).
