@@ -9,7 +9,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify};
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
 use crate::rpc::retry::{DEFAULT_MAX_RETRIES, with_retry};

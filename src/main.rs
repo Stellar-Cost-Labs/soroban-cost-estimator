@@ -306,7 +306,6 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 .await
             }
             cli::CacheAction::Verify => cmd_cache_verify(),
-            cli::CacheAction::Stats => cmd_cache_stats(),
             cli::CacheAction::Clear { network } => cmd_cache_clear(&network),
             cli::CacheAction::Query {
                 network,
