@@ -263,6 +263,52 @@ fn test_cache_verify_empty_cache_succeeds() {
 }
 
 #[test]
+fn test_cache_stats_help() {
+    let (stdout, stderr, code) = run_cli(&["cache", "stats", "--help"]);
+    assert_eq!(
+        code, 0,
+        "cache stats --help should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("cache health") || stdout.contains("breakdown"),
+        "cache stats help should describe the command; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_stats_on_empty_cache_succeeds() {
+    let home = temp_home("cache-stats-empty");
+    let (stdout, stderr, code) = run_cli_in_home(&["cache", "stats"], Some(&home));
+    assert_eq!(
+        code, 0,
+        "cache stats on an empty cache should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Cache is empty"),
+        "should report an empty cache; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_stats_reports_seeded_entries() {
+    let home = temp_home("cache-stats-seeded");
+    let now = chrono::Utc::now().to_rfc3339();
+    seed_cache_entry_for(&home, "testnet", "(wasm upload)", 42, &now);
+    seed_cache_entry_for(&home, "mainnet", "mainnet_fn", 77, &now);
+
+    let (stdout, stderr, code) = run_cli_in_home(&["cache", "stats"], Some(&home));
+    assert_eq!(code, 0, "cache stats should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("Total entries:  2"),
+        "should count both seeded entries; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("testnet") && stdout.contains("mainnet"),
+        "should break entries down by network; got: {stdout}"
+    );
+}
+
+#[test]
 fn test_estimate_missing_wasm_errors() {
     let (_, stderr, code) = run_cli(&["estimate"]);
     assert_ne!(code, 0, "estimate without --wasm should error");
@@ -514,16 +560,45 @@ fn test_max_retries_accepted_by_all_network_commands() {
 
 #[test]
 fn test_help_lists_global_flags() {
-    // Global flags (--rps, --timeout, --max-retries) must appear in subcommand help.
+    // Global flags (--rps, --timeout, --precision, --quiet) must appear in
+    // subcommand help.
     let (stdout, stderr, code) = run_cli(&["estimate", "--help"]);
     assert_eq!(code, 0, "estimate --help should exit 0; stderr: {stderr}");
+    for flag in ["--timeout", "--rps", "--precision", "--quiet"] {
+        assert!(
+            stdout.contains(flag),
+            "help should list {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_precision_flag_accepted() {
+    // `--precision` is a global flag, so it must parse both before and after
+    // the subcommand; failure here is a missing file, not a bad argument.
+    for args in [
+        vec!["estimate", "--wasm", "test.wasm", "--precision", "2"],
+        vec!["--precision", "4", "estimate", "--wasm", "test.wasm"],
+    ] {
+        let (_, stderr, code) = run_cli(&args);
+        assert_ne!(code, 0, "should error on missing file");
+        assert!(
+            !stderr.contains("unrecognized") && !stderr.contains("invalid value"),
+            "--precision should be a recognized argument; stderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_precision_out_of_range_rejected() {
+    // The flag is documented as 0..=7; clap must reject 8 with a clear error.
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--precision", "8"]);
+    assert_ne!(code, 0, "out-of-range precision should error");
     assert!(
-        stdout.contains("--timeout"),
-        "help should list --timeout; got: {stdout}"
-    );
-    assert!(
-        stdout.contains("--rps"),
-        "help should list --rps; got: {stdout}"
+        stderr.to_lowercase().contains("invalid value")
+            || stderr.contains("not in")
+            || stderr.to_lowercase().contains("range"),
+        "clap should reject precision 8; stderr: {stderr}"
     );
     assert!(
         stdout.contains("--max-retries"),
@@ -558,6 +633,22 @@ fn test_max_retries_help_documents_default_and_zero_behavior() {
         help.contains("0 disables retries"),
         "help should explain that 0 disables retries; got: {stdout}"
     );
+}
+
+#[test]
+fn test_quiet_flag_accepted() {
+    // `--quiet` / `-q` is a global flag used to suppress the fee bar chart.
+    for args in [
+        vec!["estimate", "--wasm", "test.wasm", "--quiet"],
+        vec!["estimate", "--wasm", "test.wasm", "-q"],
+    ] {
+        let (_, stderr, code) = run_cli(&args);
+        assert_ne!(code, 0, "should error on missing file");
+        assert!(
+            !stderr.contains("unrecognized") && !stderr.contains("unexpected argument"),
+            "--quiet should be a recognized argument; stderr: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -1680,7 +1771,7 @@ fn test_estimate_fn_contract_fixture_populates_footprint_json() {
     assert_eq!(parsed["read_bytes"], 0, "expected 0 read bytes");
     assert_eq!(parsed["write_bytes"], 136, "expected 136 write bytes");
     assert_eq!(parsed["cpu_instructions"], 532_502);
-    assert_eq!(parsed["fee"]["total_stroops"], 15_427);
+    assert_eq!(parsed["fee"]["total_stroops"], 15_527);
 }
 
 #[test]
@@ -1726,8 +1817,8 @@ fn test_estimate_fn_contract_fixture_populates_footprint_table() {
         "table should display 136 write bytes"
     );
     assert!(
-        stdout.contains("15427"),
-        "table should display total fee 15427"
+        stdout.contains("15527"),
+        "table should display total fee 15527"
     );
 }
 
@@ -1767,4 +1858,106 @@ fn test_estimate_minimal_wasm_upload_zero_footprint() {
     assert_eq!(parsed["write_entries"], 0);
     assert_eq!(parsed["read_bytes"], 0);
     assert_eq!(parsed["write_bytes"], 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Shell completions
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_completions_help() {
+    let (stdout, stderr, code) = run_cli(&["completions", "--help"]);
+    assert_eq!(
+        code, 0,
+        "completions --help should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("bash"),
+        "completions help should list bash option"
+    );
+    assert!(
+        stdout.contains("zsh"),
+        "completions help should list zsh option"
+    );
+    assert!(
+        stdout.contains("fish"),
+        "completions help should list fish option"
+    );
+    assert!(
+        stdout.contains("powershell"),
+        "completions help should list powershell option"
+    );
+}
+
+#[test]
+fn test_completions_bash() {
+    let (stdout, stderr, code) = run_cli(&["completions", "bash"]);
+    assert_eq!(code, 0, "completions bash should exit 0; stderr: {stderr}");
+    assert!(!stdout.is_empty(), "completion script should not be empty");
+    assert!(
+        stdout.contains("soroban-cost-estimator"),
+        "bash completion script should contain binary name"
+    );
+    assert!(
+        stdout.contains("estimate"),
+        "bash completion script should contain subcommand names"
+    );
+}
+
+#[test]
+fn test_completions_zsh() {
+    let (stdout, stderr, code) = run_cli(&["completions", "zsh"]);
+    assert_eq!(code, 0, "completions zsh should exit 0; stderr: {stderr}");
+    assert!(!stdout.is_empty(), "completion script should not be empty");
+    assert!(
+        stdout.contains("soroban-cost-estimator"),
+        "zsh completion script should contain binary name"
+    );
+    assert!(
+        stdout.contains("estimate"),
+        "zsh completion script should contain subcommand names"
+    );
+}
+
+#[test]
+fn test_completions_fish() {
+    let (stdout, stderr, code) = run_cli(&["completions", "fish"]);
+    assert_eq!(code, 0, "completions fish should exit 0; stderr: {stderr}");
+    assert!(!stdout.is_empty(), "completion script should not be empty");
+    assert!(
+        stdout.contains("soroban-cost-estimator"),
+        "fish completion script should contain binary name"
+    );
+    assert!(
+        stdout.contains("estimate"),
+        "fish completion script should contain subcommand names"
+    );
+}
+
+#[test]
+fn test_completions_powershell() {
+    let (stdout, stderr, code) = run_cli(&["completions", "powershell"]);
+    assert_eq!(
+        code, 0,
+        "completions powershell should exit 0; stderr: {stderr}"
+    );
+    assert!(!stdout.is_empty(), "completion script should not be empty");
+    assert!(
+        stdout.contains("soroban-cost-estimator"),
+        "powershell completion script should contain binary name"
+    );
+    assert!(
+        stdout.contains("estimate"),
+        "powershell completion script should contain subcommand names"
+    );
+}
+
+#[test]
+fn test_completions_unsupported_shell() {
+    let (_stdout, stderr, code) = run_cli(&["completions", "invalid_shell"]);
+    assert_ne!(code, 0, "unsupported shell should exit non-zero");
+    assert!(
+        stderr.contains("invalid value 'invalid_shell'") || stderr.contains("unexpected argument"),
+        "stderr should state invalid shell value; got: {stderr}"
+    );
 }

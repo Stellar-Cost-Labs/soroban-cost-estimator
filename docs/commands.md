@@ -713,6 +713,8 @@ All commands accept:
 | `--max-retries <N>` | Retry transient RPC failures up to N times (default `3`). 0 disables retries. |
 | `--help` / `-h` | Print command-specific help |
 
+`--format` applies to report-producing commands. The legacy `--json` flag remains supported as an alias for `--format json` where it was previously available.
+
 ## Network Resolution
 
 By default, commands use these RPC endpoints:
