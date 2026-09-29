@@ -6,9 +6,7 @@ use soroban_cost_estimator::cli;
 use soroban_cost_estimator::config_snapshot;
 use soroban_cost_estimator::error;
 use soroban_cost_estimator::report;
-use soroban_cost_estimator::report::formatter::{
-    ReportFormatter, TableFormatter, formatter_by_name,
-};
+use soroban_cost_estimator::report::formatter::{TableFormatter, formatter_by_name};
 use soroban_cost_estimator::rpc;
 use soroban_cost_estimator::wasm;
 use soroban_cost_estimator::xdr_helper;
@@ -114,13 +112,65 @@ impl EstimateAllResult {
     }
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+struct FileConfig {
+    network: Option<String>,
+    rpc_url: Option<String>,
+    json: Option<bool>,
+}
+
+fn config_path(cli_path: Option<&str>) -> std::path::PathBuf {
+    cli_path.map(std::path::PathBuf::from).unwrap_or_else(|| {
+        dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("soroban-cost-estimator")
+            .join("config.toml")
+    })
+}
+
+fn load_config(cli_path: Option<&str>) -> error::AppResult<FileConfig> {
+    let path = config_path(cli_path);
+    if !path.exists() {
+        return Ok(FileConfig::default());
+    }
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| error::AppError::Config(format!("{}: {e}", path.display())))?;
+    toml::from_str(&content)
+        .map_err(|e| error::AppError::Config(format!("{}: {e}", path.display())))
+}
+
+fn env_string(cli_value: String, file_value: &str, env: &str) -> String {
+    let val = std::env::var(env).unwrap_or(cli_value);
+    let trimmed = val.trim();
+    if trimmed.is_empty() {
+        file_value.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn env_or_file_bool(value: bool, file: Option<bool>) -> bool {
+    std::env::var("SOROBAN_JSON")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .or(file)
+        .unwrap_or(value)
+}
+
 #[tokio::main]
 async fn main() {
     let args = cli::Cli::parse();
 
     cli::init_color(args.color);
+    cli::init_quiet(args.quiet);
 
-    let default_level = if args.verbose { "debug" } else { "info" };
+    let default_level = if args.quiet {
+        "warn"
+    } else if args.verbose {
+        "debug"
+    } else {
+        "info"
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level)),
@@ -138,21 +188,28 @@ async fn main() {
 
 #[allow(clippy::too_many_lines)]
 async fn run(args: cli::Cli) -> error::AppResult<()> {
+    let file = load_config(args.config.as_deref())?;
     let rps = args.rps;
     let timeout = args.timeout;
     let max_retries = args.max_retries;
     let verbose = args.verbose;
+    // `--precision` is a single global flag; read it once so every command
+    // reads the same value.
+    let precision = args.precision;
     let fallback = args.rpc_fallback_url.as_deref();
     let headers = args.headers;
-
-    // Bound the on-disk estimate cache before any command can write to it.
-    // A `--max-cache-size-mb` of 0 disables the byte quota; 0 entries
-    // disables the entry quota.
-    cache::set_cache_limits(cache::CacheLimits {
-        max_bytes: args.max_cache_size_mb.saturating_mul(1024 * 1024),
-        max_entries: args.max_cache_entries,
-    })?;
-
+    let format = match args.format {
+        Some(fmt) => fmt,
+        None => {
+            if env_or_file_bool(false, file.json) {
+                cli::OutputFormat::Json
+            } else {
+                cli::OutputFormat::Table
+            }
+        }
+    };
+    let default_network = file.network.unwrap_or_else(|| "testnet".to_string());
+    let default_rpc_url = file.rpc_url;
     match args.command {
         cli::Command::Estimate {
             wasm,
@@ -164,10 +221,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cache_ttl,
             clear_cache,
             json,
-            precision,
             auto_snapshot,
-            diff,
-            wasm_new,
+            dry_run,
         } => {
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
@@ -178,8 +233,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             };
             cmd_estimate(
                 &wasm,
-                &network,
-                rpc_url.as_deref(),
+                &env_string(network, &default_network, "SOROBAN_NETWORK"),
+                rpc_url.as_deref().or(default_rpc_url.as_deref()),
                 fallback,
                 id.as_deref(),
                 r#fn.as_deref(),
@@ -195,8 +250,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 args.wasm_info,
                 args.verbose,
                 auto_snapshot,
-                diff,
-                wasm_new.as_deref(),
+                dry_run,
             )
             .await
         }
@@ -206,7 +260,6 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             rpc_url,
             id,
             json,
-            precision,
             auto_snapshot,
         } => {
             let format = match (args.format, json) {
@@ -216,8 +269,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             };
             cmd_estimate_all(
                 &wasm,
-                &network,
-                rpc_url.as_deref(),
+                &env_string(network, &default_network, "SOROBAN_NETWORK"),
+                rpc_url.as_deref().or(default_rpc_url.as_deref()),
                 fallback,
                 id.as_deref(),
                 format.as_str(),
@@ -248,7 +301,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     (None, false) => cli::OutputFormat::Table,
                 };
                 cmd_config_snapshot(
-                    &network,
+                    &env_string(network, &default_network, "SOROBAN_NETWORK"),
                     fallback,
                     out.as_deref(),
                     format,
@@ -269,14 +322,19 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 summary,
                 json,
             } => {
+                let json_flag = if args.format.is_some() {
+                    format == cli::OutputFormat::Json
+                } else {
+                    json || format == cli::OutputFormat::Json
+                };
                 cmd_config_diff(
-                    &network,
+                    &env_string(network, &default_network, "SOROBAN_NETWORK"),
                     fallback,
                     against.as_deref(),
                     pricing_only,
                     threshold_percent,
                     summary,
-                    json,
+                    json_flag,
                     rps,
                     timeout,
                     max_retries,
@@ -309,8 +367,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 };
                 cmd_cache_warm(
                     &wasm,
-                    &network,
-                    rpc_url.as_deref(),
+                    &env_string(network, &default_network, "SOROBAN_NETWORK"),
+                    rpc_url.as_deref().or(default_rpc_url.as_deref()),
                     fallback,
                     id.as_deref(),
                     format,
@@ -323,7 +381,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 .await
             }
             cli::CacheAction::Verify => cmd_cache_verify(),
-            cli::CacheAction::Prune => cmd_cache_prune(),
+            cli::CacheAction::List { network, json } => cmd_cache_list(&network, json),
             cli::CacheAction::Clear { network } => cmd_cache_clear(&network),
             cli::CacheAction::Query {
                 network,
@@ -724,8 +782,7 @@ async fn cmd_estimate(
     wasm_info_flag: bool,
     verbose: bool,
     auto_snapshot: bool,
-    diff: bool,
-    wasm_new: Option<&str>,
+    dry_run: bool,
 ) -> error::AppResult<()> {
     let json_flag = format == "json";
     let table_mode = format == "table";
@@ -835,8 +892,128 @@ async fn cmd_estimate(
             precision,
             extra_headers,
             verbose,
-        })
-        .await?;
+        );
+
+        let sc_vals: Vec<stellar_xdr::ScVal> = args
+            .iter()
+            .map(|a| xdr_helper::parse_arg_scval(a))
+            .collect();
+        debug!(arg_count = sc_vals.len(), "parsed arguments");
+
+        let tx_xdr =
+            xdr_helper::build_simulation_tx_envelope(&wasm_info.bytes, contract_id, fn_name, &sc_vals)?;
+
+        xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
+        debug!(arg_count = args.len(), "validated arguments against contract spec");
+
+        let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
+        debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
+
+        // In dry-run mode, print the planned simulation payload and exit
+        // without contacting the network. Useful for air-gapped environments
+        // or local contract verification.
+        if dry_run {
+            let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
+            println!("Dry run — planned simulation payload (no network calls):");
+            println!();
+            println!("  Resolved RPC endpoint: {endpoint}");
+            println!(
+                "  Contract ID:           {}",
+                contract_id.unwrap_or("(wasm upload)")
+            );
+            println!(
+                "  Function name:         {}",
+                fn_name.unwrap_or("(wasm upload)")
+            );
+            println!("  Network:               {network}");
+            println!();
+            println!("  WASM SHA-256:          {wasm_hash}");
+            println!("  WASM size:             {} bytes", wasm_info.bytes.len());
+            println!(
+                "  Contract spec:         {}",
+                if wasm_info.has_spec {
+                    "present"
+                } else {
+                    "absent"
+                }
+            );
+            println!();
+            println!("  Arguments ({}):", args.len());
+            for (i, (arg, sc_val)) in args.iter().zip(&sc_vals).enumerate() {
+                println!("    [{i}] {arg} → {sc_val:?}");
+            }
+            println!();
+            println!("  Transaction envelope:");
+            println!("    XDR size:   {} bytes", tx_xdr.len());
+            println!("    Base64 size: {} bytes", tx_b64.len());
+            println!("    Base64 data: {tx_b64}");
+            return Ok(());
+        }
+
+        // Fail fast on a misconfigured --rpc-url or down node (#55): validate
+        // the endpoint is reachable and healthy before running any simulation.
+        // Local argument errors above are reported first; this guards the
+        // (potentially expensive) simulateTransaction call itself.
+        client.health_check().await?;
+
+        // Time the simulateTransaction round-trip so the report can flag
+        // slow RPC endpoints. Includes any retries performed by the client.
+        let rpc_start = std::time::Instant::now();
+        let response = rpc::simulate::simulate_transaction(&client, &tx_b64).await?;
+        let rpc_latency_ms = rpc_start.elapsed().as_millis() as u64;
+
+        if missing_simulation_data(&response) {
+            return Err(error::AppError::SimulationFailed(
+                "simulation returned no cost data and no latest ledger — check --id, --fn, and the RPC endpoint".to_string(),
+            ));
+        }
+
+        let (cpu_instructions, memory_bytes, read_entries, write_entries, read_bytes, write_bytes) =
+            response_resources(&response)?;
+
+        let latest_ledger: u32 = response
+            .latest_ledger
+            .and_then(|l| u32::try_from(l).ok())
+            .unwrap_or(0);
+
+        let total_fee_stroops = rpc::simulate::parse_resource_fee(&response.min_resource_fee)
+            .unwrap_or(None)
+            .or(rpc::simulate::parse_transaction_data_resource_fee(
+                &response.transaction_data,
+            )?)
+            .unwrap_or(0);
+
+        debug!(cpu_instructions, memory_bytes, latest_ledger, total_fee_stroops, "simulation complete");
+
+        let fee_rates = fetch_fee_rates(&client).await;
+
+        let fee = report::fee_calc::compute_fee_breakdown(
+            total_fee_stroops,
+            cpu_instructions,
+            read_entries,
+            write_entries,
+            read_bytes,
+            tx_xdr.len() as u32,
+            fee_rates,
+            precision,
+        );
+
+        let report = report::cost_report::CostReport {
+            function: function_name.to_string(),
+            wasm_hash: wasm_hash.clone(),
+            cpu_instructions,
+            memory_bytes,
+            tx_size: tx_xdr.len() as u32,
+            read_entries,
+            write_entries,
+            read_bytes,
+            write_bytes,
+            fee: fee.clone(),
+            ledger: latest_ledger,
+            network: network.to_string(),
+            rpc_latency_ms,
+            rates: Some(fee_rates),
+        };
 
         let _ = cache::save_estimate(
             &wasm_hash,
@@ -873,9 +1050,40 @@ async fn cmd_estimate(
             }
         }
 
-        match formatter_by_name(format) {
-            Some(formatter) => println!("{}", formatter.format(&report)),
-            None => println!("{}", TableFormatter.format(&report)),
+        // The table formatter is the only one that renders the fee bar chart,
+        // and only when the terminal has room for it (>= MIN_CHART_WIDTH
+        // columns), stdout is a TTY, and `--quiet` was not passed. Machine
+        // formats never grow a human-only chart.
+        if format == "table" {
+            match cli::chart_width() {
+                Some(width) => {
+                    println!("{}", TableFormatter.format_with_options(&report, true, width));
+                }
+                None => {
+                    println!(
+                        "{}",
+                        TableFormatter.format_with_options(
+                            &report,
+                            false,
+                            report::cost_report::DEFAULT_CHART_WIDTH,
+                        )
+                    );
+                }
+            }
+        } else {
+            match formatter_by_name(format) {
+                Some(formatter) => println!("{}", formatter.format(&report)),
+                None => {
+                    println!(
+                        "{}",
+                        TableFormatter.format_with_options(
+                            &report,
+                            false,
+                            report::cost_report::DEFAULT_CHART_WIDTH,
+                        )
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -2251,6 +2459,58 @@ fn cmd_cache_verify() -> error::AppResult<()> {
     }
 
     Ok(())
+}
+
+/// `cache list` command: list every cached estimate for a network.
+///
+/// Prints a table (or the full records as a JSON array when `--json` is
+/// passed), newest estimate first. An empty cache prints a friendly message.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+fn cmd_cache_list(network: &str, json: bool) -> error::AppResult<()> {
+    let estimates = cache::list_cached_estimates(network)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&estimates)?);
+        return Ok(());
+    }
+
+    if estimates.is_empty() {
+        println!("No cached estimates for {network}.");
+        return Ok(());
+    }
+
+    let mut table = Table::new();
+    table.set_header(vec![
+        "Function",
+        "WASM Hash",
+        "Fee (stroops)",
+        "Ledger",
+        "Timestamp",
+    ]);
+    for e in &estimates {
+        table.add_row(vec![
+            Cell::new(e.function.as_str()),
+            Cell::new(truncate_hash(&e.wasm_hash)),
+            Cell::new(e.total_stroops),
+            Cell::new(e.ledger),
+            Cell::new(e.timestamp.as_str()),
+        ]);
+    }
+    println!("{table}");
+    println!("{} cached estimate(s) for {network}.", estimates.len());
+    Ok(())
+}
+
+/// Truncate a WASM hash to its first 12 characters for compact table display.
+fn truncate_hash(hash: &str) -> String {
+    if hash.chars().count() > 12 {
+        let prefix: String = hash.chars().take(12).collect();
+        format!("{prefix}…")
+    } else {
+        hash.to_string()
+    }
 }
 
 /// `cache clear` command: delete every cached estimate for a network.
