@@ -1568,6 +1568,20 @@ mod header_tests {
     }
 
     #[test]
+    fn test_parse_headers_empty() {
+        assert!(parseheaders(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_parse_headers_stores_parsed() {
+        let headers = parseheaders(&[
+            "X-API-Key: secret".to_string(),
+            "Authorization: Bearer tok".to_string(),
+        ]);
+        assert_eq!(headers.len(), 2);
+    }
+
+    #[test]
     fn test_with_headers_empty() {
         let client = RpcClient::with_headers("http://localhost", &[], false);
         assert!(client.custom_headers().is_empty());
@@ -1604,6 +1618,18 @@ mod header_tests {
                 .unwrap(),
             "Bearer tok"
         );
+    }
+
+    #[test]
+    fn test_parse_headers_skips_malformed() {
+        let headers = parseheaders(&[
+            "Good: ok".to_string(),
+            "NoColonHere".to_string(),
+            "Also-Bad:".to_string(),
+        ]);
+        // Only the valid header should be kept.
+        assert_eq!(headers.len(), 1);
+        assert!(headers.contains_key("good"));
     }
 
     #[test]
