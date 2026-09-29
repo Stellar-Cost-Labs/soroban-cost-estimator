@@ -46,6 +46,24 @@ fn run_cli_in_home(args: &[&str], home: Option<&Path>) -> (String, String, i32) 
     (stdout, stderr, code)
 }
 
+/// Runs the CLI with tracing output silenced (`RUST_LOG=error`) so stdout holds
+/// only the command's own report, which is what the `wasm info` assertions
+/// parse.
+fn run_cli_quiet(args: &[&str], home: &Path) -> (String, String, i32) {
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(args)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run CLI");
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.code().unwrap_or(-1),
+    )
+}
+
 /// Creates a unique temporary directory for one test, removing any leftover
 /// from a previous run. Kept dependency-free on purpose — the crate has no
 /// dev-dependencies and this is all the isolation the suite needs.
@@ -223,6 +241,17 @@ fn test_cache_help() {
     assert!(stdout.contains("verify"), "cache help should list verify");
     assert!(stdout.contains("query"), "cache help should list query");
     assert!(stdout.contains("clear"), "cache help should list clear");
+}
+
+#[test]
+fn test_cache_stats_empty_cache_succeeds() {
+    let home = temp_home("cache-stats-empty");
+    let (stdout, stderr, code) = run_cli_quiet(&["cache", "stats"], &home);
+    assert_eq!(code, 0, "cache stats should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("Cache is empty"),
+        "empty cache should say so; got: {stdout}"
+    );
 }
 
 #[test]
@@ -1161,6 +1190,115 @@ fn test_wasm_info_reports_absent_contract_meta() {
         stdout.contains("Contract meta: absent"),
         "bare WASM should report absent meta; got: {stdout}"
     );
+}
+
+#[test]
+fn test_wasm_info_nested_subcommand_reports_offline_metadata() {
+    let home = temp_home("wasm-info-nested");
+    let (stdout, stderr, code) =
+        run_cli_quiet(&["wasm", "info", "tests/fixtures/contract.wasm"], &home);
+    assert_eq!(code, 0, "`wasm info` should succeed; stderr: {stderr}");
+    assert!(stdout.contains("WASM info:"), "got: {stdout}");
+    assert!(stdout.contains("Size:"), "got: {stdout}");
+    assert!(stdout.contains("SHA-256:"), "got: {stdout}");
+    assert!(stdout.contains("Sections:"), "got: {stdout}");
+    assert!(stdout.contains("contractspecv0"), "got: {stdout}");
+    assert!(stdout.contains("Functions:"), "got: {stdout}");
+    assert!(
+        stdout.contains("increment(step: i64) -> i64"),
+        "signature with argument and return types missing; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("SDK version:"),
+        "embedded SDK version should be shown; got: {stdout}"
+    );
+    assert!(stdout.contains("Contract spec: present"), "got: {stdout}");
+}
+
+#[test]
+fn test_wasm_info_nested_json_emits_full_spec() {
+    let home = temp_home("wasm-info-nested-json");
+    let (stdout, stderr, code) = run_cli_quiet(
+        &["wasm", "info", "tests/fixtures/contract.wasm", "--json"],
+        &home,
+    );
+    assert_eq!(
+        code, 0,
+        "`wasm info --json` should succeed; stderr: {stderr}"
+    );
+
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON output");
+    assert_eq!(parsed["path"], "tests/fixtures/contract.wasm");
+    assert!(parsed["size"].as_u64().expect("size") > 0, "got: {parsed}");
+    assert_eq!(
+        parsed["sha256"].as_str().map(str::len),
+        Some(64),
+        "expected a hex SHA-256 digest"
+    );
+    assert_eq!(parsed["has_spec"], true);
+    assert!(parsed["sdk_version"].is_string(), "got: {parsed}");
+
+    let sections = parsed["sections"].as_array().expect("sections array");
+    assert!(!sections.is_empty());
+    assert!(sections.iter().all(|s| s["size"].as_u64().unwrap_or(0) > 0));
+    assert!(
+        sections
+            .iter()
+            .any(|s| s["name"] == "contractspecv0" && s["custom"] == true),
+        "custom contractspecv0 section missing; got: {parsed}"
+    );
+
+    let functions = parsed["functions"].as_array().expect("functions array");
+    let increment = functions
+        .iter()
+        .find(|f| f["name"] == "increment")
+        .expect("increment function");
+    assert_eq!(increment["params"][0]["name"], "step");
+    assert_eq!(increment["params"][0]["type"], "i64");
+    assert_eq!(increment["returns"][0]["type"], "i64");
+    assert_eq!(increment["signature"], "increment(step: i64) -> i64");
+
+    let spec_entries = parsed["spec_entries"].as_array().expect("spec entries");
+    assert!(
+        spec_entries
+            .iter()
+            .any(|e| e["kind"] == "function" && e["name"] == "increment"),
+        "function spec entry missing; got: {parsed}"
+    );
+    assert!(parsed["module"]["exports"].is_array());
+}
+
+#[test]
+fn test_wasm_info_nested_rejects_non_wasm_file() {
+    let home = temp_home("wasm-info-invalid");
+    let path = home.join("not-a-wasm.bin");
+    std::fs::write(&path, b"this is definitely not a wasm module").expect("write file");
+
+    let (stdout, stderr, code) =
+        run_cli_quiet(&["wasm", "info", path.to_str().expect("utf-8 path")], &home);
+    assert_ne!(code, 0, "invalid input should fail");
+    assert!(
+        stderr.contains("not a valid WebAssembly binary"),
+        "error should explain the input is not WASM; stderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("WASM info:"),
+        "no report for an invalid file: {stdout}"
+    );
+}
+
+#[test]
+fn test_wasm_info_nested_and_flat_agree() {
+    let home = temp_home("wasm-info-both-forms");
+    let (nested, _, nested_code) =
+        run_cli_quiet(&["wasm", "info", "tests/fixtures/contract.wasm"], &home);
+    let (flat, _, flat_code) = run_cli_quiet(
+        &["wasm-info", "--wasm", "tests/fixtures/contract.wasm"],
+        &home,
+    );
+    assert_eq!(nested_code, 0);
+    assert_eq!(flat_code, 0);
+    assert_eq!(nested, flat, "both command forms should report the same");
 }
 
 #[test]

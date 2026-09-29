@@ -16,9 +16,12 @@ management**.
   - [`config history`](#config-history) — chronological change log
   - [`config last-changed`](#config-last-changed) — last-change timestamps
 - [Cache Management](#cache-management)
+  - [`cache stats`](#cache-stats) — cache health overview
   - [`cache verify`](#cache-verify) — check cache integrity
   - [`cache warm`](#cache-warm) — pre-populate cache
   - [`cache clear`](#cache-clear) — wipe cached estimates for a network
+- [WASM Inspection](#wasm-inspection)
+  - [`wasm info`](#wasm-info) — offline contract metadata report
 - [Monitoring](#monitoring)
   - [`watch`](#watch) — poll and diff on interval
 
@@ -512,6 +515,38 @@ Last-changed timestamps for testnet:
 
 ## Cache Management
 
+### `cache stats`
+
+Show a cache health overview: total entries, disk usage, age of the oldest and
+newest entries, and a per-network breakdown.
+
+**Usage**
+
+```
+soroban-cost-estimator cache stats
+```
+
+**Flags**
+
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--help` | `-h` | | Print help |
+
+**Behavior**
+
+- Purely local SQLite I/O — no network calls.
+- Prints a one-line summary when the cache is empty.
+
+**Example**
+
+```bash
+soroban-cost-estimator cache stats
+# → Total entries: 12
+#   Disk usage:     48.0 KB
+```
+
+---
+
 ### `cache verify`
 
 Check that every cached estimate is valid JSON and not corrupted.
@@ -639,6 +674,84 @@ soroban-cost-estimator cache clear
 soroban-cost-estimator cache clear --network mainnet
 # → Cleared 3 cached estimate(s) for mainnet.
 ```
+
+---
+
+## WASM Inspection
+
+### `wasm info`
+
+Print everything about a compiled contract that can be derived from the file
+itself — no network access, no RPC simulation.
+
+**Usage**
+
+```
+soroban-cost-estimator wasm info <WASM> [--json]
+```
+
+The legacy flat form `soroban-cost-estimator wasm-info --wasm <WASM>` remains
+available and prints exactly the same report.
+
+**Flags**
+
+| Flag | Short | Required | Default | Description |
+|------|-------|----------|---------|-------------|
+| `<WASM>` | | ✅ | — | Path to the compiled Soroban contract `.wasm` file |
+| `--json` | | | `false` | Emit the full parsed spec/metadata as JSON |
+| `--help` | `-h` | | | Print help |
+
+**Behavior**
+
+- Reports the file size and the SHA-256 digest of the raw bytes.
+- Lists the exported functions with their spec-derived argument **and return**
+  types, e.g. `increment(step: i64) -> i64`.
+- Shows the embedded contract metadata (`contractmetav0`): contract name,
+  version, description, and the Soroban SDK version the contract was built
+  with.
+- Prints a per-section size summary (name, id, and byte size of every section,
+  including custom sections such as `contractspecv0`).
+- `--json` emits the full parsed AST: every `contractspecv0` entry (functions,
+  UDT structs/unions/enums, error enums, and events) with their nested type
+  trees, plus imports, exports, and memory limits.
+- Zero network access: the command only reads and parses the file.
+- If the file is not a valid WebAssembly binary, it exits with code 1 and a
+  `not a valid WebAssembly binary` error.
+
+**Example**
+
+```bash
+soroban-cost-estimator wasm info target/wasm32-unknown-unknown/release/contract.wasm
+```
+
+**Sample output**
+
+```text
+WASM info: tests/fixtures/contract.wasm
+  Size:      4742 bytes
+  SHA-256:   ea14bca998e98f0ddb338e8e5cef6e19f07378a3b71e8b4f8868cedc857e4ecd
+  Functions: 1
+    [1] increment(step: i64) -> i64
+  Contract spec: present (1 entries, typed params/returns decoded from contractspecv0)
+  SDK version:   25.3.2
+Sections: 15 (4701 bytes of section content in a 4742 byte file)
+  [1] type (id 1): 81 bytes
+  ...
+  [10] contractspecv0 (id 0): 147 bytes
+Contract meta: present
+  rsver: 1.96.0
+  rssdkver: 25.3.2
+```
+
+**JSON output**
+
+```bash
+soroban-cost-estimator wasm info target/contract.wasm --json
+```
+
+Top-level keys: `path`, `size`, `sha256`, `has_spec`, `sdk_version`,
+`sections`, `contract_meta`, `functions`, `spec_entries`, and `module`
+(start function, memories, imports, exports).
 
 ---
 
