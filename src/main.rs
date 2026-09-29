@@ -561,6 +561,9 @@ async fn cmd_estimate(
         debug!(functions = wasm_info.functions.len(), has_spec = wasm_info.has_spec, "WASM loaded");
         emit_wasm_structure(&wasm_info, verbose, wasm_info_flag, json_flag);
 
+        // Validate WASM memory and table constraints against network limits (defaults: 64KB max size, 2048 pages)
+        wasm_info.validate_wasm_limits(65536, 2048)?;
+
         let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
         let function_name = fn_name.unwrap_or("(wasm upload)");
 
