@@ -1906,7 +1906,6 @@ async fn cmd_watch(
     }
 }
 
-/// `cache verify` command: check every cache entry parses as valid JSON.
 /// `cache stats` command: show cache health overview.
 ///
 /// Prints total entries, disk usage, age (oldest/newest), and per-network
@@ -1973,6 +1972,7 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// `cache verify` command: check every cache entry parses as valid JSON.
 ///
 /// Prints a summary line per corrupted entry and exits with code 1 when any
 /// entry fails verification, so scripts can treat a corrupt cache as an
