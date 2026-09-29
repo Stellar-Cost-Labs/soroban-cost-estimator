@@ -1452,19 +1452,29 @@ fn start_mock_rpc_server(
                             Ok(0) => break,
                             Ok(n) => {
                                 req_str.push_str(&String::from_utf8_lossy(&buf[..n]));
-                                if req_str.contains("\r\n\r\n") {
-                                    if let Some(pos) = req_str.find("Content-Length: ") {
-                                        let cl_str = &req_str[pos + 16..];
-                                        let end = cl_str.find("\r\n").unwrap_or(cl_str.len());
-                                        if let Ok(cl) = cl_str[..end].trim().parse::<usize>() {
-                                            let body_start = req_str.find("\r\n\r\n").unwrap() + 4;
-                                            if req_str.len() - body_start >= cl {
-                                                break;
+                                if let Some(header_end) = req_str.find("\r\n\r\n") {
+                                    let body_start = header_end + 4;
+                                    // HTTP clients serialize header names in
+                                    // lowercase (`content-length`), so the
+                                    // length must be matched
+                                    // case-insensitively. Reading the whole
+                                    // body before replying is essential:
+                                    // closing the socket while the client is
+                                    // still writing a large body (e.g. a WASM
+                                    // upload envelope) surfaces as a failed
+                                    // HTTP send.
+                                    let content_length = req_str[..header_end]
+                                        .lines()
+                                        .find_map(|line| {
+                                            let (name, value) = line.split_once(':')?;
+                                            if name.trim().eq_ignore_ascii_case("content-length") {
+                                                value.trim().parse::<usize>().ok()
+                                            } else {
+                                                None
                                             }
-                                        } else {
-                                            break;
-                                        }
-                                    } else {
+                                        })
+                                        .unwrap_or(0);
+                                    if req_str.len().saturating_sub(body_start) >= content_length {
                                         break;
                                     }
                                 }
@@ -1653,6 +1663,55 @@ fn test_estimate_minimal_wasm_upload_zero_footprint() {
     assert_eq!(parsed["write_entries"], 0);
     assert_eq!(parsed["read_bytes"], 0);
     assert_eq!(parsed["write_bytes"], 0);
+}
+
+/// Regression: the mock server must read the *entire* request body before
+/// answering. HTTP clients serialize header names in lowercase
+/// (`content-length`), and a large body — such as a WASM upload envelope —
+/// spans several reads. Replying early closes the socket while the client is
+/// still writing, which surfaces as "failed to send HTTP request" (observed
+/// on Windows CI for the `--diff` and cache-quota end-to-end tests).
+#[test]
+fn test_mock_rpc_server_drains_full_request_body() {
+    use std::io::{Read, Write};
+
+    let (rpc_url, _stop) = start_mock_rpc_server("", "1000", 100);
+    let addr = rpc_url.strip_prefix("http://").expect("http url");
+    let mut stream = std::net::TcpStream::connect(addr).expect("connect mock server");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("set read timeout");
+
+    // A body much larger than the server's read buffer, carrying the method
+    // name in the body (as JSON-RPC does) rather than in the request path.
+    let body = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"simulateTransaction\",\"params\":{{\"padding\":\"{}\"}}}}",
+        "x".repeat(8_000)
+    );
+    let headers = format!(
+        "POST / HTTP/1.1\r\nHost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+
+    // Headers and body are written separately so the server cannot observe
+    // the complete request in its first read.
+    stream.write_all(headers.as_bytes()).expect("write headers");
+    let _ = stream.flush();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    stream.write_all(body.as_bytes()).expect("write body");
+    let _ = stream.flush();
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read response");
+
+    assert!(
+        response.contains("minResourceFee"),
+        "server must answer simulateTransaction once the full body is read; got: {response}"
+    );
+    assert!(
+        !response.contains("Method not found"),
+        "answering before draining the body yields a bogus method-not-found reply; got: {response}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
