@@ -174,6 +174,13 @@ pub enum Command {
         #[arg(long, value_name = "N")]
         threshold_percent: Option<f64>,
     },
+
+    /// Generate shell completion scripts for Bash, Zsh, Fish, and PowerShell.
+    Completions {
+        /// Target shell for completion script generation.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Subcommand, Debug)]
