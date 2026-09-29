@@ -368,7 +368,8 @@ impl RpcClient {
             // default builder cannot), so fall back to a plain client to keep
             // construction infallible.
             client: reqwest::Client::builder()
-                .timeout(timeout)
+                .timeout(timeout) 
+                .connect_timeout(connect_timeout)
                 .tcp_keepalive(Duration::from_secs(30))
                 .pool_idle_timeout(Duration::from_secs(90))
                 .default_headers(headers.clone())
