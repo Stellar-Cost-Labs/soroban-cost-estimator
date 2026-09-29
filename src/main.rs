@@ -1337,9 +1337,70 @@ fn wasm_info_json(
     })
 }
 
+/// Decides which ledger a config snapshot should be stamped with.
+///
+/// #267: this must be the network's **current** ledger, not the newest
+/// `last_modified_ledger` across the config settings. Those per-setting values
+/// only move on protocol-governance events, so they sit frozen between upgrades
+/// and made every snapshot report the same long-stale ledger.
+///
+/// Falls back to the newest per-setting value (the old behavior) when the node
+/// omits `latestLedger` or reports one beyond the model's `u32` range, so a
+/// snapshot never silently claims ledger 0.
+fn snapshot_ledger(fetched: &rpc::config::ConfigSettingsFetch) -> u32 {
+    use tracing::warn;
+
+    match fetched.latest_ledger {
+        Some(latest) => match u32::try_from(latest) {
+            Ok(ledger) => ledger,
+            Err(_) => {
+                warn!(
+                    latest,
+                    "node reported a ledger beyond the snapshot model's range — \
+                     falling back to per-setting last_modified values"
+                );
+                newest_last_modified(fetched)
+            }
+        },
+        None => {
+            warn!(
+                "node omitted latestLedger — falling back to the newest per-setting \
+                 last_modified ledger, which may be stale"
+            );
+            newest_last_modified(fetched)
+        }
+    }
+}
+
+/// The newest `last_modified_ledger` across the fetched settings, or 0.
+fn newest_last_modified(fetched: &rpc::config::ConfigSettingsFetch) -> u32 {
+    fetched
+        .entries
+        .iter()
+        .map(|e| e.last_modified_ledger)
+        .max()
+        .unwrap_or(0)
+}
+
 /// Fetches the current network config settings and builds a snapshot.
 ///
 /// Shared by `config snapshot`, `config diff`, and `watch`.
+///
+/// # Ledger stamping
+/// `snapshot.ledger` is the network's **current** ledger, taken from the
+/// node's `latestLedger` on the same `getLedgerEntries` response. It is not
+/// derived from the settings' `last_modified_ledger` values: those answer "when
+/// did this setting last change?", and since settings only change on
+/// protocol-governance events they stay frozen between upgrades — stamping
+/// from them made every snapshot report the same long-stale ledger and made
+/// two runs minutes apart indistinguishable.
+///
+/// The per-setting `last_modified_ledger` values are preserved in
+/// `settings_last_modified` so that provenance is not lost.
+///
+/// If the node omits `latestLedger`, the snapshot falls back to the newest
+/// per-setting value (the old behavior) and says so, rather than silently
+/// recording ledger 0.
 ///
 /// # Network calls
 /// Makes one batched `getLedgerEntries` RPC call.
@@ -1368,17 +1429,31 @@ async fn fetch_config_snapshot(
             verbose,
         );
         debug!("fetching all config settings");
-        let raw_entries = rpc::config::fetch_all_config_settings(&client).await?;
-        debug!(entries = raw_entries.len(), "received config entries");
+        let fetched = rpc::config::fetch_all_config_settings(&client).await?;
+        debug!(
+            entries = fetched.entries.len(),
+            latest_ledger = ?fetched.latest_ledger,
+            "received config entries"
+        );
+
+        // Keep the per-setting provenance before decoding, so it survives even
+        // if a later step discards the raw entries.
+        let settings_last_modified: std::collections::BTreeMap<String, u32> = fetched
+            .entries
+            .iter()
+            .map(|raw| (raw.id.human_name().to_string(), raw.last_modified_ledger))
+            .collect();
+
+        // Stamp with the current ledger, not the frozen per-setting values.
+        let ledger = snapshot_ledger(&fetched);
 
         let mut snapshot = xdr_helper::begin_snapshot(network, 0);
-        for raw in &raw_entries {
+        for raw in &fetched.entries {
             let config_entry = xdr_helper::decode_config_entry_xdr(&raw.config_xdr, verbose)?;
             xdr_helper::apply_config_entry(&mut snapshot, config_entry);
         }
-        if let Some(latest) = raw_entries.iter().map(|e| e.last_modified_ledger).max() {
-            snapshot.ledger = latest;
-        }
+        snapshot.settings_last_modified = settings_last_modified;
+        snapshot.ledger = ledger;
         debug!(ledger = snapshot.ledger, "config snapshot built");
         Ok(snapshot)
     }
@@ -2209,19 +2284,177 @@ mod tests {
     use super::EstimateAllResult;
     use super::EstimateAllStatus;
     use super::parse_interval_secs;
+    use super::snapshot_ledger;
     use super::upgrade_detected;
     use super::wasm_info_json;
     use soroban_cost_estimator::config_snapshot::diff;
     use soroban_cost_estimator::config_snapshot::model::{
         ConfigSnapshot, ContractComputeV0, ContractLedgerCostV0,
     };
+    use soroban_cost_estimator::rpc::config::{
+        ConfigSettingEntryRaw, ConfigSettingId, ConfigSettingsFetch,
+    };
     use soroban_cost_estimator::wasm::parser::{ContractMeta, FunctionInfo, ParamInfo, WasmInfo};
+
+    // ── Snapshot ledger stamping (#267) ────────────────────────────────────
+    //
+    // The ledger a snapshot records must be the network's *current* ledger, not
+    // the newest `last_modified_ledger` across the config settings. Settings
+    // only change on governance events, so the latter stays frozen between
+    // upgrades and made every snapshot report the same long-stale ledger.
+
+    /// Realistic per-setting ledgers: all far behind the current chain, and
+    /// frozen across minutes, exactly as observed on testnet in #267.
+    const STALE_SETTING_LEDGERS: [(&ConfigSettingId, u32); 6] = [
+        (&ConfigSettingId::ContractComputeV0, 606_666),
+        (&ConfigSettingId::ContractLedgerCostV0, 3_470_630),
+        (&ConfigSettingId::ContractHistoricalDataV0, 606_666),
+        (&ConfigSettingId::ContractEventsV0, 606_666),
+        (&ConfigSettingId::ContractBandwidthV0, 606_666),
+        (&ConfigSettingId::StateArchival, 2_332),
+    ];
+
+    fn fetch_with(latest_ledger: Option<u64>) -> ConfigSettingsFetch {
+        ConfigSettingsFetch {
+            entries: STALE_SETTING_LEDGERS
+                .iter()
+                .map(|(id, ledger)| ConfigSettingEntryRaw {
+                    id: **id,
+                    config_xdr: "x".to_string(),
+                    last_modified_ledger: *ledger,
+                })
+                .collect(),
+            latest_ledger,
+        }
+    }
+
+    #[test]
+    fn test_snapshot_ledger_uses_current_ledger_not_last_modified() {
+        // The exact values from the #267 report: current 4_635_340 vs. the
+        // newest setting change at 3_470_630 — 1,164,710 ledgers stale.
+        let fetched = fetch_with(Some(4_635_340));
+
+        assert_eq!(
+            snapshot_ledger(&fetched),
+            4_635_340,
+            "snapshot must record the current ledger"
+        );
+        assert_eq!(
+            snapshot_ledger(&fetched),
+            4_635_340,
+            "and must not fall back to max(last_modified_ledger)=3470630"
+        );
+        assert_ne!(
+            snapshot_ledger(&fetched),
+            3_470_630,
+            "the frozen per-setting max must not win"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_ledger_advances_between_runs() {
+        // Two runs minutes apart must report different ledgers even though the
+        // settings have not changed.
+        let first = snapshot_ledger(&fetch_with(Some(4_635_340)));
+        let second = snapshot_ledger(&fetch_with(Some(4_635_412)));
+
+        assert_eq!(first, 4_635_340);
+        assert_eq!(second, 4_635_412);
+        assert_ne!(
+            first, second,
+            "two runs minutes apart must not report the same ledger"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_ledger_falls_back_when_latest_ledger_absent() {
+        // A node that omits latestLedger must not silently yield ledger 0.
+        let fetched = fetch_with(None);
+
+        assert_eq!(
+            snapshot_ledger(&fetched),
+            3_470_630,
+            "fallback should be the newest per-setting value, not 0"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_ledger_falls_back_when_ledger_exceeds_u32() {
+        // Beyond the model's range we cannot represent it, so fall back rather
+        // than truncating into a plausible-looking but wrong number.
+        let fetched = fetch_with(Some(u64::from(u32::MAX) + 1));
+
+        assert_eq!(snapshot_ledger(&fetched), 3_470_630);
+    }
+
+    #[test]
+    fn test_snapshot_ledger_falls_back_to_zero_without_entries() {
+        let fetched = ConfigSettingsFetch {
+            entries: Vec::new(),
+            latest_ledger: None,
+        };
+
+        assert_eq!(snapshot_ledger(&fetched), 0);
+    }
+
+    #[test]
+    fn test_snapshot_preserves_per_setting_provenance() {
+        // The per-setting last_modified values must survive the restamping, so
+        // "when did this price last move?" stays answerable.
+        let fetched = fetch_with(Some(4_635_340));
+        let provenance: std::collections::BTreeMap<String, u32> = fetched
+            .entries
+            .iter()
+            .map(|raw| (raw.id.human_name().to_string(), raw.last_modified_ledger))
+            .collect();
+
+        assert_eq!(provenance.len(), 6);
+        assert_eq!(
+            provenance.get("CONFIG_SETTING_CONTRACT_LEDGER_COST_V0"),
+            Some(&3_470_630),
+            "the stale per-setting value must be kept, not replaced"
+        );
+        assert_eq!(
+            provenance.get("CONFIG_SETTING_CONTRACT_COMPUTE_V0"),
+            Some(&606_666)
+        );
+        // The current ledger is distinct from, and larger than, all of them.
+        let current = snapshot_ledger(&fetched);
+        assert!(provenance.values().all(|lm| *lm < current));
+    }
+
+    #[test]
+    fn test_snapshots_without_provenance_field_still_deserialize() {
+        // Snapshots written before this field existed must keep loading, or
+        // every previously saved snapshot becomes unreadable.
+        let legacy = r#"{
+  "network": "testnet",
+  "timestamp": "2026-01-01T00:00:00Z",
+  "ledger": 3470630,
+  "contract_compute": null,
+  "contract_ledger_cost": null,
+  "contract_historical_data": null,
+  "contract_events": null,
+  "contract_bandwidth": null,
+  "state_archival": null
+}"#;
+
+        let snapshot: ConfigSnapshot =
+            serde_json::from_str(legacy).expect("legacy snapshot should still parse");
+
+        assert_eq!(snapshot.ledger, 3_470_630);
+        assert!(
+            snapshot.settings_last_modified.is_empty(),
+            "absent provenance must default to empty, not fail"
+        );
+    }
 
     fn snapshot_with_compute_fee(fee: i64) -> ConfigSnapshot {
         ConfigSnapshot {
             network: "testnet".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             ledger: 100,
+            settings_last_modified: std::collections::BTreeMap::new(),
             contract_compute: Some(ContractComputeV0 {
                 ledger_max_instructions: 1_000_000,
                 tx_max_instructions: 100_000,

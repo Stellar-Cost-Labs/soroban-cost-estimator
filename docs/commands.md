@@ -325,13 +325,14 @@ soroban-cost-estimator config snapshot --network testnet
 ```text
 Config snapshot saved to: /home/you/.soroban-cost-estimator/snapshots/testnet-2026-08-04T07-15-38.487702259+00-00.json
 Network: testnet
-Ledger:  3470630
+Ledger:  4635341
 Time:    2026-08-04T07:15:38.487702259+00:00
 ```
 
-The printed `Ledger` is the last ledger at which the config entries were
-modified on-chain — it is *not* the network's current ledger, and that is
-intentional: it is the ledger against which stale-cache checks are made.
+The printed `Ledger` is the network's **current** ledger at fetch time, as
+reported by the node's `latestLedger` — it is the ledger against which stale-cache
+checks are made. The per-setting modification ledgers are kept separately in
+`settings_last_modified`; see [`config snapshot`](commands/config-snapshot.md).
 
 ---
 

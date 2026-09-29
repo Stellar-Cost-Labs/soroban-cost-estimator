@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// A complete snapshot of the network's Soroban resource-pricing configuration.
@@ -5,7 +7,22 @@ use serde::{Deserialize, Serialize};
 pub struct ConfigSnapshot {
     pub network: String,
     pub timestamp: String,
+    /// The network's **current** ledger when the snapshot was taken, as
+    /// reported by the node's `latestLedger`.
+    ///
+    /// This is deliberately *not* the newest `last_modified_ledger` across the
+    /// config settings. Those settings only change on protocol-governance
+    /// events, so that value is frozen between upgrades and would leave every
+    /// snapshot reporting the same long-stale ledger.
     pub ledger: u32,
+    /// Per-setting provenance: for each config setting, the ledger in which
+    /// that setting last changed (the entry's `lastModifiedLedgerSeq`).
+    ///
+    /// Kept so the "when did this price last move?" question stays answerable
+    /// from a snapshot. Defaults to empty when absent, which keeps snapshots
+    /// written by earlier versions loadable.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub settings_last_modified: BTreeMap<String, u32>,
     pub contract_compute: Option<ContractComputeV0>,
     pub contract_ledger_cost: Option<ContractLedgerCostV0>,
     pub contract_historical_data: Option<ContractHistoricalDataV0>,

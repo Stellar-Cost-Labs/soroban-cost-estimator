@@ -24,6 +24,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `config snapshot` and `config diff` now stamp `ConfigSnapshot.ledger` with the
+  network's **current** ledger (the node's `latestLedger`) instead of
+  `max(last_modified_ledger)` across the fetched `ConfigSetting*` entries.
+  Config settings only change on protocol-governance events, so that value is
+  frozen between upgrades — every snapshot reported the same long-stale ledger
+  (observed on testnet: `3470630` while the chain was at `4.9M+`), and two
+  runs minutes apart were indistinguishable. The per-setting
+  `last_modified_ledger` values are preserved in a new
+  `settings_last_modified` field so their provenance is not lost; snapshots
+  written by earlier versions still load.
 - Restore the WebSocket RPC client (`rpc::ws`) after the merge of `main`
   dropped its `AppError` variants and `resolve_ws_endpoint`, which broke
   compilation and red-flagged every CI job.

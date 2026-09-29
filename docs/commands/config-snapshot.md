@@ -38,13 +38,39 @@ Actual output from a live testnet run:
 ```text
 Config snapshot saved to: /home/you/.soroban-cost-estimator/snapshots/testnet-2026-08-04T07-15-38.487702259+00-00.json
 Network: testnet
-Ledger:  3470630
+Ledger:  4635341
 Time:    2026-08-04T07:15:38.487702259+00:00
 ```
 
-The printed `Ledger` is the last ledger at which the config entries were
-modified on-chain — it is *not* the network's current ledger, and that is
-intentional: it is the ledger against which stale-cache checks are made.
+The printed `Ledger` is the network's **current** ledger at the moment of the
+fetch, as reported by the node's `latestLedger`. It may trail Horizon or
+`getLatestLedger` by a ledger or two, which is normal — the two endpoints close
+ledgers independently.
+
+This is deliberately *not* the ledger at which the config entries were last
+modified. Config settings only change on protocol-governance events, so that
+value sits frozen between upgrades and would leave every snapshot reporting the
+same long-stale ledger. If you need the per-setting modification ledgers, they
+are kept per setting in `settings_last_modified`:
+
+```json
+"ledger": 4635341,
+"settings_last_modified": {
+  "CONFIG_SETTING_CONTRACT_BANDWIDTH_V0": 606666,
+  "CONFIG_SETTING_CONTRACT_COMPUTE_V0": 606666,
+  "CONFIG_SETTING_CONTRACT_EVENTS_V0": 606666,
+  "CONFIG_SETTING_CONTRACT_HISTORICAL_DATA_V0": 606666,
+  "CONFIG_SETTING_CONTRACT_LEDGER_COST_V0": 3470630,
+  "CONFIG_SETTING_STATE_ARCHIVAL": 2332
+}
+```
+
+So `ledger` answers *"when was this snapshot taken?"* and
+`settings_last_modified` answers *"when did each price last move?"* — two
+different questions, now both answerable from one snapshot.
+
+Snapshots written by earlier versions have no `settings_last_modified` key and
+still load; the field simply reads as empty for them.
 
 ## What you get
 

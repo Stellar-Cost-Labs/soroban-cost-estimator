@@ -57,6 +57,7 @@ pub fn begin_snapshot(network: &str, ledger: u32) -> ConfigSnapshot {
         network: network.to_string(),
         timestamp: Utc::now().to_rfc3339(),
         ledger,
+        settings_last_modified: std::collections::BTreeMap::new(),
         contract_compute: None,
         contract_ledger_cost: None,
         contract_historical_data: None,
