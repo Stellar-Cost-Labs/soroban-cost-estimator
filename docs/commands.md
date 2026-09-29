@@ -710,6 +710,7 @@ All commands accept:
 |------|-------------|
 | `--rps <N>` | Cap RPC requests at N per second (0 disables) |
 | `--timeout <SECS>` | HTTP request timeout for RPC calls in seconds (default `30`) |
+| `--max-retries <N>` | Retry transient RPC failures up to N times (default `3`). 0 disables retries. |
 | `--help` / `-h` | Print command-specific help |
 
 ## Network Resolution
