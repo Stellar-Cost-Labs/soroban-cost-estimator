@@ -183,6 +183,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 &headers,
                 args.wasm_info,
                 args.verbose,
+                auto_snapshot,
             )
             .await
         }
@@ -214,6 +215,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 &headers,
                 args.wasm_info,
                 args.verbose,
+                auto_snapshot,
             )
             .await
         }
@@ -534,6 +536,7 @@ fn emit_wasm_structure(
 /// the same params — so a repeated WASM-upload envelope (when `--fn` is
 /// omitted) or identical fee-rate fetches transmit at most once.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::fn_params_excessive_bools)]
 async fn cmd_estimate(
     wasm_path: &str,
     network: &str,
@@ -552,6 +555,7 @@ async fn cmd_estimate(
     extra_headers: &[String],
     wasm_info_flag: bool,
     verbose: bool,
+    auto_snapshot: bool,
 ) -> error::AppResult<()> {
     let json_flag = format == "json";
     let table_mode = format == "table";
@@ -725,6 +729,7 @@ async fn cmd_estimate(
                 timeout,
                 max_retries,
                 extra_headers,
+                verbose,
             )
             .await
             {
@@ -791,6 +796,7 @@ async fn cmd_estimate_all(
     extra_headers: &[String],
     wasm_info_flag: bool,
     verbose: bool,
+    auto_snapshot: bool,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -923,6 +929,7 @@ async fn cmd_estimate_all(
                 timeout,
                 max_retries,
                 extra_headers,
+                verbose,
             )
             .await
             {
@@ -1658,14 +1665,12 @@ async fn auto_snapshot_if_changed(
     timeout: u64,
     max_retries: usize,
     extra_headers: &[String],
+    verbose: bool,
 ) -> error::AppResult<()> {
     use tracing::{debug, info};
 
     // Try to load the latest snapshot; if none exists, save a new one.
-    let old_snapshot = match config_snapshot::store::load_latest_snapshot(network) {
-        Ok(snap) => Some(snap),
-        Err(_) => None,
-    };
+    let old_snapshot = config_snapshot::store::load_latest_snapshot(network).ok();
 
     let new_snapshot = fetch_config_snapshot(
         network,
@@ -1674,6 +1679,7 @@ async fn auto_snapshot_if_changed(
         timeout,
         max_retries,
         extra_headers,
+        verbose,
     )
     .await?;
 
@@ -2083,6 +2089,7 @@ async fn cmd_cache_warm(
         extra_headers,
         false,
         verbose,
+        false,
     )
     .await
 }
