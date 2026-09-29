@@ -1352,3 +1352,71 @@ fn test_load_fresh_estimate_expired_returns_none() {
         assert!(fresh.is_none(), "an expired entry must yield None");
     });
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// cache_stats (issue #281)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// `cache_stats` on a fresh cache reports zero entries, no timestamps, an
+/// empty per-network breakdown, and no disk error.
+#[test]
+fn test_cache_stats_empty_cache() {
+    with_temp_home(|_tmp| {
+        let stats = cache::cache_stats().expect("stats on empty cache");
+        assert_eq!(stats.total_entries, 0, "fresh cache should have 0 entries");
+        assert!(
+            stats.oldest_entry.is_none(),
+            "no oldest entry on an empty cache"
+        );
+        assert!(
+            stats.newest_entry.is_none(),
+            "no newest entry on an empty cache"
+        );
+        assert!(
+            stats.per_network.is_empty(),
+            "empty cache should have no per-network breakdown"
+        );
+    });
+}
+
+/// `cache_stats` aggregates every cached estimate across networks: total
+/// count, oldest/newest timestamps, per-network breakdown, and disk usage.
+#[test]
+fn test_cache_stats_reports_populated_cache() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true)
+            .expect("save testnet f1");
+        cache::save_estimate("h2", "f2", &[], "mainnet", 2, 200, 20, 10, None, true)
+            .expect("save mainnet f2");
+
+        let stats = cache::cache_stats().expect("stats on populated cache");
+        assert_eq!(stats.total_entries, 2, "both entries should be counted");
+        assert!(stats.disk_bytes > 0, "the SQLite file should occupy space");
+        assert!(
+            stats.oldest_entry.is_some(),
+            "an oldest timestamp should be reported"
+        );
+        assert!(
+            stats.newest_entry.is_some(),
+            "a newest timestamp should be reported"
+        );
+
+        let count = |network: &str| {
+            stats
+                .per_network
+                .iter()
+                .find(|(name, _)| name == network)
+                .map(|(_, count)| *count)
+        };
+        assert_eq!(
+            count("mainnet"),
+            Some(1),
+            "mainnet breakdown should count 1"
+        );
+        assert_eq!(
+            count("testnet"),
+            Some(1),
+            "testnet breakdown should count 1"
+        );
+    });
+}
