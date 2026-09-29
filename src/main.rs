@@ -114,6 +114,60 @@ impl EstimateAllResult {
     }
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+struct FileConfig {
+    network: Option<String>,
+    rpc_url: Option<String>,
+    json: Option<bool>,
+}
+
+fn config_path(cli_path: Option<&str>) -> std::path::PathBuf {
+    cli_path.map(std::path::PathBuf::from).unwrap_or_else(|| {
+        dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("soroban-cost-estimator")
+            .join("config.toml")
+    })
+}
+
+fn load_config(cli_path: Option<&str>) -> error::AppResult<FileConfig> {
+    let path = config_path(cli_path);
+    if !path.exists() {
+        return Ok(FileConfig::default());
+    }
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| error::AppError::Config(format!("{}: {e}", path.display())))?;
+    toml::from_str(&content)
+        .map_err(|e| error::AppError::Config(format!("{}: {e}", path.display())))
+}
+
+fn env_string(cli_value: String, file_value: &str, env: &str) -> String {
+    let val = std::env::var(env).unwrap_or(cli_value);
+    let trimmed = val.trim();
+    if trimmed.is_empty() {
+        file_value.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn env_or_file_bool(value: bool, file: Option<bool>) -> bool {
+    std::env::var("SOROBAN_JSON")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .or(file)
+        .unwrap_or(value)
+}
+
+const fn output_format_name(format: cli::OutputFormat) -> &'static str {
+    match format {
+        cli::OutputFormat::Table => "table",
+        cli::OutputFormat::Json => "json",
+        cli::OutputFormat::Csv => "csv",
+        cli::OutputFormat::Markdown => "markdown",
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args = cli::Cli::parse();
@@ -142,6 +196,18 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
     let max_retries = args.max_retries;
     let fallback = args.rpc_fallback_url.as_deref();
     let headers = args.headers;
+    let format = match args.format {
+        Some(fmt) => fmt,
+        None => {
+            if env_or_file_bool(false, file.json) {
+                cli::OutputFormat::Json
+            } else {
+                cli::OutputFormat::Table
+            }
+        }
+    };
+    let default_network = file.network.unwrap_or_else(|| "testnet".to_string());
+    let default_rpc_url = file.rpc_url;
     match args.command {
         cli::Command::Estimate {
             wasm,
@@ -153,23 +219,28 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cache_ttl,
             clear_cache,
             json,
-            format,
             precision,
         } => {
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
-            let format = format.unwrap_or_else(|| if json { "json" } else { "table" }.to_string());
+            let format_str = if args.format.is_some() {
+                output_format_name(format)
+            } else if json {
+                "json"
+            } else {
+                output_format_name(format)
+            };
             cmd_estimate(
                 &wasm,
-                &network,
-                rpc_url.as_deref(),
+                &env_string(network, &default_network, "SOROBAN_NETWORK"),
+                rpc_url.as_deref().or(default_rpc_url.as_deref()),
                 fallback,
                 id.as_deref(),
                 r#fn.as_deref(),
                 &contract_args,
                 cache_ttl.as_deref(),
                 clear_cache,
-                &format,
+                format_str,
                 rps,
                 timeout,
                 max_retries,
@@ -186,17 +257,22 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             rpc_url,
             id,
             json,
-            format,
             precision,
         } => {
-            let format = format.unwrap_or_else(|| if json { "json" } else { "table" }.to_string());
+            let format_str = if args.format.is_some() {
+                output_format_name(format)
+            } else if json {
+                "json"
+            } else {
+                output_format_name(format)
+            };
             cmd_estimate_all(
                 &wasm,
-                &network,
-                rpc_url.as_deref(),
+                &env_string(network, &default_network, "SOROBAN_NETWORK"),
+                rpc_url.as_deref().or(default_rpc_url.as_deref()),
                 fallback,
                 id.as_deref(),
-                &format,
+                format_str,
                 rps,
                 timeout,
                 max_retries,
@@ -207,14 +283,30 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             )
             .await
         }
-        cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(&wasm, json),
+        cli::Command::WasmInfo { wasm, json } => {
+            let effective_format = if args.format.is_some() {
+                format
+            } else if json {
+                cli::OutputFormat::Json
+            } else {
+                format
+            };
+            cmd_wasm_info(&wasm, effective_format)
+        }
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot { network, out, json } => {
+                let effective_format = if args.format.is_some() {
+                    format
+                } else if json {
+                    cli::OutputFormat::Json
+                } else {
+                    format
+                };
                 cmd_config_snapshot(
-                    &network,
+                    &env_string(network, &default_network, "SOROBAN_NETWORK"),
                     fallback,
                     out.as_deref(),
-                    json,
+                    effective_format,
                     rps,
                     timeout,
                     max_retries,
@@ -231,14 +323,19 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 summary,
                 json,
             } => {
+                let json_flag = if args.format.is_some() {
+                    format == cli::OutputFormat::Json
+                } else {
+                    json || format == cli::OutputFormat::Json
+                };
                 cmd_config_diff(
-                    &network,
+                    &env_string(network, &default_network, "SOROBAN_NETWORK"),
                     fallback,
                     against.as_deref(),
                     pricing_only,
                     threshold_percent,
                     summary,
-                    json,
+                    json_flag,
                     rps,
                     timeout,
                     max_retries,
@@ -263,13 +360,20 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 id,
                 json,
             } => {
+                let effective_format = if args.format.is_some() {
+                    format
+                } else if json {
+                    cli::OutputFormat::Json
+                } else {
+                    format
+                };
                 cmd_cache_warm(
                     &wasm,
-                    &network,
-                    rpc_url.as_deref(),
+                    &env_string(network, &default_network, "SOROBAN_NETWORK"),
+                    rpc_url.as_deref().or(default_rpc_url.as_deref()),
                     fallback,
                     id.as_deref(),
-                    json,
+                    effective_format,
                     rps,
                     timeout,
                     max_retries,
@@ -1909,7 +2013,7 @@ async fn cmd_cache_warm(
     max_retries: usize,
     extra_headers: &[String],
 ) -> error::AppResult<()> {
-    let fmt = if json_flag { "json" } else { "table" };
+    let fmt = output_format_name(format);
     cmd_estimate_all(
         wasm_path,
         network,
