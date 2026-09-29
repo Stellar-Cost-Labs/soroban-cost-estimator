@@ -1,5 +1,6 @@
 ---
 source: tests/report_snapshots.rs
+assertion_line: 70
 expression: TableFormatter.format(&report)
 ---
 Function: increment
@@ -43,10 +44,12 @@ Fee Breakdown:
 | Total            | 15427 stroops (0.0015427) |
 +------------------+---------------------------+
 
-Fee Breakdown Chart:
+Fee Distribution:
 
-  Refundable     | ######################################## |  10931 (70.9%)
-  Non-refundable | ################                         |   4496 (29.1%)
+  CPU         | █░                                                      |   2.4%
+  Storage I/O | ██████████████▒                                         |  26.3%
+  Bandwidth   | ░                                                       |   0.4%
+  Rent        | ███████████████████████████████████████                 |  70.9%
 
 Optimization Suggestions:
   No cost optimizations identified (fee rates unavailable or no reducible resources).
