@@ -122,3 +122,7 @@ path = "src/bin/gen_test_wasm.rs"
 name = "wasm_parse"
 harness = false
 
+[[bench]]
+name = "cache_lookup"
+harness = false
+
