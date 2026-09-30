@@ -219,6 +219,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
     // reads the same value.
     let precision = args.precision;
     let fallback = args.rpc_fallback_url.as_deref();
+    let cli_format = args.format;
     let headers = args.headers;
     // Bound the on-disk estimate cache before any command can write to it.
     // A `--max-cache-size-mb` of 0 disables the byte quota; 0 entries
@@ -228,7 +229,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
         max_entries: args.max_cache_entries,
     })?;
 
-    let format = match args.format {
+    let format = match cli_format {
         Some(fmt) => fmt,
         None => {
             if env_or_file_bool(false, file.json) {
@@ -256,6 +257,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             wasm_new,
             watch,
             dry_run,
+            project,
         } => {
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
@@ -287,6 +289,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 diff,
                 wasm_new.as_deref(),
                 dry_run,
+                project.as_deref(),
             )
             .await
         }
@@ -353,6 +356,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::Diff {
                 network,
                 against,
+                against_previous,
                 pricing_only,
                 threshold_percent,
                 summary,
@@ -363,21 +367,31 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 } else {
                     json || format == cli::OutputFormat::Json
                 };
-                cmd_config_diff(
-                    &env_string(network, &default_network, "SOROBAN_NETWORK"),
-                    fallback,
-                    against.as_deref(),
-                    pricing_only,
-                    threshold_percent,
-                    summary,
-                    json_flag,
-                    rps,
-                    timeout,
-                    max_retries,
-                    &headers,
-                    verbose,
-                )
-                .await
+                if against_previous {
+                    cmd_config_diff_against_previous(
+                        &env_string(network, &default_network, "SOROBAN_NETWORK"),
+                        pricing_only,
+                        threshold_percent,
+                        summary,
+                        json_flag,
+                    )
+                } else {
+                    cmd_config_diff(
+                        &env_string(network, &default_network, "SOROBAN_NETWORK"),
+                        fallback,
+                        against.as_deref(),
+                        pricing_only,
+                        threshold_percent,
+                        summary,
+                        json_flag,
+                        rps,
+                        timeout,
+                        max_retries,
+                        &headers,
+                        verbose,
+                    )
+                    .await
+                }
             }
             cli::ConfigAction::History { network } => cmd_config_history(&network),
             cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network),
@@ -386,28 +400,13 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 cmd_config_export(network.as_deref(), &output)
             }
             cli::ConfigAction::Import { bundle } => cmd_config_import(&bundle),
-        },
-        cli::Command::Cache { action } => match action {
-            cli::CacheAction::Export { out } => cmd_cache_export(out.as_deref()),
-            cli::CacheAction::Warm {
-                wasm,
-                network,
-                rpc_url,
-                id,
-                json,
-            } => {
-                let format = match (args.format, json) {
-                    (Some(fmt), _) => fmt,
-                    (None, true) => cli::OutputFormat::Json,
-                    (None, false) => cli::OutputFormat::Table,
-                };
-                cmd_cache_warm(
-                    &wasm,
-                    &env_string(network, &default_network, "SOROBAN_NETWORK"),
-                    rpc_url.as_deref().or(default_rpc_url.as_deref()),
+            cli::ConfigAction::Cache { action } => {
+                handle_cache_action(
+                    action,
+                    cli_format,
+                    &default_network,
+                    default_rpc_url.as_deref(),
                     fallback,
-                    id.as_deref(),
-                    format,
                     rps,
                     timeout,
                     max_retries,
@@ -416,31 +415,22 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 )
                 .await
             }
-            cli::CacheAction::Verify => cmd_cache_verify(),
-            cli::CacheAction::Prune => cmd_cache_prune(),
-            cli::CacheAction::List { network, json } => cmd_cache_list(&network, json),
-            cli::CacheAction::Clear { network } => cmd_cache_clear(&network),
-            cli::CacheAction::Query {
-                network,
-                function,
-                wasm_hash,
-                min_stroops,
-                max_stroops,
-                from,
-                to,
-                json,
-            } => cmd_cache_query(
-                &network,
-                function.as_deref(),
-                wasm_hash.as_deref(),
-                min_stroops,
-                max_stroops,
-                from.as_deref(),
-                to.as_deref(),
-                json,
-            ),
-            cli::CacheAction::Stats { json } => cmd_cache_stats(json),
         },
+        cli::Command::Cache { action } => {
+            handle_cache_action(
+                action,
+                cli_format,
+                &default_network,
+                default_rpc_url.as_deref(),
+                fallback,
+                rps,
+                timeout,
+                max_retries,
+                &headers,
+                verbose,
+            )
+            .await
+        }
         cli::Command::Watch {
             network,
             interval,
@@ -801,6 +791,7 @@ async fn simulate_report(
         network: req.network.to_string(),
         rpc_latency_ms,
         rates: Some(fee_rates),
+        projections: None,
     })
 }
 
@@ -836,7 +827,15 @@ async fn cmd_estimate(
     diff: bool,
     wasm_new: Option<&str>,
     dry_run: bool,
+    project: Option<&str>,
 ) -> error::AppResult<()> {
+    // Parse the requested projection counts up front so an invalid list is
+    // rejected before any RPC traffic, regardless of the output format.
+    let projection_counts = match project {
+        Some(s) => Some(report::cost_report::parse_projection_counts(s)?),
+        None => None,
+    };
+
     // `--wasm-new` is only meaningful together with `--diff`; silently
     // ignoring it would produce a single report the user did not ask for.
     if !diff && wasm_new.is_some() {
@@ -886,7 +885,7 @@ async fn cmd_estimate(
         .await;
     }
 
-    let run = estimate_once(
+    let mut run = estimate_once(
         wasm_path,
         network,
         rpc_url,
@@ -915,7 +914,18 @@ async fn cmd_estimate(
         return Ok(());
     }
 
-    if let EstimateRun::Simulated { report, .. } = &run {
+    if let EstimateRun::Simulated { report, .. } = &mut run {
+        // Attach batch cost projections before rendering so every output
+        // format (table, markdown, json, csv) sees the same report.
+        if let Some(ref counts) = projection_counts {
+            report.projections = Some(report::cost_report::calculate_projections(
+                report.fee.total_stroops,
+                counts,
+                precision,
+                None,
+            )?);
+        }
+
         // The table formatter is the only one that renders the fee bar chart,
         // and only when the terminal has room for it (>= MIN_CHART_WIDTH
         // columns), stdout is a TTY, and `--quiet` was not passed. Machine
@@ -2326,6 +2336,23 @@ fn upgrade_detected(diff: &config_snapshot::diff::ConfigDiff) -> bool {
     diff.has_pricing_changes
 }
 
+/// Cached estimates recorded before `ledger`, shaped for the
+/// `config diff --json` payload.
+///
+/// Both diff modes emit the same envelope, so a consumer sees one schema
+/// whether the newer side came from the network or from disk. An unreadable
+/// cache yields an empty list rather than failing the diff.
+fn stale_estimates_for(network: &str, ledger: u32) -> Vec<cache::CachedEstimate> {
+    cache::list_cached_estimates(network)
+        .map(|estimates| {
+            cache::find_stale_estimates(&estimates, ledger)
+                .into_iter()
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// `config diff` command: compare current config against a snapshot.
 #[allow(clippy::fn_params_excessive_bools)]
 async fn cmd_config_diff(
@@ -2376,18 +2403,9 @@ async fn cmd_config_diff(
             "diff computed"
         );
         if json_flag {
-            // Collect stale estimates for inclusion in JSON output.
-            let stale: Vec<cache::CachedEstimate> = cache::list_cached_estimates(network)
-                .map(|estimates| {
-                    cache::find_stale_estimates(&estimates, new_snapshot.ledger)
-                        .into_iter()
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
             let json_output = serde_json::json!({
                 "diff": diff,
-                "stale_estimates": stale,
+                "stale_estimates": stale_estimates_for(network, new_snapshot.ledger),
             });
             println!("{}", serde_json::to_string_pretty(&json_output)?);
         } else if summary {
@@ -2440,6 +2458,67 @@ async fn cmd_config_diff(
     }
     .instrument(span)
     .await
+}
+
+/// `config diff --against-previous`: compare the two most recent snapshots on
+/// disk against each other, with no network access at all.
+///
+/// Both sides come from stored snapshots, so the network name only selects
+/// which snapshot files to read. Output and exit-code behavior deliberately
+/// match the live mode: `--json` emits the same envelope, `--summary` the same
+/// one-line summary, and a pricing change still exits 1.
+///
+/// Unlike the live mode it never auto-saves, because the newer snapshot is
+/// already the one on disk.
+///
+/// # Network calls
+/// None — pure file I/O.
+fn cmd_config_diff_against_previous(
+    network: &str,
+    pricing_only: bool,
+    threshold_percent: Option<f64>,
+    summary: bool,
+    json_flag: bool,
+) -> error::AppResult<()> {
+    debug!(network, "diffing the two most recent snapshots");
+    let (old_snapshot, new_snapshot) = config_snapshot::store::load_last_two_snapshots(network)?;
+    let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
+    debug!(
+        change_count = diff.changes.len(),
+        has_pricing = diff.has_pricing_changes,
+        "diff computed"
+    );
+
+    if json_flag {
+        let json_output = serde_json::json!({
+            "diff": diff,
+            "stale_estimates": stale_estimates_for(network, new_snapshot.ledger),
+        });
+        println!("{}", serde_json::to_string_pretty(&json_output)?);
+    } else if summary {
+        println!("{}", config_snapshot::diff::format_diff_summary(&diff));
+    } else {
+        println!(
+            "{}",
+            config_snapshot::diff::format_diff(
+                &diff,
+                cli::should_colorize(),
+                pricing_only,
+                threshold_percent,
+            )
+        );
+        print_stale_estimates(network, new_snapshot.ledger);
+    }
+
+    let should_exit = match threshold_percent {
+        Some(t) => diff.has_significant_pricing_changes(t),
+        None => diff.has_pricing_changes,
+    };
+
+    if should_exit {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// `config history` command: print the full chronological change log.
@@ -3011,26 +3090,113 @@ fn cmd_cache_clear(network: &str) -> error::AppResult<()> {
 ///
 /// # Network calls
 /// None — pure file I/O.
+/// Dispatch cache actions for either `cache <action>` or `config cache <action>`.
+async fn handle_cache_action(
+    action: cli::CacheAction,
+    cli_format: Option<cli::OutputFormat>,
+    default_network: &str,
+    default_rpc_url: Option<&str>,
+    fallback: Option<&str>,
+    rps: Option<u64>,
+    timeout: u64,
+    max_retries: usize,
+    headers: &[String],
+    verbose: bool,
+) -> error::AppResult<()> {
+    match action {
+        cli::CacheAction::Export { out } => cmd_cache_export(out.as_deref()),
+        cli::CacheAction::Warm {
+            wasm,
+            network,
+            rpc_url,
+            id,
+            json,
+        } => {
+            let format = match (cli_format, json) {
+                (Some(fmt), _) => fmt,
+                (None, true) => cli::OutputFormat::Json,
+                (None, false) => cli::OutputFormat::Table,
+            };
+            cmd_cache_warm(
+                &wasm,
+                &env_string(network, default_network, "SOROBAN_NETWORK"),
+                rpc_url.as_deref().or(default_rpc_url),
+                fallback,
+                id.as_deref(),
+                format,
+                rps,
+                timeout,
+                max_retries,
+                headers,
+                verbose,
+            )
+            .await
+        }
+        cli::CacheAction::List { network, json } => cmd_cache_list(&network, json),
+        cli::CacheAction::Verify => cmd_cache_verify(),
+        cli::CacheAction::Clear { network } => cmd_cache_clear(&network),
+        cli::CacheAction::Prune => cmd_cache_prune(),
+        cli::CacheAction::Query {
+            network,
+            r#fn,
+            wasm_hash,
+            min_fee,
+            max_fee,
+            since,
+            to,
+            json,
+        } => cmd_cache_query(
+            network.as_deref(),
+            r#fn.as_deref(),
+            wasm_hash.as_deref(),
+            min_fee,
+            max_fee,
+            since.as_deref(),
+            to.as_deref(),
+            json,
+        ),
+        cli::CacheAction::Stats { json } => cmd_cache_stats(json),
+    }
+}
+
+/// `cache query` / `config cache query` command: list cached estimates matching the given filters.
+///
+/// Prints a table (or JSON when `--json` is passed). An empty result prints a
+/// friendly message instead of an empty table.
+///
+/// # Network calls
+/// None — pure file I/O.
+#[allow(clippy::too_many_arguments)]
 fn cmd_cache_query(
-    network: &str,
+    network: Option<&str>,
     function: Option<&str>,
     wasm_hash: Option<&str>,
-    min_stroops: Option<i64>,
-    max_stroops: Option<i64>,
-    from: Option<&str>,
+    min_fee: Option<i64>,
+    max_fee: Option<i64>,
+    since: Option<&str>,
     to: Option<&str>,
     json: bool,
 ) -> error::AppResult<()> {
-    let filter = cache::QueryFilter {
-        function: function.map(str::to_string),
-        wasm_hash: wasm_hash.map(str::to_string),
-        min_stroops,
-        max_stroops,
-        from: from.map(str::to_string),
-        to: to.map(str::to_string),
+    let since_dt = match since {
+        Some(s) => Some(cache::parse_since_timestamp(s)?),
+        None => None,
+    };
+    let to_dt = match to {
+        Some(s) => Some(cache::parse_to_timestamp(s)?),
+        None => None,
     };
 
-    let estimates = cache::query_estimates(network, &filter)?;
+    let filter = cache::CacheFilter {
+        function: function.map(str::to_string),
+        wasm_hash: wasm_hash.map(str::to_string),
+        network: network.map(str::to_string),
+        min_fee,
+        max_fee,
+        since: since_dt,
+        to: to_dt,
+    };
+
+    let estimates = cache::query_cache(&filter)?;
 
     if estimates.is_empty() {
         if json {
@@ -3042,7 +3208,7 @@ fn cmd_cache_query(
     }
 
     if json {
-        let json = serde_json::json!(estimates);
+        let json = serde_json::to_string_pretty(&estimates)?;
         println!("{json}");
         return Ok(());
     }
@@ -3054,21 +3220,21 @@ fn cmd_cache_query(
         table.force_no_tty();
     }
     table.set_header(vec![
+        "Timestamp",
         "Function",
         "Network",
         "WASM Hash",
-        "Stroops",
-        "Ledger",
-        "Timestamp",
+        "CPU",
+        "Fee (stroops)",
     ]);
     for e in &estimates {
         table.add_row(vec![
+            Cell::new(e.timestamp.as_str()),
             Cell::new(e.function.as_str()),
             Cell::new(e.network.as_str()),
             Cell::new(e.wasm_hash.as_str()),
+            Cell::new(e.cpu_instructions),
             Cell::new(e.total_stroops),
-            Cell::new(e.ledger),
-            Cell::new(e.timestamp.as_str()),
         ]);
     }
     println!("{table}");
@@ -3561,6 +3727,7 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
             rates: None,
+            projections: None,
         }
     }
 

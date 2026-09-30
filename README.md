@@ -202,6 +202,14 @@ instead of the full diff, handy for CI status lines:
 soroban-cost-estimator config diff --network testnet --summary
 ```
 
+Add `--against-previous` to diff the **two newest snapshots on disk** against
+each other instead of the live network. It makes no network calls, so it works
+offline and stays meaningful after the endpoint has moved on:
+
+```bash
+soroban-cost-estimator config diff --network testnet --against-previous
+```
+
 - Exits **0** if no changes detected
 - Exits **1** with a detailed field-by-field diff if pricing changed
 - **Auto-saves a snapshot of the new config** when a protocol upgrade is
@@ -301,6 +309,22 @@ soroban-cost-estimator cache clear --network mainnet
   untouched
 - The same clearing logic backs the `estimate --clear-cache` flag, so both
   paths behave identically
+
+### `config cache query`
+
+Search and filter cached simulation estimates by WASM hash, function name, network, fee range, or date.
+
+```bash
+# Query with search filters
+soroban-cost-estimator config cache query --network testnet --min-fee 100000
+
+# Filter by function name and date, outputting JSON
+soroban-cost-estimator config cache query --fn transfer --since 2026-01-01 --json
+```
+
+- When run with no filters, returns all cached estimates
+- Combines multiple filters using logical AND semantics
+- Supports `--wasm-hash`, `--fn`, `--network`, `--min-fee`, `--max-fee`, `--since`, and `--json`
 
 ## Installation
 
