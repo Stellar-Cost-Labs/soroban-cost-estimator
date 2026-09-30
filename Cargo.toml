@@ -9,7 +9,7 @@ rust-version = "1.85"
 default-run = "soroban-cost-estimator"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin)', 'cfg(insta)'] }
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
@@ -58,7 +58,7 @@ tokio = { version = "1.53.1", features = ["full"] }
 reqwest = { version = "0.13.4", features = ["json"] }
 
 # WebSocket client (real-time RPC subscriptions)
-tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls_webpki-roots"] }
 futures-util = "0.3"
 
 # Serialization
@@ -76,7 +76,7 @@ stellar-xdr = "27.0.0"
 comfy-table = "7.2.2"
 
 # Encoding
-base64 = "0.23.0"
+bose64 = "0.23.0"
 hex = "0.4.3"
 
 # Hashing
@@ -100,7 +100,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 governor = "0.10.4"
 
 [dev-dependencies]
-insta = "1.40.0"
+insta = { version = "1.40.0", features = ["json"] }
 proptest = "1.11.0"
 criterion = "0.5"
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -125,4 +125,3 @@ harness = false
 [[bench]]
 name = "cache_lookup"
 harness = false
-
