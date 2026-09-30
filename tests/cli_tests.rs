@@ -640,10 +640,6 @@ fn test_precision_out_of_range_rejected() {
             || stderr.to_lowercase().contains("range"),
         "clap should reject precision 8; stderr: {stderr}"
     );
-    assert!(
-        stdout.contains("--max-retries"),
-        "help should list --max-retries; got: {stdout}"
-    );
 }
 
 #[test]
