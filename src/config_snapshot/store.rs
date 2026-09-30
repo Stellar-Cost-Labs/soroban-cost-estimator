@@ -303,3 +303,59 @@ pub fn import_snapshots(bundle_path: &str) -> AppResult<usize> {
     }
     Ok(imported)
 }
+
+/// Summary of one saved snapshot, read from the snapshot file itself.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SnapshotMetadata {
+    pub filename: String,
+    pub network: String,
+    pub timestamp: String,
+    pub ledger_sequence: u32,
+}
+
+/// Snapshot header fields; other fields in the file are ignored by serde.
+#[derive(serde::Deserialize)]
+struct SnapshotHeader {
+    network: String,
+    timestamp: String,
+    ledger: u32,
+}
+
+/// Lists metadata for saved snapshots.
+///
+/// `network = None` returns snapshots for every network. Filtering uses the
+/// `network` field stored inside each file, not the filename. Results are
+/// sorted by network, then timestamp, then filename.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn list_snapshots_metadata(network: Option<&str>) -> AppResult<Vec<SnapshotMetadata>> {
+    let dir = snapshots_dir()?;
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)?;
+        let header: SnapshotHeader = serde_json::from_str(&text)
+            .map_err(|e| AppError::SnapshotParse(format!("{}: {e}", path.display())))?;
+        if network.is_some_and(|n| n != header.network) {
+            continue;
+        }
+        let filename = path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        out.push(SnapshotMetadata {
+            filename,
+            network: header.network,
+            timestamp: header.timestamp,
+            ledger_sequence: header.ledger,
+        });
+    }
+    out.sort_by(|a, b| {
+        (&a.network, &a.timestamp, &a.filename).cmp(&(&b.network, &b.timestamp, &b.filename))
+    });
+    Ok(out)
+}
