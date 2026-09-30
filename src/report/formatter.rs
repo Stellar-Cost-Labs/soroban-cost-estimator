@@ -85,6 +85,14 @@ impl TableFormatter {
         output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
         output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
 
+        // Contract metadata from the WASM `contractmeta` section: always
+        // rendered (present or absent) so the report states whether the
+        // binary carried one.
+        output.push_str(&crate::wasm::parser::format_contract_meta(
+            &report.contract_meta,
+        ));
+        output.push_str("\n\n");
+
         let table = build_resource_table(report);
         output.push_str(&table.to_string());
         output.push('\n');
@@ -471,6 +479,7 @@ mod tests {
             rpc_latency_ms: 87,
             rates: None,
             projections: None,
+            contract_meta: crate::wasm::parser::ContractMeta::default(),
         }
     }
 
@@ -502,6 +511,7 @@ mod tests {
             rpc_latency_ms: 0,
             rates: None,
             projections: None,
+            contract_meta: crate::wasm::parser::ContractMeta::default(),
         }
     }
 

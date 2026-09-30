@@ -33,6 +33,7 @@ fn sample_report() -> CostReport {
         rpc_latency_ms: 87,
         rates: None,
         projections: None,
+        contract_meta: ContractMeta::default(),
     }
 }
 
@@ -64,6 +65,7 @@ fn empty_report() -> CostReport {
         rpc_latency_ms: 0,
         rates: None,
         projections: None,
+        contract_meta: ContractMeta::default(),
     }
 }
 
