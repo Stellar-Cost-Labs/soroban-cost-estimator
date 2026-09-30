@@ -25,10 +25,25 @@ Each cached estimate is keyed by three things:
 3. **Args hash** — the SHA-256 of the joined raw `--arg` values.
 
 The file name is `{wasm_hash}-{function}-{args_hash}.json` in the cache
-directory. The fixture contract's deployed WASM carries the hash
+directory, derived via `derive_cache_key(wasm_hash, function, args_hash)`.
+When a cached entry is loaded, the WASM and args hashes stored *inside* the
+file are re-checked against the key in its filename; an entry whose contents
+do not match its key is treated as missing rather than trusted, so a
+crash-damaged or mis-renamed file can never serve a stale estimate for a
+different contract or invocation. The fixture contract's deployed WASM carries
+the hash
 `ea14bca998e98f0ddb338e8e5cef6e19f07378a3b71e8b4f8868cedc857e4ecd`, which is
 why the tool's cached estimate for the deployed contract matches the fixture
 exactly.
+
+## Verifying and repairing the cache
+
+`cache verify` walks the cache directory and checks every file: valid JSON,
+the expected entry shape, and stored hashes matching the filename key. It
+prints one line per corrupted file and a summary, then exits `1` if anything
+is corrupt. With `--repair` (alias `--fix`) it also deletes the corrupted
+files and exits `0`, so a scheduled repair can be as simple as
+`soroban-cost-estimator cache verify --repair`.
 
 ## What a cache entry contains
 

@@ -592,8 +592,8 @@ fn test_estimate_nonexistent_wasm_file() {
         "a missing WASM file should exit 1; stderr: {stderr}"
     );
     assert!(
-        stderr.starts_with("Error:"),
-        "runtime failures are reported on stderr as `Error: …`; got: {stderr}"
+        stderr.contains("Error: File not found"),
+        "runtime failures are reported on stderr as `Error: …` (after any tracing \n    logs, which also go to stderr); got: {stderr}"
     );
     assert!(
         stderr.contains("File not found"),
@@ -1256,8 +1256,8 @@ fn test_wasm_info_reports_absent_contract_meta() {
 
 #[test]
 fn test_watch_interval_suffixes_are_parsed() {
-    // `30m` must resolve to 1800s in the banner — the interval parser is unit
-    // tested in-crate, this pins the wiring through the CLI.
+    // `30m` must resolve to 1800s in the banner — the interval parser is
+    // unit tested in-crate, this pins the wiring through the CLI.
     let home = temp_home("watch-interval");
     let mut child = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
         .args(["watch", "--network", "not-a-network", "--interval", "30m"])

@@ -199,18 +199,37 @@ Useful in CI or cron jobs to monitor for unexpected pricing changes.
 Press `Ctrl-C` (SIGINT) or send `SIGTERM` to stop **cleanly** (exit code 0):
 the in-flight poll is cancelled rather than writing a partial snapshot.
 
+### `config snapshot show`
+
+Print a previously captured snapshot without touching the network — as
+readable per-category tables, or as raw JSON with `--json`.
+
+```bash
+soroban-cost-estimator config snapshot show [--latest | --at <timestamp> | <path>] [--network testnet] [--json]
+```
+
+- No selector (or `--latest`): the most recent snapshot for `--network`
+- `--at <prefix>`: the most recent stored snapshot whose timestamp matches
+  the prefix, e.g. `--at 2026-08` for anything from August 2026
+- `<path>`: any snapshot JSON file by path
+- Sections or fields a pre-`0.1` snapshot never captured render as
+  `(not captured)` / `(unknown)`
+
 ### `cache verify`
 
 Check that every cached estimate in `~/.soroban-cost-estimator/cache/` is
-still valid JSON and parses as a cache entry — i.e. nothing was corrupted by
-a crash or disk issue.
+still valid JSON, parses as a cache entry, and still matches its cache key
+(WASM hash + function + args hash) — i.e. nothing was corrupted by a crash or
+disk issue.
 
 ```bash
-soroban-cost-estimator cache verify
+soroban-cost-estimator cache verify [--repair]
 ```
 
 - Exits **0** if the cache is empty or every entry is valid
 - Exits **1** and lists the corrupted filenames if any entry fails
+- `--repair` (alias `--fix`): delete the corrupted files instead of just
+  naming them, print how many were removed, and exit **0**
 
 ### `cache clear`
 
@@ -343,6 +362,9 @@ Full reproduction steps (`stellar contract install` → `create` →
 | JSON output (`--json`) | ✅ |
 | Fee breakdown (non-refundable/refundable) | ✅ |
 | Estimate result caching | ✅ |
+| Cache key validation + `cache verify --repair` | ✅ |
+| `config snapshot show` | ✅ |
+| Protocol-upgrade auto-snapshot & announcement | ✅ |
 | Verified against live testnet (cross-checked) | ✅ |
 | Footprint read/write entries & bytes (real, not zeros) | ✅ |
 | Watch graceful shutdown (SIGINT/SIGTERM) | ✅ |

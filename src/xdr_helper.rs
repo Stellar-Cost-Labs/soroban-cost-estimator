@@ -57,12 +57,14 @@ pub fn begin_snapshot(network: &str, ledger: u32) -> ConfigSnapshot {
         network: network.to_string(),
         timestamp: Utc::now().to_rfc3339(),
         ledger,
+        network_protocol_version: None,
         contract_compute: None,
         contract_ledger_cost: None,
         contract_historical_data: None,
         contract_events: None,
         contract_bandwidth: None,
         state_archival: None,
+        tags: Vec::new(),
     }
 }
 

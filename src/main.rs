@@ -175,6 +175,7 @@ async fn main() {
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level)),
         )
+        .with_writer(std::io::stderr)
         .init();
 
     info!(command = ?args.command, verbose = args.verbose, "starting soroban-cost-estimator");
@@ -1946,6 +1947,16 @@ async fn fetch_config_snapshot(
         if let Some(latest) = raw_entries.iter().map(|e| e.last_modified_ledger).max() {
             snapshot.ledger = latest;
         }
+
+        // Record the network's protocol version so snapshots can anchor
+        // automatic protocol-upgrade capture. A server that does not report
+        // it degrades to `None` ("unknown") rather than failing the fetch —
+        // the config settings themselves are still valid.
+        match rpc::config::fetch_network_protocol_version(&client).await {
+            Ok(version) => snapshot.network_protocol_version = Some(version),
+            Err(e) => debug!(error = %e, "could not fetch protocol version"),
+        }
+
         debug!(ledger = snapshot.ledger, "config snapshot built");
         Ok(snapshot)
     }
@@ -1979,6 +1990,113 @@ fn print_stale_estimates(network: &str, ledger: u32) {
             println!("  Warning: could not check cache: {e}");
         }
     }
+}
+
+/// A detected increase of the network's protocol version relative to the
+/// most recent stored snapshot.
+struct ProtocolUpgrade {
+    /// Protocol version of the previous snapshot (`None` when that snapshot
+    /// predates protocol tracking).
+    from: Option<u32>,
+    /// Protocol version the network now reports.
+    to: u32,
+    /// The previous snapshot the transition was measured against — the
+    /// baseline for the automatic post-upgrade diff.
+    previous: config_snapshot::model::ConfigSnapshot,
+}
+
+/// True when the new snapshot reports a strictly higher protocol version
+/// than the stored one. A previous snapshot without a recorded version can
+/// claim no transition (it predates tracking, not the network).
+fn is_protocol_upgrade(
+    old: &config_snapshot::model::ConfigSnapshot,
+    new: &config_snapshot::model::ConfigSnapshot,
+) -> bool {
+    match (old.network_protocol_version, new.network_protocol_version) {
+        (Some(old_v), Some(new_v)) => new_v > old_v,
+        _ => false,
+    }
+}
+
+/// Compares a freshly fetched snapshot against the most recent stored
+/// snapshot; when the network's protocol version increased, annotates the
+/// new snapshot with a `protocol_upgrade_v{N}` tag and returns the details
+/// of the transition.
+///
+/// The stored snapshot cannot exist (first snapshot ever) or cannot be
+/// read: logged and treated as "no upgrade" rather than failing a command
+/// whose primary job — capturing the snapshot — has already succeeded.
+///
+/// # Network calls
+/// None — pure file I/O (plus whatever the caller did to fetch `snapshot`).
+fn annotate_protocol_upgrade(
+    network: &str,
+    snapshot: &mut config_snapshot::model::ConfigSnapshot,
+) -> Option<ProtocolUpgrade> {
+    use tracing::debug;
+
+    let previous = match config_snapshot::store::load_latest_snapshot(network) {
+        Ok(prev) => prev,
+        Err(e) => {
+            debug!(error = %e, "no previous snapshot to compare protocol version against");
+            return None;
+        }
+    };
+    if !is_protocol_upgrade(&previous, snapshot) {
+        return None;
+    }
+    let upgrade = ProtocolUpgrade {
+        from: previous.network_protocol_version,
+        to: snapshot.network_protocol_version.unwrap_or_default(),
+        previous,
+    };
+    snapshot
+        .tags
+        .push(format!("protocol_upgrade_v{}", upgrade.to));
+    debug!(from = ?upgrade.from, to = upgrade.to, "protocol upgrade detected");
+    Some(upgrade)
+}
+
+/// Builds the protocol-upgrade notice: the required
+/// `🎉 Stellar Protocol Upgrade detected (vX -> vY). Created snapshot: <path>`
+/// line, optionally followed by the automatic field-level diff against the
+/// previous protocol version's snapshot.
+fn format_protocol_upgrade_announcement(
+    upgrade: &ProtocolUpgrade,
+    snapshot: &config_snapshot::model::ConfigSnapshot,
+    path: &std::path::Path,
+    include_diff: bool,
+) -> String {
+    let from = upgrade
+        .from
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let mut message = format!(
+        "🎉 Stellar Protocol Upgrade detected (v{from} -> v{}). Created snapshot: {}",
+        upgrade.to,
+        path.display()
+    );
+    if include_diff {
+        let diff = config_snapshot::diff::diff_snapshots(&upgrade.previous, snapshot);
+        message.push('\n');
+        message.push_str(&config_snapshot::diff::format_diff(&diff));
+    }
+    message
+}
+
+/// Prints the protocol-upgrade notice with the created snapshot's path and,
+/// when the caller has not already diffed this exact pair, the automatic
+/// field-level diff against the previous protocol version's snapshot.
+fn announce_protocol_upgrade(
+    upgrade: &ProtocolUpgrade,
+    snapshot: &config_snapshot::model::ConfigSnapshot,
+    path: &std::path::Path,
+    include_diff: bool,
+) {
+    println!(
+        "{}",
+        format_protocol_upgrade_announcement(upgrade, snapshot, path, include_diff)
+    );
 }
 
 /// `config snapshot` command: fetch config settings and save snapshot.
@@ -2015,6 +2133,11 @@ async fn cmd_config_snapshot(
 
         if format == cli::OutputFormat::Json {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            if let Some(upgrade) = &upgrade {
+                // JSON mode must stay machine-parseable: the notice and the
+                // automatic diff go to stderr.
+                announce_protocol_upgrade(upgrade, &snapshot, &path, false);
+            }
             return Ok(());
         }
         if format == cli::OutputFormat::Csv {
@@ -2144,7 +2267,29 @@ async fn cmd_config_diff(
             );
         }
 
-        if upgrade_detected(&diff) {
+        // A protocol-version increase creates an annotated snapshot of its
+        // own, even when no pricing field moved. When the compared baseline
+        // was the latest stored snapshot (no explicit --against), its diff
+        // was already printed above, so the upgrade notice skips the repeat.
+        let protocol_upgrade = annotate_protocol_upgrade(network, &mut new_snapshot);
+
+        if let Some(upgrade) = &protocol_upgrade {
+            match config_snapshot::store::save_snapshot(&new_snapshot, None) {
+                Ok(path) => {
+                    info!(path = %path.display(), "auto-saved protocol-upgrade snapshot");
+                    announce_protocol_upgrade(
+                        upgrade,
+                        &new_snapshot,
+                        &path,
+                        against_path.is_some(),
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, "could not auto-save protocol-upgrade snapshot");
+                    eprintln!("  Warning: could not auto-save protocol-upgrade snapshot: {e}");
+                }
+            }
+        } else if upgrade_detected(&diff) {
             match config_snapshot::store::save_snapshot(&new_snapshot, None) {
                 Ok(path) => {
                     info!(path = %path.display(), "auto-saved post-upgrade snapshot");
@@ -2445,7 +2590,14 @@ async fn watch_poll_once(
                 }
             }
 
-            let _ = config_snapshot::store::save_snapshot(&snapshot, None);
+            // A protocol-version increase between polls captures an
+            // annotated snapshot; the diff against the previous protocol
+            // version was already printed above when changes were reported.
+            let upgrade = annotate_protocol_upgrade(network, &mut snapshot);
+            let saved = config_snapshot::store::save_snapshot(&snapshot, None).ok();
+            if let (Some(upgrade), Some(path)) = (&upgrade, saved.as_ref()) {
+                announce_protocol_upgrade(upgrade, &snapshot, path, false);
+            }
             *first = false;
         }
         Err(e) => {
@@ -2578,13 +2730,13 @@ fn format_bytes(bytes: u64) -> String {
 
 /// `cache verify` command: check every cache entry parses as valid JSON.
 ///
-/// Prints a summary line per corrupted entry and exits with code 1 when any
-/// entry fails verification, so scripts can treat a corrupt cache as an
-/// error. A healthy (or empty) cache exits 0.
+/// With `repair` (or `--fix`), corrupted entries are deleted instead of only
+/// reported; a repaired cache is healthy, so repair always exits 0 when the
+/// removal itself succeeds.
 ///
 /// # Network calls
 /// None — pure file I/O.
-fn cmd_cache_verify() -> error::AppResult<()> {
+fn cmd_cache_verify(repair: bool) -> error::AppResult<()> {
     use tracing::debug;
 
     let statuses = cache::verify_cache()?;
@@ -2597,19 +2749,30 @@ fn cmd_cache_verify() -> error::AppResult<()> {
 
     let total = statuses.len();
     let corrupt: Vec<&cache::CacheEntryStatus> = statuses.iter().filter(|s| !s.valid).collect();
+    let valid = total - corrupt.len();
 
-    println!("Checked {total} cache entries.");
+    for status in &corrupt {
+        println!("Corrupted cache entry: {}", status.filename);
+    }
+
+    if repair && !corrupt.is_empty() {
+        let removed = cache::repair_cache()?;
+        println!("Removed {} corrupted cache file(s).", removed.len());
+    }
 
     if corrupt.is_empty() {
-        println!("All cache entries are valid.");
-    } else {
+        println!("Verified {total} cache files: {valid} valid, 0 corrupted");
+    } else if repair {
         println!(
-            "{} of {total} cache entries failed verification:",
+            "Verified {total} cache files: {valid} valid, {} corrupted (removed)",
             corrupt.len()
         );
-        for status in &corrupt {
-            println!("  - {}", status.filename);
-        }
+    } else {
+        println!(
+            "Verified {total} cache files: {valid} valid, {} corrupted",
+            corrupt.len()
+        );
+        println!("Run `cache verify --repair` to remove the corrupted files.");
         std::process::exit(1);
     }
 
@@ -2845,6 +3008,7 @@ mod tests {
             network: "testnet".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             ledger: 100,
+            network_protocol_version: None,
             contract_compute: Some(ContractComputeV0 {
                 ledger_max_instructions: 1_000_000,
                 tx_max_instructions: 100_000,
@@ -2856,6 +3020,7 @@ mod tests {
             contract_events: None,
             contract_bandwidth: None,
             state_archival: None,
+            tags: Vec::new(),
         }
     }
 

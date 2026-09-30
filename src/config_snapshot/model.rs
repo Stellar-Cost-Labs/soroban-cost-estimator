@@ -6,12 +6,22 @@ pub struct ConfigSnapshot {
     pub network: String,
     pub timestamp: String,
     pub ledger: u32,
+    /// Network protocol version active when the snapshot was captured, when
+    /// the RPC reported one. Snapshots captured before protocol tracking (or
+    /// against RPC servers that do not report it) are `None`.
+    #[serde(default)]
+    pub network_protocol_version: Option<u32>,
     pub contract_compute: Option<ContractComputeV0>,
     pub contract_ledger_cost: Option<ContractLedgerCostV0>,
     pub contract_historical_data: Option<ContractHistoricalDataV0>,
     pub contract_events: Option<ContractEventsV0>,
     pub contract_bandwidth: Option<ContractBandwidthV0>,
     pub state_archival: Option<StateArchivalV0>,
+    /// Annotations recorded when the snapshot was captured automatically —
+    /// e.g. `protocol_upgrade_v22` on a snapshot marking a protocol
+    /// transition.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// ConfigSettingContractComputeV0

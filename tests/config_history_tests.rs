@@ -13,6 +13,7 @@ fn make_snapshot(
         network: "testnet".to_string(),
         timestamp: timestamp.to_string(),
         ledger,
+        network_protocol_version: None,
         contract_compute: Some(ContractComputeV0 {
             ledger_max_instructions: 1_000_000,
             tx_max_instructions: 100_000,
@@ -28,6 +29,7 @@ fn make_snapshot(
             fee_tx_size1_kb: bandwidth_fee,
         }),
         state_archival: None,
+        tags: Vec::new(),
     }
 }
 

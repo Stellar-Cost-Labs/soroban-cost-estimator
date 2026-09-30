@@ -166,6 +166,7 @@ fn make_snapshot(compute_fee: i64, bandwidth_fee: i64) -> ConfigSnapshot {
         network: "testnet".to_string(),
         timestamp: "2026-01-01T00:00:00Z".to_string(),
         ledger: 100,
+        network_protocol_version: None,
         contract_compute: Some(ContractComputeV0 {
             ledger_max_instructions: 1_000_000,
             tx_max_instructions: 100_000,
@@ -181,6 +182,7 @@ fn make_snapshot(compute_fee: i64, bandwidth_fee: i64) -> ConfigSnapshot {
             fee_tx_size1_kb: bandwidth_fee,
         }),
         state_archival: None,
+        tags: Vec::new(),
     }
 }
 

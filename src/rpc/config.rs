@@ -214,6 +214,55 @@ pub async fn fetch_all_config_settings(
     Ok(results)
 }
 
+/// Response from the `getVersionInfo` RPC method.
+///
+/// Carries the Soroban RPC server build info plus the ledger metadata of the
+/// latest ledger, which includes the **network protocol version** the network
+/// is currently running. `network_passphrase` may be absent on some servers.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetVersionInfoResponse {
+    pub version: String,
+    #[serde(default)]
+    pub commit_hash: Option<String>,
+    #[serde(default)]
+    pub build_timestamp: Option<String>,
+    #[serde(default)]
+    pub core_version: Option<String>,
+    #[serde(default)]
+    pub core_protocol_version: Option<u32>,
+    pub latest_ledger: u64,
+    #[serde(default)]
+    pub oldest_ledger: Option<u64>,
+    #[serde(default)]
+    pub ledger_version: Option<u32>,
+    #[serde(default)]
+    pub network_passphrase: Option<String>,
+}
+
+/// Fetches the network's current protocol version via the `getVersionInfo`
+/// RPC method.
+///
+/// Prefers `coreProtocolVersion` (the protocol the validators are running)
+/// and falls back to the latest ledger's `ledgerVersion` when it is missing.
+/// Returns an error when the RPC server reports neither — a server that
+/// cannot say which protocol it runs cannot be trusted for upgrade tracking.
+///
+/// # Network calls
+/// Makes one `getVersionInfo` RPC call.
+pub async fn fetch_network_protocol_version(client: &RpcClient) -> AppResult<u32> {
+    debug!("fetching network protocol version");
+    let info: GetVersionInfoResponse = client.call("getVersionInfo", serde_json::json!({})).await?;
+    info.core_protocol_version
+        .or(info.ledger_version)
+        .ok_or_else(|| {
+            AppError::ConfigFetch(
+                "RPC server reported no protocol version (missing coreProtocolVersion and ledgerVersion)"
+                    .to_string(),
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

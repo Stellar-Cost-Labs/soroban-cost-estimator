@@ -231,6 +231,27 @@ where
     unreachable!()
 }
 
+/// Builds the cache key for an estimate: the filename its entry is stored
+/// under.
+///
+/// The key strictly includes the **full 64-character hex SHA-256 hash of the
+/// entire WASM binary** together with the function name and the SHA-256 of
+/// the argument values, so changing even a single WASM byte produces a
+/// different key — a recompiled contract can never collide with (or reuse)
+/// the previous build's cached estimate. [`load_estimate`] additionally
+/// re-validates that a located entry's stored hashes match the requested key
+/// before serving it, so a tampered or mis-keyed file is treated as a cache
+/// miss rather than a stale hit.
+///
+/// The network is recorded inside each entry but is deliberately not part of
+/// the filename key: changing the on-disk layout is a schema migration (see
+/// [`CACHE_SCHEMA_VERSION`]) and out of scope here.
+#[must_use]
+pub fn derive_cache_key(wasm_hash: &str, function: &str, args: &[String]) -> String {
+    let args_hash = hash_args(args);
+    cache_filename(wasm_hash, function, &args_hash)
+}
+
 /// Save an estimate result to the cache.
 ///
 /// # Arguments
