@@ -16,7 +16,7 @@ expression: JsonFormatter.format(&report)
     "total_xlm": "0.0015427"
   },
   "function": "increment",
-  "ledger": 3894195,
+  "ledger_sequence": 3894195,
   "memory_bytes": 0,
   "network": "testnet",
   "read_bytes": 0,
