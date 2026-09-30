@@ -3383,6 +3383,7 @@ mod tests {
     use super::EstimateAllStatus;
     use super::parse_interval_secs;
     use super::settled_new_build_detected;
+    use super::snapshot_ledger;
     use super::upgrade_detected;
     use super::wasm_content_hash;
     use super::wasm_info_json;
