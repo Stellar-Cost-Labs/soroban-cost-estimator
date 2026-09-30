@@ -126,3 +126,8 @@ harness = false
 name = "cache_lookup"
 harness = false
 
+[[bench]]
+name = "wasm_benchmark"
+path = "benches/wasm_bench.rs"
+harness = false
+

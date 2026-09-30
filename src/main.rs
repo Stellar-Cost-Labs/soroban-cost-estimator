@@ -1018,7 +1018,6 @@ async fn estimate_once(
 ) -> error::AppResult<EstimateRun> {
     let json_flag = format == "json";
     let table_mode = format == "table";
-    use sha2::Digest;
     use tracing::{Instrument, info_span};
 
     let span = info_span!(
@@ -1056,7 +1055,7 @@ async fn estimate_once(
         // Validate WASM memory and table constraints against network limits (defaults: 64KB max size, 2048 pages)
         wasm_info.validate_wasm_limits(65536, 2048)?;
 
-        let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
+        let wasm_hash = wasm::parser::wasm_sha256_hex(&wasm_info.bytes);
         let wasm_size = wasm_info.bytes.len() as u64;
         let function_name = fn_name.unwrap_or("(wasm upload)");
 
