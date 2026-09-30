@@ -102,6 +102,16 @@ fn default_schema_version() -> u32 {
     INITIAL_SCHEMA_VERSION
 }
 
+/// Deserialize the legacy duration field when it is present as a number or
+/// null; old cache entries used `null` for an unknown duration.
+fn deserialize_duration_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<u64>::deserialize(deserializer)?;
+    Ok(value.unwrap_or_default())
+}
+
 /// A cached estimate result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedEstimate {
@@ -135,12 +145,22 @@ pub struct CachedEstimate {
     pub memory_bytes: u64,
     /// ISO-8601 timestamp of when the estimate was made.
     pub timestamp: String,
-    /// Simulation wall-clock duration in milliseconds (`None` if unknown).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub duration_ms: Option<u64>,
+    /// Simulation wall-clock duration in milliseconds (`0` if unknown).
+    #[serde(
+        default,
+        alias = "duration_ms",
+        deserialize_with = "deserialize_duration_ms"
+    )]
+    pub execution_duration_ms: u64,
     /// Whether the simulation succeeded.
     #[serde(default = "default_true")]
     pub success: bool,
+    /// Stellar network passphrase reported by the RPC endpoint.
+    #[serde(default)]
+    pub network_passphrase: Option<String>,
+    /// Stellar Core version reported by the RPC endpoint.
+    #[serde(default)]
+    pub core_version: Option<String>,
 }
 
 /// Optional filters for [`query_estimates`].
@@ -294,6 +314,9 @@ pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
             memory_bytes     INTEGER NOT NULL,
             timestamp        TEXT NOT NULL,
             duration_ms      INTEGER,
+            execution_duration_ms INTEGER NOT NULL DEFAULT 0,
+            network_passphrase TEXT,
+            core_version     TEXT,
             success          INTEGER NOT NULL DEFAULT 1,
             last_accessed    TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (wasm_hash, function, args_hash)
@@ -699,6 +722,9 @@ pub fn save_estimate_with_limits(
             memory_bytes as i64,
             now,
             duration_ms.map(|v| v as i64),
+            duration_ms.unwrap_or_default() as i64,
+            network_passphrase,
+            core_version,
             success as i64,
             now,
         ],
@@ -870,8 +896,10 @@ fn estimate_from_row(row: &rusqlite::Row<'_>) -> Result<CachedEstimate, rusqlite
         cpu_instructions: row.get::<_, i64>(7)? as u64,
         memory_bytes: row.get::<_, i64>(8)? as u64,
         timestamp: row.get(9)?,
-        duration_ms: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
-        success: row.get::<_, i64>(11)? != 0,
+        execution_duration_ms: row.get::<_, i64>(11)? as u64,
+        network_passphrase: row.get(12)?,
+        core_version: row.get(13)?,
+        success: row.get::<_, i64>(14)? != 0,
     })
 }
 
@@ -1047,7 +1075,8 @@ pub fn list_cached_estimates(network: &str) -> AppResult<Vec<CachedEstimate>> {
     let conn = open_db()?;
     let mut stmt = conn.prepare(
         "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-         cpu_instructions, memory_bytes, timestamp, duration_ms, success \
+         cpu_instructions, memory_bytes, timestamp, duration_ms, execution_duration_ms, \
+         network_passphrase, core_version, success \
          FROM estimates WHERE network = ?1 ORDER BY timestamp DESC",
     )?;
 
@@ -1161,7 +1190,8 @@ pub fn export_cached_estimates() -> AppResult<Vec<CachedEstimate>> {
     let conn = open_db()?;
     let mut stmt = conn.prepare(
         "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-         cpu_instructions, memory_bytes, timestamp \
+         cpu_instructions, memory_bytes, timestamp, duration_ms, execution_duration_ms, \
+         network_passphrase, core_version, success \
          FROM estimates ORDER BY wasm_hash, function, args_hash",
     )?;
 
@@ -1232,8 +1262,10 @@ pub fn verify_cache() -> AppResult<Vec<CacheEntryStatus>> {
             cpu_instructions: 0,
             memory_bytes: 0,
             timestamp: String::new(),
-            duration_ms: None,
+            execution_duration_ms: 0,
             success: true,
+            network_passphrase: None,
+            core_version: None,
         };
         let valid = migrate_to_latest(cached).is_ok();
 
