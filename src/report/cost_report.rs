@@ -1,4 +1,4 @@
-use comfy_table::Table;
+use comfy_table::{Cell, CellAlignment, Table};
 
 use crate::report::fee_calc::{FeeBreakdown, FeeRates};
 
@@ -154,6 +154,11 @@ pub struct CostReport {
     pub function: String,
     /// WASM bytes SHA-256 hash (hex).
     pub wasm_hash: String,
+    /// Size of the compiled WASM artifact in bytes. Reported in the
+    /// side-by-side diff so a build-size regression is visible next to the
+    /// fee delta. `0` when the caller did not supply it.
+    #[serde(default)]
+    pub wasm_size: u64,
     /// CPU instructions consumed.
     pub cpu_instructions: u64,
     /// Memory bytes used.
@@ -171,6 +176,10 @@ pub struct CostReport {
     /// Fee breakdown.
     pub fee: FeeBreakdown,
     /// The ledger sequence the simulation ran against.
+    ///
+    /// Serialized as `ledger_sequence` in JSON output (issue #329) while the
+    /// Rust field keeps its shorter name for source compatibility.
+    #[serde(rename = "ledger_sequence")]
     pub ledger: u32,
     /// Network the simulation ran on.
     pub network: String,
@@ -182,6 +191,23 @@ pub struct CostReport {
     /// serialized output; `None` when the rates were unavailable.
     #[serde(skip)]
     pub rates: Option<FeeRates>,
+    /// Optional batch invocation cost projections.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub projections: Option<Vec<CostProjection>>,
+}
+
+/// A cost projection for a specific batch invocation count.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CostProjection {
+    /// Number of simulated contract invocations.
+    pub invocations: u64,
+    /// Projected total fee in stroops (integer arithmetic).
+    pub total_stroops: i64,
+    /// Projected total fee in XLM.
+    pub total_xlm: String,
+    /// Projected fee in USD, if an XLM price was available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usd: Option<f64>,
 }
 
 /// A concrete, actionable cost-optimization suggestion derived from a report.
@@ -295,6 +321,251 @@ pub fn format_suggestions(suggestions: &[OptimizationSuggestion]) -> String {
     out
 }
 
+/// Aggregate fee and CPU distribution across a batch of simulations.
+///
+/// Computed over the **successfully estimated** functions only; skipped and
+/// errored functions carry no fee or CPU figure and are excluded by the
+/// caller. Every field is an integer: fees in stroops, CPU in instructions.
+/// The standard deviation is derived from an integer population variance and
+/// an integer square root, so no floating point is used anywhere (issue #328).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FeeDistribution {
+    /// Number of simulations the statistics were computed over.
+    pub function_count: usize,
+    /// Lowest fee, in stroops.
+    pub min_fee_stroops: i64,
+    /// Highest fee, in stroops.
+    pub max_fee_stroops: i64,
+    /// Arithmetic mean fee, in stroops (integer division, truncated).
+    pub mean_fee_stroops: i64,
+    /// Median fee, in stroops. For an even count this is the truncated mean of
+    /// the two central values.
+    pub median_fee_stroops: i64,
+    /// Population standard deviation of the fees, in stroops (floored).
+    pub std_dev_fee_stroops: i64,
+    /// Lowest CPU instruction count.
+    pub min_cpu_instructions: u64,
+    /// Highest CPU instruction count.
+    pub max_cpu_instructions: u64,
+    /// Arithmetic mean CPU instruction count (integer division, truncated).
+    pub mean_cpu_instructions: u64,
+}
+
+impl FeeDistribution {
+    /// Compute the distribution from parallel slices of fee (stroops) and CPU
+    /// instruction samples.
+    ///
+    /// This is the shared core behind [`calculate_distribution_stats`]. It is
+    /// public so the `estimate-all` CLI can derive the distribution directly
+    /// from its per-function records, without first rebuilding full
+    /// [`CostReport`]s.
+    ///
+    /// When either slice is empty — or the slices differ in length, in which
+    /// case the shorter length wins — every statistic is zero and
+    /// `function_count` is `0`.
+    ///
+    /// # Network calls
+    /// None — pure computation.
+    #[must_use]
+    pub fn from_samples(fees: &[i64], cpu: &[u64]) -> Self {
+        let count = fees.len().min(cpu.len());
+        if count == 0 {
+            return Self {
+                function_count: 0,
+                min_fee_stroops: 0,
+                max_fee_stroops: 0,
+                mean_fee_stroops: 0,
+                median_fee_stroops: 0,
+                std_dev_fee_stroops: 0,
+                min_cpu_instructions: 0,
+                max_cpu_instructions: 0,
+                mean_cpu_instructions: 0,
+            };
+        }
+
+        let mut min_fee = i64::MAX;
+        let mut max_fee = i64::MIN;
+        let mut min_cpu = u64::MAX;
+        let mut max_cpu = 0u64;
+        // Accumulate in wider integers so a large batch cannot overflow.
+        let mut sum_fee: i128 = 0;
+        let mut sum_fee_sq: i128 = 0;
+        let mut sum_cpu: u128 = 0;
+        let mut sorted_fees: Vec<i64> = Vec::with_capacity(count);
+
+        for index in 0..count {
+            let fee = fees[index];
+            min_fee = min_fee.min(fee);
+            max_fee = max_fee.max(fee);
+            sum_fee += i128::from(fee);
+            sum_fee_sq += i128::from(fee) * i128::from(fee);
+            sorted_fees.push(fee);
+
+            let instructions = cpu[index];
+            min_cpu = min_cpu.min(instructions);
+            max_cpu = max_cpu.max(instructions);
+            sum_cpu += u128::from(instructions);
+        }
+
+        let n = count as i128;
+        let mean_fee = (sum_fee / n) as i64;
+        let mean_cpu = (sum_cpu / count as u128) as u64;
+
+        sorted_fees.sort_unstable();
+        let median_fee = if count % 2 == 1 {
+            sorted_fees[count / 2]
+        } else {
+            // Sum in `i128` so two near-`i64::MAX` values cannot overflow.
+            ((i128::from(sorted_fees[count / 2 - 1]) + i128::from(sorted_fees[count / 2])) / 2)
+                as i64
+        };
+
+        // Population variance = (n·Σx² − (Σx)²) / n², computed with exact
+        // integer arithmetic (the numerator is non-negative by Cauchy–Schwarz).
+        let variance_numerator = (n * sum_fee_sq - sum_fee * sum_fee).max(0);
+        let variance = variance_numerator / (n * n);
+        let std_dev_fee = isqrt_u128(variance as u128) as i64;
+
+        Self {
+            function_count: count,
+            min_fee_stroops: min_fee,
+            max_fee_stroops: max_fee,
+            mean_fee_stroops: mean_fee,
+            median_fee_stroops: median_fee,
+            std_dev_fee_stroops: std_dev_fee,
+            min_cpu_instructions: min_cpu,
+            max_cpu_instructions: max_cpu,
+            mean_cpu_instructions: mean_cpu,
+        }
+    }
+}
+
+/// Integer (floor) square root of a `u128`.
+///
+/// Uses Newton's method; returns `0` for `0` and `1` for `1`. Keeps the
+/// standard-deviation computation free of floating point.
+fn isqrt_u128(value: u128) -> u128 {
+    if value < 2 {
+        return value;
+    }
+    let mut x = value;
+    let mut y = x / 2 + 1;
+    while y < x {
+        x = y;
+        y = u128::midpoint(x, value / x);
+    }
+    x
+}
+
+/// Compute the distribution statistics for a batch of cost reports (issue
+/// #328).
+///
+/// Callers should pass only the successfully simulated reports so that
+/// skipped/errored functions do not skew the statistics. Returns an all-zero
+/// distribution when `reports` is empty.
+///
+/// # Network calls
+/// None — pure computation.
+#[must_use]
+pub fn calculate_distribution_stats(reports: &[CostReport]) -> FeeDistribution {
+    let fees: Vec<i64> = reports.iter().map(|r| r.fee.total_stroops).collect();
+    let cpu: Vec<u64> = reports.iter().map(|r| r.cpu_instructions).collect();
+    FeeDistribution::from_samples(&fees, &cpu)
+}
+
+/// Insert `,` thousands separators into a run of ASCII digits.
+fn group_digits(digits: &str) -> String {
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// Format a signed integer with `,` thousands separators.
+///
+/// Example: `format_thousands(1_234_567)` → `"1,234,567"`.
+#[must_use]
+pub fn format_thousands(value: i64) -> String {
+    let grouped = group_digits(&value.unsigned_abs().to_string());
+    if value < 0 {
+        format!("-{grouped}")
+    } else {
+        grouped
+    }
+}
+
+/// Format an unsigned integer with `,` thousands separators.
+#[must_use]
+pub fn format_thousands_u64(value: u64) -> String {
+    group_digits(&value.to_string())
+}
+
+/// Format a ledger sequence number with `,` thousands separators.
+///
+/// Example: `format_ledger_sequence(1_234_567)` → `"1,234,567"` (issue #329).
+#[must_use]
+pub fn format_ledger_sequence(ledger: u32) -> String {
+    group_digits(&ledger.to_string())
+}
+
+/// Render the distribution statistics as a human-readable box for the
+/// `estimate-all` summary (issue #328).
+///
+/// Returns an explanatory line instead of a zeroed box when nothing was
+/// successfully estimated, so the section is never silently empty.
+#[must_use]
+pub fn format_distribution_box(distribution: &FeeDistribution, precision: u32) -> String {
+    if distribution.function_count == 0 {
+        return "No functions estimated; no fee distribution to report.".to_string();
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "\nFee distribution across {} function(s):\n\n",
+        distribution.function_count
+    ));
+    out.push_str("  Fees (stroops):\n");
+    out.push_str(&format!(
+        "    min     : {}\n",
+        format_thousands(distribution.min_fee_stroops)
+    ));
+    out.push_str(&format!(
+        "    max     : {}\n",
+        format_thousands(distribution.max_fee_stroops)
+    ));
+    out.push_str(&format!(
+        "    mean    : {} ({})\n",
+        format_thousands(distribution.mean_fee_stroops),
+        crate::report::fee_calc::stroops_to_xlm(distribution.mean_fee_stroops, precision)
+    ));
+    out.push_str(&format!(
+        "    median  : {}\n",
+        format_thousands(distribution.median_fee_stroops)
+    ));
+    out.push_str(&format!(
+        "    std dev : {}\n",
+        format_thousands(distribution.std_dev_fee_stroops)
+    ));
+    out.push_str("\n  CPU instructions:\n");
+    out.push_str(&format!(
+        "    min     : {}\n",
+        format_thousands_u64(distribution.min_cpu_instructions)
+    ));
+    out.push_str(&format!(
+        "    max     : {}\n",
+        format_thousands_u64(distribution.max_cpu_instructions)
+    ));
+    out.push_str(&format!(
+        "    mean    : {}\n",
+        format_thousands_u64(distribution.mean_cpu_instructions)
+    ));
+    out
+}
+
 /// Formats a cost report as a human-readable table.
 pub fn format_report_table(report: &CostReport) -> String {
     let mut output = String::new();
@@ -303,6 +574,10 @@ pub fn format_report_table(report: &CostReport) -> String {
     output.push_str(&format!(
         "Network: {} (ledger {})\n",
         report.network, report.ledger
+    ));
+    output.push_str(&format!(
+        "Simulated at ledger sequence: {}\n",
+        format_ledger_sequence(report.ledger)
     ));
     output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
     output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
@@ -395,12 +670,153 @@ pub fn format_report_table(report: &CostReport) -> String {
     // ASCII bar chart for visual cost breakdown
     output.push_str(&render_fee_bar_chart(&report.fee, DEFAULT_CHART_WIDTH));
 
+    if let Some(ref projections) = report.projections {
+        output.push_str(&format_projections_table(projections));
+    }
+
     output
 }
 
 /// Formats a cost report as a JSON string.
 pub fn format_report_json(report: &CostReport) -> String {
     serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Parse a comma-separated list of invocation counts for cost projections.
+///
+/// Ensures each count is non-zero, unique, fits within `i64::MAX` so it can be
+/// multiplied by stroop fees safely, and maintains the order supplied by the user.
+pub fn parse_projection_counts(input: &str) -> crate::error::AppResult<Vec<u64>> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(crate::error::AppError::FeeCalc(
+            "projection counts cannot be empty".to_string(),
+        ));
+    }
+
+    let mut counts = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for raw_part in trimmed.split(',') {
+        let part = raw_part.trim();
+        if part.is_empty() {
+            return Err(crate::error::AppError::FeeCalc(
+                "projection counts contain an empty value".to_string(),
+            ));
+        }
+
+        if part.starts_with('-') {
+            return Err(crate::error::AppError::FeeCalc(format!(
+                "invalid projection count '{part}': count cannot be negative"
+            )));
+        }
+
+        let count: u64 = part.parse().map_err(|_| {
+            crate::error::AppError::FeeCalc(format!(
+                "invalid projection count '{part}': must be a positive integer"
+            ))
+        })?;
+
+        if count == 0 {
+            return Err(crate::error::AppError::FeeCalc(
+                "invalid projection count '0': count must be greater than zero".to_string(),
+            ));
+        }
+
+        if count > i64::MAX as u64 {
+            return Err(crate::error::AppError::FeeCalc(format!(
+                "invalid projection count '{part}': value exceeds maximum supported limit ({})",
+                i64::MAX
+            )));
+        }
+
+        if !seen.insert(count) {
+            return Err(crate::error::AppError::FeeCalc(format!(
+                "duplicate projection count: {count}"
+            )));
+        }
+
+        counts.push(count);
+    }
+
+    Ok(counts)
+}
+
+/// Calculate cost projections for given invocation counts.
+///
+/// Performs checked multiplication (`total_fee_stroops * count`) to prevent
+/// integer overflow. Stroop fees remain pure integers (`i64`), and XLM is
+/// formatted using the standard [`crate::report::fee_calc::stroops_to_xlm`] conversion.
+pub fn calculate_projections(
+    total_fee_stroops: i64,
+    counts: &[u64],
+    precision: u32,
+    xlm_usd_price: Option<f64>,
+) -> crate::error::AppResult<Vec<CostProjection>> {
+    let mut projections = Vec::with_capacity(counts.len());
+
+    for &count in counts {
+        let count_i64 = i64::try_from(count).map_err(|_| {
+            crate::error::AppError::FeeCalc(format!(
+                "projection count {count} exceeds maximum supported integer value"
+            ))
+        })?;
+
+        let projected_stroops = total_fee_stroops
+            .checked_mul(count_i64)
+            .ok_or_else(|| {
+                crate::error::AppError::FeeCalc(format!(
+                    "cost projection overflow: {total_fee_stroops} stroops * {count} invocations exceeds integer bounds"
+                ))
+            })?;
+
+        let total_xlm = crate::report::fee_calc::stroops_to_xlm(projected_stroops, precision);
+
+        let usd = xlm_usd_price.map(|price| (projected_stroops as f64 / 10_000_000.0) * price);
+
+        projections.push(CostProjection {
+            invocations: count,
+            total_stroops: projected_stroops,
+            total_xlm,
+            usd,
+        });
+    }
+
+    Ok(projections)
+}
+
+/// Formats a list of cost projections into a human-readable table.
+#[must_use]
+pub fn format_projections_table(projections: &[CostProjection]) -> String {
+    if projections.is_empty() {
+        return String::new();
+    }
+
+    let mut output = String::from("\nCost Projections:\n\n");
+    let mut table = Table::new();
+    if crate::cli::should_colorize() {
+        table.enforce_styling();
+    } else {
+        table.force_no_tty();
+    }
+
+    table.set_header(vec!["Invocations", "Total Stroops", "Total XLM", "USD"]);
+    for p in projections {
+        let usd_str = p
+            .usd
+            .map(|u| format!("${u:.2}"))
+            .unwrap_or_else(|| "-".to_string());
+        table.add_row(vec![
+            Cell::new(format_thousands_u64(p.invocations)).set_alignment(CellAlignment::Right),
+            Cell::new(format_thousands(p.total_stroops)).set_alignment(CellAlignment::Right),
+            Cell::new(&p.total_xlm).set_alignment(CellAlignment::Right),
+            Cell::new(usd_str).set_alignment(CellAlignment::Right),
+        ]);
+    }
+
+    output.push_str(&table.to_string());
+    output.push('\n');
+    output
 }
 
 #[cfg(test)]
@@ -411,6 +827,7 @@ mod tests {
         CostReport {
             function: "increment".to_string(),
             wasm_hash: "abc".to_string(),
+            wasm_size: 4_096,
             cpu_instructions: 532_502,
             memory_bytes: 0,
             tx_size: 156,
@@ -433,6 +850,7 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
             rates: Some(rates),
+            projections: None,
         }
     }
 
@@ -526,6 +944,7 @@ mod tests {
         let report = CostReport {
             function: "(wasm upload)".to_string(),
             wasm_hash: "0000".to_string(),
+            wasm_size: 0,
             cpu_instructions: 0,
             memory_bytes: 0,
             tx_size: 0,
@@ -548,6 +967,7 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 0,
             rates: None,
+            projections: None,
         };
 
         let table_out = format_report_table(&report);
@@ -629,5 +1049,169 @@ mod tests {
             cpu_bar_width(120) > cpu_bar_width(40),
             "bar should scale with terminal width"
         );
+    }
+
+    #[test]
+    fn test_parse_projection_counts_valid_and_ordered() {
+        let counts = parse_projection_counts("100, 1000, 10000").expect("valid counts");
+        assert_eq!(counts, vec![100, 1000, 10000]);
+
+        // Order preserved
+        let reversed = parse_projection_counts("10000,100,1000").expect("valid counts");
+        assert_eq!(reversed, vec![10000, 100, 1000]);
+    }
+
+    #[test]
+    fn test_parse_projection_counts_invalid() {
+        assert!(parse_projection_counts("").is_err());
+        assert!(parse_projection_counts("   ").is_err());
+        assert!(parse_projection_counts("100,,1000").is_err());
+        assert!(parse_projection_counts("abc").is_err());
+        assert!(parse_projection_counts("100,abc,1000").is_err());
+        assert!(parse_projection_counts("0").is_err());
+        assert!(parse_projection_counts("100,0").is_err());
+        assert!(parse_projection_counts("-5").is_err());
+        assert!(parse_projection_counts("100,-5").is_err());
+        assert!(parse_projection_counts("100,1000,100").is_err());
+        let overflow_count = format!("{}0", u64::MAX);
+        assert!(parse_projection_counts(&overflow_count).is_err());
+    }
+
+    #[test]
+    fn test_calculate_projections_multiplication() {
+        let per_invocation_fee: i64 = 15_527;
+        let counts = [100, 1_000, 10_000];
+        let projections = calculate_projections(per_invocation_fee, &counts, 7, None)
+            .expect("calculation should succeed");
+
+        assert_eq!(projections.len(), 3);
+        assert_eq!(projections[0].invocations, 100);
+        assert_eq!(projections[0].total_stroops, 1_552_700);
+        assert_eq!(projections[0].total_xlm, "0.1552700");
+        assert_eq!(projections[0].usd, None);
+
+        assert_eq!(projections[1].invocations, 1_000);
+        assert_eq!(projections[1].total_stroops, 15_527_000);
+        assert_eq!(projections[1].total_xlm, "1.5527000");
+
+        assert_eq!(projections[2].invocations, 10_000);
+        assert_eq!(projections[2].total_stroops, 155_270_000);
+        assert_eq!(projections[2].total_xlm, "15.5270000");
+    }
+
+    #[test]
+    fn test_calculate_projections_large_no_overflow() {
+        let fee: i64 = 10_000;
+        let counts = [10_000_000_000u64];
+        let projections =
+            calculate_projections(fee, &counts, 7, None).expect("large multiplication succeeds");
+        assert_eq!(projections[0].total_stroops, 100_000_000_000_000);
+    }
+
+    #[test]
+    fn test_calculate_projections_overflow_error() {
+        let fee: i64 = i64::MAX / 2;
+        let counts = [3u64];
+        let err = calculate_projections(fee, &counts, 7, None).unwrap_err();
+        match err {
+            crate::error::AppError::FeeCalc(msg) => {
+                assert!(msg.contains('3'), "error must identify count: {msg}");
+                assert!(
+                    msg.contains("overflow"),
+                    "error must explain overflow: {msg}"
+                );
+            }
+            other => panic!("expected FeeCalc error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_calculate_projections_usd_available() {
+        let fee: i64 = 10_000_000; // 1 XLM
+        let counts = [100];
+        let projections =
+            calculate_projections(fee, &counts, 7, Some(0.12)).expect("calculation succeeds");
+        assert_eq!(projections[0].usd, Some(12.0));
+    }
+
+    #[test]
+    fn test_calculate_projections_usd_unavailable() {
+        let fee: i64 = 10_000_000;
+        let counts = [100];
+        let projections =
+            calculate_projections(fee, &counts, 7, None).expect("calculation succeeds");
+        assert_eq!(projections[0].usd, None);
+    }
+
+    #[test]
+    fn test_format_thousands() {
+        assert_eq!(format_thousands(0), "0");
+        assert_eq!(format_thousands(999), "999");
+        assert_eq!(format_thousands(1_000), "1,000");
+        assert_eq!(format_thousands(10_000), "10,000");
+        assert_eq!(format_thousands(1_234_567), "1,234,567");
+
+        assert_eq!(format_thousands(-1_234_567), "-1,234,567");
+        assert_eq!(format_thousands(500), "500");
+    }
+
+    #[test]
+    fn test_format_projections_table() {
+        let projections = vec![
+            CostProjection {
+                invocations: 100,
+                total_stroops: 1_552_700,
+                total_xlm: "0.1552700".to_string(),
+                usd: None,
+            },
+            CostProjection {
+                invocations: 1_000,
+                total_stroops: 15_527_000,
+                total_xlm: "1.5527000".to_string(),
+                usd: Some(1.86),
+            },
+        ];
+
+        let table = format_projections_table(&projections);
+        assert!(table.contains("Cost Projections:"));
+        assert!(table.contains("Invocations"));
+        assert!(table.contains("Total Stroops"));
+        assert!(table.contains("Total XLM"));
+        assert!(table.contains("USD"));
+        assert!(table.contains("100"));
+        assert!(table.contains("1,552,700"));
+        assert!(table.contains("0.1552700"));
+        assert!(table.contains('-'));
+        assert!(table.contains("1,000"));
+        assert!(table.contains("15,527,000"));
+        assert!(table.contains("1.5527000"));
+        assert!(table.contains("$1.86"));
+    }
+
+    #[test]
+    fn test_format_report_table_and_json_projections() {
+        let mut report = report_with_rates(sample_rates());
+        assert!(!format_report_table(&report).contains("Cost Projections:"));
+        assert!(!format_report_json(&report).contains("\"projections\""));
+
+        report.projections = Some(vec![CostProjection {
+            invocations: 100,
+            total_stroops: 1_552_700,
+            total_xlm: "0.1552700".to_string(),
+            usd: None,
+        }]);
+
+        let table_out = format_report_table(&report);
+        assert!(table_out.contains("Cost Projections:"));
+        assert!(table_out.contains("100"));
+        assert!(table_out.contains("1,552,700"));
+
+        let json_out = format_report_json(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json_out).expect("valid json");
+        assert!(parsed["projections"].is_array());
+        assert_eq!(parsed["projections"][0]["invocations"], 100);
+        assert_eq!(parsed["projections"][0]["total_stroops"], 1_552_700);
+        assert_eq!(parsed["projections"][0]["total_xlm"], "0.1552700");
+        assert!(parsed["projections"][0].get("usd").is_none());
     }
 }
