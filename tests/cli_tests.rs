@@ -92,27 +92,6 @@ fn write_snapshot(home: &Path, network: &str, timestamp: &str, ledger: u32) -> P
     path
 }
 
-/// An RFC 3339 timestamp `days` in the past, in the same shape
-/// `begin_snapshot` records.
-fn days_ago(days: i64) -> String {
-    (chrono::Utc::now() - chrono::TimeDelta::days(days)).to_rfc3339()
-}
-
-/// Snapshot filenames on disk for `network` under `home`, oldest first.
-fn snapshot_files(home: &Path, network: &str) -> Vec<String> {
-    let dir = home.join(".soroban-cost-estimator").join("snapshots");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.file_name().to_string_lossy().to_string())
-        .filter(|name| name.starts_with(&format!("{network}-")) && name.ends_with(".json"))
-        .collect();
-    names.sort();
-    names
-}
-
 /// Runs the CLI with `HOME` isolated and tracing silenced.
 ///
 /// `tracing`'s `info!` lines go to stdout in this binary, so `RUST_LOG=error`
