@@ -299,6 +299,7 @@ mod tests {
             rpc_latency_ms: 42,
             rates: None,
             projections: None,
+            contract_meta: crate::wasm::parser::ContractMeta::default(),
         }
     }
 
