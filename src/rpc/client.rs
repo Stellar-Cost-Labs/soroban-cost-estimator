@@ -1565,6 +1565,20 @@ mod header_tests {
     }
 
     #[test]
+    fn test_parse_headers_empty() {
+        assert!(parseheaders(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_parse_headers_stores_parsed() {
+        let headers = parseheaders(&[
+            "X-API-Key: secret".to_string(),
+            "Authorization: Bearer tok".to_string(),
+        ]);
+        assert_eq!(headers.len(), 2);
+    }
+
+    #[test]
     fn test_with_headers_empty() {
         let client = RpcClient::with_headers("http://localhost", &[], false);
         assert!(client.custom_headers().is_empty());
@@ -1606,8 +1620,20 @@ mod header_tests {
     /// Malformed arguments must fail the command: silently dropping them would
     /// send unauthenticated requests to a private endpoint.
     #[test]
-    fn test_with_headers_rejects_malformed() {
-        let err = RpcClient::with_headers(
+    fn test_parse_headers_skips_malformed() {
+        let headers = parseheaders(&[
+            "Good: ok".to_string(),
+            "NoColonHere".to_string(),
+            "Also-Bad:".to_string(),
+        ]);
+        // Only the valid header should be kept.
+        assert_eq!(headers.len(), 1);
+        assert!(headers.contains_key("good"));
+    }
+
+    #[test]
+    fn test_with_headers_skips_malformed() {
+        let client = RpcClient::with_headers(
             "http://localhost",
             &[
                 "Good=ok".to_string(),
