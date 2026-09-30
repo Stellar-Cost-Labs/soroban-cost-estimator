@@ -1,5 +1,47 @@
 use serde::{Deserialize, Serialize};
 
+use crate::rpc::config::ConfigSettingId;
+
+/// Maps a [`ConfigSettingId`] to a friendly, human-readable setting name.
+///
+/// Every user-facing rendering of a config setting (diff tables, diff
+/// headers, `--json` payloads) goes through this helper so raw enum
+/// numbers like `0`, `1`, `4` never reach an output on their own.
+///
+/// Examples
+/// --------
+/// - `ConfigSettingId::ContractComputeV0` → `Contract Compute V0`
+/// - `ConfigSettingId::ContractLedgerCostV0` → `Contract Ledger Cost V0`
+/// - `ConfigSettingId::StateArchival` → `State Archival`
+pub fn config_setting_human_name(id: &ConfigSettingId) -> &'static str {
+    match id {
+        ConfigSettingId::ContractComputeV0 => "Contract Compute V0",
+        ConfigSettingId::ContractLedgerCostV0 => "Contract Ledger Cost V0",
+        ConfigSettingId::ContractHistoricalDataV0 => "Contract Historical Data V0",
+        ConfigSettingId::ContractEventsV0 => "Contract Events V0",
+        ConfigSettingId::ContractBandwidthV0 => "Contract Bandwidth V0",
+        ConfigSettingId::StateArchival => "State Archival",
+    }
+}
+
+/// Maps a snapshot field-path prefix (e.g. `contract_compute`) to its
+/// [`ConfigSettingId`], or `None` when the prefix names no known setting.
+///
+/// This is the inverse bridge from stored snapshot paths (which carry no
+/// enum value) back to the id so [`config_setting_human_name`] can label
+/// them consistently.
+pub fn config_setting_id_for_prefix(prefix: &str) -> Option<ConfigSettingId> {
+    match prefix {
+        "contract_compute" => Some(ConfigSettingId::ContractComputeV0),
+        "contract_ledger_cost" => Some(ConfigSettingId::ContractLedgerCostV0),
+        "contract_historical_data" => Some(ConfigSettingId::ContractHistoricalDataV0),
+        "contract_events" => Some(ConfigSettingId::ContractEventsV0),
+        "contract_bandwidth" => Some(ConfigSettingId::ContractBandwidthV0),
+        "state_archival" => Some(ConfigSettingId::StateArchival),
+        _ => None,
+    }
+}
+
 /// A complete snapshot of the network's Soroban resource-pricing configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigSnapshot {
