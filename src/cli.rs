@@ -133,7 +133,7 @@ pub enum Command {
     Estimate {
         #[arg(long, short)]
         wasm: String,
-        #[arg(long, default_value = "testnet")]
+        #[arg(long, default_value = "testnet", value_parser = ["testnet", "mainnet", "futurenet", "local"])]
         network: String,
         #[arg(long)]
         rpc_url: Option<String>,
@@ -194,7 +194,7 @@ pub enum Command {
     EstimateAll {
         #[arg(long, short)]
         wasm: String,
-        #[arg(long, default_value = "testnet")]
+        #[arg(long, default_value = "testnet", value_parser = ["testnet", "mainnet", "futurenet", "local"])]
         network: String,
 
         /// Explicit RPC URL (overrides network-based resolution).
@@ -227,7 +227,7 @@ pub enum Command {
         action: CacheAction,
     },
     Watch {
-        #[arg(long, default_value = "testnet")]
+        #[arg(long, default_value = "testnet", value_parser = ["testnet", "mainnet", "futurenet", "local"])]
         network: String,
         #[arg(long, default_value = "1h")]
         interval: String,
@@ -236,7 +236,7 @@ pub enum Command {
         threshold_percent: Option<f64>,
     },
 
-    /// Generate shell completion scripts for Bash, Zsh, Fish, and PowerShell.
+    /// Generate shell completion scripts for Bash, Zsh, Fish, PowerShell, and Elvish.
     Completions {
         /// Target shell for completion script generation.
         #[arg(value_enum)]
@@ -256,7 +256,7 @@ pub enum CacheAction {
     /// List every cached estimate for a network (newest first).
     List {
         /// Network whose cached estimates to list.
-        #[arg(long, default_value = "testnet")]
+        #[arg(long, default_value = "testnet", value_parser = ["testnet", "mainnet", "futurenet", "local"])]
         network: String,
 
         /// Output the full cached-estimate records as a JSON array.
@@ -270,7 +270,7 @@ pub enum CacheAction {
     /// Delete every cached estimate recorded for a network.
     Clear {
         /// Network whose cached estimates to delete.
-        #[arg(long, default_value = "testnet")]
+        #[arg(long, default_value = "testnet", value_parser = ["testnet", "mainnet", "futurenet", "local"])]
         network: String,
     },
 
@@ -278,7 +278,7 @@ pub enum CacheAction {
     Warm {
         #[arg(long, short)]
         wasm: String,
-        #[arg(long, default_value = "testnet")]
+        #[arg(long, default_value = "testnet", value_parser = ["testnet", "mainnet", "futurenet", "local"])]
         network: String,
 
         /// Explicit RPC URL (overrides network-based resolution).
@@ -342,7 +342,7 @@ pub enum CacheAction {
 #[derive(Subcommand, Debug)]
 pub enum ConfigAction {
     Snapshot {
-        #[arg(long, default_value = "testnet")]
+        #[arg(long, default_value = "testnet", value_parser = ["testnet", "mainnet", "futurenet", "local"])]
         network: String,
         #[arg(long)]
         out: Option<String>,
@@ -353,13 +353,13 @@ pub enum ConfigAction {
     /// List all saved config snapshots with their timestamp and ledger.
     List {
         /// Network whose snapshots to list.
-        #[arg(long, default_value = "testnet")]
+        #[arg(long, default_value = "testnet", value_parser = ["testnet", "mainnet", "futurenet", "local"])]
         network: String,
     },
 
     /// Diff the current network config against the most recent snapshot.
     Diff {
-        #[arg(long, default_value = "testnet")]
+        #[arg(long, default_value = "testnet", value_parser = ["testnet", "mainnet", "futurenet", "local"])]
         network: String,
         #[arg(long)]
         against: Option<String>,
@@ -386,15 +386,15 @@ pub enum ConfigAction {
         json: bool,
     },
     History {
-        #[arg(long, default_value = "testnet")]
+        #[arg(long, default_value = "testnet", value_parser = ["testnet", "mainnet", "futurenet", "local"])]
         network: String,
     },
     LastChanged {
-        #[arg(long, default_value = "testnet")]
+        #[arg(long, default_value = "testnet", value_parser = ["testnet", "mainnet", "futurenet", "local"])]
         network: String,
     },
     Validate {
-        #[arg(long, default_value = "testnet")]
+        #[arg(long, default_value = "testnet", value_parser = ["testnet", "mainnet", "futurenet", "local"])]
         network: String,
     },
 

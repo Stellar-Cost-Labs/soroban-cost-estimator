@@ -2594,6 +2594,12 @@ fn test_completions_bash() {
         stdout.contains("estimate"),
         "bash completion script should contain subcommand names"
     );
+    for network in ["testnet", "mainnet", "futurenet", "local"] {
+        assert!(
+            stdout.contains(network),
+            "bash completion script should include {network}"
+        );
+    }
 }
 
 #[test]
