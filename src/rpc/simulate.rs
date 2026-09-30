@@ -55,6 +55,21 @@ pub struct SimulateTransactionResponse {
     pub state_changes: Option<Vec<Value>>,
 }
 
+impl SimulateTransactionResponse {
+    /// Latest ledger sequence the simulation ran against, as a `u32`.
+    ///
+    /// Soroban returns `latestLedger` as a `u64`, but ledger sequences fit in
+    /// `u32`. The conversion is therefore saturating: when the field is absent,
+    /// or holds a value beyond `u32::MAX`, `0` is returned and callers surface
+    /// it as "unknown ledger" (issue #329).
+    #[must_use]
+    pub fn ledger_sequence(&self) -> u32 {
+        self.latest_ledger
+            .and_then(|ledger| u32::try_from(ledger).ok())
+            .unwrap_or(0)
+    }
+}
+
 /// Cost breakdown from the simulation result.
 ///
 /// The RPC serializes these as `cpuInsns`/`memBytes` (camelCase). Values may
@@ -290,6 +305,37 @@ mod tests {
             .expect("cost should parse from numeric cpuInsns/memBytes");
         assert_eq!(cost_num.cpu_insns, 100_000);
         assert_eq!(cost_num.mem_bytes, 2_000);
+    }
+
+    /// Issue #329: the ledger sequence must propagate out of the simulation
+    /// response, tolerating both the string and numeric forms the RPC uses.
+    #[test]
+    fn test_ledger_sequence_extracts_latest_ledger() {
+        for json in [
+            r#"{ "latestLedger": 1234567 }"#,
+            r#"{ "latestLedger": "1234567" }"#,
+        ] {
+            let resp: SimulateTransactionResponse =
+                serde_json::from_str(json).expect("response should parse");
+            assert_eq!(resp.ledger_sequence(), 1_234_567);
+        }
+    }
+
+    #[test]
+    fn test_ledger_sequence_absent_is_zero() {
+        let resp: SimulateTransactionResponse =
+            serde_json::from_str(r#"{ "cost": { "cpuInsns": 1, "memBytes": 2 } }"#)
+                .expect("response should parse");
+        assert_eq!(resp.ledger_sequence(), 0);
+    }
+
+    #[test]
+    fn test_ledger_sequence_out_of_range_is_zero() {
+        let overflowing = u64::from(u32::MAX) + 1;
+        let json = format!(r#"{{ "latestLedger": {overflowing} }}"#);
+        let resp: SimulateTransactionResponse =
+            serde_json::from_str(&json).expect("response should parse");
+        assert_eq!(resp.ledger_sequence(), 0);
     }
 
     /// Round-trips a `SorobanTransactionData` through base64-XDR and asserts
