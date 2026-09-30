@@ -1038,4 +1038,12 @@ mod tests {
             "no-change output should have no ANSI codes: {output}"
         );
     }
+
+    #[test]
+    fn test_config_diff_display() {
+        let old = make_snapshot(100, 10);
+        let new = make_snapshot(120, 10);
+        let diff = diff_snapshots(&old, &new);
+        assert_eq!(format!("{}", diff), format_diff(&diff));
+    }
 }

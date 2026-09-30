@@ -14,6 +14,16 @@ pub struct ConfigSnapshot {
     pub state_archival: Option<StateArchivalV0>,
 }
 
+impl std::fmt::Display for ConfigSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Network: {} (ledger {} at {})",
+            self.network, self.ledger, self.timestamp
+        )
+    }
+}
+
 /// ConfigSettingContractComputeV0
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContractComputeV0 {
