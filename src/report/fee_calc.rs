@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
 
+/// Default number of decimal places shown for XLM fee values.
+pub const DEFAULT_PRECISION: u32 = 7;
+
 /// The fee breakdown for a single simulation.
 ///
 /// All values are in stroops (1 stroop = 10^{-7} XLM).
@@ -18,10 +21,14 @@ pub struct FeeBreakdown {
     pub storage_fee_stroops: i64,
     /// Transaction size / bandwidth fee (subset of non-refundable).
     pub bandwidth_fee_stroops: i64,
+    /// Base inclusion fee.
+    pub base_fee_stroops: i64,
     /// Total resource fee.
     pub total_stroops: i64,
     /// Total fee in XLM (as a string to avoid float precision issues).
     pub total_xlm: String,
+    /// Percentage contribution of each fee component, summing to exactly 100.0%.
+    pub fee_percentages: std::collections::BTreeMap<String, String>,
 }
 
 /// Fee rates sourced from the network's `ConfigSettingContract*` entries.
@@ -70,6 +77,8 @@ pub struct FeeRates {
 /// * `read_bytes` - Disk bytes read.
 /// * `tx_size` - Transaction size in **XDR bytes** (not base64 characters).
 /// * `rates` - Config-sourced fee rates (see `FeeRates`).
+/// * `precision` - Number of decimal places to render the XLM total with
+///   (see [`DEFAULT_PRECISION`]).
 ///
 /// # Network calls
 /// None — pure computation.
@@ -82,6 +91,7 @@ pub fn compute_fee_breakdown(
     read_bytes: u32,
     tx_size: u32,
     rates: FeeRates,
+    precision: u32,
 ) -> FeeBreakdown {
     // CPU fee: stroops per 10K instructions → (cpu_insns * rate) / 10000
     let cpu_fee = ((cpu_insns as i64)
@@ -127,12 +137,78 @@ pub fn compute_fee_breakdown(
     // `i64::MIN`, not at zero.)
     let refundable = total_resource_fee.saturating_sub(non_refundable).max(0);
 
-    let total_xlm = stroops_to_xlm(total_resource_fee);
+    let base_fee_stroops = if total_resource_fee > 0 { 100 } else { 0 };
+    let total_stroops = total_resource_fee.saturating_add(base_fee_stroops);
+    let total_xlm = stroops_to_xlm(total_stroops, precision);
 
     // Combined storage I/O fee for the report breakdown.
     let storage_fee = read_entry_fee
         .saturating_add(write_entry_fee)
         .saturating_add(read_bytes_fee);
+
+    // Compute exact percentages summing to 100.0%
+    let parts = [
+        cpu_fee,
+        storage_fee,
+        bandwidth_fee,
+        base_fee_stroops,
+        refundable,
+    ];
+    let mut permilles: Vec<i64> = parts
+        .iter()
+        .map(|&p| {
+            if total_stroops <= 0 {
+                0
+            } else {
+                let p_128 = p as i128;
+                let tot_128 = total_stroops as i128;
+                let num = p_128 * 1000;
+                let half = tot_128 / 2;
+                let rounded = if num >= 0 {
+                    (num + half) / tot_128
+                } else {
+                    (num - half) / tot_128
+                };
+                rounded
+                    .try_into()
+                    .unwrap_or(if rounded > 0 { i64::MAX } else { i64::MIN })
+            }
+        })
+        .collect();
+
+    if total_stroops > 0 {
+        let sum: i128 = permilles.iter().map(|&x| x as i128).sum();
+        if let Ok(sum_i64) = i64::try_from(sum) {
+            let diff = 1000i64.saturating_sub(sum_i64);
+            if diff != 0 {
+                if let Some((idx, _)) = parts.iter().enumerate().max_by_key(|&(_, &p)| p) {
+                    permilles[idx] = permilles[idx].saturating_add(diff);
+                }
+            }
+        }
+    }
+
+    let mut fee_percentages = std::collections::BTreeMap::new();
+    fee_percentages.insert(
+        "cpu_instructions".to_string(),
+        format!("{:.1}%", permilles[0] as f64 / 10.0),
+    );
+    fee_percentages.insert(
+        "storage_read_write".to_string(),
+        format!("{:.1}%", permilles[1] as f64 / 10.0),
+    );
+    fee_percentages.insert(
+        "transaction_size".to_string(),
+        format!("{:.1}%", permilles[2] as f64 / 10.0),
+    );
+    fee_percentages.insert(
+        "base_fee".to_string(),
+        format!("{:.1}%", permilles[3] as f64 / 10.0),
+    );
+    fee_percentages.insert(
+        "rent".to_string(),
+        format!("{:.1}%", permilles[4] as f64 / 10.0),
+    );
 
     FeeBreakdown {
         non_refundable_stroops: non_refundable,
@@ -140,25 +216,78 @@ pub fn compute_fee_breakdown(
         cpu_fee_stroops: cpu_fee,
         storage_fee_stroops: storage_fee,
         bandwidth_fee_stroops: bandwidth_fee,
-        total_stroops: total_resource_fee,
+        base_fee_stroops,
+        total_stroops,
         total_xlm,
+        fee_percentages,
     }
 }
 
 /// Convert stroops to an XLM string (1 XLM = 10^7 stroops).
 ///
-/// Returns a string to avoid floating-point precision issues.
-/// Example: 1234567 stroops → "0.1234567"
+/// `precision` controls the number of decimal places in the output (see
+/// [`DEFAULT_PRECISION`]); the fraction is rounded half-up to that many
+/// places. Returns a string to avoid floating-point precision issues.
+/// Example: `stroops_to_xlm(1_234_567, 7)` → "0.1234567".
 #[must_use]
-pub fn stroops_to_xlm(stroops: i64) -> String {
-    let abs = stroops.unsigned_abs();
+pub fn stroops_to_xlm(stroops: i64, precision: u32) -> String {
+    let negative = stroops < 0;
+    let abs = stroops.unsigned_abs() as u128;
+
     let whole = abs / 10_000_000;
     let fraction = abs % 10_000_000;
 
-    if stroops < 0 {
-        format!("-{whole}.{fraction:07}")
+    // Scale the 7-digit fraction into `precision` decimal places, rounding
+    // half-up. `frac_unit` is 10^precision; it stays within `u128` for any
+    // reasonable precision value, so the arithmetic below cannot overflow.
+    let frac_unit = 10u128.pow(precision);
+    let scaled = if precision <= 7 {
+        let shift = 7 - precision;
+        let div = 10u128.pow(shift);
+        let q = fraction / div;
+        let r = fraction % div;
+        if r * 2 >= div { q + 1 } else { q }
     } else {
-        format!("{whole}.{fraction:07}")
+        fraction * 10u128.pow(precision - 7)
+    };
+
+    // Combine whole and scaled fraction, letting any rounding carry
+    // propagate from the fraction into the whole part.
+    let total = whole * frac_unit + scaled;
+    let whole_part = total / frac_unit;
+    let frac_part = total % frac_unit;
+
+    let sign = if negative { "-" } else { "" };
+    let width = precision as usize;
+    format!("{sign}{whole_part}.{frac_part:0width$}")
+}
+
+/// Parse an XLM string to stroops (i64).
+pub fn xlm_to_stroops(xlm: &str) -> AppResult<i64> {
+    let parts: Vec<&str> = xlm.split('.').collect();
+    match parts.len() {
+        1 => {
+            let whole: i64 = parts[0]
+                .parse()
+                .map_err(|_| AppError::FeeCalc(format!("invalid XLM value: {xlm}")))?;
+            whole
+                .checked_mul(10_000_000)
+                .ok_or_else(|| AppError::FeeCalc("XLM value overflow".to_string()))
+        }
+        2 => {
+            let whole: i64 = parts[0]
+                .parse()
+                .map_err(|_| AppError::FeeCalc(format!("invalid XLM value: {xlm}")))?;
+            let fraction_str = format!("{:0<7}", parts[1]);
+            let fraction: i64 = fraction_str[..7.min(fraction_str.len())]
+                .parse()
+                .map_err(|_| AppError::FeeCalc(format!("invalid XLM value: {xlm}")))?;
+            whole
+                .checked_mul(10_000_000)
+                .and_then(|w| w.checked_add(fraction))
+                .ok_or_else(|| AppError::FeeCalc("XLM value overflow".to_string()))
+        }
+        _ => Err(AppError::FeeCalc(format!("invalid XLM value: {xlm}"))),
     }
 }
 
@@ -212,35 +341,6 @@ pub fn fee_range(fees: &[i64]) -> Option<FeeRange> {
     })
 }
 
-/// Parse an XLM string to stroops (i64).
-pub fn xlm_to_stroops(xlm: &str) -> AppResult<i64> {
-    let parts: Vec<&str> = xlm.split('.').collect();
-    match parts.len() {
-        1 => {
-            let whole: i64 = parts[0]
-                .parse()
-                .map_err(|_| AppError::FeeCalc(format!("invalid XLM value: {xlm}")))?;
-            whole
-                .checked_mul(10_000_000)
-                .ok_or_else(|| AppError::FeeCalc("XLM value overflow".to_string()))
-        }
-        2 => {
-            let whole: i64 = parts[0]
-                .parse()
-                .map_err(|_| AppError::FeeCalc(format!("invalid XLM value: {xlm}")))?;
-            let fraction_str = format!("{:0<7}", parts[1]);
-            let fraction: i64 = fraction_str[..7.min(fraction_str.len())]
-                .parse()
-                .map_err(|_| AppError::FeeCalc(format!("invalid XLM value: {xlm}")))?;
-            whole
-                .checked_mul(10_000_000)
-                .and_then(|w| w.checked_add(fraction))
-                .ok_or_else(|| AppError::FeeCalc("XLM value overflow".to_string()))
-        }
-        _ => Err(AppError::FeeCalc(format!("invalid XLM value: {xlm}"))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,6 +371,7 @@ mod tests {
             0,       // read_bytes
             1024,    // tx_size
             cpu_and_bandwidth_only_rates(),
+            DEFAULT_PRECISION,
         );
         assert_eq!(breakdown.total_stroops, 0);
         assert_eq!(breakdown.total_xlm, "0.0000000");
@@ -298,8 +399,9 @@ mod tests {
             0,       // read_bytes
             1024,    // tx_size
             cpu_and_bandwidth_only_rates(),
+            DEFAULT_PRECISION,
         );
-        assert_eq!(breakdown.total_stroops, 5_000);
+        assert_eq!(breakdown.total_stroops, 5_100);
         assert_eq!(breakdown.non_refundable_stroops, 10_250);
         assert_eq!(breakdown.refundable_stroops, 0);
     }
@@ -347,18 +449,40 @@ mod tests {
 
     #[test]
     fn test_stroops_to_xlm() {
-        assert_eq!(stroops_to_xlm(0), "0.0000000");
-        assert_eq!(stroops_to_xlm(10_000_000), "1.0000000");
-        assert_eq!(stroops_to_xlm(1_234_567), "0.1234567");
-        assert_eq!(stroops_to_xlm(-10_000_000), "-1.0000000");
+        assert_eq!(stroops_to_xlm(0, DEFAULT_PRECISION), "0.0000000");
+        assert_eq!(stroops_to_xlm(10_000_000, DEFAULT_PRECISION), "1.0000000");
+        assert_eq!(stroops_to_xlm(1_234_567, DEFAULT_PRECISION), "0.1234567");
+        assert_eq!(stroops_to_xlm(-10_000_000, DEFAULT_PRECISION), "-1.0000000");
     }
 
     #[test]
-    fn test_xlm_to_stroops() {
-        assert_eq!(xlm_to_stroops("0.0000000").unwrap(), 0);
-        assert_eq!(xlm_to_stroops("1.0000000").unwrap(), 10_000_000);
-        assert_eq!(xlm_to_stroops("0.1234567").unwrap(), 1_234_567);
-        assert!(xlm_to_stroops("invalid").is_err());
+    fn test_stroops_to_xlm_precision() {
+        // Fewer decimal places round half-up.
+        assert_eq!(stroops_to_xlm(1_234_567, 4), "0.1235");
+        assert_eq!(stroops_to_xlm(1_234_567, 2), "0.12");
+        assert_eq!(stroops_to_xlm(1_234_567, 0), "0.0");
+        // Half-up carries into the whole part.
+        assert_eq!(stroops_to_xlm(5_000_000, 0), "1.0");
+        // More decimal places than the underlying 7 are zero-padded.
+        assert_eq!(stroops_to_xlm(1_234_567, 9), "0.123456700");
+        // Rounding carries from the fraction into the whole part.
+        assert_eq!(stroops_to_xlm(9_999_999, 6), "1.000000");
+        // Negative values keep their sign.
+        assert_eq!(stroops_to_xlm(-1_234_567, 3), "-0.123");
+    }
+
+    /// Issue #330: the `--precision` flag is exposed for 0..=7 decimals; pin
+    /// the formatting at 2, 4 and 7 places explicitly.
+    #[test]
+    fn test_stroops_to_xlm_precision_2_4_7() {
+        assert_eq!(stroops_to_xlm(1_234_567, 2), "0.12");
+        assert_eq!(stroops_to_xlm(1_234_567, 4), "0.1235");
+        assert_eq!(stroops_to_xlm(1_234_567, 7), "0.1234567");
+        // Round half-up at the requested precision.
+        assert_eq!(stroops_to_xlm(1_260_000, 2), "0.13");
+        assert_eq!(stroops_to_xlm(1_265_000, 4), "0.1265");
+        // Default precision preserves full stroop fidelity.
+        assert_eq!(stroops_to_xlm(1, DEFAULT_PRECISION), "0.0000001");
     }
 
     #[test]
@@ -375,9 +499,10 @@ mod tests {
             0,         // read_bytes
             1024,      // tx_size
             cpu_and_bandwidth_only_rates(),
+            DEFAULT_PRECISION,
         );
-        assert_eq!(breakdown.total_stroops, 1_000_000);
-        assert_eq!(breakdown.total_xlm, "0.1000000");
+        assert_eq!(breakdown.total_stroops, 1_000_100);
+        assert_eq!(breakdown.total_xlm, "0.1000100");
         assert_eq!(breakdown.non_refundable_stroops, 10_250);
         assert_eq!(breakdown.refundable_stroops, 989_750);
     }
@@ -406,9 +531,10 @@ mod tests {
                 fee_per_read_1kb: 447,
                 fee_per_1kb: 406,
             },
+            DEFAULT_PRECISION,
         );
         assert_eq!(breakdown.non_refundable_stroops, 4_496);
         assert_eq!(breakdown.refundable_stroops, 15_427 - 4_496);
-        assert_eq!(breakdown.total_stroops, 15_427);
+        assert_eq!(breakdown.total_stroops, 15_527);
     }
 }

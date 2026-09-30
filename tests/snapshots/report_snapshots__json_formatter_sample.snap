@@ -1,13 +1,15 @@
 ---
 source: tests/report_snapshots.rs
-assertion_line: 75
 expression: JsonFormatter.format(&report)
 ---
 {
+  "contract_meta": {},
   "cpu_instructions": 532502,
   "fee": {
     "bandwidth_fee_stroops": 61,
+    "base_fee_stroops": 100,
     "cpu_fee_stroops": 372,
+    "fee_percentages": {},
     "non_refundable_stroops": 4496,
     "refundable_stroops": 10931,
     "storage_fee_stroops": 4063,
@@ -15,7 +17,7 @@ expression: JsonFormatter.format(&report)
     "total_xlm": "0.0015427"
   },
   "function": "increment",
-  "ledger": 3894195,
+  "ledger_sequence": 3894195,
   "memory_bytes": 0,
   "network": "testnet",
   "read_bytes": 0,
@@ -24,6 +26,7 @@ expression: JsonFormatter.format(&report)
   "suggestions": [],
   "tx_size": 156,
   "wasm_hash": "abc123def456",
+  "wasm_size": 4096,
   "write_bytes": 136,
   "write_entries": 1
 }

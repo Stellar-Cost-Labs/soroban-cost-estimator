@@ -55,6 +55,21 @@ pub struct SimulateTransactionResponse {
     pub state_changes: Option<Vec<Value>>,
 }
 
+impl SimulateTransactionResponse {
+    /// Latest ledger sequence the simulation ran against, as a `u32`.
+    ///
+    /// Soroban returns `latestLedger` as a `u64`, but ledger sequences fit in
+    /// `u32`. The conversion is therefore saturating: when the field is absent,
+    /// or holds a value beyond `u32::MAX`, `0` is returned and callers surface
+    /// it as "unknown ledger" (issue #329).
+    #[must_use]
+    pub fn ledger_sequence(&self) -> u32 {
+        self.latest_ledger
+            .and_then(|ledger| u32::try_from(ledger).ok())
+            .unwrap_or(0)
+    }
+}
+
 /// Cost breakdown from the simulation result.
 ///
 /// The RPC serializes these as `cpuInsns`/`memBytes` (camelCase). Values may
@@ -292,6 +307,37 @@ mod tests {
         assert_eq!(cost_num.mem_bytes, 2_000);
     }
 
+    /// Issue #329: the ledger sequence must propagate out of the simulation
+    /// response, tolerating both the string and numeric forms the RPC uses.
+    #[test]
+    fn test_ledger_sequence_extracts_latest_ledger() {
+        for json in [
+            r#"{ "latestLedger": 1234567 }"#,
+            r#"{ "latestLedger": "1234567" }"#,
+        ] {
+            let resp: SimulateTransactionResponse =
+                serde_json::from_str(json).expect("response should parse");
+            assert_eq!(resp.ledger_sequence(), 1_234_567);
+        }
+    }
+
+    #[test]
+    fn test_ledger_sequence_absent_is_zero() {
+        let resp: SimulateTransactionResponse =
+            serde_json::from_str(r#"{ "cost": { "cpuInsns": 1, "memBytes": 2 } }"#)
+                .expect("response should parse");
+        assert_eq!(resp.ledger_sequence(), 0);
+    }
+
+    #[test]
+    fn test_ledger_sequence_out_of_range_is_zero() {
+        let overflowing = u64::from(u32::MAX) + 1;
+        let json = format!(r#"{{ "latestLedger": {overflowing} }}"#);
+        let resp: SimulateTransactionResponse =
+            serde_json::from_str(&json).expect("response should parse");
+        assert_eq!(resp.ledger_sequence(), 0);
+    }
+
     /// Round-trips a `SorobanTransactionData` through base64-XDR and asserts
     /// the `resource_fee` (the authoritative total resource fee) is extracted.
     #[test]
@@ -378,6 +424,86 @@ mod tests {
             .expect("parse should succeed")
             .expect("fee should be present");
         assert_eq!(fee, 15_427);
+    }
+
+    #[test]
+    fn test_parse_transaction_data_resources_synthetic_multiple_footprint_entries() {
+        let key1 = stellar_xdr::LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
+            account_id: stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::Uint256([1u8; 32]),
+            )),
+        });
+        let key2 = stellar_xdr::LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
+            account_id: stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::Uint256([2u8; 32]),
+            )),
+        });
+        let key3 = stellar_xdr::LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
+            account_id: stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::Uint256([3u8; 32]),
+            )),
+        });
+
+        let data = stellar_xdr::SorobanTransactionData {
+            ext: stellar_xdr::SorobanTransactionDataExt::V0,
+            resources: stellar_xdr::SorobanResources {
+                footprint: stellar_xdr::LedgerFootprint {
+                    read_only: vec![key1].try_into().unwrap(),
+                    read_write: vec![key2, key3].try_into().unwrap(),
+                },
+                instructions: 750_000,
+                disk_read_bytes: 512,
+                write_bytes: 1024,
+            },
+            resource_fee: 50_000,
+        };
+
+        let xdr = data
+            .to_xdr(stellar_xdr::Limits::none())
+            .expect("XDR encode");
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &xdr);
+
+        let resources = parse_transaction_data_resources(&Some(b64))
+            .expect("parse should succeed")
+            .expect("resources should be present");
+
+        assert_eq!(resources.cpu_insns, 750_000);
+        assert_eq!(resources.read_entries, 1);
+        assert_eq!(resources.write_entries, 2);
+        assert_eq!(resources.read_bytes, 512);
+        assert_eq!(resources.write_bytes, 1024);
+    }
+
+    #[test]
+    fn test_parse_transaction_data_resources_empty_footprint() {
+        let data = stellar_xdr::SorobanTransactionData {
+            ext: stellar_xdr::SorobanTransactionDataExt::V0,
+            resources: stellar_xdr::SorobanResources {
+                footprint: stellar_xdr::LedgerFootprint {
+                    read_only: stellar_xdr::VecM::default(),
+                    read_write: stellar_xdr::VecM::default(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let xdr = data
+            .to_xdr(stellar_xdr::Limits::none())
+            .expect("XDR encode");
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &xdr);
+
+        let resources = parse_transaction_data_resources(&Some(b64))
+            .expect("parse should succeed")
+            .expect("resources should be present");
+
+        assert_eq!(resources.cpu_insns, 0);
+        assert_eq!(resources.read_entries, 0);
+        assert_eq!(resources.write_entries, 0);
+        assert_eq!(resources.read_bytes, 0);
+        assert_eq!(resources.write_bytes, 0);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 We welcome contributions! Here's how to get started.
 
 ## Development Setup
-
+<!-- contibuting -->
 ```bash
 # Clone the repo
 git clone https://github.com/aigbagbobila/soroban-cost-estimator.git
