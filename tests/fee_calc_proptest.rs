@@ -87,6 +87,30 @@ fn realistic_quantities() -> impl Strategy<Value = (u64, u32, u32, u32, u32)> {
     )
 }
 
+#[test]
+fn maximum_resource_values_do_not_panic_or_overflow() {
+    let breakdown = compute_fee_breakdown(
+        i64::MAX,
+        u64::MAX,
+        u32::MAX,
+        u32::MAX,
+        u32::MAX,
+        u32::MAX,
+        FeeRates {
+            fee_per_10k_insns: i64::MAX,
+            fee_per_read_entry: i64::MAX,
+            fee_per_write_entry: i64::MAX,
+            fee_per_read_1kb: i64::MAX,
+            fee_per_1kb: i64::MAX,
+        },
+        DEFAULT_PRECISION,
+    );
+
+    assert!(breakdown.refundable_stroops >= 0);
+    assert_eq!(breakdown.total_stroops, i64::MAX);
+    assert!(!breakdown.total_xlm.is_empty());
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(1024))]
 
@@ -163,6 +187,13 @@ proptest! {
             non_refundable + breakdown.refundable_stroops,
             total_resource_fee.max(non_refundable)
         );
+        if total_resource_fee >= non_refundable {
+            let expected_base_fee = if total_resource_fee > 0 { 100 } else { 0 };
+            prop_assert_eq!(
+                breakdown.total_stroops,
+                non_refundable + breakdown.refundable_stroops + expected_base_fee
+            );
+        }
         let expected_base_fee = if total_resource_fee > 0 { 100 } else { 0 };
         let expected_total_stroops = total_resource_fee.saturating_add(expected_base_fee);
         prop_assert_eq!(breakdown.total_stroops, expected_total_stroops);
