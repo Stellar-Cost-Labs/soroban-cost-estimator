@@ -90,10 +90,135 @@ pub struct CachedEstimate {
     pub success: bool,
 }
 
-/// Optional filters for [`query_estimates`].
+/// Filter criteria for querying cached simulation estimates.
 ///
 /// Every field is optional; a `None` field means "no filter on this axis".
 /// All filters are combined with logical AND.
+#[derive(Debug, Clone, Default)]
+pub struct CacheFilter {
+    /// Exact match against the function name.
+    pub function: Option<String>,
+    /// Prefix or exact match against the WASM SHA-256 hash (hex).
+    pub wasm_hash: Option<String>,
+    /// Exact match against the network name.
+    pub network: Option<String>,
+    /// Inclusive lower bound on total fee in stroops.
+    pub min_fee: Option<i64>,
+    /// Inclusive upper bound on total fee in stroops.
+    pub max_fee: Option<i64>,
+    /// Inclusive lower bound on the estimate timestamp (UTC).
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Inclusive upper bound on the estimate timestamp (UTC).
+    pub to: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl CacheFilter {
+    /// Validate filter parameters, returning an error for invalid inputs.
+    pub fn validate(&self) -> AppResult<()> {
+        if let Some(net) = &self.network {
+            crate::rpc::client::resolve_endpoint(net, None)?;
+        }
+        if let Some(f) = &self.function {
+            if f.is_empty() {
+                return Err(AppError::General(
+                    "function name filter cannot be empty".to_string(),
+                ));
+            }
+        }
+        if let Some(hash) = &self.wasm_hash {
+            let hash_trimmed = hash.trim();
+            if hash_trimmed.is_empty()
+                || hash_trimmed.len() > 64
+                || !hash_trimmed.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                return Err(AppError::General(format!(
+                    "invalid wasm hash filter {hash:?}: expected up to 64 hexadecimal characters"
+                )));
+            }
+        }
+        if let Some(min) = self.min_fee {
+            if min < 0 {
+                return Err(AppError::General(format!(
+                    "min-fee cannot be negative: {min}"
+                )));
+            }
+        }
+        if let Some(max) = self.max_fee {
+            if max < 0 {
+                return Err(AppError::General(format!(
+                    "max-fee cannot be negative: {max}"
+                )));
+            }
+        }
+        if let (Some(min), Some(max)) = (self.min_fee, self.max_fee) {
+            if min > max {
+                return Err(AppError::General(format!(
+                    "invalid fee range: min-fee ({min}) cannot exceed max-fee ({max})"
+                )));
+            }
+        }
+        if let (Some(since), Some(to)) = (self.since, self.to) {
+            if since > to {
+                return Err(AppError::General(format!(
+                    "invalid date range: since ({since}) cannot be after to ({to})"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Check whether a cached estimate satisfies all filter criteria.
+    pub fn matches(&self, entry: &CachedEstimate) -> bool {
+        if let Some(f) = &self.function {
+            if entry.function != *f {
+                return false;
+            }
+        }
+        if let Some(w) = &self.wasm_hash {
+            let entry_hash = entry.wasm_hash.to_ascii_lowercase();
+            let query_hash = w.trim().to_ascii_lowercase();
+            if !entry_hash.starts_with(&query_hash) {
+                return false;
+            }
+        }
+        if let Some(net) = &self.network {
+            if entry.network != *net {
+                return false;
+            }
+        }
+        if let Some(min) = self.min_fee {
+            if entry.total_stroops < min {
+                return false;
+            }
+        }
+        if let Some(max) = self.max_fee {
+            if entry.total_stroops > max {
+                return false;
+            }
+        }
+        if let Some(since) = &self.since {
+            let Some(ts) = parse_entry_timestamp(&entry.timestamp) else {
+                return false;
+            };
+            if ts < *since {
+                return false;
+            }
+        }
+        if let Some(to) = &self.to {
+            let Some(ts) = parse_entry_timestamp(&entry.timestamp) else {
+                return false;
+            };
+            if ts > *to {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Optional filters for [`query_estimates`] (legacy filter type).
+///
+/// Prefer using [`CacheFilter`] with [`query_cache`].
 #[derive(Debug, Clone, Default)]
 pub struct QueryFilter {
     /// Case-insensitive substring match against the function name.
@@ -108,6 +233,23 @@ pub struct QueryFilter {
     pub from: Option<String>,
     /// Inclusive upper bound on the estimate timestamp (ISO-8601).
     pub to: Option<String>,
+}
+
+impl From<QueryFilter> for CacheFilter {
+    fn from(q: QueryFilter) -> Self {
+        Self {
+            function: q.function,
+            wasm_hash: q.wasm_hash,
+            network: None,
+            min_fee: q.min_stroops,
+            max_fee: q.max_stroops,
+            since: q
+                .from
+                .as_deref()
+                .and_then(|s| parse_since_timestamp(s).ok()),
+            to: q.to.as_deref().and_then(|s| parse_to_timestamp(s).ok()),
+        }
+    }
 }
 
 /// Global lock for serializing cache writes.
@@ -467,85 +609,126 @@ pub fn list_cached_estimates(network: &str) -> AppResult<Vec<CachedEstimate>> {
     Ok(estimates)
 }
 
-/// Parse an ISO-8601 timestamp into a UTC `DateTime`.
-fn parse_ts(s: &str) -> AppResult<chrono::DateTime<chrono::Utc>> {
-    let dt = chrono::DateTime::parse_from_rfc3339(s)
-        .map_err(|e| AppError::General(format!("invalid timestamp {s:?}: {e}")))?;
-    Ok(dt.with_timezone(&chrono::Utc))
+/// Parse a timestamp from a cached estimate entry.
+fn parse_entry_timestamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let s = s.trim();
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    if let Ok(naive_dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Some(naive_dt.and_utc());
+    }
+    if let Ok(naive_dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+        return Some(naive_dt.and_utc());
+    }
+    None
+}
+
+/// Parse an ISO-8601 / RFC3339 timestamp or YYYY-MM-DD date into a UTC `DateTime`.
+pub fn parse_since_timestamp(s: &str) -> AppResult<chrono::DateTime<chrono::Utc>> {
+    let s = s.trim();
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&chrono::Utc));
+    }
+    if let Ok(naive_dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Ok(naive_dt.and_utc());
+    }
+    if let Ok(naive_dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+        return Ok(naive_dt.and_utc());
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        let naive_dt = date
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| AppError::General(format!("invalid date {s:?}")))?;
+        return Ok(naive_dt.and_utc());
+    }
+    Err(AppError::General(format!(
+        "invalid timestamp or date {s:?}: expected RFC3339 (e.g. 2026-01-01T00:00:00Z) or YYYY-MM-DD (e.g. 2026-01-01)"
+    )))
+}
+
+/// Parse an ISO-8601 / RFC3339 timestamp or YYYY-MM-DD date into a UTC `DateTime` for upper bound.
+pub fn parse_to_timestamp(s: &str) -> AppResult<chrono::DateTime<chrono::Utc>> {
+    let s = s.trim();
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&chrono::Utc));
+    }
+    if let Ok(naive_dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Ok(naive_dt.and_utc());
+    }
+    if let Ok(naive_dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+        return Ok(naive_dt.and_utc());
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        let naive_dt = date
+            .and_hms_opt(23, 59, 59)
+            .ok_or_else(|| AppError::General(format!("invalid date {s:?}")))?;
+        return Ok(naive_dt.and_utc());
+    }
+    Err(AppError::General(format!(
+        "invalid timestamp or date {s:?}: expected RFC3339 (e.g. 2026-01-01T23:59:59Z) or YYYY-MM-DD (e.g. 2026-01-01)"
+    )))
+}
+
+/// Find all cached estimates across all networks, ordered newest-first.
+pub fn list_all_cached_estimates() -> AppResult<Vec<CachedEstimate>> {
+    let conn = open_db()?;
+    let mut stmt = conn.prepare(
+        "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
+         cpu_instructions, memory_bytes, timestamp, duration_ms, success \
+         FROM estimates ORDER BY timestamp DESC",
+    )?;
+
+    let rows = stmt.query_map([], estimate_from_row)?;
+
+    let mut estimates = Vec::new();
+    for row in rows {
+        let cached = row?;
+        if let Ok(cached) = migrate_to_latest(cached) {
+            estimates.push(cached);
+        }
+    }
+
+    trace!(count = estimates.len(), "listed all cached estimates");
+    Ok(estimates)
+}
+
+/// Query cached estimates applying the optional filters in [`CacheFilter`].
+///
+/// If no filters are provided, returns all cached estimates.
+/// Results are returned newest-first (by `timestamp`).
+///
+/// # Network calls
+/// None — pure local SQLite I/O.
+pub fn query_cache(filter: &CacheFilter) -> AppResult<Vec<CachedEstimate>> {
+    filter.validate()?;
+
+    let mut estimates = match &filter.network {
+        Some(net) => list_cached_estimates(net)?,
+        None => list_all_cached_estimates()?,
+    };
+
+    // Newest-first ordering.
+    estimates.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+    let filtered: Vec<CachedEstimate> = estimates
+        .into_iter()
+        .filter(|e| filter.matches(e))
+        .collect();
+
+    trace!(count = filtered.len(), "queried cached estimates");
+    Ok(filtered)
 }
 
 /// Query cached estimates for `network`, applying the optional filters in
 /// [`QueryFilter`].
 ///
-/// Results are returned newest-first (by `timestamp`). The filters are:
-/// * `function` — case-insensitive substring match
-/// * `wasm_hash` — prefix match
-/// * `min_stroops` / `max_stroops` — inclusive `total_stroops` range
-/// * `from` / `to` — inclusive timestamp range (ISO-8601)
-///
 /// # Network calls
 /// None — pure file I/O.
 pub fn query_estimates(network: &str, filter: &QueryFilter) -> AppResult<Vec<CachedEstimate>> {
-    let mut estimates = list_cached_estimates(network)?;
-
-    // Newest-first ordering.
-    estimates.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-
-    let from_ts = match &filter.from {
-        Some(s) => Some(parse_ts(s)?),
-        None => None,
-    };
-    let to_ts = match &filter.to {
-        Some(s) => Some(parse_ts(s)?),
-        None => None,
-    };
-
-    let filtered: Vec<CachedEstimate> = estimates
-        .into_iter()
-        .filter(|e| {
-            if let Some(f) = &filter.function {
-                let f = f.to_lowercase();
-                if !e.function.to_lowercase().contains(f.as_str()) {
-                    return false;
-                }
-            }
-            if let Some(w) = &filter.wasm_hash {
-                if !e.wasm_hash.starts_with(w.as_str()) {
-                    return false;
-                }
-            }
-            if let Some(min) = filter.min_stroops {
-                if e.total_stroops < min {
-                    return false;
-                }
-            }
-            if let Some(max) = filter.max_stroops {
-                if e.total_stroops > max {
-                    return false;
-                }
-            }
-            if let Some(from) = &from_ts {
-                let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&e.timestamp) else {
-                    return false;
-                };
-                if ts.with_timezone(&chrono::Utc) < *from {
-                    return false;
-                }
-            }
-            if let Some(to) = &to_ts {
-                let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&e.timestamp) else {
-                    return false;
-                };
-                if ts.with_timezone(&chrono::Utc) > *to {
-                    return false;
-                }
-            }
-            true
-        })
-        .collect();
-
-    trace!(network, count = filtered.len(), "queried cached estimates");
-    Ok(filtered)
+    let mut cache_filter = CacheFilter::from(filter.clone());
+    cache_filter.network = Some(network.to_string());
+    query_cache(&cache_filter)
 }
 
 /// Export every cached estimate as a deterministic, JSON-serializable list.

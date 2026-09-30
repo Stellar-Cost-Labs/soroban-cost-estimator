@@ -247,28 +247,28 @@ pub enum CacheAction {
     /// Query cached estimates with optional filters.
     Query {
         /// Network to filter by.
-        #[arg(long, default_value = "testnet")]
-        network: String,
-
-        /// Filter by function name (case-insensitive substring match).
         #[arg(long)]
-        function: Option<String>,
+        network: Option<String>,
 
-        /// Filter by WASM hash prefix.
+        /// Filter by function name (--function, --fn).
+        #[arg(long = "fn", visible_alias = "function")]
+        r#fn: Option<String>,
+
+        /// Filter by WASM hash.
         #[arg(long)]
         wasm_hash: Option<String>,
 
-        /// Minimum total fee in stroops.
-        #[arg(long, value_name = "STROOPS")]
-        min_stroops: Option<i64>,
+        /// Minimum total fee in stroops (--min-stroops, --min-fee).
+        #[arg(long = "min-fee", visible_alias = "min-stroops", value_name = "FEE")]
+        min_fee: Option<i64>,
 
-        /// Maximum total fee in stroops.
-        #[arg(long, value_name = "STROOPS")]
-        max_stroops: Option<i64>,
+        /// Maximum total fee in stroops (--max-stroops, --max-fee).
+        #[arg(long = "max-fee", visible_alias = "max-stroops", value_name = "FEE")]
+        max_fee: Option<i64>,
 
-        /// Earliest timestamp (ISO-8601, e.g. "2024-06-01T00:00:00Z").
-        #[arg(long, value_name = "TIMESTAMP")]
-        from: Option<String>,
+        /// Earliest timestamp or date (--from, --since).
+        #[arg(long = "since", visible_alias = "from", value_name = "DATE/TIME")]
+        since: Option<String>,
 
         /// Latest timestamp (ISO-8601, e.g. "2024-12-31T23:59:59Z").
         #[arg(long, value_name = "TIMESTAMP")]
@@ -357,6 +357,12 @@ pub enum ConfigAction {
     Import {
         /// Path to the snapshot bundle file.
         bundle: String,
+    },
+
+    /// Query or manage the estimate cache.
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
     },
 }
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
