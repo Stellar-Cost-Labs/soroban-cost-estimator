@@ -214,6 +214,14 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
     let fallback = args.rpc_fallback_url.as_deref();
     let cli_format = args.format;
     let headers = args.headers;
+    // Bound the on-disk estimate cache before any command can write to it.
+    // A `--max-cache-size-mb` of 0 disables the byte quota; 0 entries
+    // disables the entry quota.
+    cache::set_cache_limits(cache::CacheLimits {
+        max_bytes: args.max_cache_size_mb.saturating_mul(1024 * 1024),
+        max_entries: args.max_cache_entries,
+    })?;
+
     let format = match cli_format {
         Some(fmt) => fmt,
         None => {
@@ -3012,8 +3020,10 @@ async fn handle_cache_action(
             )
             .await
         }
+        cli::CacheAction::List { network, json } => cmd_cache_list(&network, json),
         cli::CacheAction::Verify => cmd_cache_verify(),
         cli::CacheAction::Clear { network } => cmd_cache_clear(&network),
+        cli::CacheAction::Prune => cmd_cache_prune(),
         cli::CacheAction::Query {
             network,
             r#fn,
