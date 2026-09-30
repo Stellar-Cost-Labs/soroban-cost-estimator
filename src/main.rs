@@ -665,6 +665,7 @@ struct SimulationRequest<'a> {
     wasm_hash: &'a str,
     wasm_size: u64,
     functions: &'a [wasm::parser::FunctionInfo],
+    contract_meta: &'a wasm::parser::ContractMeta,
     network: &'a str,
     rpc_url: Option<&'a str>,
     rpc_fallback_url: Option<&'a str>,
@@ -792,6 +793,7 @@ async fn simulate_report(
         rpc_latency_ms,
         rates: Some(fee_rates),
         projections: None,
+        contract_meta: req.contract_meta.clone(),
     })
 }
 
@@ -1153,6 +1155,7 @@ async fn estimate_once(
             wasm_hash: &wasm_hash,
             wasm_size,
             functions: &wasm_info.functions,
+            contract_meta: &wasm_info.contract_meta,
             network,
             rpc_url,
             rpc_fallback_url,
@@ -1632,6 +1635,7 @@ async fn cmd_estimate_diff(
         wasm_hash: &old_hash,
         wasm_size: old_info.bytes.len() as u64,
         functions: &old_info.functions,
+        contract_meta: &old_info.contract_meta,
         network,
         rpc_url,
         rpc_fallback_url,
@@ -1652,6 +1656,7 @@ async fn cmd_estimate_diff(
         wasm_hash: &new_hash,
         wasm_size: new_info.bytes.len() as u64,
         functions: &new_info.functions,
+        contract_meta: &new_info.contract_meta,
         network,
         rpc_url,
         rpc_fallback_url,
@@ -3591,6 +3596,7 @@ mod tests {
                 total_xlm: "0.0000003".to_string(),
                 fee_percentages: std::collections::BTreeMap::new(),
             }),
+            contract_meta: ContractMeta::default(),
         }];
         let distribution =
             soroban_cost_estimator::report::cost_report::FeeDistribution::from_samples(
@@ -3728,6 +3734,7 @@ mod tests {
             rpc_latency_ms: 87,
             rates: None,
             projections: None,
+            contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
         }
     }
 

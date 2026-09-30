@@ -195,6 +195,11 @@ pub struct CostReport {
     /// Optional batch invocation cost projections.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub projections: Option<Vec<CostProjection>>,
+    /// Contract metadata parsed from the WASM `contractmeta` custom
+    /// section. Empty (and rendered as absent) when the binary carries no
+    /// decodable section; deserialized as empty from older payloads.
+    #[serde(default)]
+    pub contract_meta: ContractMeta,
 }
 
 /// A cost projection for a specific batch invocation count.
@@ -857,6 +862,7 @@ mod tests {
             rpc_latency_ms: 87,
             rates: Some(rates),
             projections: None,
+            contract_meta: ContractMeta::default(),
         }
     }
 
@@ -974,6 +980,7 @@ mod tests {
             rpc_latency_ms: 0,
             rates: None,
             projections: None,
+            contract_meta: ContractMeta::default(),
         };
 
         let table_out = format_report_table(&report);

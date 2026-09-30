@@ -1018,7 +1018,7 @@ mod tests {
         let old = make_snapshot(100, 5);
         let new = make_snapshot(200, 5);
         let diff = diff_snapshots(&old, &new);
-        let output = format_diff(&diff);
+        let output = format_diff(&diff, false, false, None);
         let expected = config_setting_human_name(&ConfigSettingId::ContractComputeV0);
         assert!(
             output.contains(expected),
