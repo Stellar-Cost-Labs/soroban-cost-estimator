@@ -198,6 +198,14 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
     let precision = args.precision;
     let fallback = args.rpc_fallback_url.as_deref();
     let headers = args.headers;
+    // Bound the on-disk estimate cache before any command can write to it.
+    // A `--max-cache-size-mb` of 0 disables the byte quota; 0 entries
+    // disables the entry quota.
+    cache::set_cache_limits(cache::CacheLimits {
+        max_bytes: args.max_cache_size_mb.saturating_mul(1024 * 1024),
+        max_entries: args.max_cache_entries,
+    })?;
+
     let format = match args.format {
         Some(fmt) => fmt,
         None => {
@@ -222,6 +230,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             clear_cache,
             json,
             auto_snapshot,
+            diff,
+            wasm_new,
             dry_run,
         } => {
             // `--format` wins when both it and the legacy `--json` flag are
@@ -250,6 +260,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 args.wasm_info,
                 args.verbose,
                 auto_snapshot,
+                diff,
+                wasm_new.as_deref(),
                 dry_run,
             )
             .await
@@ -381,6 +393,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 .await
             }
             cli::CacheAction::Verify => cmd_cache_verify(),
+            cli::CacheAction::Prune => cmd_cache_prune(),
             cli::CacheAction::List { network, json } => cmd_cache_list(&network, json),
             cli::CacheAction::Clear { network } => cmd_cache_clear(&network),
             cli::CacheAction::Query {
@@ -782,6 +795,8 @@ async fn cmd_estimate(
     wasm_info_flag: bool,
     verbose: bool,
     auto_snapshot: bool,
+    diff: bool,
+    wasm_new: Option<&str>,
     dry_run: bool,
 ) -> error::AppResult<()> {
     let json_flag = format == "json";
@@ -875,44 +890,32 @@ async fn cmd_estimate(
             return Ok(());
         }
 
-        let report = simulate_report(&SimulationRequest {
-            wasm_bytes: &wasm_info.bytes,
-            wasm_hash: &wasm_hash,
-            wasm_size,
-            functions: &wasm_info.functions,
-            network,
-            rpc_url,
-            rpc_fallback_url,
-            contract_id,
-            fn_name,
-            args,
-            rps,
-            timeout,
-            max_retries,
-            precision,
-            extra_headers,
-            verbose,
-        );
-
-        let sc_vals: Vec<stellar_xdr::ScVal> = args
-            .iter()
-            .map(|a| xdr_helper::parse_arg_scval(a))
-            .collect();
-        debug!(arg_count = sc_vals.len(), "parsed arguments");
-
-        let tx_xdr =
-            xdr_helper::build_simulation_tx_envelope(&wasm_info.bytes, contract_id, fn_name, &sc_vals)?;
-
-        xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
-        debug!(arg_count = args.len(), "validated arguments against contract spec");
-
-        let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
-        debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
-
         // In dry-run mode, print the planned simulation payload and exit
-        // without contacting the network. Useful for air-gapped environments
-        // or local contract verification.
+        // without contacting the network. The envelope is built here because
+        // no RPC traffic is performed.
         if dry_run {
+            let sc_vals: Vec<stellar_xdr::ScVal> = args
+                .iter()
+                .map(|a| xdr_helper::parse_arg_scval(a))
+                .collect();
+            debug!(arg_count = sc_vals.len(), "parsed arguments");
+
+            let tx_xdr = xdr_helper::build_simulation_tx_envelope(
+                &wasm_info.bytes,
+                contract_id,
+                fn_name,
+                &sc_vals,
+            )?;
+            xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
+            debug!(
+                arg_count = args.len(),
+                "validated arguments against contract spec"
+            );
+
+            let tx_b64 =
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
+            debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
+
             let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
             println!("Dry run — planned simulation payload (no network calls):");
             println!();
@@ -950,70 +953,25 @@ async fn cmd_estimate(
             return Ok(());
         }
 
-        // Fail fast on a misconfigured --rpc-url or down node (#55): validate
-        // the endpoint is reachable and healthy before running any simulation.
-        // Local argument errors above are reported first; this guards the
-        // (potentially expensive) simulateTransaction call itself.
-        client.health_check().await?;
-
-        // Time the simulateTransaction round-trip so the report can flag
-        // slow RPC endpoints. Includes any retries performed by the client.
-        let rpc_start = std::time::Instant::now();
-        let response = rpc::simulate::simulate_transaction(&client, &tx_b64).await?;
-        let rpc_latency_ms = rpc_start.elapsed().as_millis() as u64;
-
-        if missing_simulation_data(&response) {
-            return Err(error::AppError::SimulationFailed(
-                "simulation returned no cost data and no latest ledger — check --id, --fn, and the RPC endpoint".to_string(),
-            ));
-        }
-
-        let (cpu_instructions, memory_bytes, read_entries, write_entries, read_bytes, write_bytes) =
-            response_resources(&response)?;
-
-        let latest_ledger: u32 = response
-            .latest_ledger
-            .and_then(|l| u32::try_from(l).ok())
-            .unwrap_or(0);
-
-        let total_fee_stroops = rpc::simulate::parse_resource_fee(&response.min_resource_fee)
-            .unwrap_or(None)
-            .or(rpc::simulate::parse_transaction_data_resource_fee(
-                &response.transaction_data,
-            )?)
-            .unwrap_or(0);
-
-        debug!(cpu_instructions, memory_bytes, latest_ledger, total_fee_stroops, "simulation complete");
-
-        let fee_rates = fetch_fee_rates(&client).await;
-
-        let fee = report::fee_calc::compute_fee_breakdown(
-            total_fee_stroops,
-            cpu_instructions,
-            read_entries,
-            write_entries,
-            read_bytes,
-            tx_xdr.len() as u32,
-            fee_rates,
+        let report = simulate_report(&SimulationRequest {
+            wasm_bytes: &wasm_info.bytes,
+            wasm_hash: &wasm_hash,
+            wasm_size,
+            functions: &wasm_info.functions,
+            network,
+            rpc_url,
+            rpc_fallback_url,
+            contract_id,
+            fn_name,
+            args,
+            rps,
+            timeout,
+            max_retries,
             precision,
-        );
-
-        let report = report::cost_report::CostReport {
-            function: function_name.to_string(),
-            wasm_hash: wasm_hash.clone(),
-            cpu_instructions,
-            memory_bytes,
-            tx_size: tx_xdr.len() as u32,
-            read_entries,
-            write_entries,
-            read_bytes,
-            write_bytes,
-            fee: fee.clone(),
-            ledger: latest_ledger,
-            network: network.to_string(),
-            rpc_latency_ms,
-            rates: Some(fee_rates),
-        };
+            extra_headers,
+            verbose,
+        })
+        .await?;
 
         let _ = cache::save_estimate(
             &wasm_hash,
@@ -1057,7 +1015,10 @@ async fn cmd_estimate(
         if format == "table" {
             match cli::chart_width() {
                 Some(width) => {
-                    println!("{}", TableFormatter.format_with_options(&report, true, width));
+                    println!(
+                        "{}",
+                        TableFormatter.format_with_options(&report, true, width)
+                    );
                 }
                 None => {
                     println!(
