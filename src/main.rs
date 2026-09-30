@@ -638,6 +638,29 @@ fn emit_wasm_structure(
     }
 }
 
+/// Fetch the protocol limits used by [`report::cost_report::check_resource_limits`].
+///
+/// Only the settings that carry a limit are requested; entries that fail to
+/// decode leave the corresponding limits as `None` and are simply skipped.
+async fn fetch_network_config(
+    client: &rpc::client::RpcClient,
+) -> report::cost_report::NetworkConfig {
+    let mut snapshot = xdr_helper::begin_snapshot("", 0);
+    for setting in [
+        rpc::config::ConfigSettingId::ContractComputeV0,
+        rpc::config::ConfigSettingId::ContractLedgerCostV0,
+        rpc::config::ConfigSettingId::ContractBandwidthV0,
+    ] {
+        if let Ok(raw) = rpc::config::fetch_config_setting(client, setting).await {
+            if let Ok(entry) = xdr_helper::decode_config_entry_xdr(&raw.config_xdr, client.verbose)
+            {
+                xdr_helper::apply_config_entry(&mut snapshot, entry);
+            }
+        }
+    }
+    report::cost_report::NetworkConfig::from_snapshot(&snapshot)
+}
+
 /// `estimate` command: simulate a single invocation and print cost report.
 ///
 /// All RPC traffic (simulation and fee-rate fetches) goes through one
@@ -702,6 +725,7 @@ async fn cmd_estimate(
         args,
         cache_ttl,
         clear_cache,
+        history,
         format,
         precision,
         extra_headers,
@@ -808,6 +832,7 @@ async fn estimate_once(
     args: &[String],
     cache_ttl: Option<&str>,
     clear_cache: bool,
+    history: bool,
     format: &str,
     precision: u32,
     extra_headers: &[String],
@@ -1217,6 +1242,9 @@ async fn emit_watch_estimate(
         fn_name,
         args,
         None,
+        false,
+        // `--watch` prints its own per-build header, so the trend table is
+        // not rendered and history stays off.
         false,
         format,
         precision,
@@ -3039,8 +3067,6 @@ fn cmd_config_import(bundle: &str) -> error::AppResult<()> {
 mod tests {
     use super::EstimateAllResult;
     use super::EstimateAllStatus;
-    use super::format_estimate_all_csv;
-    use super::format_estimate_all_markdown;
     use super::parse_interval_secs;
     use super::settled_new_build_detected;
     use super::upgrade_detected;
@@ -3381,6 +3407,8 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
             rates: None,
+            warnings: Vec::new(),
+            history: None,
         }
     }
 
