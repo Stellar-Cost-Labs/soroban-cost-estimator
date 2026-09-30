@@ -340,8 +340,31 @@ pub enum CacheAction {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum SnapshotAction {
+    /// List saved snapshots: filename, network, timestamp, ledger sequence
+    /// and protocol version.
+    List {
+        /// Only list snapshots for this network (default: testnet).
+        #[arg(long, default_value = "testnet", conflicts_with = "all")]
+        network: String,
+
+        /// List snapshots for every network.
+        #[arg(long)]
+        all: bool,
+
+        /// Output a JSON array instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum ConfigAction {
+    /// Take a config snapshot, or manage saved snapshots (`list`).
+    #[command(args_conflicts_with_subcommands = true)]
     Snapshot {
+        #[command(subcommand)]
+        action: Option<SnapshotAction>,
         #[arg(long, default_value = "testnet")]
         network: String,
         #[arg(long)]

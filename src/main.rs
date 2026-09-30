@@ -326,7 +326,19 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cmd_wasm_info(&wasm, format)
         }
         cli::Command::Config { action } => match action {
-            cli::ConfigAction::Snapshot { network, out, json } => {
+            cli::ConfigAction::Snapshot {
+                action: Some(cli::SnapshotAction::List { network, all, json }),
+                ..
+            } => {
+                let network = env_string(network, &default_network, "SOROBAN_NETWORK");
+                cmd_config_snapshot_list_metadata((!all).then_some(network.as_str()), json)
+            }
+            cli::ConfigAction::Snapshot {
+                action: None,
+                network,
+                out,
+                json,
+            } => {
                 let format = match (args.format, json) {
                     (Some(fmt), _) => fmt,
                     (None, true) => cli::OutputFormat::Json,
@@ -2206,7 +2218,17 @@ async fn fetch_config_snapshot(
         if let Some(latest) = raw_entries.iter().map(|e| e.last_modified_ledger).max() {
             snapshot.ledger = latest;
         }
-        debug!(ledger = snapshot.ledger, "config snapshot built");
+        // The protocol version is informational (shown by `config snapshot
+        // list`), so a failure here must not lose the snapshot itself.
+        match rpc::config::fetch_protocol_version(&client).await {
+            Ok(version) => snapshot.protocol_version = Some(version),
+            Err(e) => warn!(error = %e, "could not fetch protocol version; recording none"),
+        }
+        debug!(
+            ledger = snapshot.ledger,
+            protocol_version = ?snapshot.protocol_version,
+            "config snapshot built"
+        );
         Ok(snapshot)
     }
     .instrument(span)
@@ -2314,6 +2336,50 @@ fn cmd_config_snapshot_list(network: &str) -> error::AppResult<()> {
             snapshot.timestamp, snapshot.ledger, path_str
         );
     }
+    Ok(())
+}
+
+/// `config snapshot list` command: table or JSON array of saved snapshot
+/// metadata. `network = None` lists every network.
+///
+/// # Network calls
+/// None — pure file I/O.
+fn cmd_config_snapshot_list_metadata(network: Option<&str>, json: bool) -> error::AppResult<()> {
+    let snapshots = config_snapshot::store::list_snapshots_metadata(network)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&snapshots)?);
+        return Ok(());
+    }
+
+    let scope = network.map_or_else(|| "any network".to_string(), |n| format!("network '{n}'"));
+    if snapshots.is_empty() {
+        println!("No snapshots found for {scope}. Run `config snapshot` to take one.");
+        return Ok(());
+    }
+
+    let mut table = Table::new();
+    table.set_header(vec![
+        "Filename",
+        "Network",
+        "Timestamp",
+        "Ledger Sequence",
+        "Protocol Version",
+    ]);
+    for s in &snapshots {
+        table.add_row(vec![
+            Cell::new(s.filename.as_str()),
+            Cell::new(s.network.as_str()),
+            Cell::new(s.timestamp.as_str()),
+            Cell::new(s.ledger_sequence),
+            Cell::new(
+                s.protocol_version
+                    .map_or_else(|| "-".to_string(), |v| v.to_string()),
+            ),
+        ]);
+    }
+    println!("{table}");
+    println!("{} snapshot(s) for {scope}.", snapshots.len());
     Ok(())
 }
 
@@ -3324,6 +3390,7 @@ mod tests {
             network: "testnet".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             ledger: 100,
+            protocol_version: None,
             contract_compute: Some(ContractComputeV0 {
                 ledger_max_instructions: 1_000_000,
                 tx_max_instructions: 100_000,
