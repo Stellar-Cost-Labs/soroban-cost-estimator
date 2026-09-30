@@ -764,7 +764,10 @@ async fn simulate_report(
         memory_bytes, latest_ledger, total_fee_stroops, "simulation complete"
     );
 
-    let fee_rates = fetch_fee_rates(&client).await;
+    // One batched config fetch for the whole run, reused by every fee
+    // evaluation below.
+    let config_cache = fetch_network_config(&client).await;
+    let fee_rates = fee_rates_from_config(config_cache.peek(), client.verbose);
 
     let fee = report::fee_calc::compute_fee_breakdown(
         total_fee_stroops,

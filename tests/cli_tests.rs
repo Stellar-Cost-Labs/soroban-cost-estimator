@@ -2476,7 +2476,9 @@ fn test_estimate_all_fetches_config_settings_exactly_once() {
     // Sanity check that the run really did produce per-function results.
     let parsed: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
-    let results = parsed.as_array().expect("estimate-all JSON is an array");
+    let results = parsed["functions"]
+        .as_array()
+        .expect("estimate-all JSON has a `functions` array; got: {stdout}");
     assert_eq!(results.len(), FUNCTIONS);
     for result in results {
         assert_eq!(result["status"], "ok", "function result: {result}");
