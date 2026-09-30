@@ -950,7 +950,7 @@ async fn estimate_once(
 
         if missing_simulation_data(&response) {
             return Err(error::AppError::SimulationFailed(
-                "simulation returned no cost data and no latest ledger — check --id, --fn, and the RPC endpoint".to_string(),
+                "simulation returned no cost data and no latest ledger: check --id, --fn, and the RPC endpoint".to_string(),
             ));
         }
 
@@ -987,6 +987,7 @@ async fn estimate_once(
         let report = report::cost_report::CostReport {
             function: function_name.to_string(),
             wasm_hash: wasm_hash.clone(),
+            wasm_size_bytes: u32::try_from(wasm_info.bytes.len()).unwrap_or(u32::MAX),
             cpu_instructions,
             memory_bytes,
             tx_size: tx_xdr.len() as u32,
@@ -1472,6 +1473,7 @@ async fn cmd_estimate_all(
         // the network cannot be reached.
         use sha2::Digest;
         let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
+        let wasm_size_bytes = u32::try_from(wasm_info.bytes.len()).unwrap_or(u32::MAX);
 
         let json_flag = format == "json";
         let text_mode = format == "table" || format == "markdown";
@@ -1531,6 +1533,12 @@ async fn cmd_estimate_all(
         let mut csv_rows: Vec<String> = Vec::new();
 
         let mut json_results: Vec<EstimateAllResult> = Vec::new();
+        // Per-function reports for the aggregated summary (#320). Only
+        // successful simulations contribute, so the aggregates describe real
+        // measurements rather than placeholders.
+        let mut reports: Vec<report::cost_report::CostReport> = Vec::new();
+        let mut skipped = 0usize;
+        let mut errored = 0usize;
         let total = wasm_info.functions.len();
         debug!(total, "enumerated functions");
 
@@ -1538,7 +1546,7 @@ async fn cmd_estimate_all(
             if text_mode {
                 println!("[{}/{}] {}", i + 1, total, fn_info.name);
             }
-            let result = estimate_all_function(
+            let (result, cost_report) = estimate_all_function(
                 &client,
                 &wasm_info,
                 fn_info,
@@ -1548,8 +1556,14 @@ async fn cmd_estimate_all(
                 json_flag,
                 fee_rates.as_ref(),
                 precision,
+                wasm_size_bytes,
             )
             .await?;
+            match result.status {
+                EstimateAllStatus::Ok => reports.push(cost_report),
+                EstimateAllStatus::Skipped => skipped += 1,
+                EstimateAllStatus::Error => errored += 1,
+            }
             if format == "csv" {
                 let row = csv_row(&result);
                 csv_rows.push(row);
@@ -1607,7 +1621,13 @@ async fn cmd_estimate_all(
         emit_fee_range_summary(&fees, format == "json", precision);
 
         if format == "json" {
-            println!("{}", serde_json::to_string_pretty(&json_results)?);
+            // A single JSON document carrying both the per-function records and
+            // the aggregate, so `--json` output stays parseable as a whole.
+            let payload = serde_json::json!({
+                "functions": json_results,
+                "summary": summary,
+            });
+            println!("{}", serde_json::to_string_pretty(&payload)?);
         } else if format == "csv" {
             println!("function,network,ledger,wasm_hash,cpu_instructions,memory_bytes,read_entries,write_entries,read_bytes,write_bytes,tx_size,non_refundable_stroops,refundable_stroops,total_stroops,total_xlm");
             for row in &csv_rows {
@@ -1621,44 +1641,14 @@ async fn cmd_estimate_all(
     .await
 }
 
-/// Emit the aggregate fee-range summary for an `estimate-all` batch (#223).
-///
-/// In human mode it is printed as three lines. The fee range is intentionally
-/// omitted from the structured JSON array (which already contains a per-function
-/// `fee` record); callers can derive min/max/average from those records.
-fn emit_fee_range_summary(fees: &[i64], json_flag: bool, precision: u32) {
-    if json_flag {
-        return;
-    }
-    let Some(range) = report::fee_calc::fee_range(fees) else {
-        println!("No functions estimated; no fee range to report.");
-        return;
-    };
-
-    println!();
-    println!("Fee range across {} function(s):", range.count);
-    println!(
-        "  min: {} stroops ({})",
-        range.min_stroops,
-        report::fee_calc::stroops_to_xlm(range.min_stroops, precision)
-    );
-    println!(
-        "  max: {} stroops ({})",
-        range.max_stroops,
-        report::fee_calc::stroops_to_xlm(range.max_stroops, precision)
-    );
-    println!(
-        "  avg: {} stroops ({})",
-        range.avg_stroops,
-        report::fee_calc::stroops_to_xlm(range.avg_stroops, precision)
-    );
-}
-
 /// Estimates one exported function against the network, returning a well-typed
-/// [`EstimateAllResult`].
+/// [`EstimateAllResult`] plus the matching [`report::cost_report::CostReport`].
 ///
-/// The returned record is always built; in table mode it is printed directly
-/// and discarded, while JSON mode collects every record into a uniform array.
+/// Both records describe the same simulation: the result is the uniform
+/// per-function record that `estimate-all` serializes, and the report carries
+/// the full resource footprint the batch summary aggregates. Skipped and
+/// errored functions return an empty report placeholder so the caller can
+/// classify by looking at the result's status.
 #[allow(clippy::too_many_lines)]
 async fn estimate_all_function(
     client: &rpc::client::RpcClient,
@@ -1670,19 +1660,48 @@ async fn estimate_all_function(
     json_flag: bool,
     fee_rates: Option<&report::fee_calc::FeeRates>,
     precision: u32,
-) -> error::AppResult<EstimateAllResult> {
+    wasm_size_bytes: u32,
+) -> error::AppResult<(EstimateAllResult, report::cost_report::CostReport)> {
     use tracing::{Instrument, debug, info_span};
 
     let span =
         info_span!("estimate_all_function", fn = %fn_info.name, param_count = fn_info.param_count);
     async {
+        // Placeholder report for a function that was not simulated; the caller
+        // discards it based on the returned status.
+        let placeholder = || report::cost_report::CostReport {
+            function: fn_info.name.clone(),
+            wasm_hash: wasm_hash.to_string(),
+            wasm_size_bytes,
+            cpu_instructions: 0,
+            memory_bytes: 0,
+            tx_size: 0,
+            read_entries: 0,
+            write_entries: 0,
+            read_bytes: 0,
+            write_bytes: 0,
+            fee: report::fee_calc::FeeBreakdown {
+                non_refundable_stroops: 0,
+                refundable_stroops: 0,
+                cpu_fee_stroops: 0,
+                storage_fee_stroops: 0,
+                bandwidth_fee_stroops: 0,
+                total_stroops: 0,
+                total_xlm: report::fee_calc::stroops_to_xlm(0, precision),
+            },
+            ledger: 0,
+            network: network.to_string(),
+            rpc_latency_ms: 0,
+            rates: None,
+        };
+
         if fn_info.param_count > 0 {
             let reason = format!("needs --fn/--arg ({} param(s))", fn_info.param_count);
             debug!(reason, "skipping function");
             if !json_flag {
                 println!("── Estimating '{}' ── Skipped: {reason}", fn_info.name);
             }
-            return Ok(EstimateAllResult::skipped(&fn_info.name, reason));
+            return Ok((EstimateAllResult::skipped(&fn_info.name, reason), placeholder()));
         }
 
         let tx_xdr = match xdr_helper::build_simulation_tx_envelope(
@@ -1697,7 +1716,10 @@ async fn estimate_all_function(
                 if !json_flag {
                     eprintln!("── Estimating '{}' ── Skipped: {e}", fn_info.name);
                 }
-                return Ok(EstimateAllResult::skipped(&fn_info.name, e.to_string()));
+                return Ok((
+                    EstimateAllResult::skipped(&fn_info.name, e.to_string()),
+                    placeholder(),
+                ));
             }
         };
         let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
@@ -1706,14 +1728,17 @@ async fn estimate_all_function(
         let sim_start = std::time::Instant::now();
         match rpc::simulate::simulate_transaction(client, &tx_b64).await {
             Ok(resp) => {
-                let duration_ms = Some(sim_start.elapsed().as_millis() as u64);
+                let duration_ms = sim_start.elapsed().as_millis() as u64;
                 if missing_simulation_data(&resp) {
-                    let msg = "simulation returned no cost data and no latest ledger — check --id and the RPC endpoint";
+                    let msg = "simulation returned no cost data and no latest ledger: check --id and the RPC endpoint";
                     debug!(msg, "simulation missing data");
                     if !json_flag {
                         eprintln!("── Estimating '{}' ── Error: {msg}", fn_info.name);
                     }
-                    return Ok(EstimateAllResult::errored(&fn_info.name, msg));
+                    return Ok((
+                        EstimateAllResult::errored(&fn_info.name, msg),
+                        placeholder(),
+                    ));
                 }
 
                 let (cpu, mem, read_entries, write_entries, read_bytes, write_bytes) =
@@ -1741,7 +1766,7 @@ async fn estimate_all_function(
                     total_fee,
                     cpu,
                     mem,
-                    duration_ms,
+                    Some(duration_ms),
                     true,
                 );
 
@@ -1778,30 +1803,52 @@ async fn estimate_all_function(
                     );
                 }
 
-                Ok(EstimateAllResult {
-                    function: fn_info.name.clone(),
-                    status: EstimateAllStatus::Ok,
-                    reason: None,
-                    error: None,
-                    wasm_hash: Some(wasm_hash.to_string()),
-                    network: Some(network.to_string()),
-                    ledger: Some(ledger),
-                    cpu_instructions: Some(cpu),
-                    memory_bytes: Some(mem),
-                    read_entries: Some(read_entries),
-                    write_entries: Some(write_entries),
-                    read_bytes: Some(read_bytes),
-                    write_bytes: Some(write_bytes),
-                    tx_size: Some(tx_xdr.len() as u32),
-                    fee: Some(fee),
-                })
+                Ok((
+                    EstimateAllResult {
+                        function: fn_info.name.clone(),
+                        status: EstimateAllStatus::Ok,
+                        reason: None,
+                        error: None,
+                        wasm_hash: Some(wasm_hash.to_string()),
+                        network: Some(network.to_string()),
+                        ledger: Some(ledger),
+                        cpu_instructions: Some(cpu),
+                        memory_bytes: Some(mem),
+                        read_entries: Some(read_entries),
+                        write_entries: Some(write_entries),
+                        read_bytes: Some(read_bytes),
+                        write_bytes: Some(write_bytes),
+                        tx_size: Some(tx_xdr.len() as u32),
+                        fee: Some(fee.clone()),
+                    },
+                    report::cost_report::CostReport {
+                        function: fn_info.name.clone(),
+                        wasm_hash: wasm_hash.to_string(),
+                        wasm_size_bytes,
+                        cpu_instructions: cpu,
+                        memory_bytes: mem,
+                        tx_size: u32::try_from(tx_xdr.len()).unwrap_or(u32::MAX),
+                        read_entries,
+                        write_entries,
+                        read_bytes,
+                        write_bytes,
+                        fee,
+                        ledger,
+                        network: network.to_string(),
+                        rpc_latency_ms: duration_ms,
+                        rates: fee_rates.copied(),
+                    },
+                ))
             }
             Err(e) => {
                 debug!(error = %e, "simulation failed");
                 if !json_flag {
                     eprintln!("Skipped — simulation failed: {e}");
                 }
-                Ok(EstimateAllResult::errored(&fn_info.name, e.to_string()))
+                Ok((
+                    EstimateAllResult::errored(&fn_info.name, e.to_string()),
+                    placeholder(),
+                ))
             }
         }
     }
@@ -2802,11 +2849,12 @@ async fn cmd_cache_warm(
         rps,
         timeout,
         max_retries,
-        7,
+        report::fee_calc::DEFAULT_PRECISION,
         extra_headers,
         false,
         verbose,
         false,
+        report_options,
     )
     .await
 }

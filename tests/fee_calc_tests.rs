@@ -64,7 +64,8 @@ fn test_whole_only_overflow_is_rejected() {
     // 922337203686 * 10^7 exceeds i64::MAX → checked_mul overflow.
     let err = xlm_to_stroops("922337203686").unwrap_err();
     assert!(
-        err.to_string().contains("overflow"),
+        err.to_string()
+            .contains("XLM value is out of range for stroops"),
         "unexpected error: {err}"
     );
     // Far beyond i64 range: the parse itself fails (reported as invalid).
@@ -76,7 +77,8 @@ fn test_fractional_overflow_is_rejected() {
     // One stroop past i64::MAX: checked_add overflows on the fraction.
     let err = xlm_to_stroops("922337203685.4775808").unwrap_err();
     assert!(
-        err.to_string().contains("overflow"),
+        err.to_string()
+            .contains("XLM value is out of range for stroops"),
         "unexpected error: {err}"
     );
 }

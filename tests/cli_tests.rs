@@ -596,7 +596,7 @@ fn test_estimate_nonexistent_wasm_file() {
         "runtime failures are reported on stderr as `Error: …`; got: {stderr}"
     );
     assert!(
-        stderr.contains("File not found"),
+        stderr.contains("file not found"),
         "a missing file should surface as a file not found error; got: {stderr}"
     );
 }
@@ -879,7 +879,7 @@ fn test_estimate_all_nonexistent_wasm_file() {
     let (_, stderr, code) = run_cli(&["estimate-all", "--wasm", "no/such/file.wasm"]);
     assert_eq!(code, 1, "a missing WASM file should exit 1");
     assert!(
-        stderr.contains("File not found"),
+        stderr.contains("file not found"),
         "a missing file should surface as a file not found error; got: {stderr}"
     );
 }
@@ -1015,7 +1015,7 @@ fn test_cache_warm_nonexistent_wasm_file() {
         "a missing WASM file should exit 1; stderr: {stderr}"
     );
     assert!(
-        stderr.contains("File not found") || stderr.contains("Error: failed to perform I/O"),
+        stderr.contains("file not found") || stderr.contains("Error: failed to perform I/O"),
         "stderr: {stderr}"
     );
 }

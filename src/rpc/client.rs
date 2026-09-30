@@ -280,8 +280,12 @@ impl RpcClient {
     /// to every request.
     ///
     /// Behaves exactly like [`Self::with_fallback`] and additionally attaches
-    /// the parsed `"Key: Value"` headers (skipping any entry that cannot be
-    /// parsed or that has an empty value) to every outbound request.
+    /// the parsed headers to every outbound request.
+    ///
+    /// # Errors
+    /// Returns [`AppError::InvalidHeader`] when any supplied header is
+    /// malformed. Validation happens before any network traffic so a bad
+    /// `--header` argument fails immediately.
     pub fn with_fallback_headers(
         url: &str,
         fallback_url: Option<&str>,
@@ -297,6 +301,7 @@ impl RpcClient {
             rps,
             ?timeout,
             max_retries,
+            headers = %redacted_headers(headers),
             "creating RPC client"
         );
         let headers = parseheaders(headers);
@@ -636,23 +641,123 @@ fn deserialize_result<T: serde::de::DeserializeOwned>(value: Value) -> AppResult
         .map_err(|e| AppError::General(format!("failed to deserialize RPC response: {e}")))
 }
 
-/// Parse a `"Key: Value"` string into an HTTP header name and value.
+/// Header names whose values are credentials and must never be logged.
 ///
-/// Returns an error if the format is invalid (missing colon, empty key,
-/// or non-ASCII characters in the header name).
-fn parse_header(raw: &str) -> Result<(HeaderName, HeaderValue), String> {
-    let colon_pos = raw.find(':').ok_or("missing ':' separator")?;
-    let name_str = raw[..colon_pos].trim();
-    let value_str = raw[colon_pos + 1..].trim();
+/// Matching is case-insensitive (HTTP header names are), so `X-Api-Key` and
+/// `x-api-key` are both redacted.
+const SENSITIVE_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "api-key",
+    "cookie",
+];
+
+/// Placeholder substituted for a sensitive header value in logs.
+const REDACTED: &str = "<redacted>";
+
+/// True when `name` identifies a header whose value must never be logged.
+#[must_use]
+pub fn is_sensitive_header(name: &HeaderName) -> bool {
+    let lower = name.as_str().to_ascii_lowercase();
+    SENSITIVE_HEADERS.iter().any(|s| *s == lower)
+}
+
+/// Returns a copy of `headers` with every sensitive value replaced by
+/// `<redacted>`.
+///
+/// Used for diagnostics (`--verbose` / `debug!` logs) so an API key or bearer
+/// token is never written to a terminal, log file, or CI transcript.
+#[must_use]
+pub fn redact_sensitive(headers: &HeaderMap) -> HeaderMap {
+    let mut redacted = HeaderMap::with_capacity(headers.len());
+    for (name, value) in headers {
+        if is_sensitive_header(name) {
+            let placeholder = HeaderValue::from_static(REDACTED);
+            redacted.insert(name.clone(), placeholder);
+        } else {
+            redacted.insert(name.clone(), value.clone());
+        }
+    }
+    redacted
+}
+
+/// Renders raw `"Key: Value"` / `"Key=Value"` CLI arguments for logging, with
+/// sensitive values redacted before they ever reach a log sink.
+///
+/// Operates on the raw strings (rather than a parsed `HeaderMap`) so it can be
+/// called before validation, while a malformed argument is still being
+/// reported.
+fn redacted_headers(raw_headers: &[String]) -> String {
+    if raw_headers.is_empty() {
+        return "(none)".to_string();
+    }
+    let rendered: Vec<String> = raw_headers
+        .iter()
+        .map(|raw| match split_header(raw) {
+            Some((name, _)) if is_sensitive_header_text(name) => format!("{name}={REDACTED}"),
+            _ => raw.clone(),
+        })
+        .collect();
+    rendered.join(", ")
+}
+
+/// True when the (case-insensitive) `name` is a credential-bearing header.
+fn is_sensitive_header_text(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    SENSITIVE_HEADERS.iter().any(|s| *s == lower)
+}
+
+/// Splits a raw header argument into `(name, value)`.
+///
+/// Both spellings are accepted: `KEY=VALUE` (documented) and `KEY: VALUE`
+/// (the conventional HTTP form). The **earliest** separator wins, so
+/// `Authorization=Bearer a:b` and `Authorization: Bearer a=b` both split after
+/// the header name instead of truncating the value at a later separator.
+fn split_header(raw: &str) -> Option<(&str, &str)> {
+    let equals = raw.find('=');
+    let colon = raw.find(':');
+    let position = match (equals, colon) {
+        (Some(equals), Some(colon)) => equals.min(colon),
+        (Some(equals), None) => equals,
+        (None, Some(colon)) => colon,
+        (None, None) => return None,
+    };
+    let (name, value) = raw.split_at(position);
+    Some((name.trim(), value[1..].trim()))
+}
+
+/// Parse a single raw header argument into an HTTP header name and value.
+///
+/// # Errors
+/// Returns [`AppError::InvalidHeader`] when the argument has no `=`/`:`
+/// separator, when the header name is empty, or when `reqwest` rejects the
+/// name or value (illegal characters, non-visible ASCII, …).
+pub fn parse_header(raw: &str) -> AppResult<(HeaderName, HeaderValue)> {
+    let Some((name_str, value_str)) = split_header(raw) else {
+        return Err(AppError::InvalidHeader(format!(
+            "'{raw}' is not a KEY=VALUE pair (or KEY: VALUE)"
+        )));
+    };
 
     if name_str.is_empty() {
-        return Err("empty header name".to_string());
+        return Err(AppError::InvalidHeader(format!(
+            "'{raw}' has an empty header name"
+        )));
     }
 
     let name = HeaderName::from_bytes(name_str.as_bytes())
-        .map_err(|e| format!("invalid header name: {e}"))?;
-    let value =
-        HeaderValue::from_str(value_str).map_err(|e| format!("invalid header value: {e}"))?;
+        .map_err(|e| AppError::InvalidHeader(format!("invalid header name '{name_str}': {e}")))?;
+
+    if value_str.is_empty() {
+        return Err(AppError::InvalidHeader(format!(
+            "header '{name_str}' has an empty value"
+        )));
+    }
+
+    let value = HeaderValue::from_str(value_str).map_err(|e| {
+        AppError::InvalidHeader(format!("invalid header value for '{name_str}': {e}"))
+    })?;
 
     Ok((name, value))
 }
@@ -668,7 +773,7 @@ fn parseheaders(rawheaders: &[String]) -> HeaderMap {
             }
         }
     }
-    headers
+    Ok(headers)
 }
 
 #[cfg(test)]
@@ -1344,42 +1449,119 @@ mod tests {
 mod header_tests {
     use super::*;
 
+    fn parse_ok(raw: &str) -> (String, String) {
+        let (name, value) =
+            parse_header(raw).unwrap_or_else(|e| panic!("expected {raw:?} to parse: {e}"));
+        (
+            name.as_str().to_string(),
+            value.to_str().unwrap_or_default().to_string(),
+        )
+    }
+
+    fn parse_err(raw: &str) -> AppError {
+        parse_header(raw).expect_err(&format!("expected {raw:?} to be rejected"))
+    }
+
     #[test]
-    fn test_parse_header_valid() {
-        let (name, value) = parse_header("X-API-Key: secret123").unwrap();
-        assert_eq!(name.as_str(), "x-api-key");
-        assert_eq!(value.to_str().unwrap(), "secret123");
+    fn test_parse_header_equals_separator() {
+        assert_eq!(
+            parse_ok("X-API-Key=secret123"),
+            ("x-api-key".to_string(), "secret123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_header_colon_separator_still_accepted() {
+        assert_eq!(
+            parse_ok("X-API-Key: secret123"),
+            ("x-api-key".to_string(), "secret123".to_string())
+        );
     }
 
     #[test]
     fn test_parse_header_with_spaces() {
-        let (name, value) = parse_header(" Authorization : Bearer tok ").unwrap();
-        assert_eq!(name.as_str(), "authorization");
-        assert_eq!(value.to_str().unwrap(), "Bearer tok");
+        assert_eq!(
+            parse_ok(" Authorization = Bearer tok "),
+            ("authorization".to_string(), "Bearer tok".to_string())
+        );
+        assert_eq!(
+            parse_ok(" Authorization : Bearer tok "),
+            ("authorization".to_string(), "Bearer tok".to_string())
+        );
     }
 
-    #[test]
-    fn test_parse_header_missing_colon() {
-        assert!(parse_header("NoColon").is_err());
-    }
-
-    #[test]
-    fn test_parse_header_empty_name() {
-        assert!(parse_header(": value").is_err());
-    }
-
-    #[test]
-    fn test_parse_header_empty_value() {
-        let (name, value) = parse_header("X-Custom:").unwrap();
-        assert_eq!(name.as_str(), "x-custom");
-        assert_eq!(value.to_str().unwrap(), "");
-    }
-
+    /// A `Bearer` token may legitimately contain both `=` and `:`. The earliest
+    /// separator must win so the value is never truncated.
     #[test]
     fn test_parse_header_value_with_colons() {
-        let (name, value) = parse_header("X-Auth: token:with:colons").unwrap();
-        assert_eq!(name.as_str(), "x-auth");
-        assert_eq!(value.to_str().unwrap(), "token:with:colons");
+        assert_eq!(
+            parse_ok("X-Auth=token:with:colons"),
+            ("x-auth".to_string(), "token:with:colons".to_string())
+        );
+        assert_eq!(
+            parse_ok("X-Auth: token:with:colons"),
+            ("x-auth".to_string(), "token:with:colons".to_string())
+        );
+    }
+
+    /// `=` is documented, but `:` is the conventional HTTP spelling and both
+    /// appear in the wild. The earliest separator wins in either direction.
+    #[test]
+    fn test_parse_header_accepts_both_separators() {
+        assert_eq!(
+            parse_ok("X-Auth: Bearer a=b"),
+            ("x-auth".to_string(), "Bearer a=b".to_string())
+        );
+        assert_eq!(
+            parse_ok("X-Auth=Bearer a:b"),
+            ("x-auth".to_string(), "Bearer a:b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_header_missing_separator_is_rejected() {
+        let err = parse_err("NoSeparator");
+        assert!(matches!(err, AppError::InvalidHeader(_)));
+        assert!(
+            err.to_string().contains("KEY=VALUE"),
+            "the error should name the expected format; got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_header_empty_name_is_rejected() {
+        assert!(matches!(parse_err("= value"), AppError::InvalidHeader(_)));
+        assert!(matches!(parse_err(": value"), AppError::InvalidHeader(_)));
+    }
+
+    #[test]
+    fn test_parse_header_empty_value_is_rejected() {
+        let err = parse_err("X-Custom=");
+        assert!(matches!(err, AppError::InvalidHeader(_)));
+        assert!(err.to_string().contains("empty value"), "got: {err}");
+    }
+
+    /// A header name with a space is not a legal HTTP token, so `reqwest`
+    /// rejects it — the error must surface rather than be dropped.
+    #[test]
+    fn test_parse_header_illegal_name_is_rejected() {
+        let err = parse_err("X Custom=value");
+        assert!(matches!(err, AppError::InvalidHeader(_)));
+        assert!(
+            err.to_string().contains("invalid header name"),
+            "got: {err}"
+        );
+    }
+
+    /// A value containing a raw newline is not a legal header value.
+    #[test]
+    fn test_parse_header_illegal_value_is_rejected() {
+        let err = parse_err("X-Custom=bad\nvalue");
+        assert!(matches!(err, AppError::InvalidHeader(_)));
+        assert!(
+            err.to_string().contains("invalid header value"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1409,8 +1591,8 @@ mod header_tests {
         let client = RpcClient::with_headers(
             "http://localhost",
             &[
-                "X-API-Key: secret".to_string(),
-                "Authorization: Bearer tok".to_string(),
+                "X-API-Key=secret".to_string(),
+                "Authorization=Bearer tok".to_string(),
             ],
             false,
         );
@@ -1435,6 +1617,8 @@ mod header_tests {
         );
     }
 
+    /// Malformed arguments must fail the command: silently dropping them would
+    /// send unauthenticated requests to a private endpoint.
     #[test]
     fn test_parse_headers_skips_malformed() {
         let headers = parseheaders(&[
@@ -1452,9 +1636,9 @@ mod header_tests {
         let client = RpcClient::with_headers(
             "http://localhost",
             &[
-                "Good: ok".to_string(),
-                "NoColonHere".to_string(),
-                "Also-Bad:".to_string(),
+                "Good=ok".to_string(),
+                "NoSeparator".to_string(),
+                "Also-Bad=".to_string(),
             ],
             false,
         );
@@ -1467,5 +1651,107 @@ mod header_tests {
     fn test_rpc_client_new_has_no_customheaders() {
         let client = RpcClient::new("http://localhost");
         assert!(client.custom_headers().is_empty());
+    }
+
+    // ── Redaction ────────────────────────────────────────────────
+
+    #[test]
+    fn test_sensitive_header_detection_is_case_insensitive() {
+        for name in [
+            "Authorization",
+            "authorization",
+            "AUTHORIZATION",
+            "X-API-Key",
+            "x-api-key",
+            "Api-Key",
+            "Proxy-Authorization",
+            "Cookie",
+        ] {
+            let parsed = HeaderName::from_bytes(name.as_bytes()).expect("valid name");
+            assert!(is_sensitive_header(&parsed), "{name} must be redacted");
+        }
+        for name in ["X-Trace-Id", "User-Agent", "Accept"] {
+            let parsed = HeaderName::from_bytes(name.as_bytes()).expect("valid name");
+            assert!(!is_sensitive_header(&parsed), "{name} must not be redacted");
+        }
+    }
+
+    #[test]
+    fn test_redact_sensitive_replaces_values_but_keeps_names() {
+        let raw = vec![
+            "Authorization=Bearer super-secret".to_string(),
+            "X-API-Key=key-123".to_string(),
+            "X-Trace-Id=trace-9".to_string(),
+        ];
+        let parsed = parse_headers(&raw).expect("valid headers");
+        let redacted = redact_sensitive(&parsed);
+
+        assert_eq!(
+            redacted.get("authorization").unwrap().to_str().unwrap(),
+            REDACTED
+        );
+        assert_eq!(
+            redacted.get("x-api-key").unwrap().to_str().unwrap(),
+            REDACTED
+        );
+        // Non-sensitive headers stay readable — that is the point of logging them.
+        assert_eq!(
+            redacted.get("x-trace-id").unwrap().to_str().unwrap(),
+            "trace-9"
+        );
+    }
+
+    #[test]
+    fn test_client_exposes_redacted_headers_only() {
+        let client = RpcClient::with_headers(
+            "http://localhost",
+            &["Authorization=Bearer super-secret".to_string()],
+        )
+        .expect("valid headers");
+        let redacted = client.redacted_headers();
+        assert_eq!(
+            redacted.get("authorization").unwrap().to_str().unwrap(),
+            REDACTED
+        );
+        // The live value is still on the client — only the log copy is masked.
+        assert_eq!(
+            client
+                .headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer super-secret"
+        );
+    }
+
+    /// The debug log renders raw CLI arguments, so it must not leak a secret
+    /// even before/without parsing.
+    #[test]
+    fn test_redacted_headers_renders_raw_arguments_safely() {
+        let raw = vec![
+            "Authorization=Bearer super-secret".to_string(),
+            "X-API-Key: key-123".to_string(),
+            "X-Trace-Id=trace-9".to_string(),
+        ];
+        let rendered = redacted_headers(&raw);
+        assert!(!rendered.contains("super-secret"), "leaked: {rendered}");
+        assert!(!rendered.contains("key-123"), "leaked: {rendered}");
+        assert!(
+            rendered.contains("trace-9"),
+            "lost a safe value: {rendered}"
+        );
+        assert!(
+            rendered.contains("Authorization"),
+            "lost the name: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_redacted_headers_handles_empty_and_malformed() {
+        assert_eq!(redacted_headers(&[]), "(none)");
+        // A malformed argument has no name to classify; it is echoed verbatim
+        // because it cannot carry a parsed credential name.
+        assert_eq!(redacted_headers(&["garbage".to_string()]), "garbage");
     }
 }
