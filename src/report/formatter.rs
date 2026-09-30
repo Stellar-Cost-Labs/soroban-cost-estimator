@@ -31,8 +31,46 @@ pub trait ReportFormatter {
 /// This is the default output format used by the CLI.
 pub struct TableFormatter;
 
-impl ReportFormatter for TableFormatter {
-    fn format(&self, report: &CostReport) -> String {
+fn build_resource_table(report: &CostReport) -> comfy_table::Table {
+    let mut table = comfy_table::Table::new();
+    if crate::cli::should_colorize() {
+        table.enforce_styling();
+    } else {
+        table.force_no_tty();
+    }
+    table.set_header(vec!["Resource", "Consumed", "Fee (stroops)"]);
+
+    table.add_row(vec![
+        "CPU Instructions",
+        &report.cpu_instructions.to_string(),
+        "",
+    ]);
+    table.add_row(vec!["Memory Bytes", &report.memory_bytes.to_string(), ""]);
+    table.add_row(vec!["Read Entries", &report.read_entries.to_string(), ""]);
+    table.add_row(vec!["Write Entries", &report.write_entries.to_string(), ""]);
+    table.add_row(vec!["Read Bytes", &report.read_bytes.to_string(), ""]);
+    table.add_row(vec!["Write Bytes", &report.write_bytes.to_string(), ""]);
+    table.add_row(vec!["Transaction Size", &report.tx_size.to_string(), ""]);
+    table
+}
+
+impl TableFormatter {
+    /// Format a report as a human-readable table, choosing whether to append
+    /// the fee-distribution bar chart.
+    ///
+    /// `show_chart` is supplied by the CLI, which disables the chart in
+    /// `--quiet` mode and for piped/non-TTY output; `chart_width` is the
+    /// terminal width the chart bars are scaled to. [`ReportFormatter::format`]
+    /// always renders the chart at the default width so output stays
+    /// deterministic for snapshot tests and libraries that call it directly.
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn format_with_options(
+        &self,
+        report: &CostReport,
+        show_chart: bool,
+        chart_width: usize,
+    ) -> String {
         let mut output = String::new();
 
         output.push_str(&format!("Function: {}\n", report.function));
@@ -40,29 +78,14 @@ impl ReportFormatter for TableFormatter {
             "Network: {} (ledger {})\n",
             report.network, report.ledger
         ));
+        output.push_str(&format!(
+            "Simulated at ledger sequence: {}\n",
+            crate::report::cost_report::format_ledger_sequence(report.ledger)
+        ));
         output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
         output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
 
-        let mut table = comfy_table::Table::new();
-        if crate::cli::should_colorize() {
-            table.enforce_styling();
-        } else {
-            table.force_no_tty();
-        }
-        table.set_header(vec!["Resource", "Consumed", "Fee (stroops)"]);
-
-        table.add_row(vec![
-            "CPU Instructions",
-            &report.cpu_instructions.to_string(),
-            "",
-        ]);
-        table.add_row(vec!["Memory Bytes", &report.memory_bytes.to_string(), ""]);
-        table.add_row(vec!["Read Entries", &report.read_entries.to_string(), ""]);
-        table.add_row(vec!["Write Entries", &report.write_entries.to_string(), ""]);
-        table.add_row(vec!["Read Bytes", &report.read_bytes.to_string(), ""]);
-        table.add_row(vec!["Write Bytes", &report.write_bytes.to_string(), ""]);
-        table.add_row(vec!["Transaction Size", &report.tx_size.to_string(), ""]);
-
+        let table = build_resource_table(report);
         output.push_str(&table.to_string());
         output.push('\n');
 
@@ -127,12 +150,22 @@ impl ReportFormatter for TableFormatter {
         output.push_str(&fee_table.to_string());
         output.push('\n');
 
-        // ASCII bar chart for a quick visual summary of where the fee goes.
-        output.push_str(&crate::report::cost_report::format_cost_breakdown_chart(
-            report.fee.total_stroops,
-            report.fee.non_refundable_stroops,
-            report.fee.refundable_stroops,
-        ));
+        // The fee bar chart is a human-only visual; the CLI omits it for
+        // `--quiet` and non-TTY output by passing `show_chart = false`.
+        // `render_fee_bar_chart` returns an empty string when there is nothing
+        // to visualize, so the surrounding blank lines stay constant.
+        if show_chart {
+            output.push_str(&crate::report::cost_report::render_fee_bar_chart(
+                &report.fee,
+                chart_width,
+            ));
+        }
+
+        if let Some(ref projections) = report.projections {
+            output.push_str(&crate::report::cost_report::format_projections_table(
+                projections,
+            ));
+        }
 
         output.push('\n');
         output.push_str(&crate::report::cost_report::format_suggestions(
@@ -140,6 +173,16 @@ impl ReportFormatter for TableFormatter {
         ));
 
         output
+    }
+}
+
+impl ReportFormatter for TableFormatter {
+    fn format(&self, report: &CostReport) -> String {
+        self.format_with_options(
+            report,
+            true,
+            crate::report::cost_report::DEFAULT_CHART_WIDTH,
+        )
     }
 
     fn name(&self) -> &'static str {
@@ -244,6 +287,10 @@ impl ReportFormatter for MarkdownFormatter {
             "- **Network:** {} (ledger {})\n",
             report.network, report.ledger
         ));
+        output.push_str(&format!(
+            "- **Simulated at ledger sequence:** `{}`\n",
+            crate::report::cost_report::format_ledger_sequence(report.ledger)
+        ));
         output.push_str(&format!("- **WASM hash:** `{}`\n", report.wasm_hash));
         output.push_str(&format!(
             "- **RPC round-trip:** {} ms\n\n",
@@ -305,6 +352,25 @@ impl ReportFormatter for MarkdownFormatter {
             "| **Total** | **{}** ({}) | **100.0%** |\n",
             report.fee.total_stroops, report.fee.total_xlm,
         ));
+
+        if let Some(ref projections) = report.projections {
+            output.push_str("\n### Cost Projections\n\n");
+            output.push_str("| Invocations | Total Stroops | Total XLM | USD |\n");
+            output.push_str("| ---: | ---: | ---: | ---: |\n");
+            for p in projections {
+                let usd_str = p
+                    .usd
+                    .map(|u| format!("${u:.2}"))
+                    .unwrap_or_else(|| "-".to_string());
+                output.push_str(&format!(
+                    "| {} | {} | {} | {} |\n",
+                    crate::report::cost_report::format_thousands_u64(p.invocations),
+                    crate::report::cost_report::format_thousands(p.total_stroops),
+                    p.total_xlm,
+                    usd_str
+                ));
+            }
+        }
 
         // Optimization suggestions
         output.push_str("\n### Optimization Suggestions\n\n");
@@ -381,6 +447,7 @@ mod tests {
         CostReport {
             function: "increment".to_string(),
             wasm_hash: "abc123def456".to_string(),
+            wasm_size: 4_096,
             cpu_instructions: 532_502,
             memory_bytes: 0,
             tx_size: 156,
@@ -403,6 +470,7 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
             rates: None,
+            projections: None,
         }
     }
 
@@ -410,6 +478,7 @@ mod tests {
         CostReport {
             function: "(wasm upload)".to_string(),
             wasm_hash: "0000000000000000".to_string(),
+            wasm_size: 0,
             cpu_instructions: 0,
             memory_bytes: 0,
             tx_size: 0,
@@ -432,6 +501,7 @@ mod tests {
             network: "mainnet".to_string(),
             rpc_latency_ms: 0,
             rates: None,
+            projections: None,
         }
     }
 
@@ -450,6 +520,16 @@ mod tests {
         let output = formatter.format(&sample_report());
         assert!(output.contains("testnet"));
         assert!(output.contains("3894195"));
+    }
+
+    #[test]
+    fn test_table_formatter_shows_grouped_ledger_sequence() {
+        let formatter = TableFormatter;
+        let output = formatter.format(&sample_report());
+        assert!(
+            output.contains("Simulated at ledger sequence: 3,894,195"),
+            "got: {output}"
+        );
     }
 
     #[test]
@@ -492,26 +572,31 @@ mod tests {
     fn test_table_formatter_contains_chart() {
         let formatter = TableFormatter;
         let output = formatter.format(&sample_report());
-        assert!(output.contains("Fee Breakdown Chart:"));
-        assert!(output.contains("Non-refundable"));
-        assert!(output.contains("Refundable"));
+        assert!(output.contains("Fee Distribution:"));
         // Only rows after the chart header belong to the chart — the fee
-        // breakdown section above also names both components.
+        // breakdown table above also names several components.
         let chart_start = output
-            .find("Fee Breakdown Chart:")
-            .expect("table output should contain the fee breakdown chart");
+            .find("Fee Distribution:")
+            .expect("table output should contain the fee bar chart");
         let chart_lines: Vec<&str> = output[chart_start..]
             .lines()
-            .filter(|l| l.contains("Non-refundable") || l.contains("Refundable"))
+            .filter(|line| line.contains(" | "))
             .collect();
         assert_eq!(
             chart_lines.len(),
-            2,
-            "chart should render one row per non-zero fee component"
+            4,
+            "chart should render one row per fee component"
         );
-        for line in &chart_lines {
-            assert!(line.contains('#'), "chart line should contain '#': {line}");
+        for label in ["CPU", "Storage I/O", "Bandwidth", "Rent"] {
+            assert!(
+                output[chart_start..].contains(label),
+                "chart should visualize {label}: {output}"
+            );
         }
+        assert!(
+            output[chart_start..].contains('█'),
+            "chart should use block characters: {output}"
+        );
     }
 
     #[test]
@@ -519,7 +604,17 @@ mod tests {
         let formatter = TableFormatter;
         let output = formatter.format(&empty_report());
         // Chart section should not be present when all fees are zero
-        assert!(!output.contains("Fee Breakdown Chart:"));
+        assert!(!output.contains("Fee Distribution:"));
+    }
+
+    #[test]
+    fn test_table_formatter_can_disable_chart() {
+        let formatter = TableFormatter;
+        let output = formatter.format_with_options(&sample_report(), false, 80);
+        assert!(!output.contains("Fee Distribution:"));
+        // Everything else in the report is still rendered.
+        assert!(output.contains("Fee Breakdown:"));
+        assert!(output.contains("Optimization Suggestions:"));
     }
 
     // ── JSON formatter ───────────────────────────────────────────────
@@ -539,7 +634,7 @@ mod tests {
         let output = formatter.format(&sample_report());
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["wasm_hash"], "abc123def456");
-        assert_eq!(parsed["ledger"], 3_894_195);
+        assert_eq!(parsed["ledger_sequence"], 3_894_195);
         assert_eq!(parsed["network"], "testnet");
         assert_eq!(parsed["rpc_latency_ms"], 87);
         assert_eq!(parsed["fee"]["total_stroops"], 15_527);
@@ -673,6 +768,7 @@ mod tests {
         let formatter = MarkdownFormatter;
         let output = formatter.format(&sample_report());
         assert!(output.contains("**Network:** testnet (ledger 3894195)"));
+        assert!(output.contains("- **Simulated at ledger sequence:** `3,894,195`"));
         assert!(output.contains("**WASM hash:** `abc123def456`"));
         assert!(output.contains("**RPC round-trip:** 87 ms"));
     }
@@ -733,5 +829,32 @@ mod tests {
                 formatter.name()
             );
         }
+    }
+
+    #[test]
+    fn test_formatters_with_projections() {
+        use crate::report::cost_report::CostProjection;
+        let mut report = sample_report();
+        report.projections = Some(vec![CostProjection {
+            invocations: 100,
+            total_stroops: 1_552_700,
+            total_xlm: "0.1552700".to_string(),
+            usd: Some(0.18),
+        }]);
+
+        let table_out = TableFormatter.format(&report);
+        assert!(table_out.contains("Cost Projections:"));
+        assert!(table_out.contains("100"));
+        assert!(table_out.contains("1,552,700"));
+        assert!(table_out.contains("$0.18"));
+
+        let json_out = JsonFormatter.format(&report);
+        assert!(json_out.contains("\"projections\""));
+        assert!(json_out.contains("1552700"));
+        assert!(json_out.contains("0.18"));
+
+        let md_out = MarkdownFormatter.format(&report);
+        assert!(md_out.contains("### Cost Projections"));
+        assert!(md_out.contains("| 100 | 1,552,700 | 0.1552700 | $0.18 |"));
     }
 }

@@ -49,6 +49,10 @@ fn build_version() -> &'static str {
 #[command(version = build_version())]
 #[command(about = "Estimate Soroban contract costs & track network pricing changes", long_about = None)]
 pub struct Cli {
+    /// Optional TOML config file path. Defaults to ~/.config/soroban-cost-estimator/config.toml.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub config: Option<String>,
+
     /// Select output format for commands that produce structured output (table, json, csv, markdown).
     #[arg(long, global = true, value_enum)]
     pub format: Option<OutputFormat>,
@@ -90,6 +94,36 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub wasm_info: bool,
 
+    /// Maximum on-disk estimate cache size, in megabytes. When exceeded,
+    /// the least-recently-accessed estimates are evicted down to 90% of the
+    /// limit. 0 disables the byte quota.
+    #[arg(long, global = true, value_name = "MB", default_value_t = 50)]
+    pub max_cache_size_mb: u64,
+
+    /// Maximum number of cached estimates. When exceeded, the
+    /// least-recently-accessed estimates are evicted down to 90% of the
+    /// limit. 0 disables the entry quota.
+    #[arg(long, global = true, value_name = "N", default_value_t = 10_000)]
+    pub max_cache_entries: usize,
+
+    /// Suppress non-essential output, including the fee-distribution chart.
+    #[arg(long, short, global = true)]
+    pub quiet: bool,
+
+    /// Number of decimal places shown for XLM fee values (0..=7, default 7).
+    ///
+    /// Stellar amounts are denominated in stroops (1 XLM = 10,000,000
+    /// stroops, i.e. 7 decimals). Lower values give shorter, currency-style
+    /// displays; 7 keeps full stroop fidelity.
+    #[arg(
+        long,
+        global = true,
+        value_name = "N",
+        default_value_t = crate::report::fee_calc::DEFAULT_PRECISION,
+        value_parser = clap::value_parser!(u32).range(0..=7),
+    )]
+    pub precision: u32,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -121,14 +155,41 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Number of decimal places for XLM fee values (0..=18, default 7).
-        #[arg(long, default_value_t = 7)]
-        precision: u32,
-
         /// Automatically save a new config snapshot if network pricing
         /// configuration has changed since the last snapshot.
         #[arg(long)]
         auto_snapshot: bool,
+
+        /// Compare two WASM builds and print a side-by-side cost diff.
+        /// Requires `--wasm-new`.
+        #[arg(long, requires = "wasm_new")]
+        diff: bool,
+
+        /// The "new" WASM build to compare against when `--diff` is set.
+        /// The `--wasm` file is treated as the baseline ("old") build.
+        #[arg(long, value_name = "PATH")]
+        wasm_new: Option<String>,
+
+        /// Watch the WASM file for rebuilds and re-estimate on every change,
+        /// printing a header with the timestamp and the fee change versus the
+        /// previous build (Ctrl-C stops watching and exits with code 0).
+        #[arg(long)]
+        watch: bool,
+
+        /// Parse WASM, validate arguments, and print the planned simulation
+        /// payload without contacting the network. Useful for air-gapped
+        /// environments or local contract verification.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Project costs for batch invocations (comma-separated counts, e.g. "100,1000,10000").
+        #[arg(
+            long,
+            value_name = "COUNTS",
+            num_args = 0..=1,
+            default_missing_value = "100,1000,10000"
+        )]
+        project: Option<String>,
     },
     EstimateAll {
         #[arg(long, short)]
@@ -145,10 +206,6 @@ pub enum Command {
         id: Option<String>,
         #[arg(long)]
         json: bool,
-
-        /// Number of decimal places for XLM fee values (0..=18, default 7).
-        #[arg(long, default_value_t = 7)]
-        precision: u32,
 
         /// Automatically save a new config snapshot if network pricing
         /// configuration has changed since the last snapshot.
@@ -196,6 +253,17 @@ pub enum CacheAction {
         out: Option<String>,
     },
 
+    /// List every cached estimate for a network (newest first).
+    List {
+        /// Network whose cached estimates to list.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+
+        /// Output the full cached-estimate records as a JSON array.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Check that every cached estimate is valid JSON and not corrupted.
     Verify,
 
@@ -224,31 +292,35 @@ pub enum CacheAction {
         json: bool,
     },
 
+    /// Evict least-recently-accessed estimates until the cache fits its
+    /// configured quota (`--max-cache-size-mb` / `--max-cache-entries`).
+    Prune,
+
     /// Query cached estimates with optional filters.
     Query {
         /// Network to filter by.
-        #[arg(long, default_value = "testnet")]
-        network: String,
-
-        /// Filter by function name (case-insensitive substring match).
         #[arg(long)]
-        function: Option<String>,
+        network: Option<String>,
 
-        /// Filter by WASM hash prefix.
+        /// Filter by function name (--function, --fn).
+        #[arg(long = "fn", visible_alias = "function")]
+        r#fn: Option<String>,
+
+        /// Filter by WASM hash.
         #[arg(long)]
         wasm_hash: Option<String>,
 
-        /// Minimum total fee in stroops.
-        #[arg(long, value_name = "STROOPS")]
-        min_stroops: Option<i64>,
+        /// Minimum total fee in stroops (--min-stroops, --min-fee).
+        #[arg(long = "min-fee", visible_alias = "min-stroops", value_name = "FEE")]
+        min_fee: Option<i64>,
 
-        /// Maximum total fee in stroops.
-        #[arg(long, value_name = "STROOPS")]
-        max_stroops: Option<i64>,
+        /// Maximum total fee in stroops (--max-stroops, --max-fee).
+        #[arg(long = "max-fee", visible_alias = "max-stroops", value_name = "FEE")]
+        max_fee: Option<i64>,
 
-        /// Earliest timestamp (ISO-8601, e.g. "2024-06-01T00:00:00Z").
-        #[arg(long, value_name = "TIMESTAMP")]
-        from: Option<String>,
+        /// Earliest timestamp or date (--from, --since).
+        #[arg(long = "since", visible_alias = "from", value_name = "DATE/TIME")]
+        since: Option<String>,
 
         /// Latest timestamp (ISO-8601, e.g. "2024-12-31T23:59:59Z").
         #[arg(long, value_name = "TIMESTAMP")]
@@ -292,6 +364,10 @@ pub enum ConfigAction {
         #[arg(long)]
         against: Option<String>,
 
+        /// Diff the two most recent on-disk snapshots against each other
+        /// instead of the live network. Never contacts the RPC endpoint.
+        #[arg(long, conflicts_with = "against")]
+        against_previous: bool,
         /// Hide non-pricing changes and display only fee-rate adjustments.
         #[arg(long)]
         pricing_only: bool,
@@ -338,10 +414,70 @@ pub enum ConfigAction {
         /// Path to the snapshot bundle file.
         bundle: String,
     },
+
+    /// Query or manage the estimate cache.
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
 }
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 pub static COLOR_CHOICE: AtomicU8 = AtomicU8::new(0);
+
+/// Global `--quiet` state, mirroring [`COLOR_CHOICE`]. Set once from the
+/// parsed CLI so deeply nested helpers (e.g. chart rendering) can consult it
+/// without threading a flag through every call site.
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+/// Record whether `--quiet` was passed.
+pub fn init_quiet(quiet: bool) {
+    QUIET.store(quiet, Ordering::Relaxed);
+}
+
+/// Whether the user asked for quiet output.
+#[must_use]
+pub fn is_quiet() -> bool {
+    QUIET.load(Ordering::Relaxed)
+}
+
+/// Terminal width to render the fee bar chart at, or `None` when the chart
+/// must be suppressed.
+///
+/// The chart is disabled in `--quiet` mode, when stdout is not a TTY (piped
+/// or redirected output), and when the terminal is narrower than
+/// `crate::report::cost_report::MIN_CHART_WIDTH` columns. Column count is read
+/// from `COLUMNS` when set and otherwise assumed to be
+/// `crate::report::cost_report::DEFAULT_CHART_WIDTH`.
+#[must_use]
+pub fn chart_width() -> Option<usize> {
+    use std::io::IsTerminal;
+
+    let columns = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok());
+    chart_width_for(is_quiet(), std::io::stdout().is_terminal(), columns)
+}
+
+/// Pure decision function behind [`chart_width`]: given the `--quiet` flag,
+/// whether stdout is a TTY, and the reported terminal width, decide whether to
+/// render the fee bar chart and at what width.
+///
+/// Split out from [`chart_width`] so the gating rules (quiet, non-TTY, and
+/// minimum width) can be unit tested without a real terminal.
+#[must_use]
+pub fn chart_width_for(quiet: bool, is_tty: bool, columns: Option<usize>) -> Option<usize> {
+    use crate::report::cost_report::{DEFAULT_CHART_WIDTH, MIN_CHART_WIDTH};
+
+    if quiet || !is_tty {
+        return None;
+    }
+    match columns {
+        Some(width) if width >= MIN_CHART_WIDTH => Some(width),
+        Some(_) => None,
+        None => Some(DEFAULT_CHART_WIDTH),
+    }
+}
 
 pub fn init_color(choice: clap::ColorChoice) {
     let val = match choice {
@@ -360,5 +496,28 @@ pub fn should_colorize() -> bool {
             use std::io::IsTerminal;
             std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::report::cost_report::DEFAULT_CHART_WIDTH;
+
+    #[test]
+    fn test_chart_width_for_gating() {
+        // Suppressed in quiet mode and for piped/non-TTY output.
+        assert_eq!(chart_width_for(true, true, Some(120)), None);
+        assert_eq!(chart_width_for(false, false, Some(120)), None);
+        // Suppressed on terminals narrower than the minimum.
+        assert_eq!(chart_width_for(false, true, Some(79)), None);
+        // Rendered at the minimum width and scaled to the real width.
+        assert_eq!(chart_width_for(false, true, Some(80)), Some(80));
+        assert_eq!(chart_width_for(false, true, Some(120)), Some(120));
+        // Unknown width falls back to the default assumption.
+        assert_eq!(
+            chart_width_for(false, true, None),
+            Some(DEFAULT_CHART_WIDTH)
+        );
     }
 }

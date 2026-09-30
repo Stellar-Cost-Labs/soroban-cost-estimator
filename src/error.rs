@@ -66,6 +66,12 @@ pub enum AppError {
     #[error("failed to load snapshots: none available for network {0}")]
     NoSnapshots(String),
 
+    #[error(
+        "failed to load snapshots: need at least 2 for network {network}, found {found} \
+         (run `config snapshot --network {network}` to capture another)"
+    )]
+    NotEnoughSnapshots { network: String, found: usize },
+
     // ── Simulation ──────────────────────────────────────────────────
     #[error("failed to simulate transaction: {0}")]
     SimulationFailed(String),
@@ -78,6 +84,9 @@ pub enum AppError {
     FeeCalc(String),
 
     // ── Config ──────────────────────────────────────────────────────
+    #[error("failed to process config: {0}")]
+    Config(String),
+
     #[error("failed to fetch config: {0}")]
     ConfigFetch(String),
 
