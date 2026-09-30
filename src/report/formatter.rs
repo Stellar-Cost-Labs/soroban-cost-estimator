@@ -85,6 +85,14 @@ impl TableFormatter {
         output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
         output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
 
+        // Contract metadata from the WASM `contractmeta` section: always
+        // rendered (present or absent) so the report states whether the
+        // binary carried one.
+        output.push_str(&crate::wasm::parser::format_contract_meta(
+            &report.contract_meta,
+        ));
+        output.push_str("\n\n");
+
         let table = build_resource_table(report);
         output.push_str(&table.to_string());
         output.push('\n');
@@ -471,6 +479,7 @@ mod tests {
             rpc_latency_ms: 87,
             rates: None,
             projections: None,
+            contract_meta: crate::wasm::parser::ContractMeta::default(),
         }
     }
 
@@ -502,6 +511,7 @@ mod tests {
             rpc_latency_ms: 0,
             rates: None,
             projections: None,
+            contract_meta: crate::wasm::parser::ContractMeta::default(),
         }
     }
 
@@ -615,6 +625,44 @@ mod tests {
         // Everything else in the report is still rendered.
         assert!(output.contains("Fee Breakdown:"));
         assert!(output.contains("Optimization Suggestions:"));
+    }
+
+    #[test]
+    fn test_table_formatter_contract_meta() {
+        let formatter = TableFormatter;
+        let mut report = sample_report();
+        report.contract_meta = crate::wasm::parser::ContractMeta {
+            name: Some("MetaContract".to_string()),
+            version: Some("9.9.9".to_string()),
+            description: None,
+            author: None,
+            sdk_version: Some("25.3.2".to_string()),
+            entries: vec![
+                ("name".to_string(), "MetaContract".to_string()),
+                ("version".to_string(), "9.9.9".to_string()),
+                ("rssdkver".to_string(), "25.3.2".to_string()),
+            ],
+        };
+        let output = formatter.format(&report);
+        assert!(output.contains("Contract meta: present"));
+        assert!(output.contains("name: MetaContract"));
+        assert!(output.contains("version: 9.9.9"));
+        assert!(output.contains("sdk_version: 25.3.2"));
+        // Recognized keys are folded into typed fields, not repeated below.
+        assert!(!output.contains("  rssdkver:"));
+
+        // JSON payload carries the same metadata.
+        let json = JsonFormatter.format(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(parsed["contract_meta"]["name"], "MetaContract");
+        assert_eq!(parsed["contract_meta"]["sdk_version"], "25.3.2");
+    }
+
+    #[test]
+    fn test_table_formatter_contract_meta_absent() {
+        let formatter = TableFormatter;
+        let output = formatter.format(&empty_report());
+        assert!(output.contains("Contract meta: absent"));
     }
 
     // ── JSON formatter ───────────────────────────────────────────────

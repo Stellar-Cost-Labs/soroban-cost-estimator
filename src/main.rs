@@ -66,6 +66,11 @@ pub struct EstimateAllResult {
     pub tx_size: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fee: Option<report::fee_calc::FeeBreakdown>,
+    /// Contract metadata parsed from the WASM `contractmeta` custom section
+    /// of the binary being estimated. Omitted when the binary carries no
+    /// decodable section.
+    #[serde(default, skip_serializing_if = "wasm::parser::ContractMeta::is_empty")]
+    pub contract_meta: wasm::parser::ContractMeta,
 }
 
 impl EstimateAllResult {
@@ -87,6 +92,7 @@ impl EstimateAllResult {
             write_bytes: None,
             tx_size: None,
             fee: None,
+            contract_meta: wasm::parser::ContractMeta::default(),
         }
     }
 
@@ -108,6 +114,7 @@ impl EstimateAllResult {
             write_bytes: None,
             tx_size: None,
             fee: None,
+            contract_meta: wasm::parser::ContractMeta::default(),
         }
     }
 }
@@ -681,6 +688,7 @@ struct SimulationRequest<'a> {
     wasm_hash: &'a str,
     wasm_size: u64,
     functions: &'a [wasm::parser::FunctionInfo],
+    contract_meta: &'a wasm::parser::ContractMeta,
     network: &'a str,
     rpc_url: Option<&'a str>,
     rpc_fallback_url: Option<&'a str>,
@@ -808,6 +816,7 @@ async fn simulate_report(
         rpc_latency_ms,
         rates: Some(fee_rates),
         projections: None,
+        contract_meta: req.contract_meta.clone(),
     })
 }
 
@@ -1169,6 +1178,7 @@ async fn estimate_once(
             wasm_hash: &wasm_hash,
             wasm_size,
             functions: &wasm_info.functions,
+            contract_meta: &wasm_info.contract_meta,
             network,
             rpc_url,
             rpc_fallback_url,
@@ -1648,6 +1658,7 @@ async fn cmd_estimate_diff(
         wasm_hash: &old_hash,
         wasm_size: old_info.bytes.len() as u64,
         functions: &old_info.functions,
+        contract_meta: &old_info.contract_meta,
         network,
         rpc_url,
         rpc_fallback_url,
@@ -1668,6 +1679,7 @@ async fn cmd_estimate_diff(
         wasm_hash: &new_hash,
         wasm_size: new_info.bytes.len() as u64,
         functions: &new_info.functions,
+        contract_meta: &new_info.contract_meta,
         network,
         rpc_url,
         rpc_fallback_url,
@@ -2080,6 +2092,7 @@ async fn estimate_all_function(
                     write_bytes: Some(write_bytes),
                     tx_size: Some(tx_xdr.len() as u32),
                     fee: Some(fee),
+                    contract_meta: wasm_info.contract_meta.clone(),
                 })
             }
             Err(e) => {
@@ -2176,6 +2189,8 @@ fn wasm_info_json(
             "name": wasm_info.contract_meta.name,
             "version": wasm_info.contract_meta.version,
             "description": wasm_info.contract_meta.description,
+            "author": wasm_info.contract_meta.author,
+            "sdk_version": wasm_info.contract_meta.sdk_version,
             "entries": wasm_info.contract_meta.entries.iter().map(|(key, value)| {
                 serde_json::json!({ "key": key, "value": value })
             }).collect::<Vec<_>>(),
@@ -3579,6 +3594,11 @@ mod tests {
         assert_eq!(value["sha256"], "deadbeef");
         assert_eq!(value["has_spec"], true);
         assert_eq!(value["contract_meta"]["name"], serde_json::Value::Null);
+        assert_eq!(value["contract_meta"]["author"], serde_json::Value::Null);
+        assert_eq!(
+            value["contract_meta"]["sdk_version"],
+            serde_json::Value::Null
+        );
         assert_eq!(value["contract_meta"]["entries"], serde_json::json!([]));
         assert_eq!(value["functions"][0]["name"], "increment");
         assert_eq!(value["functions"][0]["params"][0]["name"], "step");
@@ -3614,6 +3634,18 @@ mod tests {
                     total_xlm: "0.0000003".to_string(),
                     fee_percentages: std::collections::BTreeMap::new(),
                 }),
+                contract_meta: ContractMeta {
+                    name: Some("MetaContract".to_string()),
+                    version: Some("9.9.9".to_string()),
+                    description: None,
+                    author: None,
+                    sdk_version: Some("25.3.2".to_string()),
+                    entries: vec![
+                        ("name".to_string(), "MetaContract".to_string()),
+                        ("version".to_string(), "9.9.9".to_string()),
+                        ("rssdkver".to_string(), "25.3.2".to_string()),
+                    ],
+                },
             },
             EstimateAllResult::skipped("needs_args", "needs --fn/--arg (1 param(s))"),
             EstimateAllResult::errored("bad", "boom"),
@@ -3631,6 +3663,9 @@ mod tests {
         assert_eq!(ok["fee"]["total_stroops"], 3);
         assert!(ok.get("reason").is_none());
         assert!(ok.get("error").is_none());
+        // Contract metadata rides along on successful estimates.
+        assert_eq!(ok["contract_meta"]["name"], "MetaContract");
+        assert_eq!(ok["contract_meta"]["sdk_version"], "25.3.2");
 
         // skipped entry carries status + reason, omits resources/fee.
         let skipped = &value[1];
@@ -3638,6 +3673,8 @@ mod tests {
         assert_eq!(skipped["reason"], "needs --fn/--arg (1 param(s))");
         assert!(skipped.get("cpu_instructions").is_none());
         assert!(skipped.get("fee").is_none());
+        // Absent contract meta is omitted entirely, not emitted as `{}`.
+        assert!(skipped.get("contract_meta").is_none());
 
         // error entry carries status + error.
         let errored = &value[2];
@@ -3673,6 +3710,7 @@ mod tests {
                 total_xlm: "0.0000003".to_string(),
                 fee_percentages: std::collections::BTreeMap::new(),
             }),
+            contract_meta: ContractMeta::default(),
         }];
         let distribution =
             soroban_cost_estimator::report::cost_report::FeeDistribution::from_samples(
@@ -3810,6 +3848,7 @@ mod tests {
             rpc_latency_ms: 87,
             rates: None,
             projections: None,
+            contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
         }
     }
 
