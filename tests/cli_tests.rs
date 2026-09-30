@@ -2327,6 +2327,38 @@ fn test_estimate_wasm_new_requires_diff() {
 }
 
 #[test]
+fn test_estimate_diff_requires_function_signature_in_both_wasms() {
+    for (old_wasm, new_wasm, missing_flag) in [
+        (
+            "tests/fixtures/minimal.wasm",
+            "tests/fixtures/contract.wasm",
+            "--wasm",
+        ),
+        (
+            "tests/fixtures/contract.wasm",
+            "tests/fixtures/minimal.wasm",
+            "--wasm-new",
+        ),
+    ] {
+        let (_, stderr, code) = run_cli(&[
+            "estimate",
+            "--wasm",
+            old_wasm,
+            "--wasm-new",
+            new_wasm,
+            "--diff",
+            "--fn",
+            "increment",
+        ]);
+        assert_ne!(code, 0, "missing signature from {missing_flag} must fail");
+        assert!(
+            stderr.contains(&format!("missing from {missing_flag} WASM")),
+            "error should identify missing signature in {missing_flag}; got: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn test_estimate_diff_table_end_to_end() {
     let (rpc_url, _stop) = start_mock_rpc_server("", "1000", 100);
     let home = temp_home("estimate-diff-table");
