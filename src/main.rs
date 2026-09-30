@@ -66,6 +66,11 @@ pub struct EstimateAllResult {
     pub tx_size: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fee: Option<report::fee_calc::FeeBreakdown>,
+    /// Contract metadata parsed from the WASM `contractmeta` custom section
+    /// of the binary being estimated. Omitted when the binary carries no
+    /// decodable section.
+    #[serde(default, skip_serializing_if = "wasm::parser::ContractMeta::is_empty")]
+    pub contract_meta: wasm::parser::ContractMeta,
 }
 
 impl EstimateAllResult {
@@ -87,6 +92,7 @@ impl EstimateAllResult {
             write_bytes: None,
             tx_size: None,
             fee: None,
+            contract_meta: wasm::parser::ContractMeta::default(),
         }
     }
 
@@ -108,6 +114,7 @@ impl EstimateAllResult {
             write_bytes: None,
             tx_size: None,
             fee: None,
+            contract_meta: wasm::parser::ContractMeta::default(),
         }
     }
 }
@@ -353,6 +360,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::Diff {
                 network,
                 against,
+                against_previous,
                 pricing_only,
                 threshold_percent,
                 summary,
@@ -363,22 +371,31 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 } else {
                     json || format == cli::OutputFormat::Json
                 };
-                cmd_config_diff(
-                    &env_string(network, &default_network, "SOROBAN_NETWORK"),
-                    fallback,
-                    against.as_deref(),
-                    pricing_only,
-                    threshold_percent,
-                    summary,
-                    json_flag,
-                    rps,
-                    timeout,
-                    connect_timeout,
-                    max_retries,
-                    &headers,
-                    verbose,
-                )
-                .await
+                if against_previous {
+                    cmd_config_diff_against_previous(
+                        &env_string(network, &default_network, "SOROBAN_NETWORK"),
+                        pricing_only,
+                        threshold_percent,
+                        summary,
+                        json_flag,
+                    )
+                } else {
+                    cmd_config_diff(
+                        &env_string(network, &default_network, "SOROBAN_NETWORK"),
+                        fallback,
+                        against.as_deref(),
+                        pricing_only,
+                        threshold_percent,
+                        summary,
+                        json_flag,
+                        rps,
+                        timeout,
+                        max_retries,
+                        &headers,
+                        verbose,
+                    )
+                    .await
+                }
             }
             cli::ConfigAction::History { network } => cmd_config_history(&network),
             cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network),
@@ -655,6 +672,7 @@ struct SimulationRequest<'a> {
     wasm_hash: &'a str,
     wasm_size: u64,
     functions: &'a [wasm::parser::FunctionInfo],
+    contract_meta: &'a wasm::parser::ContractMeta,
     network: &'a str,
     rpc_url: Option<&'a str>,
     rpc_fallback_url: Option<&'a str>,
@@ -784,6 +802,7 @@ async fn simulate_report(
         rpc_latency_ms,
         rates: Some(fee_rates),
         projections: None,
+        contract_meta: req.contract_meta.clone(),
     })
 }
 
@@ -1151,6 +1170,7 @@ async fn estimate_once(
             wasm_hash: &wasm_hash,
             wasm_size,
             functions: &wasm_info.functions,
+            contract_meta: &wasm_info.contract_meta,
             network,
             rpc_url,
             rpc_fallback_url,
@@ -1639,6 +1659,7 @@ async fn cmd_estimate_diff(
         wasm_hash: &old_hash,
         wasm_size: old_info.bytes.len() as u64,
         functions: &old_info.functions,
+        contract_meta: &old_info.contract_meta,
         network,
         rpc_url,
         rpc_fallback_url,
@@ -1660,6 +1681,7 @@ async fn cmd_estimate_diff(
         wasm_hash: &new_hash,
         wasm_size: new_info.bytes.len() as u64,
         functions: &new_info.functions,
+        contract_meta: &new_info.contract_meta,
         network,
         rpc_url,
         rpc_fallback_url,
@@ -2073,6 +2095,7 @@ async fn estimate_all_function(
                     write_bytes: Some(write_bytes),
                     tx_size: Some(tx_xdr.len() as u32),
                     fee: Some(fee),
+                    contract_meta: wasm_info.contract_meta.clone(),
                 })
             }
             Err(e) => {
@@ -2166,6 +2189,8 @@ fn wasm_info_json(
             "name": wasm_info.contract_meta.name,
             "version": wasm_info.contract_meta.version,
             "description": wasm_info.contract_meta.description,
+            "author": wasm_info.contract_meta.author,
+            "sdk_version": wasm_info.contract_meta.sdk_version,
             "entries": wasm_info.contract_meta.entries.iter().map(|(key, value)| {
                 serde_json::json!({ "key": key, "value": value })
             }).collect::<Vec<_>>(),
@@ -2349,6 +2374,23 @@ fn upgrade_detected(diff: &config_snapshot::diff::ConfigDiff) -> bool {
     diff.has_pricing_changes
 }
 
+/// Cached estimates recorded before `ledger`, shaped for the
+/// `config diff --json` payload.
+///
+/// Both diff modes emit the same envelope, so a consumer sees one schema
+/// whether the newer side came from the network or from disk. An unreadable
+/// cache yields an empty list rather than failing the diff.
+fn stale_estimates_for(network: &str, ledger: u32) -> Vec<cache::CachedEstimate> {
+    cache::list_cached_estimates(network)
+        .map(|estimates| {
+            cache::find_stale_estimates(&estimates, ledger)
+                .into_iter()
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// `config diff` command: compare current config against a snapshot.
 #[allow(clippy::fn_params_excessive_bools)]
 async fn cmd_config_diff(
@@ -2401,18 +2443,9 @@ async fn cmd_config_diff(
             "diff computed"
         );
         if json_flag {
-            // Collect stale estimates for inclusion in JSON output.
-            let stale: Vec<cache::CachedEstimate> = cache::list_cached_estimates(network)
-                .map(|estimates| {
-                    cache::find_stale_estimates(&estimates, new_snapshot.ledger)
-                        .into_iter()
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
             let json_output = serde_json::json!({
                 "diff": diff,
-                "stale_estimates": stale,
+                "stale_estimates": stale_estimates_for(network, new_snapshot.ledger),
             });
             println!("{}", serde_json::to_string_pretty(&json_output)?);
         } else if summary {
@@ -2465,6 +2498,67 @@ async fn cmd_config_diff(
     }
     .instrument(span)
     .await
+}
+
+/// `config diff --against-previous`: compare the two most recent snapshots on
+/// disk against each other, with no network access at all.
+///
+/// Both sides come from stored snapshots, so the network name only selects
+/// which snapshot files to read. Output and exit-code behavior deliberately
+/// match the live mode: `--json` emits the same envelope, `--summary` the same
+/// one-line summary, and a pricing change still exits 1.
+///
+/// Unlike the live mode it never auto-saves, because the newer snapshot is
+/// already the one on disk.
+///
+/// # Network calls
+/// None — pure file I/O.
+fn cmd_config_diff_against_previous(
+    network: &str,
+    pricing_only: bool,
+    threshold_percent: Option<f64>,
+    summary: bool,
+    json_flag: bool,
+) -> error::AppResult<()> {
+    debug!(network, "diffing the two most recent snapshots");
+    let (old_snapshot, new_snapshot) = config_snapshot::store::load_last_two_snapshots(network)?;
+    let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
+    debug!(
+        change_count = diff.changes.len(),
+        has_pricing = diff.has_pricing_changes,
+        "diff computed"
+    );
+
+    if json_flag {
+        let json_output = serde_json::json!({
+            "diff": diff,
+            "stale_estimates": stale_estimates_for(network, new_snapshot.ledger),
+        });
+        println!("{}", serde_json::to_string_pretty(&json_output)?);
+    } else if summary {
+        println!("{}", config_snapshot::diff::format_diff_summary(&diff));
+    } else {
+        println!(
+            "{}",
+            config_snapshot::diff::format_diff(
+                &diff,
+                cli::should_colorize(),
+                pricing_only,
+                threshold_percent,
+            )
+        );
+        print_stale_estimates(network, new_snapshot.ledger);
+    }
+
+    let should_exit = match threshold_percent {
+        Some(t) => diff.has_significant_pricing_changes(t),
+        None => diff.has_pricing_changes,
+    };
+
+    if should_exit {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// `config history` command: print the full chronological change log.
@@ -3431,6 +3525,11 @@ mod tests {
         assert_eq!(value["sha256"], "deadbeef");
         assert_eq!(value["has_spec"], true);
         assert_eq!(value["contract_meta"]["name"], serde_json::Value::Null);
+        assert_eq!(value["contract_meta"]["author"], serde_json::Value::Null);
+        assert_eq!(
+            value["contract_meta"]["sdk_version"],
+            serde_json::Value::Null
+        );
         assert_eq!(value["contract_meta"]["entries"], serde_json::json!([]));
         assert_eq!(value["functions"][0]["name"], "increment");
         assert_eq!(value["functions"][0]["params"][0]["name"], "step");
@@ -3466,6 +3565,18 @@ mod tests {
                     total_xlm: "0.0000003".to_string(),
                     fee_percentages: std::collections::BTreeMap::new(),
                 }),
+                contract_meta: ContractMeta {
+                    name: Some("MetaContract".to_string()),
+                    version: Some("9.9.9".to_string()),
+                    description: None,
+                    author: None,
+                    sdk_version: Some("25.3.2".to_string()),
+                    entries: vec![
+                        ("name".to_string(), "MetaContract".to_string()),
+                        ("version".to_string(), "9.9.9".to_string()),
+                        ("rssdkver".to_string(), "25.3.2".to_string()),
+                    ],
+                },
             },
             EstimateAllResult::skipped("needs_args", "needs --fn/--arg (1 param(s))"),
             EstimateAllResult::errored("bad", "boom"),
@@ -3483,6 +3594,9 @@ mod tests {
         assert_eq!(ok["fee"]["total_stroops"], 3);
         assert!(ok.get("reason").is_none());
         assert!(ok.get("error").is_none());
+        // Contract metadata rides along on successful estimates.
+        assert_eq!(ok["contract_meta"]["name"], "MetaContract");
+        assert_eq!(ok["contract_meta"]["sdk_version"], "25.3.2");
 
         // skipped entry carries status + reason, omits resources/fee.
         let skipped = &value[1];
@@ -3490,6 +3604,8 @@ mod tests {
         assert_eq!(skipped["reason"], "needs --fn/--arg (1 param(s))");
         assert!(skipped.get("cpu_instructions").is_none());
         assert!(skipped.get("fee").is_none());
+        // Absent contract meta is omitted entirely, not emitted as `{}`.
+        assert!(skipped.get("contract_meta").is_none());
 
         // error entry carries status + error.
         let errored = &value[2];
@@ -3525,6 +3641,7 @@ mod tests {
                 total_xlm: "0.0000003".to_string(),
                 fee_percentages: std::collections::BTreeMap::new(),
             }),
+            contract_meta: ContractMeta::default(),
         }];
         let distribution =
             soroban_cost_estimator::report::cost_report::FeeDistribution::from_samples(
@@ -3662,6 +3779,7 @@ mod tests {
             rpc_latency_ms: 87,
             rates: None,
             projections: None,
+            contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
         }
     }
 
