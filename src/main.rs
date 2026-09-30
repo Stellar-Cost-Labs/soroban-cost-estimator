@@ -1075,11 +1075,13 @@ async fn estimate_once(
             return Ok(EstimateRun::Cached);
         }
 
+<<<<<<<<< Temporary merge branch 1
         let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
-        let client = rpc::client::RpcClient::with_fallback_headers(
+        let client = rpc::client::RpcClient::with_fallback_headers_connect_timeout(
             &endpoint,
             rpc_fallback_url,
             rps,
+            std::time::Duration::from_secs(connect_timeout),
             std::time::Duration::from_secs(timeout),
             max_retries,
             extra_headers,
@@ -1091,6 +1093,27 @@ async fn estimate_once(
             .map(|a| xdr_helper::parse_arg_scval(a))
             .collect();
         debug!(arg_count = sc_vals.len(), "parsed arguments");
+
+        let tx_xdr =
+            xdr_helper::build_simulation_tx_envelope(&wasm_info.bytes, contract_id, fn_name, &sc_vals)?;
+
+        xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
+        debug!(arg_count = args.len(), "validated arguments against contract spec");
+
+        let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
+        debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
+
+=========
+>>>>>>>>> Temporary merge branch 2
+        // In dry-run mode, print the planned simulation payload and exit
+        // without contacting the network. The envelope is built here because
+        // no RPC traffic is performed.
+        if dry_run {
+            let sc_vals: Vec<stellar_xdr::ScVal> = args
+                .iter()
+                .map(|a| xdr_helper::parse_arg_scval(a))
+                .collect();
+            debug!(arg_count = sc_vals.len(), "parsed arguments");
 
             let tx_xdr = xdr_helper::build_simulation_tx_envelope(
                 &wasm_info.bytes,
