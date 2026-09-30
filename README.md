@@ -393,6 +393,32 @@ cargo install soroban-cost-estimator
 5. **Config drift detection**: Compares two snapshots field-by-field and reports
    which pricing parameters changed, flagging cached estimates that are now stale.
 
+## Configuration file
+
+Defaults for common flags can live in a `config.toml`. It is read from the
+first of these that exists:
+
+1. the path given with `--config <path>` (must exist; no other location is read)
+2. `$XDG_CONFIG_HOME/soroban-cost-estimator/config.toml`
+3. `~/.config/soroban-cost-estimator/config.toml` (the platform config dir)
+4. `~/.soroban-cost-estimator/config.toml`
+
+```toml
+default_network = "mainnet"   # used when --network is not given
+format = "json"               # table | json | csv | markdown
+timeout_secs = 60             # used when --timeout is not given
+
+[rpc_urls]                    # replaces the built-in endpoint per network
+testnet = "https://soroban-testnet.stellar.org"
+mainnet = "https://my-mainnet-rpc.example"
+```
+
+Explicit flags always win: built-in defaults < `config.toml` < CLI
+arguments. `--rpc-url` overrides `[rpc_urls]`. `[rpc_urls]` also applies to
+commands without an `--rpc-url` flag (`config snapshot`, `config diff`,
+`watch`). A missing file is fine; an unreadable or malformed one is an
+error. The older keys `network`, `rpc_url` and `json` are still accepted.
+
 ## Storage
 
 All data is stored locally in `~/.soroban-cost-estimator/`:

@@ -18,14 +18,48 @@ use crate::rpc::retry::{DEFAULT_MAX_RETRIES, with_retry};
 /// CLI's `--timeout` default (30 seconds).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Resolves a network name to its well-known Soroban RPC endpoint.
+/// Per-network endpoints from the user's `config.toml` (`[rpc_urls]`),
+/// consulted by [`resolve_endpoint`] before the built-in well-known URLs.
+static ENDPOINT_OVERRIDES: std::sync::Mutex<std::collections::BTreeMap<String, String>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Replaces the process-wide per-network endpoint overrides.
+///
+/// An explicit custom URL passed to [`resolve_endpoint`] (i.e. `--rpc-url`)
+/// still wins over these.
+pub fn set_endpoint_overrides(
+    overrides: std::collections::BTreeMap<String, String>,
+) -> AppResult<()> {
+    let mut guard = ENDPOINT_OVERRIDES
+        .lock()
+        .map_err(|e| AppError::General(format!("endpoint overrides lock poisoned: {e}")))?;
+    *guard = overrides;
+    Ok(())
+}
+
+fn endpoint_override(network: &str) -> AppResult<Option<String>> {
+    let guard = ENDPOINT_OVERRIDES
+        .lock()
+        .map_err(|e| AppError::General(format!("endpoint overrides lock poisoned: {e}")))?;
+    Ok(guard.get(network).cloned())
+}
+
+/// Resolves a network name to its Soroban RPC endpoint.
+///
+/// Precedence: `custom_url` (`--rpc-url`), then the network's entry in the
+/// user config's `[rpc_urls]`, then the built-in well-known URL.
 ///
 /// # Network calls
-/// None — returns hardcoded well-known URLs. Custom URLs override network resolution.
+/// None — returns configured or hardcoded well-known URLs.
 pub fn resolve_endpoint(network: &str, custom_url: Option<&str>) -> AppResult<String> {
     if let Some(url) = custom_url {
         debug!(url, "using custom RPC endpoint");
         return Ok(url.to_string());
+    }
+
+    if let Some(url) = endpoint_override(network)? {
+        debug!(network, url, "using RPC endpoint from config file");
+        return Ok(url);
     }
 
     let endpoint = match network {
@@ -684,7 +718,7 @@ mod tests {
     use crate::error::{AppError, AppResult};
     use crate::rpc::retry::DEFAULT_MAX_RETRIES;
 
-    use super::{RpcClient, resolve_ws_endpoint};
+    use super::{RpcClient, resolve_endpoint, resolve_ws_endpoint, set_endpoint_overrides};
 
     /// Spawns a tiny HTTP server that answers JSON-RPC
     /// `simulateTransaction`-style calls with `{"result":{"pong":true}}`,
@@ -1327,6 +1361,38 @@ mod tests {
     fn test_resolve_ws_endpoint_unknown_network_errors() {
         assert!(matches!(
             resolve_ws_endpoint("nosuchnet", None),
+            Err(AppError::UnknownNetwork(_))
+        ));
+    }
+
+    #[test]
+    fn test_config_endpoint_override_sits_between_custom_and_builtin() {
+        // Uses a network name no other test resolves, since the override map
+        // is process-wide.
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("overridenet".to_string(), "https://cfg.example".to_string());
+        set_endpoint_overrides(overrides).unwrap();
+
+        assert_eq!(
+            resolve_endpoint("overridenet", None).unwrap(),
+            "https://cfg.example"
+        );
+        assert_eq!(
+            resolve_endpoint("overridenet", Some("http://cli.example")).unwrap(),
+            "http://cli.example"
+        );
+        assert_eq!(
+            resolve_ws_endpoint("overridenet", None).unwrap(),
+            "wss://cfg.example/ws"
+        );
+        assert_eq!(
+            resolve_endpoint("testnet", None).unwrap(),
+            "https://soroban-testnet.stellar.org"
+        );
+
+        set_endpoint_overrides(std::collections::BTreeMap::new()).unwrap();
+        assert!(matches!(
+            resolve_endpoint("overridenet", None),
             Err(AppError::UnknownNetwork(_))
         ));
     }
