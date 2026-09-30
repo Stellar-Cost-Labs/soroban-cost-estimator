@@ -181,6 +181,15 @@ pub enum Command {
         /// environments or local contract verification.
         #[arg(long)]
         dry_run: bool,
+
+        /// Project costs for batch invocations (comma-separated counts, e.g. "100,1000,10000").
+        #[arg(
+            long,
+            value_name = "COUNTS",
+            num_args = 0..=1,
+            default_missing_value = "100,1000,10000"
+        )]
+        project: Option<String>,
     },
     EstimateAll {
         #[arg(long, short)]
