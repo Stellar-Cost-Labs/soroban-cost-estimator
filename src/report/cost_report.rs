@@ -1,6 +1,7 @@
 use comfy_table::{Cell, CellAlignment, Table};
 
 use crate::report::fee_calc::{FeeBreakdown, FeeRates};
+use crate::wasm::parser::{ContractMeta, format_contract_meta};
 
 // fee_percentage removed since we now use the precalculated exact percentages
 
@@ -194,6 +195,11 @@ pub struct CostReport {
     /// Optional batch invocation cost projections.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub projections: Option<Vec<CostProjection>>,
+    /// Contract metadata parsed from the WASM `contractmeta` custom
+    /// section. Empty (and rendered as absent) when the binary carries no
+    /// decodable section; deserialized as empty from older payloads.
+    #[serde(default)]
+    pub contract_meta: ContractMeta,
 }
 
 /// A cost projection for a specific batch invocation count.
@@ -582,6 +588,11 @@ pub fn format_report_table(report: &CostReport) -> String {
     output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
     output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
 
+    // Contract metadata from the WASM `contractmeta` section: present or
+    // absent, always rendered so the reader knows the section was checked.
+    output.push_str(&format_contract_meta(&report.contract_meta));
+    output.push_str("\n\n");
+
     let mut table = Table::new();
     if crate::cli::should_colorize() {
         table.enforce_styling();
@@ -851,6 +862,7 @@ mod tests {
             rpc_latency_ms: 87,
             rates: Some(rates),
             projections: None,
+            contract_meta: ContractMeta::default(),
         }
     }
 
@@ -968,6 +980,7 @@ mod tests {
             rpc_latency_ms: 0,
             rates: None,
             projections: None,
+            contract_meta: ContractMeta::default(),
         };
 
         let table_out = format_report_table(&report);
