@@ -413,6 +413,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 fallback,
                 rps,
                 timeout,
+                connect_timeout,
                 max_retries,
                 &headers,
                 verbose,
@@ -662,6 +663,7 @@ struct SimulationRequest<'a> {
     args: &'a [String],
     rps: Option<u64>,
     timeout: u64,
+    connect_timeout: u64,
     max_retries: usize,
     precision: u32,
     extra_headers: &'a [String],
@@ -683,11 +685,12 @@ async fn simulate_report(
     req: &SimulationRequest<'_>,
 ) -> error::AppResult<report::cost_report::CostReport> {
     let endpoint = rpc::client::resolve_endpoint(req.network, req.rpc_url)?;
-    let client = rpc::client::RpcClient::with_fallback_headers(
+    let client = rpc::client::RpcClient::with_fallback_headers_connect_timeout(
         &endpoint,
         req.rpc_fallback_url,
         req.rps,
         std::time::Duration::from_secs(req.timeout),
+        std::time::Duration::from_secs(req.connect_timeout),
         req.max_retries,
         req.extra_headers,
         req.verbose,
@@ -847,6 +850,7 @@ async fn cmd_estimate(
             format,
             rps,
             timeout,
+            connect_timeout,
             max_retries,
             precision,
             extra_headers,
@@ -867,6 +871,7 @@ async fn cmd_estimate(
             format,
             rps,
             timeout,
+            connect_timeout,
             max_retries,
             precision,
             extra_headers,
@@ -890,6 +895,7 @@ async fn cmd_estimate(
         extra_headers,
         rps,
         timeout,
+        connect_timeout,
         max_retries,
         format == "table",
         wasm_info_flag,
@@ -965,6 +971,7 @@ async fn cmd_estimate(
             rpc_fallback_url,
             rps,
             timeout,
+            connect_timeout,
             max_retries,
             extra_headers,
             verbose,
@@ -1007,6 +1014,7 @@ async fn estimate_once(
     extra_headers: &[String],
     rps: Option<u64>,
     timeout: u64,
+    connect_timeout: u64,
     max_retries: usize,
     print_wasm_hash: bool,
     wasm_info_flag: bool,
@@ -1075,36 +1083,6 @@ async fn estimate_once(
             return Ok(EstimateRun::Cached);
         }
 
-<<<<<<<<< Temporary merge branch 1
-        let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
-        let client = rpc::client::RpcClient::with_fallback_headers_connect_timeout(
-            &endpoint,
-            rpc_fallback_url,
-            rps,
-            std::time::Duration::from_secs(connect_timeout),
-            std::time::Duration::from_secs(timeout),
-            max_retries,
-            extra_headers,
-            verbose,
-        );
-
-        let sc_vals: Vec<stellar_xdr::ScVal> = args
-            .iter()
-            .map(|a| xdr_helper::parse_arg_scval(a))
-            .collect();
-        debug!(arg_count = sc_vals.len(), "parsed arguments");
-
-        let tx_xdr =
-            xdr_helper::build_simulation_tx_envelope(&wasm_info.bytes, contract_id, fn_name, &sc_vals)?;
-
-        xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
-        debug!(arg_count = args.len(), "validated arguments against contract spec");
-
-        let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
-        debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
-
-=========
->>>>>>>>> Temporary merge branch 2
         // In dry-run mode, print the planned simulation payload and exit
         // without contacting the network. The envelope is built here because
         // no RPC traffic is performed.
@@ -1181,6 +1159,7 @@ async fn estimate_once(
             args,
             rps,
             timeout,
+            connect_timeout,
             max_retries,
             precision,
             extra_headers,
@@ -1343,6 +1322,7 @@ async fn emit_watch_estimate(
     format: &str,
     rps: Option<u64>,
     timeout: u64,
+    connect_timeout: u64,
     max_retries: usize,
     precision: u32,
     extra_headers: &[String],
@@ -1364,6 +1344,7 @@ async fn emit_watch_estimate(
         extra_headers,
         rps,
         timeout,
+        connect_timeout,
         max_retries,
         false,
         // `--wasm-info` is a one-shot report; the watcher prints its own
@@ -1427,6 +1408,7 @@ async fn estimate_watch_poll_once(
     format: &str,
     rps: Option<u64>,
     timeout: u64,
+    connect_timeout: u64,
     max_retries: usize,
     precision: u32,
     extra_headers: &[String],
@@ -1469,6 +1451,7 @@ async fn estimate_watch_poll_once(
         format,
         rps,
         timeout,
+        connect_timeout,
         max_retries,
         precision,
         extra_headers,
@@ -1505,6 +1488,7 @@ async fn cmd_estimate_watch(
     format: &str,
     rps: Option<u64>,
     timeout: u64,
+    connect_timeout: u64,
     max_retries: usize,
     precision: u32,
     extra_headers: &[String],
@@ -1546,6 +1530,7 @@ async fn cmd_estimate_watch(
                 format,
                 rps,
                 timeout,
+                connect_timeout,
                 max_retries,
                 precision,
                 extra_headers,
@@ -1588,6 +1573,7 @@ async fn cmd_estimate_watch(
                     format,
                     rps,
                     timeout,
+                    connect_timeout,
                     max_retries,
                     precision,
                     extra_headers,
@@ -1620,6 +1606,7 @@ async fn cmd_estimate_diff(
     format: &str,
     rps: Option<u64>,
     timeout: u64,
+    connect_timeout: u64,
     max_retries: usize,
     precision: u32,
     extra_headers: &[String],
@@ -1660,6 +1647,7 @@ async fn cmd_estimate_diff(
         args,
         rps,
         timeout,
+        connect_timeout,
         max_retries,
         precision,
         extra_headers,
@@ -1680,6 +1668,7 @@ async fn cmd_estimate_diff(
         args,
         rps,
         timeout,
+        connect_timeout,
         max_retries,
         precision,
         extra_headers,
@@ -1880,6 +1869,7 @@ async fn cmd_estimate_all(
                 rpc_fallback_url,
                 rps,
                 timeout,
+                connect_timeout,
                 max_retries,
                 extra_headers,
                 verbose,
@@ -2618,6 +2608,7 @@ async fn auto_snapshot_if_changed(
     rpc_fallback_url: Option<&str>,
     rps: Option<u64>,
     timeout: u64,
+    connect_timeout: u64,
     max_retries: usize,
     extra_headers: &[String],
     verbose: bool,
@@ -2632,6 +2623,7 @@ async fn auto_snapshot_if_changed(
         rpc_fallback_url,
         rps,
         timeout,
+        connect_timeout,
         max_retries,
         extra_headers,
         verbose,
@@ -3059,6 +3051,7 @@ async fn handle_cache_action(
     fallback: Option<&str>,
     rps: Option<u64>,
     timeout: u64,
+    connect_timeout: u64,
     max_retries: usize,
     headers: &[String],
     verbose: bool,
@@ -3086,6 +3079,7 @@ async fn handle_cache_action(
                 format,
                 rps,
                 timeout,
+                connect_timeout,
                 max_retries,
                 headers,
                 verbose,

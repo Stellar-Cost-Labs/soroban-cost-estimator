@@ -259,7 +259,16 @@ impl RpcClient {
         connect_timeout: Duration,
         max_retries: usize,
     ) -> Self {
-        Self::with_fallback_connect_timeout(url, None, rps, timeout, connect_timeout, max_retries)
+        Self::with_fallback_headers_connect_timeout(
+            url,
+            None,
+            rps,
+            timeout,
+            connect_timeout,
+            max_retries,
+            &[],
+            false,
+        )
     }
 
     /// Create a new RPC client pointing at the given URL, with an optional
@@ -291,10 +300,11 @@ impl RpcClient {
 
     /// Create a new RPC client that attaches custom HTTP headers (each a
     /// `"Key: Value"` string) to every request, without rate limiting, with
-    /// the default request timeout and the default retry policy. Entries
-    /// that cannot be parsed (or that carry an empty value) are skipped.
+    /// the default request timeout, the default connect timeout, and the default
+    /// retry policy. Entries that cannot be parsed (or that carry an empty
+    /// value) are skipped.
     pub fn with_headers(url: &str, headers: &[String], verbose: bool) -> Self {
-        Self::with_fallback_headers(
+        Self::with_fallback_headers_connect_timeout(
             url,
             None,
             None,
@@ -310,7 +320,7 @@ impl RpcClient {
     /// limit, request timeout, retry policy, and custom HTTP headers attached
     /// to every request.
     ///
-    /// Behaves exactly like [`Self::with_fallback_connect_timeout`] and
+    /// Behaves exactly like [`Self::with_fallback_headers_connect_timeout`] and
     /// additionally attaches the parsed `"Key: Value"` headers (skipping any
     /// entry that cannot be parsed or that has an empty value) to every
     /// outbound request. Uses the [`DEFAULT_CONNECT_TIMEOUT`] default.
@@ -331,6 +341,7 @@ impl RpcClient {
             DEFAULT_CONNECT_TIMEOUT,
             max_retries,
             headers,
+            verbose,
         )
     }
 
@@ -350,6 +361,7 @@ impl RpcClient {
         connect_timeout: Duration,
         max_retries: usize,
         headers: &[String],
+        verbose: bool,
     ) -> Self {
         debug!(
             url,
@@ -368,7 +380,7 @@ impl RpcClient {
             // default builder cannot), so fall back to a plain client to keep
             // construction infallible.
             client: reqwest::Client::builder()
-                .timeout(timeout) 
+                .timeout(timeout)
                 .connect_timeout(connect_timeout)
                 .tcp_keepalive(Duration::from_secs(30))
                 .pool_idle_timeout(Duration::from_secs(90))
@@ -1239,7 +1251,8 @@ mod tests {
     /// `--connect-timeout` default of 5 seconds.
     #[test]
     fn test_default_connect_timeout_is_five_seconds() {
-        let client = RpcClient::with_options("http://localhost", None, Duration::from_secs(30), 3);
+        let client =
+            RpcClient::with_options("http://localhost", None, Duration::from_secs(30), 3, false);
         assert_eq!(client.connect_timeout, Duration::from_secs(5));
 
         let client = RpcClient::with_fallback_headers(
@@ -1249,6 +1262,7 @@ mod tests {
             Duration::from_secs(30),
             3,
             &[],
+            false,
         );
         assert_eq!(client.connect_timeout, Duration::from_secs(5));
     }
