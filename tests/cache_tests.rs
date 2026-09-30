@@ -1431,6 +1431,540 @@ fn test_export_cache_json_round_trip() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────
+// SQLite storage backend: indexes & legacy JSON migration (#334)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The SHA-256 hex of the concatenated args, matching the library's cache
+/// key derivation.
+fn args_hash_of(args: &[&str]) -> String {
+    let mut hasher = sha2::Sha256::new();
+    for arg in args {
+        hasher.update(arg.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// Path of the data directory under a temp HOME.
+fn data_dir(tmp: &Path) -> PathBuf {
+    tmp.join(".soroban-cost-estimator")
+}
+
+/// Write a legacy (pre-SQLite) cache entry JSON file into
+/// `~/.soroban-cost-estimator/cache/`.
+fn write_legacy_cache_file(tmp: &Path, name: &str, contents: &str) {
+    let dir = data_dir(tmp).join("cache");
+    std::fs::create_dir_all(&dir).expect("create legacy cache dir");
+    std::fs::write(dir.join(name), contents).expect("write legacy cache file");
+}
+
+/// SQLite index names present on the `estimates` table.
+fn estimate_index_names(conn: &rusqlite::Connection) -> Vec<String> {
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'estimates'")
+        .expect("prepare index query");
+    stmt.query_map([], |row| row.get::<_, String>(0))
+        .expect("query indexes")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect indexes")
+}
+
+#[test]
+fn test_sqlite_schema_creates_lookup_indexes() {
+    with_temp_home(|tmp| {
+        let dir = data_dir(tmp);
+        std::fs::create_dir_all(&dir).expect("create data dir");
+        let conn = rusqlite::Connection::open(dir.join("cache.db")).expect("open cache db");
+        cache::ensure_cache_schema(&conn).expect("ensure schema");
+
+        let names = estimate_index_names(&conn);
+        for expected in [
+            "idx_estimates_lookup",
+            "idx_estimates_network_created",
+            "idx_estimates_key_net_created",
+            "idx_estimates_last_accessed",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "expected index {expected} on estimates; found {names:?}"
+            );
+        }
+    });
+}
+
+#[test]
+fn test_legacy_json_cache_is_imported_transparently() {
+    with_temp_home(|tmp| {
+        let legacy = format!(
+            r#"{{
+  "wasm_hash": "abc",
+  "function": "f",
+  "args_hash": "{}",
+  "network": "testnet",
+  "ledger": 7,
+  "total_stroops": 1234,
+  "cpu_instructions": 10,
+  "memory_bytes": 5,
+  "timestamp": "2026-01-01T00:00:00Z"
+}}"#,
+            args_hash_of(&[])
+        );
+        write_legacy_cache_file(tmp, "abc-f.json", &legacy);
+
+        // No explicit migration call: opening the cache does it transparently.
+        let loaded = cache::load_estimate("abc", "f", &[])
+            .expect("load migrated entry")
+            .expect("legacy entry should have been imported");
+        assert_eq!(loaded.total_stroops, 1234);
+        assert_eq!(loaded.ledger, 7);
+        assert_eq!(loaded.version, cache::CACHE_SCHEMA_VERSION);
+        assert_eq!(loaded.duration_ms, None);
+        assert!(loaded.success);
+
+        // The legacy directory is retired once fully imported.
+        assert!(
+            !data_dir(tmp).join("cache").exists(),
+            "legacy JSON cache dir should be removed after a full import"
+        );
+    });
+}
+
+#[test]
+fn test_legacy_json_cache_keeps_unparseable_files() {
+    with_temp_home(|tmp| {
+        let valid = format!(
+            r#"{{"wasm_hash":"abc","function":"f","args_hash":"{}","network":"testnet","ledger":1,"total_stroops":1,"cpu_instructions":1,"memory_bytes":1,"timestamp":"2026-01-01T00:00:00Z"}}"#,
+            args_hash_of(&[])
+        );
+        write_legacy_cache_file(tmp, "good.json", &valid);
+        write_legacy_cache_file(tmp, "bad.json", "{ not valid json");
+
+        let estimates = cache::list_cached_estimates("testnet").expect("list");
+        assert_eq!(estimates.len(), 1, "one valid entry should be imported");
+
+        let legacy_dir = data_dir(tmp).join("cache");
+        assert!(
+            legacy_dir.join("bad.json.rejected").exists(),
+            "unparseable files must be kept under a .rejected extension"
+        );
+        assert!(
+            !legacy_dir.join("bad.json").exists(),
+            "the original unparseable file should no longer be retried"
+        );
+    });
+}
+
+#[test]
+fn test_legacy_json_entry_from_future_version_is_kept() {
+    with_temp_home(|tmp| {
+        let future = format!(
+            r#"{{"schema_version":{},"wasm_hash":"abc","function":"f","args_hash":"{}","network":"testnet","ledger":1,"total_stroops":1,"cpu_instructions":1,"memory_bytes":1,"timestamp":"2026-01-01T00:00:00Z"}}"#,
+            cache::CACHE_SCHEMA_VERSION + 5,
+            args_hash_of(&[])
+        );
+        write_legacy_cache_file(tmp, "future.json", &future);
+
+        let estimates = cache::list_cached_estimates("testnet").expect("list");
+        assert!(estimates.is_empty(), "future entries must not be imported");
+        assert!(
+            data_dir(tmp).join("cache").join("future.json").exists(),
+            "a future-schema legacy file must be preserved, not deleted"
+        );
+    });
+}
+
+#[test]
+fn test_pre_v3_database_gains_last_accessed_column() {
+    with_temp_home(|tmp| {
+        let dir = data_dir(tmp);
+        std::fs::create_dir_all(&dir).expect("create data dir");
+        let db = dir.join("cache.db");
+
+        // Recreate the exact pre-v3 table shape: no `last_accessed` column
+        // and none of the secondary indexes.
+        {
+            let conn = rusqlite::Connection::open(&db).expect("open cache db");
+            conn.execute_batch(
+                "CREATE TABLE estimates (\n                     version INTEGER NOT NULL,\n                     wasm_hash TEXT NOT NULL,\n                     function TEXT NOT NULL,\n                     args_hash TEXT NOT NULL,\n                     network TEXT NOT NULL,\n                     ledger INTEGER NOT NULL,\n                     total_stroops INTEGER NOT NULL,\n                     cpu_instructions INTEGER NOT NULL,\n                     memory_bytes INTEGER NOT NULL,\n                     timestamp TEXT NOT NULL,\n                     duration_ms INTEGER,\n                     success INTEGER NOT NULL DEFAULT 1,\n                     PRIMARY KEY (wasm_hash, function, args_hash)\n                 );",
+            )
+            .expect("create legacy table");
+            conn.execute(
+                "INSERT INTO estimates (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
+                 VALUES (2, 'h', 'f', ?1, 'testnet', 1, 100, 10, 5, '2026-01-01T00:00:00Z')",
+                [args_hash_of(&[])],
+            )
+            .expect("insert legacy row");
+        }
+
+        // Opening through the library migrates the table in place.
+        let loaded = cache::load_estimate("h", "f", &[])
+            .expect("load")
+            .expect("row should survive the table migration");
+        assert_eq!(loaded.version, cache::CACHE_SCHEMA_VERSION);
+        assert_eq!(loaded.total_stroops, 100);
+
+        let conn = rusqlite::Connection::open(&db).expect("reopen cache db");
+        let has_column = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(estimates)")
+                .expect("pragma");
+            let names: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .expect("query columns")
+                .collect::<Result<_, _>>()
+                .expect("collect columns");
+            names.iter().any(|n| n == "last_accessed")
+        };
+        assert!(has_column, "pre-v3 cache should gain last_accessed");
+        assert!(
+            !estimate_index_names(&conn).is_empty(),
+            "pre-v3 cache should gain the lookup indexes"
+        );
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Schema versioning & migration (#341)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// An *unversioned* legacy entry (v0) is migrated to the current schema and
+/// gets the conservative defaults for fields it predates.
+#[test]
+fn test_v0_unversioned_entry_migrates_to_current_schema() {
+    with_temp_home(|tmp| {
+        write_raw_entry(tmp, "legacy0", "old_func", &["a"], Some(0), 3);
+
+        let loaded = cache::load_estimate("legacy0", "old_func", &["a".to_string()])
+            .expect("v0 entry should load")
+            .expect("entry should exist");
+        assert_eq!(loaded.version, cache::CACHE_SCHEMA_VERSION);
+        assert_eq!(loaded.ledger, 3);
+        assert_eq!(loaded.duration_ms, None, "v0 has no duration data");
+        assert!(loaded.success, "v0 entries were always successful");
+    });
+}
+
+/// A v2 entry moves to v3 without losing the fields v2 introduced.
+#[test]
+fn test_v2_entry_migrates_to_v3_preserving_fields() {
+    let entry = cache::CachedEstimate {
+        version: cache::DURATION_SCHEMA_VERSION,
+        wasm_hash: "abc".to_string(),
+        function: "f".to_string(),
+        args_hash: "def".to_string(),
+        network: "testnet".to_string(),
+        ledger: 9,
+        total_stroops: 4_200,
+        cpu_instructions: 111,
+        memory_bytes: 22,
+        timestamp: "2026-01-01T00:00:00Z".to_string(),
+        duration_ms: Some(1_234),
+        success: false,
+    };
+    let migrated = cache::migrate_to_latest(entry).expect("migrate v2 to v3");
+    assert_eq!(migrated.version, cache::CACHE_SCHEMA_VERSION);
+    assert_eq!(migrated.duration_ms, Some(1_234));
+    assert!(!migrated.success, "a recorded failure must be preserved");
+    assert_eq!(migrated.total_stroops, 4_200);
+}
+
+/// Serialized entries carry the `schema_version` key, and the pre-rename
+/// `version` key is still accepted on read.
+#[test]
+fn test_schema_version_serialization_key() {
+    let entry = cache::CachedEstimate {
+        version: cache::CACHE_SCHEMA_VERSION,
+        wasm_hash: "abc".to_string(),
+        function: "f".to_string(),
+        args_hash: "def".to_string(),
+        network: "testnet".to_string(),
+        ledger: 1,
+        total_stroops: 1,
+        cpu_instructions: 1,
+        memory_bytes: 1,
+        timestamp: "2026-01-01T00:00:00Z".to_string(),
+        duration_ms: None,
+        success: true,
+    };
+    let json = serde_json::to_string(&entry).expect("serialize");
+    assert!(
+        json.contains("\"schema_version\""),
+        "serialized cache entries must carry schema_version: {json}"
+    );
+
+    let with_legacy_key = json.replace("\"schema_version\"", "\"version\"");
+    let parsed: cache::CachedEstimate =
+        serde_json::from_str(&with_legacy_key).expect("legacy `version` key must deserialize");
+    assert_eq!(parsed.version, cache::CACHE_SCHEMA_VERSION);
+}
+
+/// An entry with no `version`/`schema_version` key at all (the true v0 JSON
+/// shape) deserializes to the initial schema version and migrates forward.
+#[test]
+fn test_unversioned_json_deserializes_and_migrates() {
+    let json = r#"{
+        "wasm_hash": "abc",
+        "function": "f",
+        "args_hash": "def",
+        "network": "testnet",
+        "ledger": 5,
+        "total_stroops": 10,
+        "cpu_instructions": 1,
+        "memory_bytes": 1,
+        "timestamp": "2026-01-01T00:00:00Z"
+    }"#;
+    let parsed: cache::CachedEstimate = serde_json::from_str(json).expect("v0 JSON");
+    assert_eq!(parsed.version, cache::INITIAL_SCHEMA_VERSION);
+
+    let migrated = cache::migrate_to_latest(parsed).expect("migrate");
+    assert_eq!(migrated.version, cache::CACHE_SCHEMA_VERSION);
+}
+
+/// The upgrade hint names the entry's version so the user knows what to do.
+#[test]
+fn test_future_schema_error_names_version_and_remedy() {
+    let entry = cache::CachedEstimate {
+        version: cache::CACHE_SCHEMA_VERSION + 1,
+        wasm_hash: "abc".to_string(),
+        function: "f".to_string(),
+        args_hash: "def".to_string(),
+        network: "testnet".to_string(),
+        ledger: 1,
+        total_stroops: 1,
+        cpu_instructions: 1,
+        memory_bytes: 1,
+        timestamp: "2026-01-01T00:00:00Z".to_string(),
+        duration_ms: None,
+        success: true,
+    };
+    let err = cache::migrate_to_latest(entry).expect_err("future version must be rejected");
+    let message = err.to_string();
+    assert!(message.contains("newer"), "{message}");
+    assert!(
+        message.contains("upgrade"),
+        "should include an upgrade hint: {message}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// LRU eviction (#333)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// [`cache::CacheLimits`] with only an entry quota (byte quota disabled).
+fn entry_limits(max_entries: usize) -> cache::CacheLimits {
+    cache::CacheLimits {
+        max_bytes: 0,
+        max_entries,
+    }
+}
+
+/// Save one estimate with explicit limits (keeps eviction tests independent
+/// of the process-wide CLI configuration).
+fn save_with(
+    limits: cache::CacheLimits,
+    wasm_hash: &str,
+    function: &str,
+    ledger: u32,
+) -> soroban_cost_estimator::error::AppResult<()> {
+    cache::save_estimate_with_limits(
+        wasm_hash,
+        function,
+        &[],
+        "testnet",
+        ledger,
+        1_000,
+        100,
+        50,
+        None,
+        true,
+        limits,
+    )
+}
+
+#[test]
+fn test_eviction_by_entry_quota_keeps_cache_bounded() {
+    with_temp_home(|_tmp| {
+        let limits = entry_limits(5);
+        for i in 0..10 {
+            save_with(limits, "h", &format!("f{i}"), i).expect("save");
+        }
+
+        let estimates = cache::list_cached_estimates("testnet").expect("list");
+        assert!(
+            estimates.len() <= 5,
+            "entry quota must be respected, got {} entries",
+            estimates.len()
+        );
+        assert!(!estimates.is_empty(), "eviction must not empty the cache");
+        assert!(
+            estimates.iter().any(|e| e.function == "f9"),
+            "the newest entry must survive eviction: {estimates:?}"
+        );
+        assert!(
+            !estimates.iter().any(|e| e.function == "f0"),
+            "the oldest entry must be evicted first: {estimates:?}"
+        );
+    });
+}
+
+#[test]
+fn test_eviction_protects_most_recently_accessed_entry() {
+    with_temp_home(|_tmp| {
+        let limits = entry_limits(3);
+        let pause = || std::thread::sleep(std::time::Duration::from_millis(2));
+
+        save_with(limits, "h", "f0", 0).expect("save f0");
+        pause();
+        save_with(limits, "h", "f1", 1).expect("save f1");
+        pause();
+        save_with(limits, "h", "f2", 2).expect("save f2");
+        pause();
+
+        // Reading f0 makes it the most recently accessed entry even though
+        // it is the oldest by creation time.
+        cache::load_estimate("h", "f0", &[])
+            .expect("load f0")
+            .expect("f0 exists");
+        pause();
+
+        // Pushing past the quota evicts f1 and f2 (LRU order), not f0.
+        save_with(limits, "h", "f3", 3).expect("save f3");
+
+        let estimates = cache::list_cached_estimates("testnet").expect("list");
+        assert!(
+            estimates.iter().any(|e| e.function == "f0"),
+            "recently accessed f0 must survive: {estimates:?}"
+        );
+        assert!(
+            estimates.iter().any(|e| e.function == "f3"),
+            "the newest entry must survive: {estimates:?}"
+        );
+        assert!(
+            !estimates.iter().any(|e| e.function == "f1"),
+            "the least-recently-accessed entry must be evicted: {estimates:?}"
+        );
+    });
+}
+
+#[test]
+fn test_eviction_by_byte_quota_stays_under_limit() {
+    with_temp_home(|_tmp| {
+        // A quota comfortably above SQLite's structural floor (page 1 plus a
+        // root page per table/index) but well below the size of 600 rows.
+        let max_bytes = 96 * 1024;
+        let limits = cache::CacheLimits {
+            max_bytes,
+            max_entries: 0,
+        };
+        const SAVED: u32 = 600;
+
+        for i in 0..SAVED {
+            save_with(limits, &format!("hash-{i:04}"), "f", i).expect("save");
+        }
+
+        let stats = cache::cache_stats().expect("stats");
+        assert!(
+            stats.total_entries < SAVED as usize,
+            "byte quota should have evicted entries, kept {}",
+            stats.total_entries
+        );
+        assert!(
+            stats.live_bytes <= max_bytes,
+            "live cache size {} must stay under the {max_bytes} byte quota",
+            stats.live_bytes,
+        );
+    });
+}
+
+/// A byte quota smaller than the database's structural floor must not wipe
+/// the cache: eviction stops once deleting rows stops reducing the size.
+#[test]
+fn test_unattainable_byte_quota_does_not_empty_cache() {
+    with_temp_home(|_tmp| {
+        // 1 byte is below any SQLite database's floor.
+        let limits = cache::CacheLimits {
+            max_bytes: 1,
+            max_entries: 0,
+        };
+        for i in 0..20 {
+            save_with(limits, &format!("hash-{i:04}"), "f", i).expect("save");
+        }
+
+        let estimates = cache::list_cached_estimates("testnet").expect("list");
+        assert!(
+            !estimates.is_empty(),
+            "an unattainable byte quota must not evict every entry"
+        );
+    });
+}
+
+#[test]
+fn test_unbounded_limits_disable_eviction() {
+    with_temp_home(|_tmp| {
+        for i in 0..50 {
+            save_with(cache::CacheLimits::UNBOUNDED, "h", &format!("f{i}"), i).expect("save");
+        }
+        let estimates = cache::list_cached_estimates("testnet").expect("list");
+        assert_eq!(estimates.len(), 50, "unbounded limits must never evict");
+    });
+}
+
+#[test]
+fn test_evict_lru_is_noop_under_default_limits() {
+    with_temp_home(|_tmp| {
+        for i in 0..5 {
+            cache::save_estimate(
+                "h",
+                &format!("f{i}"),
+                &[],
+                "testnet",
+                i,
+                100,
+                10,
+                5,
+                None,
+                true,
+            )
+            .expect("save");
+        }
+        let evicted = cache::evict_lru().expect("prune");
+        assert_eq!(evicted, 0, "a small cache is within the default quota");
+    });
+}
+
+#[test]
+fn test_concurrent_saves_respect_entry_quota() {
+    with_temp_home(|_tmp| {
+        let limits = entry_limits(10);
+        let handles: Vec<_> = (0..4)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for j in 0..20 {
+                        save_with(limits, &format!("hash-{t}"), &format!("f{j}"), j)
+                            .expect("concurrent save");
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("concurrent save thread panicked");
+        }
+
+        let estimates = cache::list_cached_estimates("testnet").expect("list");
+        assert!(
+            estimates.len() <= 10,
+            "quota must hold under concurrent writers, got {}",
+            estimates.len()
+        );
+        let statuses = cache::verify_cache().expect("verify after concurrent eviction");
+        assert!(
+            statuses.iter().all(|s| s.valid),
+            "concurrent eviction must not corrupt entries: {statuses:?}"
+        );
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // cache_stats (issue #281)
 // ─────────────────────────────────────────────────────────────────────────
 
