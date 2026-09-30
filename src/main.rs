@@ -796,6 +796,7 @@ async fn simulate_report(
         network: req.network.to_string(),
         rpc_latency_ms,
         rates: Some(fee_rates),
+        projections: None,
     })
 }
 
@@ -833,11 +834,200 @@ async fn cmd_estimate(
     dry_run: bool,
     project: Option<&str>,
 ) -> error::AppResult<()> {
+    // Parse the requested projection counts up front so an invalid list is
+    // rejected before any RPC traffic, regardless of the output format.
     let projection_counts = match project {
         Some(s) => Some(report::cost_report::parse_projection_counts(s)?),
         None => None,
     };
 
+    // `--wasm-new` is only meaningful together with `--diff`; silently
+    // ignoring it would produce a single report the user did not ask for.
+    if !diff && wasm_new.is_some() {
+        return Err(error::AppError::General(
+            "--wasm-new requires --diff (comparison mode)".to_string(),
+        ));
+    }
+
+    if diff {
+        return cmd_estimate_diff(
+            wasm_path,
+            wasm_new,
+            network,
+            rpc_url,
+            rpc_fallback_url,
+            contract_id,
+            fn_name,
+            args,
+            format,
+            rps,
+            timeout,
+            max_retries,
+            precision,
+            extra_headers,
+            verbose,
+        )
+        .await;
+    }
+
+    if watch {
+        return cmd_estimate_watch(
+            wasm_path,
+            network,
+            rpc_url,
+            rpc_fallback_url,
+            contract_id,
+            fn_name,
+            args,
+            format,
+            rps,
+            timeout,
+            max_retries,
+            precision,
+            extra_headers,
+            verbose,
+        )
+        .await;
+    }
+
+    let mut run = estimate_once(
+        wasm_path,
+        network,
+        rpc_url,
+        rpc_fallback_url,
+        contract_id,
+        fn_name,
+        args,
+        cache_ttl,
+        clear_cache,
+        format,
+        precision,
+        extra_headers,
+        rps,
+        timeout,
+        max_retries,
+        format == "table",
+        wasm_info_flag,
+        verbose,
+        dry_run,
+    )
+    .await?;
+
+    // `--dry-run` promises no network access, so bail before the rendering and
+    // before the auto-snapshot guard (which fetches live pricing config).
+    if matches!(run, EstimateRun::DryRun) {
+        return Ok(());
+    }
+
+    if let EstimateRun::Simulated { report, .. } = &mut run {
+        // Attach batch cost projections before rendering so every output
+        // format (table, markdown, json, csv) sees the same report.
+        if let Some(ref counts) = projection_counts {
+            report.projections = Some(report::cost_report::calculate_projections(
+                report.fee.total_stroops,
+                counts,
+                precision,
+                None,
+            )?);
+        }
+
+        // The table formatter is the only one that renders the fee bar chart,
+        // and only when the terminal has room for it (>= MIN_CHART_WIDTH
+        // columns), stdout is a TTY, and `--quiet` was not passed. Machine
+        // formats never grow a human-only chart.
+        if format == "table" {
+            match cli::chart_width() {
+                Some(width) => {
+                    println!(
+                        "{}",
+                        TableFormatter.format_with_options(report, true, width)
+                    );
+                }
+                None => {
+                    println!(
+                        "{}",
+                        TableFormatter.format_with_options(
+                            report,
+                            false,
+                            report::cost_report::DEFAULT_CHART_WIDTH,
+                        )
+                    );
+                }
+            }
+        } else {
+            match formatter_by_name(format) {
+                Some(formatter) => println!("{}", formatter.format(report)),
+                None => {
+                    println!(
+                        "{}",
+                        TableFormatter.format_with_options(
+                            report,
+                            false,
+                            report::cost_report::DEFAULT_CHART_WIDTH,
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    // Main's `--auto-snapshot` step belongs here rather than inside
+    // `estimate_once`: that helper is shared with watch mode, which re-simulates
+    // on every rebuild and would otherwise re-write a snapshot per build.
+    if auto_snapshot {
+        if let Err(e) = auto_snapshot_if_changed(
+            network,
+            rpc_fallback_url,
+            rps,
+            timeout,
+            max_retries,
+            extra_headers,
+            verbose,
+        )
+        .await
+        {
+            warn!(error = %e, "auto-snapshot failed");
+            eprintln!("Warning: auto-snapshot failed: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// Run a single estimation for `estimate` (and each `estimate --watch` build).
+///
+/// Performs the full pipeline — WASM load + hash, cache lookup, transaction
+/// construction, argument validation, endpoint health check, simulation,
+/// fee-rate fetch, fee breakdown, and cache write — and returns the outcome
+/// for the caller to render. Only the `WASM SHA-256` preamble (when
+/// `print_wasm_hash` is set, i.e. human single-shot runs) and the cache-hit
+/// message are emitted inline.
+///
+/// # Network calls
+/// One `simulateTransaction` RPC call plus (when not served from cache) up
+/// to three configuration-setting fetches for the fee-rate breakdown.
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::fn_params_excessive_bools)]
+async fn estimate_once(
+    wasm_path: &str,
+    network: &str,
+    rpc_url: Option<&str>,
+    rpc_fallback_url: Option<&str>,
+    contract_id: Option<&str>,
+    fn_name: Option<&str>,
+    args: &[String],
+    cache_ttl: Option<&str>,
+    clear_cache: bool,
+    format: &str,
+    precision: u32,
+    extra_headers: &[String],
+    rps: Option<u64>,
+    timeout: u64,
+    max_retries: usize,
+    print_wasm_hash: bool,
+    wasm_info_flag: bool,
+    verbose: bool,
+    dry_run: bool,
+) -> error::AppResult<EstimateRun> {
     let json_flag = format == "json";
     let table_mode = format == "table";
     use sha2::Digest;
@@ -1310,33 +1500,11 @@ async fn cmd_estimate_watch(
     let human = format == "table";
     let path = std::path::Path::new(wasm_path);
 
-        let projections = match projection_counts {
-            Some(ref counts) => Some(report::cost_report::calculate_projections(
-                fee.total_stroops,
-                counts,
-                precision,
-                None,
-            )?),
-            None => None,
-        };
-
-        let report = report::cost_report::CostReport {
-            function: function_name.to_string(),
-            wasm_hash: wasm_hash.clone(),
-            cpu_instructions,
-            memory_bytes,
-            tx_size: tx_xdr.len() as u32,
-            read_entries,
-            write_entries,
-            read_bytes,
-            write_bytes,
-            fee: fee.clone(),
-            ledger: latest_ledger,
-            network: network.to_string(),
-            rpc_latency_ms,
-            rates: Some(fee_rates),
-            projections,
-        };
+    info!(wasm_path, "starting estimate watch");
+    watch_say(
+        human,
+        format!("Watching {wasm_path} for changes... (Ctrl-C to stop)"),
+    );
 
     let mut state = EstimateWatchState {
         last_hash: None,
@@ -3383,6 +3551,7 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
             rates: None,
+            projections: None,
         }
     }
 

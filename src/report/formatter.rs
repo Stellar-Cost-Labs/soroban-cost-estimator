@@ -364,8 +364,8 @@ impl ReportFormatter for MarkdownFormatter {
                     .unwrap_or_else(|| "-".to_string());
                 output.push_str(&format!(
                     "| {} | {} | {} | {} |\n",
-                    crate::report::cost_report::format_thousands(p.invocations),
-                    crate::report::cost_report::format_thousands_i64(p.total_stroops),
+                    crate::report::cost_report::format_thousands_u64(p.invocations),
+                    crate::report::cost_report::format_thousands(p.total_stroops),
                     p.total_xlm,
                     usd_str
                 ));

@@ -296,6 +296,7 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 42,
             rates: None,
+            projections: None,
         }
     }
 

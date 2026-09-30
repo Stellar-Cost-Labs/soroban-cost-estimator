@@ -785,32 +785,6 @@ pub fn calculate_projections(
     Ok(projections)
 }
 
-/// Format an unsigned integer with comma thousands separators.
-#[must_use]
-pub fn format_thousands(n: u64) -> String {
-    let s = n.to_string();
-    let bytes = s.as_bytes();
-    let len = bytes.len();
-    let mut out = String::with_capacity(len + len / 3);
-    for (i, &b) in bytes.iter().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(b as char);
-    }
-    out
-}
-
-/// Format a signed 64-bit integer with comma thousands separators.
-#[must_use]
-pub fn format_thousands_i64(n: i64) -> String {
-    if n < 0 {
-        format!("-{}", format_thousands(n.unsigned_abs()))
-    } else {
-        format_thousands(n as u64)
-    }
-}
-
 /// Formats a list of cost projections into a human-readable table.
 #[must_use]
 pub fn format_projections_table(projections: &[CostProjection]) -> String {
@@ -833,8 +807,8 @@ pub fn format_projections_table(projections: &[CostProjection]) -> String {
             .map(|u| format!("${u:.2}"))
             .unwrap_or_else(|| "-".to_string());
         table.add_row(vec![
-            Cell::new(format_thousands(p.invocations)).set_alignment(CellAlignment::Right),
-            Cell::new(format_thousands_i64(p.total_stroops)).set_alignment(CellAlignment::Right),
+            Cell::new(format_thousands_u64(p.invocations)).set_alignment(CellAlignment::Right),
+            Cell::new(format_thousands(p.total_stroops)).set_alignment(CellAlignment::Right),
             Cell::new(&p.total_xlm).set_alignment(CellAlignment::Right),
             Cell::new(usd_str).set_alignment(CellAlignment::Right),
         ]);
@@ -1177,8 +1151,8 @@ mod tests {
         assert_eq!(format_thousands(10_000), "10,000");
         assert_eq!(format_thousands(1_234_567), "1,234,567");
 
-        assert_eq!(format_thousands_i64(-1_234_567), "-1,234,567");
-        assert_eq!(format_thousands_i64(500), "500");
+        assert_eq!(format_thousands(-1_234_567), "-1,234,567");
+        assert_eq!(format_thousands(500), "500");
     }
 
     #[test]
