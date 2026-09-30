@@ -303,6 +303,8 @@ impl RpcClient {
         Self {
             url: url.to_string(),
             fallback_url: fallback_url.map(String::from),
+            timeout_secs: timeout.as_secs(),
+
             // `ClientBuilder::build` only fails on invalid configuration (a
             // default builder cannot), so fall back to a plain client to keep
             // construction infallible.
@@ -495,7 +497,15 @@ impl RpcClient {
                     Err(e)
                 }
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                if let AppError::Http(ref error) = e {
+                    if error.is_timeout() {
+                        return Err(AppError::RpcTimeout(self.timeout_secs));
+                    }
+                }
+
+                Err(e)
+            }
         }
     }
 
@@ -542,12 +552,10 @@ impl RpcClient {
             let limiter = limiter.clone();
 
             async move {
-                // Every outbound attempt (including retries) consumes a
-                // token, so the wire rate never exceeds the configured
-                // requests-per-second cap.
                 if let Some(limiter) = &limiter {
                     limiter.until_ready().await;
                 }
+
                 client
                     .post(&url)
                     .json(&request_body)
@@ -556,7 +564,15 @@ impl RpcClient {
                     .map_err(AppError::from)
             }
         })
-        .await?;
+        .await
+        {
+            Ok(response) => response,
+            Err(AppError::Http(error)) if error.is_timeout() => {
+                return Err(AppError::RpcTimeout(self.timeout_secs));
+            }
+            Err(error) => return Err(error),
+        };
+
         let status = response.status();
 
         // A 502/503/504 means the endpoint is briefly unavailable rather than
@@ -1121,10 +1137,9 @@ mod tests {
 
         let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
 
-        assert!(
-            result.is_err(),
-            "a hanging server must eventually produce a timeout error"
-        );
+        let error = result.expect_err("request should time out");
+
+        assert_eq!(error.to_string(), "RPC request timed out after 1 seconds");
     }
 
     /// Reserves a port and immediately closes it, so connecting to it yields
