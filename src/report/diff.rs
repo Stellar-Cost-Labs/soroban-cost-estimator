@@ -240,6 +240,8 @@ pub fn format_cost_report_diff_sized(
     }
     if color {
         table.enforce_styling();
+    } else {
+        table.force_no_tty();
     }
     table.set_header(vec!["Resource", "Old", "New", "Change (+/- %)"]);
 
@@ -296,6 +298,7 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 42,
             rates: None,
+            projections: None,
         }
     }
 

@@ -58,11 +58,17 @@ fn temp_home(label: &str) -> PathBuf {
 
 /// A minimal but structurally valid config snapshot, matching `ConfigSnapshot`.
 fn snapshot_json(network: &str, ledger: u32) -> String {
+    snapshot_json_at(network, ledger, "2026-01-01T00:00:00+00:00")
+}
+
+/// As [`snapshot_json`], but with an explicit RFC 3339 timestamp so a test can
+/// lay out several snapshots in a known chronological order.
+fn snapshot_json_at(network: &str, ledger: u32, timestamp: &str) -> String {
     format!(
         r#"{{
   "network": "{network}",
   "ledger": {ledger},
-  "timestamp": "2026-01-01T00:00:00+00:00",
+  "timestamp": "{timestamp}",
   "contract_compute": null,
   "contract_ledger_cost": null,
   "contract_historical_data": null,
@@ -71,6 +77,40 @@ fn snapshot_json(network: &str, ledger: u32) -> String {
   "state_archival": null
 }}"#
     )
+}
+
+/// Writes one snapshot into the isolated home's snapshots directory.
+///
+/// The filename mirrors `save_snapshot`: `{network}-{timestamp}.json` with
+/// `:` replaced by `-`. That naming is what orders snapshots on disk, so a
+/// test has to reproduce it to exercise the real lookup path.
+fn write_snapshot(home: &Path, network: &str, timestamp: &str, ledger: u32) -> PathBuf {
+    let dir = home.join(".soroban-cost-estimator").join("snapshots");
+    std::fs::create_dir_all(&dir).expect("create snapshots dir");
+    let path = dir.join(format!("{network}-{}.json", timestamp.replace(':', "-")));
+    std::fs::write(&path, snapshot_json_at(network, ledger, timestamp)).expect("write snapshot");
+    path
+}
+
+/// Runs the CLI with `HOME` isolated and tracing silenced.
+///
+/// `tracing`'s `info!` lines go to stdout in this binary, so `RUST_LOG=error`
+/// is what makes stdout exactly the command's own output for JSON assertions.
+fn run_cli_quiet(args: &[&str], home: Option<&Path>) -> (String, String, i32) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"));
+    cmd.args(args).env("RUST_LOG", "error");
+    if let Some(home) = home {
+        cmd.env("HOME", home);
+        cmd.env("USERPROFILE", home);
+    }
+
+    let output = cmd.output().expect("failed to run CLI");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let code = output.status.code().unwrap_or(-1);
+
+    (stdout, stderr, code)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -185,7 +225,7 @@ fn test_config_diff_help() {
         code, 0,
         "config diff --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--network", "--against", "--summary"] {
+    for flag in ["--network", "--against", "--against-previous", "--summary"] {
         assert!(
             stdout.contains(flag),
             "diff help should mention {flag}; got: {stdout}"
@@ -1112,6 +1152,158 @@ fn test_config_diff_loads_valid_snapshot_before_network() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// `config diff --against-previous`
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_config_diff_against_previous_no_snapshots_errors() {
+    // Scenario 0: nothing on disk to compare. The network name is
+    // deliberately unresolvable, so if the command reached for the RPC
+    // endpoint at all the failure would name the network instead.
+    let home = temp_home("diff-prev-none");
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against-previous",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "0 snapshots should exit 1");
+    assert!(
+        stderr.contains("need at least 2 for network not-a-network") && stderr.contains("found 0"),
+        "the error should report the snapshot count; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("failed to locate RPC endpoint"),
+        "--against-previous must never contact the network; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_diff_against_previous_one_snapshot_errors() {
+    // Scenario 1: a single point in time has nothing to diff against.
+    let home = temp_home("diff-prev-one");
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:01+00:00", 100);
+
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against-previous",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "1 snapshot should exit 1");
+    assert!(
+        stderr.contains("need at least 2 for network not-a-network") && stderr.contains("found 1"),
+        "the error should report the snapshot count; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("failed to locate RPC endpoint"),
+        "--against-previous must never contact the network; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_diff_against_previous_diffs_two_newest_snapshots() {
+    // Scenario 2+: three snapshots on disk, so the command must compare the
+    // two newest (ledgers 200 → 300) and leave the oldest (100) alone. The
+    // network is unresolvable on purpose: this command is purely local, so a
+    // network failure here would mean it leaked past the snapshot store.
+    let home = temp_home("diff-prev-two");
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:01+00:00", 100);
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:02+00:00", 200);
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:03+00:00", 300);
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against-previous",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(
+        code, 0,
+        "identical consecutive snapshots should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("(ledger 200) → 2026-01-01T00:00:03+00:00 (ledger 300)"),
+        "the two newest snapshots must be the ones compared; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("(ledger 100)"),
+        "the oldest snapshot must not take part in the diff; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("No changes detected"),
+        "identical snapshots should report no changes; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_diff_against_previous_summary_output() {
+    let home = temp_home("diff-prev-summary");
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:01+00:00", 100);
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:02+00:00", 200);
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against-previous",
+            "--summary",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 0, "--summary should exit 0 here; stderr: {stderr}");
+    assert!(
+        stdout.contains("0 pricing changes, 0 non-pricing changes"),
+        "--summary should emit exactly the one-line summary; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_diff_against_previous_json_uses_the_live_envelope() {
+    // Both diff modes emit `{ diff, stale_estimates }`, so a consumer sees one
+    // schema whether the newer side came from the network or from disk.
+    let home = temp_home("diff-prev-json");
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:01+00:00", 100);
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:02+00:00", 200);
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against-previous",
+            "--json",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 0, "--json should exit 0 here; stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("valid JSON; {e}: {stdout}"));
+    assert_eq!(parsed["diff"]["old_snapshot"]["ledger"], 100);
+    assert_eq!(parsed["diff"]["new_snapshot"]["ledger"], 200);
+    assert_eq!(parsed["diff"]["has_pricing_changes"], false);
+    assert_eq!(parsed["stale_estimates"].as_array().map(Vec::len), Some(0));
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // `watch`
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -1288,6 +1480,281 @@ fn test_cache_query_json_flag_accepted() {
     assert!(
         serde_json::from_str::<serde_json::Value>(trimmed).is_ok(),
         "output should be valid JSON; got: {stdout}"
+    );
+}
+
+fn seed_cache_estimate(
+    home: &Path,
+    wasm_hash: &str,
+    function: &str,
+    network: &str,
+    fee: i64,
+    cpu: u64,
+    timestamp: &str,
+) {
+    let args_hash = hex::encode(sha2::Sha256::digest(function.as_bytes()));
+    let dir = home.join(".soroban-cost-estimator");
+    std::fs::create_dir_all(&dir).expect("create data dir");
+    let db = dir.join("cache.db");
+    let conn = rusqlite::Connection::open(&db).expect("open cache db");
+    cache::ensure_cache_schema(&conn).expect("ensure cache schema");
+
+    conn.execute(
+        "INSERT OR REPLACE INTO estimates \
+         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            cache::CACHE_SCHEMA_VERSION as i64,
+            wasm_hash,
+            function,
+            args_hash,
+            network,
+            42i64,
+            fee,
+            cpu as i64,
+            1024i64,
+            timestamp,
+        ],
+    )
+    .expect("insert test cache estimate");
+}
+
+#[test]
+fn test_config_cache_query_help() {
+    let (stdout, stderr, code) = run_cli(&["config", "cache", "query", "--help"]);
+    assert_eq!(
+        code, 0,
+        "config cache query --help should exit 0; stderr: {stderr}"
+    );
+    for flag in [
+        "--network",
+        "--fn",
+        "--wasm-hash",
+        "--min-fee",
+        "--max-fee",
+        "--since",
+        "--json",
+    ] {
+        assert!(
+            stdout.contains(flag),
+            "config cache query help should mention {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_config_cache_query_empty_cache() {
+    let home = temp_home("config-cache-query-empty");
+    let (stdout, stderr, code) = run_cli_in_home(&["config", "cache", "query"], Some(&home));
+    assert_eq!(
+        code, 0,
+        "config cache query on empty cache should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("No cached estimates match the query."),
+        "empty cache should report no results; got: {stdout}"
+    );
+}
+
+fn run_cli_json_in_home(args: &[&str], home: &Path) -> (String, String, i32) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"));
+    cmd.args(args);
+    cmd.env("HOME", home);
+    cmd.env("USERPROFILE", home);
+    cmd.env("RUST_LOG", "error");
+    let output = cmd.output().expect("failed to run CLI");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let code = output.status.code().unwrap_or(-1);
+    (stdout, stderr, code)
+}
+
+#[test]
+fn test_config_cache_query_empty_json() {
+    let home = temp_home("config-cache-query-empty-json");
+    let (stdout, stderr, code) =
+        run_cli_json_in_home(&["config", "cache", "query", "--json"], &home);
+    assert_eq!(
+        code, 0,
+        "config cache query --json should exit 0; stderr: {stderr}"
+    );
+    assert_eq!(
+        stdout.trim(),
+        "[]",
+        "empty JSON should be []; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_cache_query_with_filters_table() {
+    let home = temp_home("config-cache-query-table");
+    seed_cache_estimate(
+        &home,
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        "transfer",
+        "testnet",
+        150_000,
+        12_000,
+        "2026-02-01T10:00:00Z",
+    );
+    seed_cache_estimate(
+        &home,
+        "2222222222222222222222222222222222222222222222222222222222222222",
+        "approve",
+        "testnet",
+        250_000,
+        24_000,
+        "2026-02-02T10:00:00Z",
+    );
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &["config", "cache", "query", "--fn", "transfer"],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "query should succeed; stderr: {stderr}");
+    assert!(
+        stdout.contains("Timestamp"),
+        "table should contain Timestamp"
+    );
+    assert!(stdout.contains("Function"), "table should contain Function");
+    assert!(stdout.contains("CPU"), "table should contain CPU");
+    assert!(stdout.contains("Fee"), "table should contain Fee");
+    assert!(stdout.contains("transfer"), "table should contain transfer");
+    assert!(
+        !stdout.contains("approve"),
+        "table should NOT contain approve"
+    );
+}
+
+#[test]
+fn test_config_cache_query_with_filters_json() {
+    let home = temp_home("config-cache-query-json");
+    seed_cache_estimate(
+        &home,
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        "transfer",
+        "testnet",
+        150_000,
+        12_000,
+        "2026-02-01T10:00:00Z",
+    );
+    seed_cache_estimate(
+        &home,
+        "2222222222222222222222222222222222222222222222222222222222222222",
+        "approve",
+        "testnet",
+        250_000,
+        24_000,
+        "2026-02-02T10:00:00Z",
+    );
+
+    let (stdout, stderr, code) = run_cli_json_in_home(
+        &["config", "cache", "query", "--fn", "transfer", "--json"],
+        &home,
+    );
+    assert_eq!(code, 0, "query --json should succeed; stderr: {stderr}");
+    let val: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json output");
+    let arr = val.as_array().expect("json array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["function"], "transfer");
+    assert_eq!(arr[0]["total_stroops"], 150_000);
+}
+
+#[test]
+fn test_config_cache_query_no_filters_returns_all_networks() {
+    let home = temp_home("config-cache-query-all");
+    seed_cache_estimate(
+        &home,
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        "fn_testnet",
+        "testnet",
+        150_000,
+        12_000,
+        "2026-02-01T10:00:00Z",
+    );
+    seed_cache_estimate(
+        &home,
+        "2222222222222222222222222222222222222222222222222222222222222222",
+        "fn_mainnet",
+        "mainnet",
+        250_000,
+        24_000,
+        "2026-02-02T10:00:00Z",
+    );
+
+    let (stdout, stderr, code) =
+        run_cli_json_in_home(&["config", "cache", "query", "--json"], &home);
+    assert_eq!(code, 0, "query --json should succeed; stderr: {stderr}");
+    let val: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json output");
+    let arr = val.as_array().expect("json array");
+    assert_eq!(
+        arr.len(),
+        2,
+        "query without filters should return all cached entries"
+    );
+}
+
+#[test]
+fn test_config_cache_query_invalid_network_error() {
+    let home = temp_home("config-cache-query-inv-net");
+    let (_stdout, stderr, code) = run_cli_in_home(
+        &["config", "cache", "query", "--network", "invalid_net_xyz"],
+        Some(&home),
+    );
+    assert_ne!(code, 0, "invalid network must fail");
+    assert!(
+        stderr.contains("not configured for network") || stderr.contains("invalid_net_xyz"),
+        "stderr should mention invalid network; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_cache_query_invalid_fee_range_error() {
+    let home = temp_home("config-cache-query-inv-fee");
+    let (_stdout, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "cache",
+            "query",
+            "--min-fee",
+            "200000",
+            "--max-fee",
+            "100000",
+        ],
+        Some(&home),
+    );
+    assert_ne!(code, 0, "invalid fee range must fail");
+    assert!(
+        stderr.contains("cannot exceed max-fee"),
+        "stderr should mention invalid fee range; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_cache_query_invalid_since_error() {
+    let home = temp_home("config-cache-query-inv-since");
+    let (_stdout, stderr, code) = run_cli_in_home(
+        &["config", "cache", "query", "--since", "bad-date-format"],
+        Some(&home),
+    );
+    assert_ne!(code, 0, "invalid since date must fail");
+    assert!(
+        stderr.contains("invalid timestamp or date"),
+        "stderr should mention invalid timestamp or date; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_cache_query_invalid_wasm_hash_error() {
+    let home = temp_home("config-cache-query-inv-hash");
+    let (_stdout, stderr, code) = run_cli_in_home(
+        &["config", "cache", "query", "--wasm-hash", "xyz_not_hex"],
+        Some(&home),
+    );
+    assert_ne!(code, 0, "invalid wasm hash must fail");
+    assert!(
+        stderr.contains("hexadecimal"),
+        "stderr should mention hexadecimal; got: {stderr}"
     );
 }
 
@@ -2107,5 +2574,316 @@ fn test_completions_unsupported_shell() {
     assert!(
         stderr.contains("invalid value 'invalid_shell'") || stderr.contains("unexpected argument"),
         "stderr should state invalid shell value; got: {stderr}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Cost projections (`--project`)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_estimate_project_flag_custom_counts_table() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-project-table");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+            "--project",
+            "100,1000,10000",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate should succeed; stderr: {stderr}"
+    );
+
+    assert!(stdout.contains("Cost Projections:"));
+    assert!(stdout.contains("Invocations"));
+    assert!(stdout.contains("Total Stroops"));
+    assert!(stdout.contains("Total XLM"));
+    assert!(stdout.contains("USD"));
+    assert!(stdout.contains("100"));
+    assert!(stdout.contains("1,552,700"));
+    assert!(stdout.contains("0.1552700"));
+    assert!(stdout.contains("1,000"));
+    assert!(stdout.contains("15,527,000"));
+    assert!(stdout.contains("1.5527000"));
+    assert!(stdout.contains("10,000"));
+    assert!(stdout.contains("155,270,000"));
+    assert!(stdout.contains("15.5270000"));
+    assert!(stdout.contains('-'));
+}
+
+#[test]
+fn test_estimate_project_flag_default_counts() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-project-default");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+            "--project",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate should succeed; stderr: {stderr}"
+    );
+
+    assert!(stdout.contains("Cost Projections:"));
+    assert!(stdout.contains("100"));
+    assert!(stdout.contains("1,000"));
+    assert!(stdout.contains("10,000"));
+}
+
+#[test]
+fn test_estimate_project_flag_preserves_order() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-project-order");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+            "--project",
+            "10000,100,1000",
+            "--json",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate should succeed; stderr: {stderr}"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    let projections = parsed["projections"].as_array().expect("projections array");
+    assert_eq!(projections.len(), 3);
+    assert_eq!(projections[0]["invocations"], 10000);
+    assert_eq!(projections[1]["invocations"], 100);
+    assert_eq!(projections[2]["invocations"], 1000);
+}
+
+#[test]
+fn test_estimate_no_project_flag_omits_projections() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-no-project");
+
+    // Table mode without --project
+    let output_table = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout_table = String::from_utf8_lossy(&output_table.stdout);
+    assert!(!stdout_table.contains("Cost Projections:"));
+
+    // JSON mode without --project
+    let output_json = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+            "--json",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout_json = String::from_utf8_lossy(&output_json.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout_json.trim()).expect("valid JSON output; got: {stdout_json}");
+    assert!(parsed.get("projections").is_none());
+}
+
+#[test]
+fn test_estimate_project_json_structure() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-project-json");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+            "--project",
+            "100,1000,10000",
+            "--json",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate should succeed; stderr: {stderr}"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    let projections = parsed["projections"].as_array().expect("projections array");
+    assert_eq!(projections.len(), 3);
+
+    assert_eq!(projections[0]["invocations"], 100);
+    assert_eq!(projections[0]["total_stroops"], 1_552_700);
+    assert_eq!(projections[0]["total_xlm"], "0.1552700");
+    assert!(projections[0].get("usd").is_none());
+
+    assert_eq!(projections[1]["invocations"], 1000);
+    assert_eq!(projections[1]["total_stroops"], 15_527_000);
+    assert_eq!(projections[1]["total_xlm"], "1.5527000");
+
+    assert_eq!(projections[2]["invocations"], 10000);
+    assert_eq!(projections[2]["total_stroops"], 155_270_000);
+    assert_eq!(projections[2]["total_xlm"], "15.5270000");
+}
+
+#[test]
+fn test_estimate_project_invalid_input_error() {
+    let (_stdout, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--project",
+        "abc",
+    ]);
+    assert_ne!(code, 0, "invalid projection count 'abc' should fail");
+    assert!(
+        stderr.contains("invalid projection count 'abc'"),
+        "stderr should mention invalid count: {stderr}"
+    );
+
+    let (_, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--project",
+        "100,abc,1000",
+    ]);
+    assert_ne!(
+        code, 0,
+        "invalid projection count '100,abc,1000' should fail"
+    );
+    assert!(
+        stderr.contains("invalid projection count 'abc'"),
+        "stderr should mention invalid count: {stderr}"
+    );
+
+    let (_, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--project",
+        "0",
+    ]);
+    assert_ne!(code, 0, "projection count 0 should fail");
+    assert!(
+        stderr.contains("greater than zero"),
+        "stderr should mention greater than zero: {stderr}"
+    );
+
+    let (_, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--project",
+        "100,100",
+    ]);
+    assert_ne!(code, 0, "duplicate projection count should fail");
+    assert!(
+        stderr.contains("duplicate projection count: 100"),
+        "stderr should mention duplicate count: {stderr}"
     );
 }
