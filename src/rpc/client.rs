@@ -1,15 +1,18 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use governor::{Quota, RateLimiter};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::Mutex;
-use tracing::{debug, trace, warn};
+use tokio::sync::{Mutex, Notify};
+use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
-use crate::rpc::retry::with_retry;
+use crate::rpc::retry::{DEFAULT_MAX_RETRIES, with_retry};
 
 /// Default per-request HTTP timeout applied to every RPC call. Matches the
 /// CLI's `--timeout` default (30 seconds).
@@ -69,6 +72,66 @@ pub fn resolve_ws_endpoint(network: &str, custom_url: Option<&str>) -> AppResult
 /// Key identifying a deduplicable JSON-RPC request: `(method, serialized params)`.
 type RequestKey = (String, String);
 
+/// A single-flight handle for one in-flight request.
+///
+/// The first caller for a request key (the "leader") owns a `SharedFuture`
+/// and performs the network call. Concurrent identical callers (the
+/// "followers") await the *same* handle instead of issuing their own request,
+/// so N identical calls in flight share one underlying future and one HTTP
+/// POST.
+///
+/// A leader that succeeds publishes its raw JSON-RPC `result`, which every
+/// follower reads without touching the network. A leader that fails publishes
+/// nothing: followers observe an empty outcome and become the next leader, so
+/// one caller's failure never poisons the rest — they simply retry.
+#[derive(Debug, Clone, Default)]
+struct SharedFuture {
+    inner: Arc<SharedFutureInner>,
+}
+
+/// Shared state behind a [`SharedFuture`].
+#[derive(Debug, Default)]
+struct SharedFutureInner {
+    /// Successful outcome published by the leader, if it completed. Written
+    /// once by the leader and read by every follower.
+    outcome: Mutex<Option<Value>>,
+    /// Set once the leader has finished — successfully or not.
+    finished: AtomicBool,
+    /// Wakes followers the moment `finished` flips to `true`.
+    done: Notify,
+}
+
+impl SharedFuture {
+    /// Publishes the leader's successful result for its followers.
+    async fn publish(&self, value: Value) {
+        *self.inner.outcome.lock().await = Some(value);
+    }
+
+    /// Returns the leader's published result, if it succeeded.
+    async fn outcome(&self) -> Option<Value> {
+        self.inner.outcome.lock().await.clone()
+    }
+
+    /// Waits until the leader has finished (success or failure).
+    ///
+    /// Interest is registered *before* `finished` is checked, so a leader that
+    /// completes in the interim cannot produce a lost wakeup.
+    async fn wait(&self) {
+        let notified = self.inner.done.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.inner.finished.load(Ordering::Acquire) {
+            notified.await;
+        }
+    }
+
+    /// Marks this shared future complete and wakes every follower.
+    fn finish(&self) {
+        self.inner.finished.store(true, Ordering::Release);
+        self.inner.done.notify_waiters();
+    }
+}
+
 /// Private, shared deduplication state for a `RpcClient`.
 ///
 /// Deduplication collapses identical JSON-RPC requests — the same method with
@@ -79,14 +142,24 @@ type RequestKey = (String, String);
 #[derive(Debug, Default)]
 struct DedupState {
     /// Results of identical requests that already completed successfully,
-    /// keyed by request. A cache hit skips the network entirely.
+    /// keyed by request. A cache hit skips the network entirely and also lets
+    /// a request arriving *after* its twin finished share the result.
     completed: HashMap<RequestKey, Value>,
-    /// Per-request serialization gates. The first caller for a key (the
-    /// "leader") performs the request; concurrent identical callers wait on
-    /// the gate, then read the cached result. Followers of a *failed* leader
-    /// observe no cached result and simply become the next leader, so a
-    /// retry only costs the request itself.
-    in_flight: HashMap<RequestKey, Arc<Mutex<()>>>,
+    /// One single-flight handle per key currently in flight. Concurrent
+    /// identical callers attach to the existing handle rather than opening a
+    /// second request.
+    in_flight: HashMap<RequestKey, SharedFuture>,
+}
+
+/// Response envelope for the `getHealth` JSON-RPC method.
+///
+/// Stellar RPC returns a `status` of `healthy`, `degraded`, or `unhealthy`
+/// plus ledger-window information; the health check only needs `status`.
+/// Extra fields in the response are ignored by serde.
+#[derive(Debug, Deserialize)]
+struct HealthResponse {
+    /// Node health status: `healthy`, `degraded`, or `unhealthy`.
+    status: String,
 }
 
 /// A minimal JSON-RPC 2.0 client for Soroban RPC endpoints.
@@ -106,17 +179,25 @@ pub struct RpcClient {
     dedup: Arc<Mutex<DedupState>>,
     /// Fixed-rate limiter shared by every network call, when enabled.
     limiter: Option<Arc<governor::DefaultDirectRateLimiter>>,
+    /// Maximum number of retries on transient (HTTP) failures, with
+    /// exponential backoff.
+    max_retries: usize,
+    /// Custom HTTP headers attached to every outbound request.
+    pub headers: HeaderMap,
+    /// Whether to print verbose RPC request/response diagnostics to stderr.
+    pub verbose: bool,
 }
 
 impl RpcClient {
     /// Create a new RPC client pointing at the given URL, without rate
     /// limiting and with the default request timeout.
     pub fn new(url: &str) -> Self {
-        Self::with_rate_limit(url, None)
+        Self::with_rate_limit(url, None, false)
     }
 
     /// Create a new RPC client pointing at the given URL, optionally capping
-    /// outbound requests to `rps` requests per second.
+    /// outbound requests to `rps` requests per second. Retries use the
+    /// [`DEFAULT_MAX_RETRIES`] default.
     ///
     /// The limiter spaces consecutive outbound calls at least `1/rps` seconds
     /// apart (a fixed-rate limiter with a burst of 1). `None` or `Some(0)`
@@ -126,43 +207,99 @@ impl RpcClient {
     /// The underlying `reqwest::Client` is configured with connection pooling
     /// and TCP keep-alive so that HTTP connections are reused across multiple
     /// RPC calls within a single run, reducing handshake overhead.
-    pub fn with_rate_limit(url: &str, rps: Option<u64>) -> Self {
-        Self::with_options(url, rps, DEFAULT_TIMEOUT)
+    pub fn with_rate_limit(url: &str, rps: Option<u64>, verbose: bool) -> Self {
+        Self::with_options(url, rps, DEFAULT_TIMEOUT, DEFAULT_MAX_RETRIES, verbose)
     }
 
     /// Create a new RPC client pointing at the given URL, optionally capping
-    /// outbound requests to `rps` requests per second and bounding each HTTP
-    /// request with `timeout`.
+    /// outbound requests to `rps` requests per second, bounding each HTTP
+    /// request with `timeout`, and retrying transient failures up to
+    /// `max_retries` times with exponential backoff.
     ///
     /// The limiter spaces consecutive outbound calls at least `1/rps` seconds
     /// apart (a fixed-rate limiter with a burst of 1). `None` or `Some(0)`
     /// disables rate limiting entirely. Values larger than `u32::MAX` are
     /// clamped. `timeout` applies to the whole request (connect through
-    /// response body) and is passed straight to reqwest.
-    pub fn with_options(url: &str, rps: Option<u64>, timeout: Duration) -> Self {
-        Self::with_fallback(url, None, rps, timeout)
+    /// response body) and is passed straight to reqwest. A `max_retries` of
+    /// `0` disables retries.
+    pub fn with_options(
+        url: &str,
+        rps: Option<u64>,
+        timeout: Duration,
+        max_retries: usize,
+        verbose: bool,
+    ) -> Self {
+        Self::with_fallback(url, None, rps, timeout, max_retries, verbose)
     }
 
     /// Create a new RPC client pointing at the given URL, with an optional
     /// secondary URL used for failover, optionally capping outbound requests
-    /// to `rps` requests per second and bounding each HTTP request with
-    /// `timeout`.
+    /// to `rps` requests per second, bounding each HTTP request with
+    /// `timeout`, and retrying transient failures up to `max_retries` times
+    /// with exponential backoff.
     ///
     /// When a request to the primary endpoint fails with a network-level
-    /// error (connection refused, timeout, DNS failure, etc.) and a fallback
-    /// URL is configured, the request is retried against the fallback before
-    /// the error is propagated. RPC-level errors (e.g. bad method, invalid
+    /// error (connection refused, timeout, DNS failure, etc.) or returns a
+    /// transient gateway status (HTTP 502/503/504) and a fallback URL is
+    /// configured, the request is retried against the fallback before the
+    /// error is propagated. RPC-level errors (e.g. bad method, invalid
     /// params) are not retried against the fallback — they would fail there
     /// too.
     ///
-    /// The limiter and timeout behave exactly as in [`Self::with_options`].
+    /// The limiter, timeout, and retry behavior behave exactly as in
+    /// [`Self::with_options`].
     pub fn with_fallback(
         url: &str,
         fallback_url: Option<&str>,
         rps: Option<u64>,
         timeout: Duration,
+        max_retries: usize,
+        verbose: bool,
     ) -> Self {
-        debug!(url, ?fallback_url, rps, ?timeout, "creating RPC client");
+        Self::with_fallback_headers(url, fallback_url, rps, timeout, max_retries, &[], verbose)
+    }
+
+    /// Create a new RPC client that attaches custom HTTP headers (each a
+    /// `"Key: Value"` string) to every request, without rate limiting, with
+    /// the default request timeout and the default retry policy. Entries
+    /// that cannot be parsed (or that carry an empty value) are skipped.
+    pub fn with_headers(url: &str, headers: &[String], verbose: bool) -> Self {
+        Self::with_fallback_headers(
+            url,
+            None,
+            None,
+            DEFAULT_TIMEOUT,
+            DEFAULT_MAX_RETRIES,
+            headers,
+            verbose,
+        )
+    }
+
+    /// Create a new RPC client with an optional fallback URL, optional rate
+    /// limit, request timeout, retry policy, and custom HTTP headers attached
+    /// to every request.
+    ///
+    /// Behaves exactly like [`Self::with_fallback`] and additionally attaches
+    /// the parsed `"Key: Value"` headers (skipping any entry that cannot be
+    /// parsed or that has an empty value) to every outbound request.
+    pub fn with_fallback_headers(
+        url: &str,
+        fallback_url: Option<&str>,
+        rps: Option<u64>,
+        timeout: Duration,
+        max_retries: usize,
+        headers: &[String],
+        verbose: bool,
+    ) -> Self {
+        debug!(
+            url,
+            ?fallback_url,
+            rps,
+            ?timeout,
+            max_retries,
+            "creating RPC client"
+        );
+        let headers = parseheaders(headers);
         Self {
             url: url.to_string(),
             fallback_url: fallback_url.map(String::from),
@@ -171,24 +308,85 @@ impl RpcClient {
             // construction infallible.
             client: reqwest::Client::builder()
                 .timeout(timeout)
+                .tcp_keepalive(Duration::from_secs(30))
+                .pool_idle_timeout(Duration::from_secs(90))
+                .default_headers(headers.clone())
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             dedup: Arc::new(Mutex::new(DedupState::default())),
             limiter: rps.and_then(build_rate_limiter),
+            max_retries,
+            headers,
+            verbose,
+        }
+    }
+
+    /// Returns the custom HTTP headers configured for this client.
+    ///
+    /// These are the headers parsed from the `--header` values and attached to
+    /// every outbound request; exposed for diagnostics and for tests that pin
+    /// down header parsing/merging behavior.
+    pub fn custom_headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
+    /// Validate that the RPC endpoint is reachable and healthy before any
+    /// simulation is run.
+    ///
+    /// Issues a lightweight `getHealth` JSON-RPC call and fails fast with a
+    /// clear, actionable error when the endpoint cannot be reached or reports
+    /// a status other than `healthy` — so a misconfigured `--rpc-url` (or a
+    /// down RPC node) is surfaced up front instead of surfacing midway through
+    /// an expensive batch of simulations.
+    ///
+    /// # Network calls
+    /// Makes at most one `getHealth` RPC call to the configured endpoint.
+    pub async fn health_check(&self) -> AppResult<()> {
+        let health: HealthResponse = self
+            .call("getHealth", serde_json::json!({}))
+            .await
+            .map_err(|e| {
+                AppError::Rpc {
+                    status: -1,
+                    message: format!(
+                        "unable to reach RPC endpoint {url}: {e}. Check --rpc-url / --network and that the node is reachable.",
+                        url = self.url
+                    ),
+                }
+            })?;
+
+        if health.status == "healthy" {
+            debug!(url = self.url, "RPC endpoint health check passed");
+            Ok(())
+        } else {
+            Err(AppError::Rpc {
+                status: -1,
+                message: format!(
+                    "RPC endpoint {url} reported unhealthy status: {status}. Check --rpc-url / --network.",
+                    url = self.url,
+                    status = health.status,
+                ),
+            })
         }
     }
 
     /// Send a JSON-RPC request and deserialize the response.
     ///
-    /// Requests are deduplicated by `(method, params)`: a request identical to
-    /// one already completed returns the cached result without sending
-    /// anything, and concurrent identical requests are collapsed into a single
-    /// network call (single-flight). A failed leader does not poison its
-    /// followers — the next waiter retries the request itself.
+    /// Requests are deduplicated by `(method, params)`:
+    ///
+    /// * a request identical to one that already **completed** returns the
+    ///   cached result without sending anything;
+    /// * a request identical to one currently **in flight** attaches to that
+    ///   request's [`SharedFuture`] and awaits it, so concurrent duplicates
+    ///   share a single underlying future and a single HTTP POST.
+    ///
+    /// A failed leader publishes no outcome, so its followers loop back and
+    /// become the next leader — a failure costs one retry, never a poisoned
+    /// batch.
     ///
     /// # Network calls
-    /// At most one HTTP POST for any distinct `(method, params)` pair; zero
-    /// for a cache hit.
+    /// At most one HTTP POST for any distinct `(method, params)` pair while it
+    /// is in flight; zero for a cache hit or a follower.
     pub async fn call<T: serde::de::DeserializeOwned>(
         &self,
         method: &str,
@@ -203,33 +401,49 @@ impl RpcClient {
                 return deserialize_result::<T>(cached);
             }
 
-            // Claim (or reuse) the serialization gate for this key.
-            let gate = {
+            // Attach to the in-flight single-flight handle for this key, or
+            // become its leader by installing a fresh one. Attachment happens
+            // under the state lock so two callers can never both become
+            // leader for the same key.
+            let (shared, is_leader) = {
                 let mut state = self.dedup.lock().await;
-                Arc::clone(
-                    state
-                        .in_flight
-                        .entry(key.clone())
-                        .or_insert_with(|| Arc::new(Mutex::new(()))),
-                )
+                if let Some(existing) = state.in_flight.get(&key) {
+                    (existing.clone(), false)
+                } else {
+                    let handle = SharedFuture::default();
+                    state.in_flight.insert(key.clone(), handle.clone());
+                    (handle, true)
+                }
             };
 
-            if let Ok(_guard) = gate.try_lock() {
-                // Leader: perform the network request and publish the result
-                // for any waiters before releasing the gate.
-                let result = self.perform_call(method, params).await;
+            if !is_leader {
+                // Follower: await the leader's shared future. A successful
+                // leader published its result for us; a failed one published
+                // nothing, so loop back and become the next leader (a retry).
+                shared.wait().await;
+                if let Some(value) = shared.outcome().await {
+                    trace!(method, "deduplicated against in-flight request");
+                    return deserialize_result::<T>(value);
+                }
+                continue;
+            }
+
+            // Leader: perform the network request, publish the result for any
+            // followers, then release the key so later callers can reuse the
+            // completed result.
+            let result = self.perform_call(method, params).await;
+            if let Ok(value) = &result {
+                shared.publish(value.clone()).await;
+            }
+            {
                 let mut state = self.dedup.lock().await;
                 if let Ok(value) = &result {
                     state.completed.insert(key.clone(), value.clone());
                 }
                 state.in_flight.remove(&key);
-                return result.and_then(deserialize_result::<T>);
             }
-
-            // Follower: wait for the leader to finish, then loop back to the
-            // fast path. If the leader failed, nothing was cached and this
-            // iteration becomes the new leader (a retry).
-            let _follower_guard = gate.lock().await;
+            shared.finish();
+            return result.and_then(deserialize_result::<T>);
         }
     }
 
@@ -244,7 +458,8 @@ impl RpcClient {
     ///
     /// Tries the primary endpoint first. If the primary fails with a
     /// network-level error (connection refused, timeout, DNS failure, etc.)
-    /// and a fallback URL is configured, retries against the fallback.
+    /// or a transient gateway status (HTTP 502/503/504) and a fallback URL is
+    /// configured, retries against the fallback, logging a notice to stderr.
     ///
     /// RPC-level errors (e.g. bad method, invalid params) are **not** retried
     /// against the fallback — they would fail there too.
@@ -263,14 +478,17 @@ impl RpcClient {
         trace!(method, "sending RPC request");
         match self.post_and_parse(method, &body, &self.url).await {
             Ok(result) => Ok(result),
-            Err(e) if Self::is_network_error(&e) => {
+            Err(e) if Self::is_failover_trigger(&e) => {
                 if let Some(ref fallback) = self.fallback_url {
-                    warn!(
+                    // The operator-facing notice goes to stderr so it never
+                    // contaminates machine-readable stdout (json/csv/markdown).
+                    eprintln!("Primary RPC failed, failing over to fallback endpoint: {fallback}");
+                    debug!(
                         method,
                         primary = %self.url,
                         fallback = %fallback,
                         error = %e,
-                        "primary RPC endpoint failed — trying fallback"
+                        "primary RPC endpoint failed — failing over to fallback"
                     );
                     self.post_and_parse(method, &body, fallback).await
                 } else {
@@ -281,15 +499,22 @@ impl RpcClient {
         }
     }
 
-    /// Check whether an error is a network-level failure (as opposed to an
-    /// RPC-level error returned inside a successful HTTP response).
-    fn is_network_error(error: &AppError) -> bool {
+    /// True when `error` should trigger a failover attempt against the
+    /// configured fallback endpoint.
+    ///
+    /// This covers transport-level failures (connection refused, timeout,
+    /// DNS failure, ...) and transient gateway statuses (HTTP 502/503/504).
+    /// RPC-level errors returned inside a successful HTTP response — bad
+    /// method, invalid params — are **not** failover triggers: they would
+    /// fail identically on the fallback.
+    fn is_failover_trigger(error: &AppError) -> bool {
         match error {
             AppError::Http(e) => {
                 // reqwest errors that indicate connectivity problems — these
                 // are the cases where a fallback endpoint might succeed.
                 e.is_connect() || e.is_timeout() || e.is_request()
             }
+            AppError::RpcUnavailable { .. } => true,
             _ => false,
         }
     }
@@ -302,7 +527,15 @@ impl RpcClient {
         let request_body = body.clone();
         let limiter = self.limiter.clone();
 
-        let response = with_retry(|| {
+        let start = std::time::Instant::now();
+        let request_body_str = serde_json::to_string(&request_body).unwrap_or_default();
+        let payload_size = request_body_str.len();
+        if self.verbose {
+            eprintln!("[RPC] POST {} ({} bytes)", url, payload_size);
+            eprintln!("[RPC] -> {}", request_body_str);
+        }
+
+        let response = with_retry(self.max_retries, || {
             let client = client.clone();
             let url = url.clone();
             let request_body = request_body.clone();
@@ -325,14 +558,24 @@ impl RpcClient {
         })
         .await?;
         let status = response.status();
-        let response_body: Value = response.json().await?;
-        if std::env::var("SCE_DEBUG_RPC").is_ok() {
+
+        // A 502/503/504 means the endpoint is briefly unavailable rather than
+        // misconfigured. Surface it as a dedicated error *before* parsing the
+        // body — gateways commonly return an HTML error page, and both the
+        // retry loop and the failover logic key off this variant.
+        let status_code = status.as_u16();
+        if matches!(status_code, 502..=504) {
             debug!(
                 method,
-                response = %serde_json::to_string(&response_body).unwrap_or_default(),
-                "RPC response"
+                status = status_code,
+                "transient gateway error from RPC endpoint"
             );
+            return Err(AppError::RpcUnavailable {
+                status: status_code,
+            });
         }
+
+        let response_body: Value = response.json().await?;
 
         if let Some(error) = response_body.get("error") {
             let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
@@ -341,7 +584,7 @@ impl RpcClient {
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown error")
                 .to_string();
-            debug!(method, code, message, "RPC error");
+            debug!(method, code, message, "RPC error response");
             return Err(AppError::Rpc {
                 status: code,
                 message,
@@ -353,6 +596,19 @@ impl RpcClient {
             message: "response missing 'result' field".to_string(),
         })?;
 
+        let elapsed = start.elapsed();
+        if self.verbose {
+            let response_str = serde_json::to_string(&result).unwrap_or_default();
+            eprintln!("[RPC] <- HTTP {} ({} ms)", status, elapsed.as_millis());
+            eprintln!("[RPC] <- {}", response_str);
+        }
+
+        debug!(
+            method,
+            status = %status,
+            result = %serde_json::to_string(result).unwrap_or_default(),
+            "RPC response received"
+        );
         trace!(method, "RPC call succeeded");
         Ok(result.clone())
     }
@@ -380,6 +636,41 @@ fn deserialize_result<T: serde::de::DeserializeOwned>(value: Value) -> AppResult
         .map_err(|e| AppError::General(format!("failed to deserialize RPC response: {e}")))
 }
 
+/// Parse a `"Key: Value"` string into an HTTP header name and value.
+///
+/// Returns an error if the format is invalid (missing colon, empty key,
+/// or non-ASCII characters in the header name).
+fn parse_header(raw: &str) -> Result<(HeaderName, HeaderValue), String> {
+    let colon_pos = raw.find(':').ok_or("missing ':' separator")?;
+    let name_str = raw[..colon_pos].trim();
+    let value_str = raw[colon_pos + 1..].trim();
+
+    if name_str.is_empty() {
+        return Err("empty header name".to_string());
+    }
+
+    let name = HeaderName::from_bytes(name_str.as_bytes())
+        .map_err(|e| format!("invalid header name: {e}"))?;
+    let value =
+        HeaderValue::from_str(value_str).map_err(|e| format!("invalid header value: {e}"))?;
+
+    Ok((name, value))
+}
+
+/// Parse a list of `"Key: Value"` strings into a [`HeaderMap`], skipping any
+/// entry that cannot be parsed or that has an empty value.
+fn parseheaders(rawheaders: &[String]) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for raw in rawheaders {
+        if let Ok((name, value)) = parse_header(raw) {
+            if !value.as_bytes().is_empty() {
+                headers.insert(name, value);
+            }
+        }
+    }
+    headers
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -391,13 +682,44 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     use crate::error::{AppError, AppResult};
+    use crate::rpc::retry::DEFAULT_MAX_RETRIES;
 
     use super::{RpcClient, resolve_ws_endpoint};
 
-    /// Spawns a tiny HTTP server that answers JSON-RPC `simulateTransaction`
-    /// calls, counting how many were received. The first `fail_times` calls
-    /// return a JSON-RPC error body instead of a result.
+    /// Spawns a tiny HTTP server that answers JSON-RPC
+    /// `simulateTransaction`-style calls with `{"result":{"pong":true}}`,
+    /// counting how many were received. The first `fail_times` calls return
+    /// a JSON-RPC error body instead of a result.
     async fn spawn_json_rpc_stub(fail_times: u32) -> (String, Arc<AtomicUsize>) {
+        spawn_json_rpc_stub_with_result(fail_times, r#"{"pong":true}"#).await
+    }
+
+    /// Like [`spawn_json_rpc_stub`], but each response is held back by `delay`
+    /// before being written. This keeps the leader's request genuinely in
+    /// flight, so concurrent followers must coalesce against its shared future
+    /// rather than racing to completion.
+    async fn spawn_delayed_json_rpc_stub(delay: Duration) -> (String, Arc<AtomicUsize>) {
+        spawn_json_rpc_stub_with_delay(0, r#"{"pong":true}"#, delay).await
+    }
+
+    /// Like [`spawn_json_rpc_stub`], but successful responses embed `result_body`
+    /// verbatim as the JSON-RPC `result` value — for stubbing methods with a
+    /// specific response shape (e.g. `getHealth`).
+    async fn spawn_json_rpc_stub_with_result(
+        fail_times: u32,
+        result_body: &'static str,
+    ) -> (String, Arc<AtomicUsize>) {
+        spawn_json_rpc_stub_with_delay(fail_times, result_body, Duration::ZERO).await
+    }
+
+    /// Spawns a JSON-RPC stub that fails the first `fail_times` calls, returns
+    /// `result_body` on success, and waits `delay` before answering every
+    /// request.
+    async fn spawn_json_rpc_stub_with_delay(
+        fail_times: u32,
+        result_body: &'static str,
+        delay: Duration,
+    ) -> (String, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("failed to bind stub server");
@@ -412,7 +734,7 @@ mod tests {
                 };
                 let counter = Arc::clone(&server_counter);
                 tokio::spawn(async move {
-                    let _ = handle_conn(stream, counter, fail_times).await;
+                    let _ = handle_conn(stream, counter, fail_times, result_body, delay).await;
                 });
             }
         });
@@ -424,6 +746,8 @@ mod tests {
         mut stream: TcpStream,
         counter: Arc<AtomicUsize>,
         fail_times: u32,
+        result_body: &'static str,
+        delay: Duration,
     ) -> std::io::Result<()> {
         let mut buf = Vec::new();
         let mut tmp = [0u8; 1024];
@@ -461,10 +785,14 @@ mod tests {
         }
 
         let call_no = counter.fetch_add(1, Ordering::SeqCst);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         let body = if (call_no as u32) < fail_times {
             r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure"}}"#
+                .to_string()
         } else {
-            r#"{"jsonrpc":"2.0","id":1,"result":{"pong":true}}"#
+            format!(r#"{{"jsonrpc":"2.0","id":1,"result":{result_body}}}"#)
         };
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -473,6 +801,42 @@ mod tests {
         stream.write_all(response.as_bytes()).await?;
         stream.flush().await?;
         Ok(())
+    }
+
+    /// Spawns a tiny HTTP server that always answers with `status` and a
+    /// plain-text (non-JSON) body, counting how many requests it received.
+    /// Used to exercise transient gateway failures (HTTP 502/503/504) and
+    /// other non-JSON error statuses.
+    async fn spawn_status_stub(status: u16) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind stub server");
+        let addr = listener.local_addr().expect("no local address");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let server_counter = Arc::clone(&counter);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let counter = Arc::clone(&server_counter);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let body = "upstream unavailable";
+                    let response = format!(
+                        "HTTP/1.1 {status} Error\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+
+        (format!("http://{addr}"), counter)
     }
 
     #[tokio::test]
@@ -544,6 +908,71 @@ mod tests {
         );
     }
 
+    /// Many identical calls fired concurrently against a deliberately slow
+    /// endpoint must all attach to the leader's single in-flight shared future:
+    /// exactly one HTTP request, and every caller observes the leader's result.
+    #[tokio::test]
+    async fn test_dedup_many_concurrent_identical_requests_share_one_future() {
+        let (url, counter) = spawn_delayed_json_rpc_stub(Duration::from_millis(50)).await;
+        let client = Arc::new(RpcClient::new(&url));
+
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let client = Arc::clone(&client);
+            handles.push(tokio::spawn(async move {
+                client
+                    .call::<Value>("test.method", serde_json::json!({"k": "v"}))
+                    .await
+            }));
+        }
+
+        for handle in handles {
+            let value = handle
+                .await
+                .expect("task should not panic")
+                .expect("shared future must resolve for every follower");
+            assert_eq!(
+                value,
+                serde_json::json!({"pong": true}),
+                "every follower must observe the leader's result"
+            );
+        }
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "all identical in-flight requests must share a single future"
+        );
+    }
+
+    /// Concurrent calls split across two distinct payloads must coalesce into
+    /// exactly two in-flight futures — one network request per distinct key.
+    #[tokio::test]
+    async fn test_dedup_concurrent_mixed_payloads() {
+        let (url, counter) = spawn_delayed_json_rpc_stub(Duration::from_millis(50)).await;
+        let client = Arc::new(RpcClient::new(&url));
+
+        let mut handles = Vec::new();
+        for i in 0..40 {
+            let client = Arc::clone(&client);
+            let k = if i % 2 == 0 { "even" } else { "odd" };
+            handles.push(tokio::spawn(async move {
+                let _: Value = client
+                    .call("test.method", serde_json::json!({ "k": k }))
+                    .await
+                    .expect("mixed concurrent call");
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("task should not panic");
+        }
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "only the two distinct payloads may hit the network"
+        );
+    }
+
     /// A failed leader reports the error to its own caller but must not poison
     /// waiters: a follower observes no cached result and retries the request
     /// itself, so the follower succeeds at the cost of one extra network
@@ -584,7 +1013,7 @@ mod tests {
     #[tokio::test]
     async fn test_rate_limiter_spaces_outbound_requests() {
         let (url, counter) = spawn_json_rpc_stub(0).await;
-        let client = RpcClient::with_rate_limit(&url, Some(20));
+        let client = RpcClient::with_rate_limit(&url, Some(20), false);
 
         let start = std::time::Instant::now();
         let _: Value = client
@@ -614,7 +1043,7 @@ mod tests {
     #[tokio::test]
     async fn test_rate_limiter_preserves_dedup() {
         let (url, counter) = spawn_json_rpc_stub(0).await;
-        let client = RpcClient::with_rate_limit(&url, Some(20));
+        let client = RpcClient::with_rate_limit(&url, Some(20), false);
         let params = serde_json::json!({"k": "v"});
 
         let start = std::time::Instant::now();
@@ -643,7 +1072,7 @@ mod tests {
     #[tokio::test]
     async fn test_no_rate_limit_when_disabled() {
         let (url, counter) = spawn_json_rpc_stub(0).await;
-        let client = RpcClient::with_rate_limit(&url, Some(0));
+        let client = RpcClient::with_rate_limit(&url, Some(0), false);
 
         let start = std::time::Instant::now();
         let _: Value = client
@@ -688,7 +1117,7 @@ mod tests {
     #[tokio::test]
     async fn test_request_timeout_applies() {
         let url = spawn_hanging_stub().await;
-        let client = RpcClient::with_options(&url, None, Duration::from_millis(100));
+        let client = RpcClient::with_options(&url, None, Duration::from_millis(100), 0, false);
 
         let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
 
@@ -721,6 +1150,8 @@ mod tests {
             Some(&fallback_url),
             None,
             Duration::from_secs(30),
+            DEFAULT_MAX_RETRIES,
+            false,
         );
 
         let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
@@ -748,6 +1179,8 @@ mod tests {
             Some(&fallback_url),
             None,
             Duration::from_secs(30),
+            DEFAULT_MAX_RETRIES,
+            false,
         );
 
         let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
@@ -757,6 +1190,120 @@ mod tests {
             fallback_counter.load(Ordering::SeqCst),
             0,
             "fallback must not be contacted for RPC-level errors"
+        );
+    }
+
+    /// A primary endpoint answering 502/503/504 is transiently unavailable:
+    /// the request must fail over to the fallback instead of surfacing the
+    /// gateway error. `max_retries: 0` keeps the test fast.
+    #[tokio::test]
+    async fn test_failover_on_primary_gateway_error() {
+        for status in [502u16, 503, 504] {
+            let (primary_url, primary_counter) = spawn_status_stub(status).await;
+            let (fallback_url, fallback_counter) = spawn_json_rpc_stub(0).await;
+            let client = RpcClient::with_fallback(
+                &primary_url,
+                Some(&fallback_url),
+                None,
+                Duration::from_secs(30),
+                0,
+                false,
+            );
+
+            let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
+
+            assert!(
+                result.is_ok(),
+                "HTTP {status} from the primary must fail over to the fallback: {result:?}"
+            );
+            assert_eq!(
+                primary_counter.load(Ordering::SeqCst),
+                1,
+                "primary should be tried exactly once with retries disabled"
+            );
+            assert_eq!(
+                fallback_counter.load(Ordering::SeqCst),
+                1,
+                "fallback endpoint should have served the request"
+            );
+        }
+    }
+
+    /// A non-transient HTTP error (e.g. 500) is not a failover trigger: the
+    /// error must propagate without contacting the fallback.
+    #[tokio::test]
+    async fn test_no_failover_on_non_gateway_http_error() {
+        let (primary_url, _) = spawn_status_stub(500).await;
+        let (fallback_url, fallback_counter) = spawn_json_rpc_stub(0).await;
+        let client = RpcClient::with_fallback(
+            &primary_url,
+            Some(&fallback_url),
+            None,
+            Duration::from_secs(30),
+            0,
+            false,
+        );
+
+        let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
+
+        assert!(result.is_err(), "HTTP 500 must be propagated");
+        assert_eq!(
+            fallback_counter.load(Ordering::SeqCst),
+            0,
+            "fallback must not be contacted for a non-gateway HTTP error"
+        );
+    }
+
+    /// A reachable endpoint reporting `healthy` must pass the health check.
+    #[tokio::test]
+    async fn test_health_check_ok_when_healthy() {
+        let (url, _) =
+            spawn_json_rpc_stub_with_result(0, r#"{"status":"healthy","latestLedger":42}"#).await;
+        let client = RpcClient::new(&url);
+
+        client
+            .health_check()
+            .await
+            .expect("healthy endpoint passes");
+    }
+
+    /// A reachable endpoint reporting anything other than `healthy` (e.g.
+    /// `degraded`) must fail the health check with an actionable error.
+    #[tokio::test]
+    async fn test_health_check_errs_on_non_healthy_status() {
+        let (url, _) = spawn_json_rpc_stub_with_result(0, r#"{"status":"degraded"}"#).await;
+        let client = RpcClient::new(&url);
+
+        let err = client
+            .health_check()
+            .await
+            .expect_err("degraded endpoint fails");
+        let message = err.to_string();
+        assert!(
+            message.contains("reported unhealthy status: degraded"),
+            "unexpected error: {message}"
+        );
+    }
+
+    /// An unreachable endpoint must fail the health check fast with a message
+    /// pointing at `--rpc-url` / `--network` rather than surfacing later mid-
+    /// simulation.
+    #[tokio::test]
+    async fn test_health_check_errs_when_endpoint_unreachable() {
+        let dead_url = refused_port_url().await;
+        // `max_retries: 0` keeps this fast: a refused connection is retryable,
+        // and the default backoff (0.5s + 1s + 2s) is irrelevant to the
+        // health check failing fast on an unreachable endpoint.
+        let client = RpcClient::with_options(&dead_url, None, Duration::from_millis(500), 0, false);
+
+        let err = client
+            .health_check()
+            .await
+            .expect_err("dead endpoint fails");
+        let message = err.to_string();
+        assert!(
+            message.contains("unable to reach RPC endpoint") && message.contains("--rpc-url"),
+            "unexpected error: {message}"
         );
     }
 
@@ -790,5 +1337,135 @@ mod tests {
             resolve_ws_endpoint("testnet", Some("ws://localhost:8000/ws")).unwrap(),
             "ws://localhost:8000/ws"
         );
+    }
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_header_valid() {
+        let (name, value) = parse_header("X-API-Key: secret123").unwrap();
+        assert_eq!(name.as_str(), "x-api-key");
+        assert_eq!(value.to_str().unwrap(), "secret123");
+    }
+
+    #[test]
+    fn test_parse_header_with_spaces() {
+        let (name, value) = parse_header(" Authorization : Bearer tok ").unwrap();
+        assert_eq!(name.as_str(), "authorization");
+        assert_eq!(value.to_str().unwrap(), "Bearer tok");
+    }
+
+    #[test]
+    fn test_parse_header_missing_colon() {
+        assert!(parse_header("NoColon").is_err());
+    }
+
+    #[test]
+    fn test_parse_header_empty_name() {
+        assert!(parse_header(": value").is_err());
+    }
+
+    #[test]
+    fn test_parse_header_empty_value() {
+        let (name, value) = parse_header("X-Custom:").unwrap();
+        assert_eq!(name.as_str(), "x-custom");
+        assert_eq!(value.to_str().unwrap(), "");
+    }
+
+    #[test]
+    fn test_parse_header_value_with_colons() {
+        let (name, value) = parse_header("X-Auth: token:with:colons").unwrap();
+        assert_eq!(name.as_str(), "x-auth");
+        assert_eq!(value.to_str().unwrap(), "token:with:colons");
+    }
+
+    #[test]
+    fn test_parse_headers_empty() {
+        assert!(parseheaders(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_parse_headers_stores_parsed() {
+        let headers = parseheaders(&[
+            "X-API-Key: secret".to_string(),
+            "Authorization: Bearer tok".to_string(),
+        ]);
+        assert_eq!(headers.len(), 2);
+    }
+
+    #[test]
+    fn test_with_headers_empty() {
+        let client = RpcClient::with_headers("http://localhost", &[], false);
+        assert!(client.custom_headers().is_empty());
+        let client = RpcClient::with_headers("http://localhost", &[], false);
+        assert!(client.headers.is_empty());
+    }
+
+    #[test]
+    fn test_with_headers_stores_parsed() {
+        let client = RpcClient::with_headers(
+            "http://localhost",
+            &[
+                "X-API-Key: secret".to_string(),
+                "Authorization: Bearer tok".to_string(),
+            ],
+            false,
+        );
+        assert_eq!(client.custom_headers().len(), 2);
+        assert_eq!(
+            client
+                .custom_headers()
+                .get("x-api-key")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "secret"
+        );
+        assert_eq!(
+            client
+                .custom_headers()
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer tok"
+        );
+    }
+
+    #[test]
+    fn test_parse_headers_skips_malformed() {
+        let headers = parseheaders(&[
+            "Good: ok".to_string(),
+            "NoColonHere".to_string(),
+            "Also-Bad:".to_string(),
+        ]);
+        // Only the valid header should be kept.
+        assert_eq!(headers.len(), 1);
+        assert!(headers.contains_key("good"));
+    }
+
+    #[test]
+    fn test_with_headers_skips_malformed() {
+        let client = RpcClient::with_headers(
+            "http://localhost",
+            &[
+                "Good: ok".to_string(),
+                "NoColonHere".to_string(),
+                "Also-Bad:".to_string(),
+            ],
+            false,
+        );
+        // Only the valid header should be stored.
+        assert_eq!(client.custom_headers().len(), 1);
+        assert!(client.custom_headers().contains_key("good"));
+    }
+
+    #[test]
+    fn test_rpc_client_new_has_no_customheaders() {
+        let client = RpcClient::new("http://localhost");
+        assert!(client.custom_headers().is_empty());
     }
 }

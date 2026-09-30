@@ -127,6 +127,7 @@ fn test_estimate_help() {
         "--id",
         "--arg",
         "--cache-ttl",
+        "--clear-cache",
         "--json",
     ] {
         assert!(
@@ -221,6 +222,7 @@ fn test_cache_help() {
     assert_eq!(code, 0, "cache --help should exit 0; stderr: {stderr}");
     assert!(stdout.contains("verify"), "cache help should list verify");
     assert!(stdout.contains("query"), "cache help should list query");
+    assert!(stdout.contains("clear"), "cache help should list clear");
 }
 
 #[test]
@@ -257,6 +259,52 @@ fn test_cache_verify_empty_cache_succeeds() {
     assert!(
         stdout.contains("empty") || stdout.contains("nothing to verify"),
         "should report an empty cache: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_stats_help() {
+    let (stdout, stderr, code) = run_cli(&["cache", "stats", "--help"]);
+    assert_eq!(
+        code, 0,
+        "cache stats --help should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("cache health") || stdout.contains("breakdown"),
+        "cache stats help should describe the command; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_stats_on_empty_cache_succeeds() {
+    let home = temp_home("cache-stats-empty");
+    let (stdout, stderr, code) = run_cli_in_home(&["cache", "stats"], Some(&home));
+    assert_eq!(
+        code, 0,
+        "cache stats on an empty cache should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Cache is empty"),
+        "should report an empty cache; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_stats_reports_seeded_entries() {
+    let home = temp_home("cache-stats-seeded");
+    let now = chrono::Utc::now().to_rfc3339();
+    seed_cache_entry_for(&home, "testnet", "(wasm upload)", 42, &now);
+    seed_cache_entry_for(&home, "mainnet", "mainnet_fn", 77, &now);
+
+    let (stdout, stderr, code) = run_cli_in_home(&["cache", "stats"], Some(&home));
+    assert_eq!(code, 0, "cache stats should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("Total entries:  2"),
+        "should count both seeded entries; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("testnet") && stdout.contains("mainnet"),
+        "should break entries down by network; got: {stdout}"
     );
 }
 
@@ -431,17 +479,62 @@ fn test_timeout_flag_accepted_before_subcommand() {
 
 #[test]
 fn test_help_lists_global_flags() {
-    // Global flags (--rps, --timeout) must appear in subcommand help.
+    // Global flags (--rps, --timeout, --precision, --quiet) must appear in
+    // subcommand help.
     let (stdout, stderr, code) = run_cli(&["estimate", "--help"]);
     assert_eq!(code, 0, "estimate --help should exit 0; stderr: {stderr}");
+    for flag in ["--timeout", "--rps", "--precision", "--quiet"] {
+        assert!(
+            stdout.contains(flag),
+            "help should list {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_precision_flag_accepted() {
+    // `--precision` is a global flag, so it must parse both before and after
+    // the subcommand; failure here is a missing file, not a bad argument.
+    for args in [
+        vec!["estimate", "--wasm", "test.wasm", "--precision", "2"],
+        vec!["--precision", "4", "estimate", "--wasm", "test.wasm"],
+    ] {
+        let (_, stderr, code) = run_cli(&args);
+        assert_ne!(code, 0, "should error on missing file");
+        assert!(
+            !stderr.contains("unrecognized") && !stderr.contains("invalid value"),
+            "--precision should be a recognized argument; stderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_precision_out_of_range_rejected() {
+    // The flag is documented as 0..=7; clap must reject 8 with a clear error.
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--precision", "8"]);
+    assert_ne!(code, 0, "out-of-range precision should error");
     assert!(
-        stdout.contains("--timeout"),
-        "help should list --timeout; got: {stdout}"
+        stderr.to_lowercase().contains("invalid value")
+            || stderr.contains("not in")
+            || stderr.to_lowercase().contains("range"),
+        "clap should reject precision 8; stderr: {stderr}"
     );
-    assert!(
-        stdout.contains("--rps"),
-        "help should list --rps; got: {stdout}"
-    );
+}
+
+#[test]
+fn test_quiet_flag_accepted() {
+    // `--quiet` / `-q` is a global flag used to suppress the fee bar chart.
+    for args in [
+        vec!["estimate", "--wasm", "test.wasm", "--quiet"],
+        vec!["estimate", "--wasm", "test.wasm", "-q"],
+    ] {
+        let (_, stderr, code) = run_cli(&args);
+        assert_ne!(code, 0, "should error on missing file");
+        assert!(
+            !stderr.contains("unrecognized") && !stderr.contains("unexpected argument"),
+            "--quiet should be a recognized argument; stderr: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -634,6 +727,16 @@ fn test_estimate_rpc_url_overrides_unknown_network() {
 /// (empty for no args). The entry is written directly into the SQLite cache
 /// database so the `estimate` command's cache-hit path can find it.
 fn seed_cache_entry(home: &Path, timestamp: &str) {
+    seed_cache_entry_for(home, "testnet", "(wasm upload)", 42, timestamp);
+}
+
+/// Seed a cache entry on the given network/function, in `home`.
+///
+/// A thin generalization of [`seed_cache_entry`] so tests can populate more
+/// than one network (or several functions) and exercise per-network
+/// cache-clear isolation. The row targets `tests/fixtures/minimal.wasm` with
+/// no args, exactly like [`seed_cache_entry`].
+fn seed_cache_entry_for(home: &Path, network: &str, function: &str, ledger: i64, timestamp: &str) {
     let wasm_bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
     let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_bytes));
     let args_hash = hex::encode(sha2::Sha256::digest(b""));
@@ -653,10 +756,10 @@ fn seed_cache_entry(home: &Path, timestamp: &str) {
         rusqlite::params![
             1i64,
             wasm_hash,
-            "(wasm upload)",
+            function,
             args_hash,
-            "testnet",
-            42i64,
+            network,
+            ledger,
             1_000i64,
             500i64,
             250i64,
@@ -1255,6 +1358,156 @@ fn test_cache_query_json_flag_accepted() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// `cache clear` / `estimate --clear-cache` (Issue #24)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_cache_clear_help() {
+    let (stdout, stderr, code) = run_cli(&["cache", "clear", "--help"]);
+    assert_eq!(
+        code, 0,
+        "cache clear --help should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("--network"),
+        "cache clear help should mention --network; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_clear_on_empty_cache_succeeds() {
+    // Default network is testnet; a pristine cache reports zero cleared.
+    let home = temp_home("cache-clear-empty");
+    let (stdout, stderr, code) = run_cli_in_home(&["cache", "clear"], Some(&home));
+    assert_eq!(
+        code, 0,
+        "cache clear on empty cache should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Cleared 0 cached estimate(s) for testnet."),
+        "should report zero cleared for testnet; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_clear_removes_only_requested_network() {
+    let home = temp_home("cache-clear-network");
+    let now = chrono::Utc::now().to_rfc3339();
+    // Distinct function names per row: the cache key is (wasm_hash, function,
+    // args_hash) and does not include the network, so reusing "(wasm upload)"
+    // on mainnet would overwrite the testnet row.
+    seed_cache_entry_for(&home, "testnet", "(wasm upload)", 42, &now);
+    seed_cache_entry_for(&home, "testnet", "increment", 42, &now);
+    seed_cache_entry_for(&home, "mainnet", "mainnet_fn", 77, &now);
+
+    // Default `cache clear` targets testnet only.
+    let (stdout, stderr, code) = run_cli_in_home(&["cache", "clear"], Some(&home));
+    assert_eq!(code, 0, "cache clear should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("Cleared 2 cached estimate(s) for testnet."),
+        "should report both testnet entries cleared; got: {stdout}"
+    );
+
+    // testnet is empty now; mainnet is untouched.
+    let (stdout, _, code) =
+        run_cli_in_home(&["cache", "query", "--network", "testnet"], Some(&home));
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("No cached estimates match the query."),
+        "testnet should have no entries left; got: {stdout}"
+    );
+    let (stdout, _, _) = run_cli_in_home(&["cache", "query", "--network", "mainnet"], Some(&home));
+    assert!(
+        !stdout.contains("No cached estimates match the query.") && stdout.contains("mainnet_fn"),
+        "mainnet entry should survive the testnet clear; got: {stdout}"
+    );
+
+    // An explicit --network clears only that network.
+    let (stdout, stderr, code) =
+        run_cli_in_home(&["cache", "clear", "--network", "mainnet"], Some(&home));
+    assert_eq!(
+        code, 0,
+        "cache clear mainnet should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Cleared 1 cached estimate(s) for mainnet."),
+        "should report the mainnet entry cleared; got: {stdout}"
+    );
+    let (stdout, _, _) = run_cli_in_home(&["cache", "query", "--network", "mainnet"], Some(&home));
+    assert!(
+        stdout.contains("No cached estimates match the query."),
+        "mainnet should be empty after its own clear; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_estimate_clear_cache_flag_accepted() {
+    // --clear-cache must be a recognized estimate flag (the run fails on the
+    // missing WASM file, not on the argument).
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--clear-cache"]);
+    assert_ne!(code, 0, "missing WASM file should still error");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--clear-cache should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_clear_cache_wipes_network_before_simulation() {
+    // A fresh testnet entry plus --cache-ttl would otherwise short-circuit on
+    // a cache hit. With --clear-cache the entry is wiped first, so the run
+    // falls through to the (dead) RPC endpoint — proving the clear ran before
+    // the simulation. The mainnet entry must survive untouched.
+    let home = temp_home("estimate-clear-cache");
+    let now = chrono::Utc::now().to_rfc3339();
+    // The testnet row must use the exact key `estimate` looks up for
+    // minimal.wasm (function "(wasm upload)", no args); the mainnet row uses
+    // a distinct function name so the two networks' rows coexist.
+    seed_cache_entry_for(&home, "testnet", "(wasm upload)", 42, &now);
+    seed_cache_entry_for(&home, "mainnet", "mainnet_fn", 77, &now);
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--cache-ttl",
+            "1h",
+            "--clear-cache",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            DEAD_RPC,
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 1,
+        "cleared cache should fall through to the dead RPC endpoint; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Cleared 1 cached estimate(s) for testnet."),
+        "stdout should announce the clear; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Cache hit"),
+        "--clear-cache must prevent a cache hit; got: {stdout}"
+    );
+
+    // testnet is empty; mainnet is untouched.
+    let (stdout, _, _) = run_cli_in_home(&["cache", "query", "--network", "testnet"], Some(&home));
+    assert!(
+        stdout.contains("No cached estimates match the query."),
+        "testnet should have no entries left; got: {stdout}"
+    );
+    let (stdout, _, _) = run_cli_in_home(&["cache", "query", "--network", "mainnet"], Some(&home));
+    assert!(
+        stdout.contains("mainnet_fn"),
+        "mainnet entries should survive the testnet clear; got: {stdout}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Simulation footprint metrics tests (Issue #2)
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -1324,6 +1577,10 @@ fn start_mock_rpc_server(
                                 r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":"{ledger}","minResourceFee":"{min_fee}","transactionData":"{live_tx_data}"}}}}"#
                             )
                         }
+                    } else if req_str.contains("getHealth") {
+                        format!(
+                            r#"{{"jsonrpc":"2.0","id":1,"result":{{"status":"healthy","latestLedger":{ledger}}}}}"#
+                        )
                     } else if req_str.contains("getLedgerEntries") {
                         format!(
                             r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":{ledger},"entries":[]}}}}"#
@@ -1400,7 +1657,7 @@ fn test_estimate_fn_contract_fixture_populates_footprint_json() {
     assert_eq!(parsed["read_bytes"], 0, "expected 0 read bytes");
     assert_eq!(parsed["write_bytes"], 136, "expected 136 write bytes");
     assert_eq!(parsed["cpu_instructions"], 532_502);
-    assert_eq!(parsed["fee"]["total_stroops"], 15_427);
+    assert_eq!(parsed["fee"]["total_stroops"], 15_527);
 }
 
 #[test]
@@ -1446,8 +1703,8 @@ fn test_estimate_fn_contract_fixture_populates_footprint_table() {
         "table should display 136 write bytes"
     );
     assert!(
-        stdout.contains("15427"),
-        "table should display total fee 15427"
+        stdout.contains("15527"),
+        "table should display total fee 15527"
     );
 }
 
@@ -1487,4 +1744,106 @@ fn test_estimate_minimal_wasm_upload_zero_footprint() {
     assert_eq!(parsed["write_entries"], 0);
     assert_eq!(parsed["read_bytes"], 0);
     assert_eq!(parsed["write_bytes"], 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Shell completions
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_completions_help() {
+    let (stdout, stderr, code) = run_cli(&["completions", "--help"]);
+    assert_eq!(
+        code, 0,
+        "completions --help should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("bash"),
+        "completions help should list bash option"
+    );
+    assert!(
+        stdout.contains("zsh"),
+        "completions help should list zsh option"
+    );
+    assert!(
+        stdout.contains("fish"),
+        "completions help should list fish option"
+    );
+    assert!(
+        stdout.contains("powershell"),
+        "completions help should list powershell option"
+    );
+}
+
+#[test]
+fn test_completions_bash() {
+    let (stdout, stderr, code) = run_cli(&["completions", "bash"]);
+    assert_eq!(code, 0, "completions bash should exit 0; stderr: {stderr}");
+    assert!(!stdout.is_empty(), "completion script should not be empty");
+    assert!(
+        stdout.contains("soroban-cost-estimator"),
+        "bash completion script should contain binary name"
+    );
+    assert!(
+        stdout.contains("estimate"),
+        "bash completion script should contain subcommand names"
+    );
+}
+
+#[test]
+fn test_completions_zsh() {
+    let (stdout, stderr, code) = run_cli(&["completions", "zsh"]);
+    assert_eq!(code, 0, "completions zsh should exit 0; stderr: {stderr}");
+    assert!(!stdout.is_empty(), "completion script should not be empty");
+    assert!(
+        stdout.contains("soroban-cost-estimator"),
+        "zsh completion script should contain binary name"
+    );
+    assert!(
+        stdout.contains("estimate"),
+        "zsh completion script should contain subcommand names"
+    );
+}
+
+#[test]
+fn test_completions_fish() {
+    let (stdout, stderr, code) = run_cli(&["completions", "fish"]);
+    assert_eq!(code, 0, "completions fish should exit 0; stderr: {stderr}");
+    assert!(!stdout.is_empty(), "completion script should not be empty");
+    assert!(
+        stdout.contains("soroban-cost-estimator"),
+        "fish completion script should contain binary name"
+    );
+    assert!(
+        stdout.contains("estimate"),
+        "fish completion script should contain subcommand names"
+    );
+}
+
+#[test]
+fn test_completions_powershell() {
+    let (stdout, stderr, code) = run_cli(&["completions", "powershell"]);
+    assert_eq!(
+        code, 0,
+        "completions powershell should exit 0; stderr: {stderr}"
+    );
+    assert!(!stdout.is_empty(), "completion script should not be empty");
+    assert!(
+        stdout.contains("soroban-cost-estimator"),
+        "powershell completion script should contain binary name"
+    );
+    assert!(
+        stdout.contains("estimate"),
+        "powershell completion script should contain subcommand names"
+    );
+}
+
+#[test]
+fn test_completions_unsupported_shell() {
+    let (_stdout, stderr, code) = run_cli(&["completions", "invalid_shell"]);
+    assert_ne!(code, 0, "unsupported shell should exit non-zero");
+    assert!(
+        stderr.contains("invalid value 'invalid_shell'") || stderr.contains("unexpected argument"),
+        "stderr should state invalid shell value; got: {stderr}"
+    );
 }
