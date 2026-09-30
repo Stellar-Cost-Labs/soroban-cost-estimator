@@ -102,10 +102,23 @@ governor = "0.10.4"
 [dev-dependencies]
 insta = "1.40.0"
 proptest = "1.11.0"
-criterion = "0.5"
+# `html_reports` is listed explicitly for the bench targets. It pulls in no
+# extra dependencies itself (it is a bare cfg flag); the plotting backend comes
+# from criterion's default `plotters` feature, so HTML reports are already on.
+# Naming it keeps the intent obvious if the `default` feature set ever changes.
+criterion = { version = "0.5", features = ["html_reports"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 
 [profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+# `bench` already inherits these from `profile.release`. They are pinned
+# explicitly so a later edit to the release profile cannot silently shift the
+# Criterion baselines in benches/ — the point of those numbers is that they
+# are comparable across runs, not just correct within one.
+[profile.bench]
 lto = true
 codegen-units = 1
 opt-level = 3
