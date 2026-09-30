@@ -1357,6 +1357,281 @@ fn test_cache_query_json_flag_accepted() {
     );
 }
 
+fn seed_cache_estimate(
+    home: &Path,
+    wasm_hash: &str,
+    function: &str,
+    network: &str,
+    fee: i64,
+    cpu: u64,
+    timestamp: &str,
+) {
+    let args_hash = hex::encode(sha2::Sha256::digest(function.as_bytes()));
+    let dir = home.join(".soroban-cost-estimator");
+    std::fs::create_dir_all(&dir).expect("create data dir");
+    let db = dir.join("cache.db");
+    let conn = rusqlite::Connection::open(&db).expect("open cache db");
+    cache::ensure_cache_schema(&conn).expect("ensure cache schema");
+
+    conn.execute(
+        "INSERT OR REPLACE INTO estimates \
+         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            cache::CACHE_SCHEMA_VERSION as i64,
+            wasm_hash,
+            function,
+            args_hash,
+            network,
+            42i64,
+            fee,
+            cpu as i64,
+            1024i64,
+            timestamp,
+        ],
+    )
+    .expect("insert test cache estimate");
+}
+
+#[test]
+fn test_config_cache_query_help() {
+    let (stdout, stderr, code) = run_cli(&["config", "cache", "query", "--help"]);
+    assert_eq!(
+        code, 0,
+        "config cache query --help should exit 0; stderr: {stderr}"
+    );
+    for flag in [
+        "--network",
+        "--fn",
+        "--wasm-hash",
+        "--min-fee",
+        "--max-fee",
+        "--since",
+        "--json",
+    ] {
+        assert!(
+            stdout.contains(flag),
+            "config cache query help should mention {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_config_cache_query_empty_cache() {
+    let home = temp_home("config-cache-query-empty");
+    let (stdout, stderr, code) = run_cli_in_home(&["config", "cache", "query"], Some(&home));
+    assert_eq!(
+        code, 0,
+        "config cache query on empty cache should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("No cached estimates match the query."),
+        "empty cache should report no results; got: {stdout}"
+    );
+}
+
+fn run_cli_json_in_home(args: &[&str], home: &Path) -> (String, String, i32) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"));
+    cmd.args(args);
+    cmd.env("HOME", home);
+    cmd.env("USERPROFILE", home);
+    cmd.env("RUST_LOG", "error");
+    let output = cmd.output().expect("failed to run CLI");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let code = output.status.code().unwrap_or(-1);
+    (stdout, stderr, code)
+}
+
+#[test]
+fn test_config_cache_query_empty_json() {
+    let home = temp_home("config-cache-query-empty-json");
+    let (stdout, stderr, code) =
+        run_cli_json_in_home(&["config", "cache", "query", "--json"], &home);
+    assert_eq!(
+        code, 0,
+        "config cache query --json should exit 0; stderr: {stderr}"
+    );
+    assert_eq!(
+        stdout.trim(),
+        "[]",
+        "empty JSON should be []; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_cache_query_with_filters_table() {
+    let home = temp_home("config-cache-query-table");
+    seed_cache_estimate(
+        &home,
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        "transfer",
+        "testnet",
+        150_000,
+        12_000,
+        "2026-02-01T10:00:00Z",
+    );
+    seed_cache_estimate(
+        &home,
+        "2222222222222222222222222222222222222222222222222222222222222222",
+        "approve",
+        "testnet",
+        250_000,
+        24_000,
+        "2026-02-02T10:00:00Z",
+    );
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &["config", "cache", "query", "--fn", "transfer"],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "query should succeed; stderr: {stderr}");
+    assert!(
+        stdout.contains("Timestamp"),
+        "table should contain Timestamp"
+    );
+    assert!(stdout.contains("Function"), "table should contain Function");
+    assert!(stdout.contains("CPU"), "table should contain CPU");
+    assert!(stdout.contains("Fee"), "table should contain Fee");
+    assert!(stdout.contains("transfer"), "table should contain transfer");
+    assert!(
+        !stdout.contains("approve"),
+        "table should NOT contain approve"
+    );
+}
+
+#[test]
+fn test_config_cache_query_with_filters_json() {
+    let home = temp_home("config-cache-query-json");
+    seed_cache_estimate(
+        &home,
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        "transfer",
+        "testnet",
+        150_000,
+        12_000,
+        "2026-02-01T10:00:00Z",
+    );
+    seed_cache_estimate(
+        &home,
+        "2222222222222222222222222222222222222222222222222222222222222222",
+        "approve",
+        "testnet",
+        250_000,
+        24_000,
+        "2026-02-02T10:00:00Z",
+    );
+
+    let (stdout, stderr, code) = run_cli_json_in_home(
+        &["config", "cache", "query", "--fn", "transfer", "--json"],
+        &home,
+    );
+    assert_eq!(code, 0, "query --json should succeed; stderr: {stderr}");
+    let val: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json output");
+    let arr = val.as_array().expect("json array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["function"], "transfer");
+    assert_eq!(arr[0]["total_stroops"], 150_000);
+}
+
+#[test]
+fn test_config_cache_query_no_filters_returns_all_networks() {
+    let home = temp_home("config-cache-query-all");
+    seed_cache_estimate(
+        &home,
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        "fn_testnet",
+        "testnet",
+        150_000,
+        12_000,
+        "2026-02-01T10:00:00Z",
+    );
+    seed_cache_estimate(
+        &home,
+        "2222222222222222222222222222222222222222222222222222222222222222",
+        "fn_mainnet",
+        "mainnet",
+        250_000,
+        24_000,
+        "2026-02-02T10:00:00Z",
+    );
+
+    let (stdout, stderr, code) =
+        run_cli_json_in_home(&["config", "cache", "query", "--json"], &home);
+    assert_eq!(code, 0, "query --json should succeed; stderr: {stderr}");
+    let val: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json output");
+    let arr = val.as_array().expect("json array");
+    assert_eq!(
+        arr.len(),
+        2,
+        "query without filters should return all cached entries"
+    );
+}
+
+#[test]
+fn test_config_cache_query_invalid_network_error() {
+    let home = temp_home("config-cache-query-inv-net");
+    let (_stdout, stderr, code) = run_cli_in_home(
+        &["config", "cache", "query", "--network", "invalid_net_xyz"],
+        Some(&home),
+    );
+    assert_ne!(code, 0, "invalid network must fail");
+    assert!(
+        stderr.contains("not configured for network") || stderr.contains("invalid_net_xyz"),
+        "stderr should mention invalid network; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_cache_query_invalid_fee_range_error() {
+    let home = temp_home("config-cache-query-inv-fee");
+    let (_stdout, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "cache",
+            "query",
+            "--min-fee",
+            "200000",
+            "--max-fee",
+            "100000",
+        ],
+        Some(&home),
+    );
+    assert_ne!(code, 0, "invalid fee range must fail");
+    assert!(
+        stderr.contains("cannot exceed max-fee"),
+        "stderr should mention invalid fee range; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_cache_query_invalid_since_error() {
+    let home = temp_home("config-cache-query-inv-since");
+    let (_stdout, stderr, code) = run_cli_in_home(
+        &["config", "cache", "query", "--since", "bad-date-format"],
+        Some(&home),
+    );
+    assert_ne!(code, 0, "invalid since date must fail");
+    assert!(
+        stderr.contains("invalid timestamp or date"),
+        "stderr should mention invalid timestamp or date; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_cache_query_invalid_wasm_hash_error() {
+    let home = temp_home("config-cache-query-inv-hash");
+    let (_stdout, stderr, code) = run_cli_in_home(
+        &["config", "cache", "query", "--wasm-hash", "xyz_not_hex"],
+        Some(&home),
+    );
+    assert_ne!(code, 0, "invalid wasm hash must fail");
+    assert!(
+        stderr.contains("hexadecimal"),
+        "stderr should mention hexadecimal; got: {stderr}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // `cache clear` / `estimate --clear-cache` (Issue #24)
 // ─────────────────────────────────────────────────────────────────────────
