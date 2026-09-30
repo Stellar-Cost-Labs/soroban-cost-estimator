@@ -49,7 +49,9 @@ fn build_version() -> &'static str {
 #[command(version = build_version())]
 #[command(about = "Estimate Soroban contract costs & track network pricing changes", long_about = None)]
 pub struct Cli {
-    /// Optional TOML config file path. Defaults to ~/.config/soroban-cost-estimator/config.toml.
+    /// Config file to read instead of the default locations
+    /// ($XDG_CONFIG_HOME or ~/.config, then ~/.soroban-cost-estimator; see
+    /// README "Configuration file"). Explicit flags override its values.
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<String>,
 
