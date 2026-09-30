@@ -198,6 +198,14 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
     let precision = args.precision;
     let fallback = args.rpc_fallback_url.as_deref();
     let headers = args.headers;
+    // Bound the on-disk estimate cache before any command can write to it.
+    // A `--max-cache-size-mb` of 0 disables the byte quota; 0 entries
+    // disables the entry quota.
+    cache::set_cache_limits(cache::CacheLimits {
+        max_bytes: args.max_cache_size_mb.saturating_mul(1024 * 1024),
+        max_entries: args.max_cache_entries,
+    })?;
+
     let format = match args.format {
         Some(fmt) => fmt,
         None => {
@@ -222,6 +230,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             clear_cache,
             json,
             auto_snapshot,
+            diff,
+            wasm_new,
             watch,
             dry_run,
         } => {
@@ -252,6 +262,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 args.wasm_info,
                 args.verbose,
                 auto_snapshot,
+                diff,
+                wasm_new.as_deref(),
                 dry_run,
             )
             .await
@@ -383,6 +395,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 .await
             }
             cli::CacheAction::Verify => cmd_cache_verify(),
+            cli::CacheAction::Prune => cmd_cache_prune(),
             cli::CacheAction::List { network, json } => cmd_cache_list(&network, json),
             cli::CacheAction::Clear { network } => cmd_cache_clear(&network),
             cli::CacheAction::Query {
@@ -630,15 +643,155 @@ fn emit_wasm_structure(
     }
 }
 
-/// `estimate` command: simulate a single invocation and print cost report.
+/// Inputs for one `simulateTransaction`-based cost report.
+///
+/// Bundles everything [`simulate_report`] needs so the single-report
+/// (`estimate`) and two-report (`estimate --diff`) paths share one
+/// implementation of the simulation pipeline.
+struct SimulationRequest<'a> {
+    wasm_bytes: &'a [u8],
+    wasm_hash: &'a str,
+    wasm_size: u64,
+    functions: &'a [wasm::parser::FunctionInfo],
+    network: &'a str,
+    rpc_url: Option<&'a str>,
+    rpc_fallback_url: Option<&'a str>,
+    contract_id: Option<&'a str>,
+    fn_name: Option<&'a str>,
+    args: &'a [String],
+    rps: Option<u64>,
+    timeout: u64,
+    max_retries: usize,
+    precision: u32,
+    extra_headers: &'a [String],
+    verbose: bool,
+}
+
+/// Simulate one WASM artifact and build its [`report::cost_report::CostReport`].
+///
+/// Shared core of `estimate` and `estimate --diff`: build the transaction
+/// envelope, fail fast on an unhealthy endpoint, run `simulateTransaction`,
+/// and derive the fee breakdown from the network's own config-sourced rates.
+/// Cache reads and writes are deliberately not performed here, so both
+/// callers decide their own caching policy.
 ///
 /// All RPC traffic (simulation and fee-rate fetches) goes through one
 /// `RpcClient`, which deduplicates identical requests — the same method with
-/// the same params — so a repeated WASM-upload envelope (when `--fn` is
-/// omitted) or identical fee-rate fetches transmit at most once.
+/// the same params — so identical fee-rate fetches transmit at most once.
+async fn simulate_report(
+    req: &SimulationRequest<'_>,
+) -> error::AppResult<report::cost_report::CostReport> {
+    let endpoint = rpc::client::resolve_endpoint(req.network, req.rpc_url)?;
+    let client = rpc::client::RpcClient::with_fallback_headers(
+        &endpoint,
+        req.rpc_fallback_url,
+        req.rps,
+        std::time::Duration::from_secs(req.timeout),
+        req.max_retries,
+        req.extra_headers,
+        req.verbose,
+    );
+
+    let sc_vals: Vec<stellar_xdr::ScVal> = req
+        .args
+        .iter()
+        .map(|a| xdr_helper::parse_arg_scval(a))
+        .collect();
+    debug!(arg_count = sc_vals.len(), "parsed arguments");
+
+    let tx_xdr = xdr_helper::build_simulation_tx_envelope(
+        req.wasm_bytes,
+        req.contract_id,
+        req.fn_name,
+        &sc_vals,
+    )?;
+
+    xdr_helper::validate_args_against_spec(req.fn_name, req.args, req.functions)?;
+    debug!(
+        arg_count = req.args.len(),
+        "validated arguments against contract spec"
+    );
+
+    let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
+    debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
+
+    // Fail fast on a misconfigured --rpc-url or down node (#55): validate
+    // the endpoint is reachable and healthy before running any simulation.
+    // Local argument errors above are reported first; this guards the
+    // (potentially expensive) simulateTransaction call itself.
+    client.health_check().await?;
+
+    // Time the simulateTransaction round-trip so the report can flag
+    // slow RPC endpoints. Includes any retries performed by the client.
+    let rpc_start = std::time::Instant::now();
+    let response = rpc::simulate::simulate_transaction(&client, &tx_b64).await?;
+    let rpc_latency_ms = rpc_start.elapsed().as_millis() as u64;
+
+    if missing_simulation_data(&response) {
+        return Err(error::AppError::SimulationFailed(
+            "simulation returned no cost data and no latest ledger — check --id, --fn, and the RPC endpoint".to_string(),
+        ));
+    }
+
+    let (cpu_instructions, memory_bytes, read_entries, write_entries, read_bytes, write_bytes) =
+        response_resources(&response)?;
+
+    let latest_ledger: u32 = response
+        .latest_ledger
+        .and_then(|l| u32::try_from(l).ok())
+        .unwrap_or(0);
+
+    let total_fee_stroops = rpc::simulate::parse_resource_fee(&response.min_resource_fee)
+        .unwrap_or(None)
+        .or(rpc::simulate::parse_transaction_data_resource_fee(
+            &response.transaction_data,
+        )?)
+        .unwrap_or(0);
+
+    debug!(
+        cpu_instructions,
+        memory_bytes, latest_ledger, total_fee_stroops, "simulation complete"
+    );
+
+    let fee_rates = fetch_fee_rates(&client).await;
+
+    let fee = report::fee_calc::compute_fee_breakdown(
+        total_fee_stroops,
+        cpu_instructions,
+        read_entries,
+        write_entries,
+        read_bytes,
+        tx_xdr.len() as u32,
+        fee_rates,
+        req.precision,
+    );
+
+    Ok(report::cost_report::CostReport {
+        function: req.fn_name.unwrap_or("(wasm upload)").to_string(),
+        wasm_hash: req.wasm_hash.to_string(),
+        wasm_size: req.wasm_size,
+        cpu_instructions,
+        memory_bytes,
+        tx_size: tx_xdr.len() as u32,
+        read_entries,
+        write_entries,
+        read_bytes,
+        write_bytes,
+        fee,
+        ledger: latest_ledger,
+        network: req.network.to_string(),
+        rpc_latency_ms,
+        rates: Some(fee_rates),
+    })
+}
+
+/// `estimate` command: simulate a single invocation and print cost report.
 ///
 /// With `--watch`, switches to [`cmd_estimate_watch`] instead: poll the WASM
 /// file and re-estimate on every settled rebuild.
+///
+/// With `--diff`, two WASM builds are simulated and rendered as a
+/// side-by-side comparison instead; see [`cmd_estimate_diff`].
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::fn_params_excessive_bools)]
 async fn cmd_estimate(
@@ -661,8 +814,39 @@ async fn cmd_estimate(
     wasm_info_flag: bool,
     verbose: bool,
     auto_snapshot: bool,
+    diff: bool,
+    wasm_new: Option<&str>,
     dry_run: bool,
 ) -> error::AppResult<()> {
+    // `--wasm-new` is only meaningful together with `--diff`; silently
+    // ignoring it would produce a single report the user did not ask for.
+    if !diff && wasm_new.is_some() {
+        return Err(error::AppError::General(
+            "--wasm-new requires --diff (comparison mode)".to_string(),
+        ));
+    }
+
+    if diff {
+        return cmd_estimate_diff(
+            wasm_path,
+            wasm_new,
+            network,
+            rpc_url,
+            rpc_fallback_url,
+            contract_id,
+            fn_name,
+            args,
+            format,
+            rps,
+            timeout,
+            max_retries,
+            precision,
+            extra_headers,
+            verbose,
+        )
+        .await;
+    }
+
     if watch {
         return cmd_estimate_watch(
             wasm_path,
@@ -840,13 +1024,18 @@ async fn estimate_once(
 
         info!("loading WASM");
         let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
-        debug!(functions = wasm_info.functions.len(), has_spec = wasm_info.has_spec, "WASM loaded");
+        debug!(
+            functions = wasm_info.functions.len(),
+            has_spec = wasm_info.has_spec,
+            "WASM loaded"
+        );
         emit_wasm_structure(&wasm_info, verbose, wasm_info_flag, json_flag);
 
         // Validate WASM memory and table constraints against network limits (defaults: 64KB max size, 2048 pages)
         wasm_info.validate_wasm_limits(65536, 2048)?;
 
         let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
+        let wasm_size = wasm_info.bytes.len() as u64;
         let function_name = fn_name.unwrap_or("(wasm upload)");
 
         // Show the hash before anything else — the user can verify they are
@@ -860,45 +1049,39 @@ async fn estimate_once(
         // With --cache-ttl, reuse a still-fresh cached estimate and skip the
         // (expensive) simulation entirely.
         let ttl_secs = cache_ttl.map(parse_interval_secs);
-        if let Some(fresh) =
-            fresh_cached_estimate(&wasm_hash, &function_name, args, ttl_secs)?
-        {
+        if let Some(fresh) = fresh_cached_estimate(&wasm_hash, &function_name, args, ttl_secs)? {
             let ttl_secs = ttl_secs.unwrap_or_default();
             info!(ttl_secs, function = %function_name, "cache hit — reusing fresh estimate");
             print_cached_estimate(&fresh, ttl_secs, json_flag, precision);
             return Ok(EstimateRun::Cached);
         }
 
-        let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
-        let client = rpc::client::RpcClient::with_fallback_headers(
-            &endpoint,
-            rpc_fallback_url,
-            rps,
-            std::time::Duration::from_secs(timeout),
-            max_retries,
-            extra_headers,
-            verbose,
-        );
-
-        let sc_vals: Vec<stellar_xdr::ScVal> = args
-            .iter()
-            .map(|a| xdr_helper::parse_arg_scval(a))
-            .collect();
-        debug!(arg_count = sc_vals.len(), "parsed arguments");
-
-        let tx_xdr =
-            xdr_helper::build_simulation_tx_envelope(&wasm_info.bytes, contract_id, fn_name, &sc_vals)?;
-
-        xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
-        debug!(arg_count = args.len(), "validated arguments against contract spec");
-
-        let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
-        debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
-
         // In dry-run mode, print the planned simulation payload and exit
-        // without contacting the network. Useful for air-gapped environments
-        // or local contract verification.
+        // without contacting the network. The envelope is built here because
+        // no RPC traffic is performed.
         if dry_run {
+            let sc_vals: Vec<stellar_xdr::ScVal> = args
+                .iter()
+                .map(|a| xdr_helper::parse_arg_scval(a))
+                .collect();
+            debug!(arg_count = sc_vals.len(), "parsed arguments");
+
+            let tx_xdr = xdr_helper::build_simulation_tx_envelope(
+                &wasm_info.bytes,
+                contract_id,
+                fn_name,
+                &sc_vals,
+            )?;
+            xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
+            debug!(
+                arg_count = args.len(),
+                "validated arguments against contract spec"
+            );
+
+            let tx_b64 =
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
+            debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
+
             let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
             println!("Dry run — planned simulation payload (no network calls):");
             println!();
@@ -936,84 +1119,43 @@ async fn estimate_once(
             return Ok(EstimateRun::DryRun);
         }
 
-        // Fail fast on a misconfigured --rpc-url or down node (#55): validate
-        // the endpoint is reachable and healthy before running any simulation.
-        // Local argument errors above are reported first; this guards the
-        // (potentially expensive) simulateTransaction call itself.
-        client.health_check().await?;
-
-        // Time the simulateTransaction round-trip so the report can flag
-        // slow RPC endpoints. Includes any retries performed by the client.
-        let rpc_start = std::time::Instant::now();
-        let response = rpc::simulate::simulate_transaction(&client, &tx_b64).await?;
-        let rpc_latency_ms = rpc_start.elapsed().as_millis() as u64;
-
-        if missing_simulation_data(&response) {
-            return Err(error::AppError::SimulationFailed(
-                "simulation returned no cost data and no latest ledger — check --id, --fn, and the RPC endpoint".to_string(),
-            ));
-        }
-
-        let (cpu_instructions, memory_bytes, read_entries, write_entries, read_bytes, write_bytes) =
-            response_resources(&response)?;
-
-        let latest_ledger: u32 = response
-            .latest_ledger
-            .and_then(|l| u32::try_from(l).ok())
-            .unwrap_or(0);
-
-        let total_fee_stroops = rpc::simulate::parse_resource_fee(&response.min_resource_fee)
-            .unwrap_or(None)
-            .or(rpc::simulate::parse_transaction_data_resource_fee(
-                &response.transaction_data,
-            )?)
-            .unwrap_or(0);
-
-        debug!(cpu_instructions, memory_bytes, latest_ledger, total_fee_stroops, "simulation complete");
-
-        let fee_rates = fetch_fee_rates(&client).await;
-
-        let fee = report::fee_calc::compute_fee_breakdown(
-            total_fee_stroops,
-            cpu_instructions,
-            read_entries,
-            write_entries,
-            read_bytes,
-            tx_xdr.len() as u32,
-            fee_rates,
+        let report = simulate_report(&SimulationRequest {
+            wasm_bytes: &wasm_info.bytes,
+            wasm_hash: &wasm_hash,
+            wasm_size,
+            functions: &wasm_info.functions,
+            network,
+            rpc_url,
+            rpc_fallback_url,
+            contract_id,
+            fn_name,
+            args,
+            rps,
+            timeout,
+            max_retries,
             precision,
-        );
-
-        let report = report::cost_report::CostReport {
-            function: function_name.to_string(),
-            wasm_hash: wasm_hash.clone(),
-            cpu_instructions,
-            memory_bytes,
-            tx_size: tx_xdr.len() as u32,
-            read_entries,
-            write_entries,
-            read_bytes,
-            write_bytes,
-            fee: fee.clone(),
-            ledger: latest_ledger,
-            network: network.to_string(),
-            rpc_latency_ms,
-            rates: Some(fee_rates),
-        };
+            extra_headers,
+            verbose,
+        })
+        .await?;
 
         let _ = cache::save_estimate(
             &wasm_hash,
             function_name,
             args,
             network,
-            latest_ledger,
-            fee.total_stroops,
-            cpu_instructions,
-            memory_bytes,
-            Some(rpc_latency_ms),
+            report.ledger,
+            report.fee.total_stroops,
+            report.cpu_instructions,
+            report.memory_bytes,
+            Some(report.rpc_latency_ms),
             true,
         );
-        info!(total_stroops = fee.total_stroops, total_xlm = %fee.total_xlm, "estimate complete");
+        info!(
+            total_stroops = report.fee.total_stroops,
+            total_xlm = %report.fee.total_xlm,
+            "estimate complete"
+        );
 
         Ok(EstimateRun::Simulated { report })
     }
@@ -1407,6 +1549,106 @@ async fn cmd_estimate_watch(
             } => {}
         }
     }
+}
+
+/// `estimate --diff`: simulate two WASM builds and print a side-by-side
+/// comparison of their resource usage and fees.
+///
+/// `--wasm` is the baseline ("old") build and `--wasm-new` the comparison
+/// ("new") build; everything else (`--fn`, `--arg`, `--id`, `--network`) is
+/// applied identically to both simulations so the numbers are comparable.
+/// The cache is neither read nor written in diff mode.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_estimate_diff(
+    old_path: &str,
+    new_path: Option<&str>,
+    network: &str,
+    rpc_url: Option<&str>,
+    rpc_fallback_url: Option<&str>,
+    contract_id: Option<&str>,
+    fn_name: Option<&str>,
+    args: &[String],
+    format: &str,
+    rps: Option<u64>,
+    timeout: u64,
+    max_retries: usize,
+    precision: u32,
+    extra_headers: &[String],
+    verbose: bool,
+) -> error::AppResult<()> {
+    use sha2::Digest;
+
+    // `--diff` is declared with `requires = "wasm_new"` in clap, so this is
+    // only reachable if the CLI is driven through the library. Report it
+    // clearly rather than panicking.
+    let Some(new_path) = new_path else {
+        return Err(error::AppError::General(
+            "--diff requires --wasm-new <PATH> (the build to compare against)".to_string(),
+        ));
+    };
+
+    let old_info = wasm::parser::load_wasm(std::path::Path::new(old_path))?;
+    let new_info = wasm::parser::load_wasm(std::path::Path::new(new_path))?;
+    let old_hash = hex::encode(sha2::Sha256::digest(&old_info.bytes));
+    let new_hash = hex::encode(sha2::Sha256::digest(&new_info.bytes));
+
+    if format == "table" {
+        println!("Old WASM SHA-256: {old_hash}");
+        println!("New WASM SHA-256: {new_hash}");
+        println!();
+    }
+
+    let old_report = simulate_report(&SimulationRequest {
+        wasm_bytes: &old_info.bytes,
+        wasm_hash: &old_hash,
+        wasm_size: old_info.bytes.len() as u64,
+        functions: &old_info.functions,
+        network,
+        rpc_url,
+        rpc_fallback_url,
+        contract_id,
+        fn_name,
+        args,
+        rps,
+        timeout,
+        max_retries,
+        precision,
+        extra_headers,
+        verbose,
+    })
+    .await?;
+
+    let new_report = simulate_report(&SimulationRequest {
+        wasm_bytes: &new_info.bytes,
+        wasm_hash: &new_hash,
+        wasm_size: new_info.bytes.len() as u64,
+        functions: &new_info.functions,
+        network,
+        rpc_url,
+        rpc_fallback_url,
+        contract_id,
+        fn_name,
+        args,
+        rps,
+        timeout,
+        max_retries,
+        precision,
+        extra_headers,
+        verbose,
+    })
+    .await?;
+
+    if format == "json" {
+        let diff = report::diff::build_cost_report_diff(&old_report, &new_report);
+        println!("{}", serde_json::to_string_pretty(&diff)?);
+    } else {
+        println!(
+            "{}",
+            report::diff::format_cost_report_diff(&old_report, &new_report)
+        );
+    }
+
+    Ok(())
 }
 
 /// Converts an `EstimateAllResult` to a CSV row.
@@ -2514,13 +2756,15 @@ async fn cmd_watch(
 ///
 /// Prints total entries, disk usage, age (oldest/newest), and per-network
 /// breakdown. Useful for checking whether the cache is being populated and
-/// how much disk space it consumes.
+/// how much disk space it consumes (against the `--max-cache-size-mb` and
+/// `--max-cache-entries` quotas).
 ///
 /// # Network calls
 /// None — pure SQLite I/O.
 #[allow(dead_code)] // wired once the `config cache stats` subcommand (#41) lands
 fn cmd_cache_stats(json: bool) -> error::AppResult<()> {
     let stats = cache::cache_stats()?;
+    let limits = cache::cache_limits();
 
     if json {
         println!("{}", serde_json::to_string_pretty(&stats)?);
@@ -2528,7 +2772,8 @@ fn cmd_cache_stats(json: bool) -> error::AppResult<()> {
     }
 
     if stats.total_entries == 0 {
-        println!("Cache is empty (0 entries, 0 bytes)");
+        println!("Cache is empty — no cached estimates.");
+        print_cache_quota(limits);
         return Ok(());
     }
 
@@ -2536,6 +2781,7 @@ fn cmd_cache_stats(json: bool) -> error::AppResult<()> {
     println!("================");
     println!("  Total entries:  {}", stats.total_entries);
     println!("  Disk usage:     {}", format_bytes(stats.disk_bytes));
+    println!("  Live size:      {}", format_bytes(stats.live_bytes));
     println!(
         "  Oldest entry:   {}",
         stats.oldest_entry.as_deref().unwrap_or("n/a")
@@ -2544,6 +2790,7 @@ fn cmd_cache_stats(json: bool) -> error::AppResult<()> {
         "  Newest entry:   {}",
         stats.newest_entry.as_deref().unwrap_or("n/a")
     );
+    print_cache_quota(limits);
 
     if !stats.per_network.is_empty() {
         println!("\nPer-network breakdown:");
@@ -2558,8 +2805,65 @@ fn cmd_cache_stats(json: bool) -> error::AppResult<()> {
     Ok(())
 }
 
+/// Print the configured cache quotas, used by `cache stats` and
+/// `cache prune`.
+fn print_cache_quota(limits: cache::CacheLimits) {
+    println!(
+        "  Byte quota:     {}",
+        if limits.max_bytes == 0 {
+            "unlimited".to_string()
+        } else {
+            format_bytes(limits.max_bytes)
+        }
+    );
+    println!(
+        "  Entry quota:    {}",
+        if limits.max_entries == 0 {
+            "unlimited".to_string()
+        } else {
+            limits.max_entries.to_string()
+        }
+    );
+}
+
+/// `cache prune` command: evict least-recently-accessed entries until the
+/// cache fits its configured quota.
+///
+/// Quotas come from the global `--max-cache-size-mb` and
+/// `--max-cache-entries` flags. Prints how many entries were evicted; running
+/// it on a cache already within quota is a no-op that reports zero.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+fn cmd_cache_prune() -> error::AppResult<()> {
+    let limits = cache::cache_limits();
+    let before = cache::cache_stats()?;
+    let evicted = cache::evict_lru()?;
+    let after = cache::cache_stats()?;
+
+    println!("Evicted {evicted} cached estimate(s).");
+    println!(
+        "Cache: {} entr{} ({}) → {} entr{} ({})",
+        before.total_entries,
+        if before.total_entries == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        format_bytes(before.disk_bytes),
+        after.total_entries,
+        if after.total_entries == 1 { "y" } else { "ies" },
+        format_bytes(after.disk_bytes),
+    );
+    println!(
+        "Quota: {} / {} entries (0 = unlimited)",
+        format_bytes(limits.max_bytes),
+        limits.max_entries
+    );
+    Ok(())
+}
+
 /// Format a byte count as a human-readable string (KB, MB, GB).
-#[allow(dead_code)] // used by cmd_cache_stats once the `config cache stats` subcommand (#41) lands
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -3144,6 +3448,7 @@ mod tests {
         soroban_cost_estimator::report::cost_report::CostReport {
             function: "increment".to_string(),
             wasm_hash: "deadbeef".to_string(),
+            wasm_size: 1024,
             cpu_instructions: 532_502,
             memory_bytes: 0,
             tx_size: 156,

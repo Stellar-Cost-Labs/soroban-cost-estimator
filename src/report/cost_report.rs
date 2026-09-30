@@ -154,6 +154,11 @@ pub struct CostReport {
     pub function: String,
     /// WASM bytes SHA-256 hash (hex).
     pub wasm_hash: String,
+    /// Size of the compiled WASM artifact in bytes. Reported in the
+    /// side-by-side diff so a build-size regression is visible next to the
+    /// fee delta. `0` when the caller did not supply it.
+    #[serde(default)]
+    pub wasm_size: u64,
     /// CPU instructions consumed.
     pub cpu_instructions: u64,
     /// Memory bytes used.
@@ -411,6 +416,7 @@ mod tests {
         CostReport {
             function: "increment".to_string(),
             wasm_hash: "abc".to_string(),
+            wasm_size: 4_096,
             cpu_instructions: 532_502,
             memory_bytes: 0,
             tx_size: 156,
@@ -526,6 +532,7 @@ mod tests {
         let report = CostReport {
             function: "(wasm upload)".to_string(),
             wasm_hash: "0000".to_string(),
+            wasm_size: 0,
             cpu_instructions: 0,
             memory_bytes: 0,
             tx_size: 0,

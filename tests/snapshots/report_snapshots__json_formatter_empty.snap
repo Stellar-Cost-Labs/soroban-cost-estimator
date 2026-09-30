@@ -25,6 +25,7 @@ expression: JsonFormatter.format(&empty)
   "suggestions": [],
   "tx_size": 0,
   "wasm_hash": "0000000000000000",
+  "wasm_size": 0,
   "write_bytes": 0,
   "write_entries": 0
 }

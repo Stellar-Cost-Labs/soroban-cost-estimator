@@ -25,6 +25,7 @@ expression: JsonFormatter.format(&report)
   "suggestions": [],
   "tx_size": 156,
   "wasm_hash": "abc123def456",
+  "wasm_size": 4096,
   "write_bytes": 136,
   "write_entries": 1
 }
