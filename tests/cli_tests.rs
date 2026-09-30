@@ -2175,3 +2175,314 @@ fn test_completions_unsupported_shell() {
         "stderr should state invalid shell value; got: {stderr}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Cost projections (`--project`)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_estimate_project_flag_custom_counts_table() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-project-table");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+            "--project",
+            "100,1000,10000",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate should succeed; stderr: {stderr}"
+    );
+
+    assert!(stdout.contains("Cost Projections:"));
+    assert!(stdout.contains("Invocations"));
+    assert!(stdout.contains("Total Stroops"));
+    assert!(stdout.contains("Total XLM"));
+    assert!(stdout.contains("USD"));
+    assert!(stdout.contains("100"));
+    assert!(stdout.contains("1,552,700"));
+    assert!(stdout.contains("0.1552700"));
+    assert!(stdout.contains("1,000"));
+    assert!(stdout.contains("15,527,000"));
+    assert!(stdout.contains("1.5527000"));
+    assert!(stdout.contains("10,000"));
+    assert!(stdout.contains("155,270,000"));
+    assert!(stdout.contains("15.5270000"));
+    assert!(stdout.contains('-'));
+}
+
+#[test]
+fn test_estimate_project_flag_default_counts() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-project-default");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+            "--project",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate should succeed; stderr: {stderr}"
+    );
+
+    assert!(stdout.contains("Cost Projections:"));
+    assert!(stdout.contains("100"));
+    assert!(stdout.contains("1,000"));
+    assert!(stdout.contains("10,000"));
+}
+
+#[test]
+fn test_estimate_project_flag_preserves_order() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-project-order");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+            "--project",
+            "10000,100,1000",
+            "--json",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate should succeed; stderr: {stderr}"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    let projections = parsed["projections"].as_array().expect("projections array");
+    assert_eq!(projections.len(), 3);
+    assert_eq!(projections[0]["invocations"], 10000);
+    assert_eq!(projections[1]["invocations"], 100);
+    assert_eq!(projections[2]["invocations"], 1000);
+}
+
+#[test]
+fn test_estimate_no_project_flag_omits_projections() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-no-project");
+
+    // Table mode without --project
+    let output_table = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout_table = String::from_utf8_lossy(&output_table.stdout);
+    assert!(!stdout_table.contains("Cost Projections:"));
+
+    // JSON mode without --project
+    let output_json = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+            "--json",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout_json = String::from_utf8_lossy(&output_json.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout_json.trim()).expect("valid JSON output; got: {stdout_json}");
+    assert!(parsed.get("projections").is_none());
+}
+
+#[test]
+fn test_estimate_project_json_structure() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-project-json");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+            "--project",
+            "100,1000,10000",
+            "--json",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate should succeed; stderr: {stderr}"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    let projections = parsed["projections"].as_array().expect("projections array");
+    assert_eq!(projections.len(), 3);
+
+    assert_eq!(projections[0]["invocations"], 100);
+    assert_eq!(projections[0]["total_stroops"], 1_552_700);
+    assert_eq!(projections[0]["total_xlm"], "0.1552700");
+    assert!(projections[0].get("usd").is_none());
+
+    assert_eq!(projections[1]["invocations"], 1000);
+    assert_eq!(projections[1]["total_stroops"], 15_527_000);
+    assert_eq!(projections[1]["total_xlm"], "1.5527000");
+
+    assert_eq!(projections[2]["invocations"], 10000);
+    assert_eq!(projections[2]["total_stroops"], 155_270_000);
+    assert_eq!(projections[2]["total_xlm"], "15.5270000");
+}
+
+#[test]
+fn test_estimate_project_invalid_input_error() {
+    let (_stdout, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--project",
+        "abc",
+    ]);
+    assert_ne!(code, 0, "invalid projection count 'abc' should fail");
+    assert!(
+        stderr.contains("invalid projection count 'abc'"),
+        "stderr should mention invalid count: {stderr}"
+    );
+
+    let (_, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--project",
+        "100,abc,1000",
+    ]);
+    assert_ne!(
+        code, 0,
+        "invalid projection count '100,abc,1000' should fail"
+    );
+    assert!(
+        stderr.contains("invalid projection count 'abc'"),
+        "stderr should mention invalid count: {stderr}"
+    );
+
+    let (_, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--project",
+        "0",
+    ]);
+    assert_ne!(code, 0, "projection count 0 should fail");
+    assert!(
+        stderr.contains("greater than zero"),
+        "stderr should mention greater than zero: {stderr}"
+    );
+
+    let (_, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--project",
+        "100,100",
+    ]);
+    assert_ne!(code, 0, "duplicate projection count should fail");
+    assert!(
+        stderr.contains("duplicate projection count: 100"),
+        "stderr should mention duplicate count: {stderr}"
+    );
+}

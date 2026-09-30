@@ -249,6 +249,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             wasm_new,
             watch,
             dry_run,
+            project,
         } => {
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
@@ -280,6 +281,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 diff,
                 wasm_new.as_deref(),
                 dry_run,
+                project.as_deref(),
             )
             .await
         }
@@ -794,6 +796,7 @@ async fn simulate_report(
         network: req.network.to_string(),
         rpc_latency_ms,
         rates: Some(fee_rates),
+        projections: None,
     })
 }
 
@@ -829,7 +832,15 @@ async fn cmd_estimate(
     diff: bool,
     wasm_new: Option<&str>,
     dry_run: bool,
+    project: Option<&str>,
 ) -> error::AppResult<()> {
+    // Parse the requested projection counts up front so an invalid list is
+    // rejected before any RPC traffic, regardless of the output format.
+    let projection_counts = match project {
+        Some(s) => Some(report::cost_report::parse_projection_counts(s)?),
+        None => None,
+    };
+
     // `--wasm-new` is only meaningful together with `--diff`; silently
     // ignoring it would produce a single report the user did not ask for.
     if !diff && wasm_new.is_some() {
@@ -879,7 +890,7 @@ async fn cmd_estimate(
         .await;
     }
 
-    let run = estimate_once(
+    let mut run = estimate_once(
         wasm_path,
         network,
         rpc_url,
@@ -908,7 +919,18 @@ async fn cmd_estimate(
         return Ok(());
     }
 
-    if let EstimateRun::Simulated { report, .. } = &run {
+    if let EstimateRun::Simulated { report, .. } = &mut run {
+        // Attach batch cost projections before rendering so every output
+        // format (table, markdown, json, csv) sees the same report.
+        if let Some(ref counts) = projection_counts {
+            report.projections = Some(report::cost_report::calculate_projections(
+                report.fee.total_stroops,
+                counts,
+                precision,
+                None,
+            )?);
+        }
+
         // The table formatter is the only one that renders the fee bar chart,
         // and only when the terminal has room for it (>= MIN_CHART_WIDTH
         // columns), stdout is a TTY, and `--quiet` was not passed. Machine
@@ -3529,6 +3551,7 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
             rates: None,
+            projections: None,
         }
     }
 
