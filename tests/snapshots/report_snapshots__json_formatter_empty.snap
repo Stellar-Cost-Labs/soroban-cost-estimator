@@ -16,7 +16,7 @@ expression: JsonFormatter.format(&empty)
     "total_xlm": "0.0000000"
   },
   "function": "(wasm upload)",
-  "ledger": 0,
+  "ledger_sequence": 0,
   "memory_bytes": 0,
   "network": "mainnet",
   "read_bytes": 0,
@@ -25,6 +25,7 @@ expression: JsonFormatter.format(&empty)
   "suggestions": [],
   "tx_size": 0,
   "wasm_hash": "0000000000000000",
+  "wasm_size": 0,
   "write_bytes": 0,
   "write_entries": 0
 }

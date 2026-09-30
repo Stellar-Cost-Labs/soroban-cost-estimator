@@ -154,6 +154,11 @@ pub struct CostReport {
     pub function: String,
     /// WASM bytes SHA-256 hash (hex).
     pub wasm_hash: String,
+    /// Size of the compiled WASM artifact in bytes. Reported in the
+    /// side-by-side diff so a build-size regression is visible next to the
+    /// fee delta. `0` when the caller did not supply it.
+    #[serde(default)]
+    pub wasm_size: u64,
     /// CPU instructions consumed.
     pub cpu_instructions: u64,
     /// Memory bytes used.
@@ -171,6 +176,10 @@ pub struct CostReport {
     /// Fee breakdown.
     pub fee: FeeBreakdown,
     /// The ledger sequence the simulation ran against.
+    ///
+    /// Serialized as `ledger_sequence` in JSON output (issue #329) while the
+    /// Rust field keeps its shorter name for source compatibility.
+    #[serde(rename = "ledger_sequence")]
     pub ledger: u32,
     /// Network the simulation ran on.
     pub network: String,
@@ -295,6 +304,251 @@ pub fn format_suggestions(suggestions: &[OptimizationSuggestion]) -> String {
     out
 }
 
+/// Aggregate fee and CPU distribution across a batch of simulations.
+///
+/// Computed over the **successfully estimated** functions only; skipped and
+/// errored functions carry no fee or CPU figure and are excluded by the
+/// caller. Every field is an integer: fees in stroops, CPU in instructions.
+/// The standard deviation is derived from an integer population variance and
+/// an integer square root, so no floating point is used anywhere (issue #328).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FeeDistribution {
+    /// Number of simulations the statistics were computed over.
+    pub function_count: usize,
+    /// Lowest fee, in stroops.
+    pub min_fee_stroops: i64,
+    /// Highest fee, in stroops.
+    pub max_fee_stroops: i64,
+    /// Arithmetic mean fee, in stroops (integer division, truncated).
+    pub mean_fee_stroops: i64,
+    /// Median fee, in stroops. For an even count this is the truncated mean of
+    /// the two central values.
+    pub median_fee_stroops: i64,
+    /// Population standard deviation of the fees, in stroops (floored).
+    pub std_dev_fee_stroops: i64,
+    /// Lowest CPU instruction count.
+    pub min_cpu_instructions: u64,
+    /// Highest CPU instruction count.
+    pub max_cpu_instructions: u64,
+    /// Arithmetic mean CPU instruction count (integer division, truncated).
+    pub mean_cpu_instructions: u64,
+}
+
+impl FeeDistribution {
+    /// Compute the distribution from parallel slices of fee (stroops) and CPU
+    /// instruction samples.
+    ///
+    /// This is the shared core behind [`calculate_distribution_stats`]. It is
+    /// public so the `estimate-all` CLI can derive the distribution directly
+    /// from its per-function records, without first rebuilding full
+    /// [`CostReport`]s.
+    ///
+    /// When either slice is empty — or the slices differ in length, in which
+    /// case the shorter length wins — every statistic is zero and
+    /// `function_count` is `0`.
+    ///
+    /// # Network calls
+    /// None — pure computation.
+    #[must_use]
+    pub fn from_samples(fees: &[i64], cpu: &[u64]) -> Self {
+        let count = fees.len().min(cpu.len());
+        if count == 0 {
+            return Self {
+                function_count: 0,
+                min_fee_stroops: 0,
+                max_fee_stroops: 0,
+                mean_fee_stroops: 0,
+                median_fee_stroops: 0,
+                std_dev_fee_stroops: 0,
+                min_cpu_instructions: 0,
+                max_cpu_instructions: 0,
+                mean_cpu_instructions: 0,
+            };
+        }
+
+        let mut min_fee = i64::MAX;
+        let mut max_fee = i64::MIN;
+        let mut min_cpu = u64::MAX;
+        let mut max_cpu = 0u64;
+        // Accumulate in wider integers so a large batch cannot overflow.
+        let mut sum_fee: i128 = 0;
+        let mut sum_fee_sq: i128 = 0;
+        let mut sum_cpu: u128 = 0;
+        let mut sorted_fees: Vec<i64> = Vec::with_capacity(count);
+
+        for index in 0..count {
+            let fee = fees[index];
+            min_fee = min_fee.min(fee);
+            max_fee = max_fee.max(fee);
+            sum_fee += i128::from(fee);
+            sum_fee_sq += i128::from(fee) * i128::from(fee);
+            sorted_fees.push(fee);
+
+            let instructions = cpu[index];
+            min_cpu = min_cpu.min(instructions);
+            max_cpu = max_cpu.max(instructions);
+            sum_cpu += u128::from(instructions);
+        }
+
+        let n = count as i128;
+        let mean_fee = (sum_fee / n) as i64;
+        let mean_cpu = (sum_cpu / count as u128) as u64;
+
+        sorted_fees.sort_unstable();
+        let median_fee = if count % 2 == 1 {
+            sorted_fees[count / 2]
+        } else {
+            // Sum in `i128` so two near-`i64::MAX` values cannot overflow.
+            ((i128::from(sorted_fees[count / 2 - 1]) + i128::from(sorted_fees[count / 2])) / 2)
+                as i64
+        };
+
+        // Population variance = (n·Σx² − (Σx)²) / n², computed with exact
+        // integer arithmetic (the numerator is non-negative by Cauchy–Schwarz).
+        let variance_numerator = (n * sum_fee_sq - sum_fee * sum_fee).max(0);
+        let variance = variance_numerator / (n * n);
+        let std_dev_fee = isqrt_u128(variance as u128) as i64;
+
+        Self {
+            function_count: count,
+            min_fee_stroops: min_fee,
+            max_fee_stroops: max_fee,
+            mean_fee_stroops: mean_fee,
+            median_fee_stroops: median_fee,
+            std_dev_fee_stroops: std_dev_fee,
+            min_cpu_instructions: min_cpu,
+            max_cpu_instructions: max_cpu,
+            mean_cpu_instructions: mean_cpu,
+        }
+    }
+}
+
+/// Integer (floor) square root of a `u128`.
+///
+/// Uses Newton's method; returns `0` for `0` and `1` for `1`. Keeps the
+/// standard-deviation computation free of floating point.
+fn isqrt_u128(value: u128) -> u128 {
+    if value < 2 {
+        return value;
+    }
+    let mut x = value;
+    let mut y = x / 2 + 1;
+    while y < x {
+        x = y;
+        y = u128::midpoint(x, value / x);
+    }
+    x
+}
+
+/// Compute the distribution statistics for a batch of cost reports (issue
+/// #328).
+///
+/// Callers should pass only the successfully simulated reports so that
+/// skipped/errored functions do not skew the statistics. Returns an all-zero
+/// distribution when `reports` is empty.
+///
+/// # Network calls
+/// None — pure computation.
+#[must_use]
+pub fn calculate_distribution_stats(reports: &[CostReport]) -> FeeDistribution {
+    let fees: Vec<i64> = reports.iter().map(|r| r.fee.total_stroops).collect();
+    let cpu: Vec<u64> = reports.iter().map(|r| r.cpu_instructions).collect();
+    FeeDistribution::from_samples(&fees, &cpu)
+}
+
+/// Insert `,` thousands separators into a run of ASCII digits.
+fn group_digits(digits: &str) -> String {
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// Format a signed integer with `,` thousands separators.
+///
+/// Example: `format_thousands(1_234_567)` → `"1,234,567"`.
+#[must_use]
+pub fn format_thousands(value: i64) -> String {
+    let grouped = group_digits(&value.unsigned_abs().to_string());
+    if value < 0 {
+        format!("-{grouped}")
+    } else {
+        grouped
+    }
+}
+
+/// Format an unsigned integer with `,` thousands separators.
+#[must_use]
+pub fn format_thousands_u64(value: u64) -> String {
+    group_digits(&value.to_string())
+}
+
+/// Format a ledger sequence number with `,` thousands separators.
+///
+/// Example: `format_ledger_sequence(1_234_567)` → `"1,234,567"` (issue #329).
+#[must_use]
+pub fn format_ledger_sequence(ledger: u32) -> String {
+    group_digits(&ledger.to_string())
+}
+
+/// Render the distribution statistics as a human-readable box for the
+/// `estimate-all` summary (issue #328).
+///
+/// Returns an explanatory line instead of a zeroed box when nothing was
+/// successfully estimated, so the section is never silently empty.
+#[must_use]
+pub fn format_distribution_box(distribution: &FeeDistribution, precision: u32) -> String {
+    if distribution.function_count == 0 {
+        return "No functions estimated; no fee distribution to report.".to_string();
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "\nFee distribution across {} function(s):\n\n",
+        distribution.function_count
+    ));
+    out.push_str("  Fees (stroops):\n");
+    out.push_str(&format!(
+        "    min     : {}\n",
+        format_thousands(distribution.min_fee_stroops)
+    ));
+    out.push_str(&format!(
+        "    max     : {}\n",
+        format_thousands(distribution.max_fee_stroops)
+    ));
+    out.push_str(&format!(
+        "    mean    : {} ({})\n",
+        format_thousands(distribution.mean_fee_stroops),
+        crate::report::fee_calc::stroops_to_xlm(distribution.mean_fee_stroops, precision)
+    ));
+    out.push_str(&format!(
+        "    median  : {}\n",
+        format_thousands(distribution.median_fee_stroops)
+    ));
+    out.push_str(&format!(
+        "    std dev : {}\n",
+        format_thousands(distribution.std_dev_fee_stroops)
+    ));
+    out.push_str("\n  CPU instructions:\n");
+    out.push_str(&format!(
+        "    min     : {}\n",
+        format_thousands_u64(distribution.min_cpu_instructions)
+    ));
+    out.push_str(&format!(
+        "    max     : {}\n",
+        format_thousands_u64(distribution.max_cpu_instructions)
+    ));
+    out.push_str(&format!(
+        "    mean    : {}\n",
+        format_thousands_u64(distribution.mean_cpu_instructions)
+    ));
+    out
+}
+
 /// Formats a cost report as a human-readable table.
 pub fn format_report_table(report: &CostReport) -> String {
     let mut output = String::new();
@@ -303,6 +557,10 @@ pub fn format_report_table(report: &CostReport) -> String {
     output.push_str(&format!(
         "Network: {} (ledger {})\n",
         report.network, report.ledger
+    ));
+    output.push_str(&format!(
+        "Simulated at ledger sequence: {}\n",
+        format_ledger_sequence(report.ledger)
     ));
     output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
     output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
@@ -411,6 +669,7 @@ mod tests {
         CostReport {
             function: "increment".to_string(),
             wasm_hash: "abc".to_string(),
+            wasm_size: 4_096,
             cpu_instructions: 532_502,
             memory_bytes: 0,
             tx_size: 156,
@@ -526,6 +785,7 @@ mod tests {
         let report = CostReport {
             function: "(wasm upload)".to_string(),
             wasm_hash: "0000".to_string(),
+            wasm_size: 0,
             cpu_instructions: 0,
             memory_bytes: 0,
             tx_size: 0,
@@ -628,6 +888,168 @@ mod tests {
         assert!(
             cpu_bar_width(120) > cpu_bar_width(40),
             "bar should scale with terminal width"
+        );
+    }
+
+    // ── #328: fee / CPU distribution statistics ─────────────────────
+
+    /// A report with the given fee and CPU figures, reusing a fully populated
+    /// base report so only the metrics under test vary.
+    fn report_with_metrics(fee_stroops: i64, cpu_instructions: u64) -> CostReport {
+        let mut report = report_with_rates(sample_rates());
+        report.fee.total_stroops = fee_stroops;
+        report.cpu_instructions = cpu_instructions;
+        report
+    }
+
+    #[test]
+    fn test_distribution_stats_single_function() {
+        let dist = FeeDistribution::from_samples(&[42], &[7]);
+        assert_eq!(dist.function_count, 1);
+        assert_eq!(dist.min_fee_stroops, 42);
+        assert_eq!(dist.max_fee_stroops, 42);
+        assert_eq!(dist.mean_fee_stroops, 42);
+        assert_eq!(dist.median_fee_stroops, 42);
+        assert_eq!(dist.std_dev_fee_stroops, 0);
+        assert_eq!(dist.min_cpu_instructions, 7);
+        assert_eq!(dist.max_cpu_instructions, 7);
+        assert_eq!(dist.mean_cpu_instructions, 7);
+    }
+
+    #[test]
+    fn test_distribution_stats_identical_fees_have_zero_spread() {
+        let dist = FeeDistribution::from_samples(&[500, 500, 500], &[10, 10, 10]);
+        assert_eq!(dist.function_count, 3);
+        assert_eq!(dist.min_fee_stroops, 500);
+        assert_eq!(dist.max_fee_stroops, 500);
+        assert_eq!(dist.mean_fee_stroops, 500);
+        assert_eq!(dist.median_fee_stroops, 500);
+        assert_eq!(dist.std_dev_fee_stroops, 0);
+    }
+
+    #[test]
+    fn test_distribution_stats_known_values() {
+        let dist = FeeDistribution::from_samples(&[100, 200, 300], &[10, 20, 30]);
+        assert_eq!(dist.min_fee_stroops, 100);
+        assert_eq!(dist.max_fee_stroops, 300);
+        assert_eq!(dist.mean_fee_stroops, 200);
+        assert_eq!(dist.median_fee_stroops, 200);
+        // Population variance = 60000 / 9 = 6666; floor(sqrt(6666)) = 81.
+        assert_eq!(dist.std_dev_fee_stroops, 81);
+        assert_eq!(dist.min_cpu_instructions, 10);
+        assert_eq!(dist.max_cpu_instructions, 30);
+        assert_eq!(dist.mean_cpu_instructions, 20);
+    }
+
+    #[test]
+    fn test_distribution_stats_even_count_median_is_mean_of_middles() {
+        let dist = FeeDistribution::from_samples(&[300, 100, 200, 400], &[1, 2, 3, 4]);
+        assert_eq!(dist.median_fee_stroops, 250); // (200 + 300) / 2
+
+        let pair = FeeDistribution::from_samples(&[100, 200], &[1, 2]);
+        assert_eq!(pair.median_fee_stroops, 150);
+        assert_eq!(pair.mean_fee_stroops, 150);
+        // variance = (2*50000 - 300^2) / 4 = 2500; sqrt = 50
+        assert_eq!(pair.std_dev_fee_stroops, 50);
+    }
+
+    #[test]
+    fn test_distribution_stats_empty_is_zeroed() {
+        let dist = FeeDistribution::from_samples(&[], &[]);
+        assert_eq!(dist, FeeDistribution::from_samples(&[], &[]));
+        assert_eq!(dist.function_count, 0);
+        assert_eq!(dist.min_fee_stroops, 0);
+        assert_eq!(dist.max_fee_stroops, 0);
+        assert_eq!(dist.mean_fee_stroops, 0);
+        assert_eq!(dist.median_fee_stroops, 0);
+        assert_eq!(dist.std_dev_fee_stroops, 0);
+        assert_eq!(dist.mean_cpu_instructions, 0);
+    }
+
+    #[test]
+    fn test_calculate_distribution_stats_from_reports() {
+        let reports = vec![
+            report_with_metrics(5_000, 100),
+            report_with_metrics(500_000, 900),
+        ];
+        let dist = calculate_distribution_stats(&reports);
+        assert_eq!(dist.function_count, 2);
+        assert_eq!(dist.min_fee_stroops, 5_000);
+        assert_eq!(dist.max_fee_stroops, 500_000);
+        assert_eq!(dist.mean_fee_stroops, 252_500);
+        assert_eq!(dist.median_fee_stroops, 252_500);
+        assert_eq!(dist.min_cpu_instructions, 100);
+        assert_eq!(dist.max_cpu_instructions, 900);
+        assert_eq!(dist.mean_cpu_instructions, 500);
+    }
+
+    #[test]
+    fn test_calculate_distribution_stats_empty_reports() {
+        let dist = calculate_distribution_stats(&[]);
+        assert_eq!(dist.function_count, 0);
+    }
+
+    #[test]
+    fn test_format_distribution_box_empty() {
+        let out = format_distribution_box(&FeeDistribution::from_samples(&[], &[]), 7);
+        assert_eq!(
+            out,
+            "No functions estimated; no fee distribution to report."
+        );
+    }
+
+    #[test]
+    fn test_format_distribution_box_contains_all_statistics() {
+        let dist = FeeDistribution::from_samples(&[5_000, 500_000], &[100_000, 5_000_000]);
+        let out = format_distribution_box(&dist, 7);
+        assert!(
+            out.contains("Fee distribution across 2 function(s):"),
+            "got: {out}"
+        );
+        assert!(out.contains("min     : 5,000"), "got: {out}");
+        assert!(out.contains("max     : 500,000"), "got: {out}");
+        assert!(out.contains("mean    : 252,500 (0.0252500)"), "got: {out}");
+        assert!(out.contains("median  : 252,500"), "got: {out}");
+        assert!(out.contains("std dev : 247,500"), "got: {out}");
+        assert!(out.contains("CPU instructions:"), "got: {out}");
+        assert!(out.contains("min     : 100,000"), "got: {out}");
+        assert!(out.contains("max     : 5,000,000"), "got: {out}");
+        assert!(out.contains("mean    : 2,550,000"), "got: {out}");
+    }
+
+    #[test]
+    fn test_format_thousands_groups_digits() {
+        assert_eq!(format_thousands(0), "0");
+        assert_eq!(format_thousands(999), "999");
+        assert_eq!(format_thousands(1_000), "1,000");
+        assert_eq!(format_thousands(1_234_567), "1,234,567");
+        assert_eq!(format_thousands(-1_234_567), "-1,234,567");
+        assert_eq!(format_thousands_u64(3_894_195), "3,894,195");
+        assert_eq!(format_ledger_sequence(1_234_567), "1,234,567");
+        assert_eq!(format_ledger_sequence(0), "0");
+    }
+
+    // ── #329: ledger sequence in output ────────────────────────────
+
+    #[test]
+    fn test_format_report_json_uses_ledger_sequence_field() {
+        let report = report_with_rates(sample_rates());
+        let parsed: serde_json::Value =
+            serde_json::from_str(&format_report_json(&report)).expect("valid json");
+        assert_eq!(parsed["ledger_sequence"], 3_894_195);
+        assert!(
+            parsed.get("ledger").is_none(),
+            "legacy `ledger` key should be renamed to `ledger_sequence`: {parsed}"
+        );
+    }
+
+    #[test]
+    fn test_format_report_table_shows_grouped_ledger_sequence() {
+        let report = report_with_rates(sample_rates());
+        let out = format_report_table(&report);
+        assert!(
+            out.contains("Simulated at ledger sequence: 3,894,195"),
+            "header should show the grouped ledger sequence, got:\n{out}"
         );
     }
 }
