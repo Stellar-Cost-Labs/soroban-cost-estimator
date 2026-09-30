@@ -6,6 +6,7 @@
 
 pub mod cache;
 pub mod cli;
+pub mod config;
 pub mod config_snapshot;
 pub mod error;
 pub mod paths;
