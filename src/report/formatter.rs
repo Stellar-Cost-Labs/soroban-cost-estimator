@@ -64,6 +64,7 @@ impl TableFormatter {
     /// always renders the chart at the default width so output stays
     /// deterministic for snapshot tests and libraries that call it directly.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn format_with_options(
         &self,
         report: &CostReport,
@@ -76,6 +77,10 @@ impl TableFormatter {
         output.push_str(&format!(
             "Network: {} (ledger {})\n",
             report.network, report.ledger
+        ));
+        output.push_str(&format!(
+            "Simulated at ledger sequence: {}\n",
+            crate::report::cost_report::format_ledger_sequence(report.ledger)
         ));
         output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
         output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
@@ -282,6 +287,10 @@ impl ReportFormatter for MarkdownFormatter {
             "- **Network:** {} (ledger {})\n",
             report.network, report.ledger
         ));
+        output.push_str(&format!(
+            "- **Simulated at ledger sequence:** `{}`\n",
+            crate::report::cost_report::format_ledger_sequence(report.ledger)
+        ));
         output.push_str(&format!("- **WASM hash:** `{}`\n", report.wasm_hash));
         output.push_str(&format!(
             "- **RPC round-trip:** {} ms\n\n",
@@ -438,6 +447,7 @@ mod tests {
         CostReport {
             function: "increment".to_string(),
             wasm_hash: "abc123def456".to_string(),
+            wasm_size: 4_096,
             cpu_instructions: 532_502,
             memory_bytes: 0,
             tx_size: 156,
@@ -468,6 +478,7 @@ mod tests {
         CostReport {
             function: "(wasm upload)".to_string(),
             wasm_hash: "0000000000000000".to_string(),
+            wasm_size: 0,
             cpu_instructions: 0,
             memory_bytes: 0,
             tx_size: 0,
@@ -509,6 +520,16 @@ mod tests {
         let output = formatter.format(&sample_report());
         assert!(output.contains("testnet"));
         assert!(output.contains("3894195"));
+    }
+
+    #[test]
+    fn test_table_formatter_shows_grouped_ledger_sequence() {
+        let formatter = TableFormatter;
+        let output = formatter.format(&sample_report());
+        assert!(
+            output.contains("Simulated at ledger sequence: 3,894,195"),
+            "got: {output}"
+        );
     }
 
     #[test]
@@ -613,7 +634,7 @@ mod tests {
         let output = formatter.format(&sample_report());
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["wasm_hash"], "abc123def456");
-        assert_eq!(parsed["ledger"], 3_894_195);
+        assert_eq!(parsed["ledger_sequence"], 3_894_195);
         assert_eq!(parsed["network"], "testnet");
         assert_eq!(parsed["rpc_latency_ms"], 87);
         assert_eq!(parsed["fee"]["total_stroops"], 15_527);
@@ -747,6 +768,7 @@ mod tests {
         let formatter = MarkdownFormatter;
         let output = formatter.format(&sample_report());
         assert!(output.contains("**Network:** testnet (ledger 3894195)"));
+        assert!(output.contains("- **Simulated at ledger sequence:** `3,894,195`"));
         assert!(output.contains("**WASM hash:** `abc123def456`"));
         assert!(output.contains("**RPC round-trip:** 87 ms"));
     }
