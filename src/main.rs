@@ -112,6 +112,21 @@ impl EstimateAllResult {
     }
 }
 
+/// Top-level JSON document emitted by `estimate-all --json`.
+///
+/// The per-function records live under a named `functions` array and the
+/// aggregate `fee_distribution` statistics sit alongside them (issue #328).
+/// Keeping the records under a key leaves room for future aggregate fields
+/// without changing the document type again.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct EstimateAllJsonReport {
+    /// One record per enumerated function, in enumeration order.
+    functions: Vec<EstimateAllResult>,
+    /// Aggregate fee/CPU distribution over the successfully estimated
+    /// functions.
+    fee_distribution: report::cost_report::FeeDistribution,
+}
+
 #[derive(Debug, Default, serde::Deserialize)]
 struct FileConfig {
     network: Option<String>,
@@ -736,10 +751,7 @@ async fn simulate_report(
     let (cpu_instructions, memory_bytes, read_entries, write_entries, read_bytes, write_bytes) =
         response_resources(&response)?;
 
-    let latest_ledger: u32 = response
-        .latest_ledger
-        .and_then(|l| u32::try_from(l).ok())
-        .unwrap_or(0);
+    let latest_ledger = response.ledger_sequence();
 
     let total_fee_stroops = rpc::simulate::parse_resource_fee(&response.min_resource_fee)
         .unwrap_or(None)
@@ -1840,16 +1852,27 @@ async fn cmd_estimate_all(
             }
         }
 
-        // Aggregate fee range across every successfully estimated function
-        // (#223): min/max/average in stroops (and XLM) for the whole batch.
+        // Aggregate fee and CPU distribution across every successfully
+        // estimated function (#328): min/max/mean/median/stddev fees and
+        // min/max/mean CPU instructions for the whole batch. Skipped and
+        // errored functions carry no fee/CPU figure and are excluded.
         let fees: Vec<i64> = json_results
             .iter()
             .filter_map(|r| r.fee.as_ref().map(|f| f.total_stroops))
             .collect();
-        emit_fee_range_summary(&fees, format == "json", precision);
+        let cpu: Vec<u64> = json_results
+            .iter()
+            .filter_map(|r| r.cpu_instructions)
+            .collect();
+        let fee_distribution = report::cost_report::FeeDistribution::from_samples(&fees, &cpu);
+        emit_fee_distribution_summary(&fee_distribution, format == "json", precision);
 
         if format == "json" {
-            println!("{}", serde_json::to_string_pretty(&json_results)?);
+            let report = EstimateAllJsonReport {
+                functions: json_results,
+                fee_distribution,
+            };
+            println!("{}", serde_json::to_string_pretty(&report)?);
         } else if format == "csv" {
             println!("function,network,ledger,wasm_hash,cpu_instructions,memory_bytes,read_entries,write_entries,read_bytes,write_bytes,tx_size,non_refundable_stroops,refundable_stroops,total_stroops,total_xlm");
             for row in &csv_rows {
@@ -1863,36 +1886,24 @@ async fn cmd_estimate_all(
     .await
 }
 
-/// Emit the aggregate fee-range summary for an `estimate-all` batch (#223).
+/// Emit the aggregate fee/CPU distribution summary for an `estimate-all`
+/// batch (#328).
 ///
-/// In human mode it is printed as three lines. The fee range is intentionally
-/// omitted from the structured JSON array (which already contains a per-function
-/// `fee` record); callers can derive min/max/average from those records.
-fn emit_fee_range_summary(fees: &[i64], json_flag: bool, precision: u32) {
+/// In JSON mode the distribution travels inside the structured report
+/// document ([`EstimateAllJsonReport`]), so only human-readable modes print
+/// the box. `format_distribution_box` explains the empty case rather than
+/// printing a meaningless zeroed distribution.
+fn emit_fee_distribution_summary(
+    distribution: &report::cost_report::FeeDistribution,
+    json_flag: bool,
+    precision: u32,
+) {
     if json_flag {
         return;
     }
-    let Some(range) = report::fee_calc::fee_range(fees) else {
-        println!("No functions estimated; no fee range to report.");
-        return;
-    };
-
-    println!();
-    println!("Fee range across {} function(s):", range.count);
     println!(
-        "  min: {} stroops ({})",
-        range.min_stroops,
-        report::fee_calc::stroops_to_xlm(range.min_stroops, precision)
-    );
-    println!(
-        "  max: {} stroops ({})",
-        range.max_stroops,
-        report::fee_calc::stroops_to_xlm(range.max_stroops, precision)
-    );
-    println!(
-        "  avg: {} stroops ({})",
-        range.avg_stroops,
-        report::fee_calc::stroops_to_xlm(range.avg_stroops, precision)
+        "{}",
+        report::cost_report::format_distribution_box(distribution, precision)
     );
 }
 
@@ -1967,10 +1978,7 @@ async fn estimate_all_function(
                     )?)
                     .unwrap_or(0);
                 let xlm = report::fee_calc::stroops_to_xlm(total_fee, precision);
-                let ledger: u32 = resp
-                    .latest_ledger
-                    .and_then(|l| u32::try_from(l).ok())
-                    .unwrap_or(0);
+                let ledger = resp.ledger_sequence();
 
                 debug!(cpu, mem, total_fee, ledger, "simulation complete");
 
@@ -3129,6 +3137,7 @@ fn cmd_config_import(bundle: &str) -> error::AppResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::EstimateAllJsonReport;
     use super::EstimateAllResult;
     use super::EstimateAllStatus;
     use super::parse_interval_secs;
@@ -3354,6 +3363,55 @@ mod tests {
         let errored = &value[2];
         assert_eq!(errored["status"], "error");
         assert_eq!(errored["error"], "boom");
+    }
+
+    #[test]
+    fn test_estimate_all_json_report_wraps_functions_and_distribution() {
+        let functions = vec![EstimateAllResult {
+            function: "inc".to_string(),
+            status: EstimateAllStatus::Ok,
+            reason: None,
+            error: None,
+            wasm_hash: Some("deadbeef".to_string()),
+            network: Some("testnet".to_string()),
+            ledger: Some(10),
+            cpu_instructions: Some(100),
+            memory_bytes: Some(0),
+            read_entries: Some(1),
+            write_entries: Some(1),
+            read_bytes: Some(0),
+            write_bytes: Some(10),
+            tx_size: Some(50),
+            fee: Some(soroban_cost_estimator::report::fee_calc::FeeBreakdown {
+                non_refundable_stroops: 1,
+                refundable_stroops: 2,
+                cpu_fee_stroops: 1,
+                storage_fee_stroops: 0,
+                bandwidth_fee_stroops: 0,
+                base_fee_stroops: 0,
+                total_stroops: 3,
+                total_xlm: "0.0000003".to_string(),
+                fee_percentages: std::collections::BTreeMap::new(),
+            }),
+        }];
+        let distribution =
+            soroban_cost_estimator::report::cost_report::FeeDistribution::from_samples(
+                &[3],
+                &[100],
+            );
+        let report = EstimateAllJsonReport {
+            functions,
+            fee_distribution: distribution,
+        };
+        let value: serde_json::Value = serde_json::to_value(&report).unwrap();
+
+        // The top-level document is now an object rather than a bare array.
+        assert!(!value.is_array(), "top-level output must be an object");
+        assert_eq!(value["functions"].as_array().unwrap().len(), 1);
+        assert_eq!(value["functions"][0]["status"], "ok");
+        assert_eq!(value["fee_distribution"]["function_count"], 1);
+        assert_eq!(value["fee_distribution"]["mean_fee_stroops"], 3);
+        assert_eq!(value["fee_distribution"]["mean_cpu_instructions"], 100);
     }
 
     // ── estimate --watch detection & header helpers ────────────────────

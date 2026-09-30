@@ -148,6 +148,7 @@ soroban-cost-estimator estimate \
 ```text
 Function: increment
 Network: testnet (ledger 3961551)
+Simulated at ledger sequence: 3,961,551
 WASM hash: ea14bca998e98f0ddb338e8e5cef6e19f07378a3b71e8b4f8868cedc857e4ecd
 
 +------------------+----------+---------------+
@@ -193,7 +194,7 @@ Fee Breakdown:
     "total_stroops": 17122,
     "total_xlm": "0.0017122"
   },
-  "ledger": 3961544,
+  "ledger_sequence": 3961544,
   "network": "testnet"
 }
 ```
@@ -236,6 +237,9 @@ soroban-cost-estimator estimate-all [OPTIONS] --wasm <WASM>
   almost certainly fail; the tool prints a note telling you to pass `--id`
   for real numbers.
 - All zero-argument function results are cached, just like `estimate`.
+- Prints a **fee distribution box** after the per-function results: min/max/
+  mean/median/standard deviation of the fees (stroops) and min/max/mean of the
+  CPU instruction counts across every successfully estimated function.
 - **Exit codes**: 0 on success, 1 on error.
 
 **Examples**
@@ -269,14 +273,30 @@ soroban-cost-estimator estimate-all \
 ```
 
 ```json
-[
-  {
-    "function": "increment",
-    "status": "skipped",
-    "reason": "needs --fn/--arg (1 param(s))"
+{
+  "functions": [
+    {
+      "function": "increment",
+      "status": "skipped",
+      "reason": "needs --fn/--arg (1 param(s))"
+    }
+  ],
+  "fee_distribution": {
+    "function_count": 0,
+    "min_fee_stroops": 0,
+    "max_fee_stroops": 0,
+    "mean_fee_stroops": 0,
+    "median_fee_stroops": 0,
+    "std_dev_fee_stroops": 0,
+    "min_cpu_instructions": 0,
+    "max_cpu_instructions": 0,
+    "mean_cpu_instructions": 0
   }
-]
+}
 ```
+
+The per-function records now live under the `functions` key, alongside the
+aggregate `fee_distribution` statistics object (issue #328).
 
 ---
 
