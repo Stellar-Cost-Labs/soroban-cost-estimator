@@ -3053,3 +3053,167 @@ fn test_estimate_all_fn_unknown_function_errors() {
         "the error should list the available functions; got: {stderr}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// `estimate --compare` tests (Issue #278)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The contract ID used by the footprint fixtures below.
+const FIXTURE_CONTRACT_ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+
+#[test]
+fn test_estimate_compare_flag_accepted() {
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--compare"]);
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--compare should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+/// The first `--compare` run has nothing to diff against; the second diffs
+/// against the entry the first run cached.
+#[test]
+fn test_estimate_compare_reports_previous_estimate_and_delta() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-compare-json");
+    let args = [
+        "estimate",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--id",
+        FIXTURE_CONTRACT_ID,
+        "--fn",
+        "increment",
+        "--arg",
+        "1",
+        "--rpc-url",
+        &rpc_url,
+        "--compare",
+        "--json",
+    ];
+
+    // 1. No previous estimate yet.
+    let (stdout, stderr, code) = run_cli_quiet(&args, Some(&home));
+    assert_eq!(
+        code, 0,
+        "first --compare run should succeed; stderr: {stderr}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON output");
+    assert_eq!(parsed["cpu_instructions"], 532_502);
+    assert!(
+        parsed["previous_estimate"].is_null(),
+        "first run has no baseline; got: {stdout}"
+    );
+    assert!(
+        parsed["delta"].is_null(),
+        "first run has no delta; got: {stdout}"
+    );
+
+    // 2. The cached first run is now the baseline.
+    let (stdout, stderr, code) = run_cli_quiet(&args, Some(&home));
+    assert_eq!(
+        code, 0,
+        "second --compare run should succeed; stderr: {stderr}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON output");
+
+    assert_eq!(parsed["previous_estimate"]["cpu_instructions"], 532_502);
+    assert_eq!(parsed["previous_estimate"]["total_stroops"], 15_527);
+    assert_eq!(parsed["previous_estimate"]["io"]["read_entries"], 1);
+    assert_eq!(parsed["previous_estimate"]["io"]["write_entries"], 1);
+
+    // Same simulation both times: every delta is zero.
+    for metric in [
+        "cpu_instructions",
+        "memory_bytes",
+        "read_entries",
+        "write_entries",
+        "fee_stroops",
+    ] {
+        assert_eq!(
+            parsed["delta"][metric]["absolute"], 0,
+            "{metric} should have a zero delta; got: {stdout}"
+        );
+        assert_eq!(
+            parsed["delta"][metric]["previous"],
+            parsed["delta"][metric]["current"]
+        );
+    }
+}
+
+#[test]
+fn test_estimate_compare_without_previous_prints_notice() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-compare-notice");
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            FIXTURE_CONTRACT_ID,
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+            "--compare",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "estimate should succeed; stderr: {stderr}");
+    assert!(
+        stdout.contains("No previous estimate found for comparison"),
+        "the notice should be printed; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_estimate_compare_table_shows_delta_section() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-compare-table");
+    let base = [
+        "estimate",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--id",
+        FIXTURE_CONTRACT_ID,
+        "--fn",
+        "increment",
+        "--arg",
+        "1",
+        "--rpc-url",
+        &rpc_url,
+    ];
+
+    // Populate the cache, then compare against it in table mode.
+    let (_, stderr, code) = run_cli_quiet(&base, Some(&home));
+    assert_eq!(code, 0, "populating run should succeed; stderr: {stderr}");
+    let mut args = base.to_vec();
+    args.push("--compare");
+    let (stdout, stderr, code) = run_cli_quiet(&args, Some(&home));
+
+    assert_eq!(code, 0, "--compare run should succeed; stderr: {stderr}");
+    assert!(
+        stdout.contains("Cost delta vs previous estimate"),
+        "table mode should render the delta section; got: {stdout}"
+    );
+    for label in [
+        "CPU Instructions",
+        "Memory Bytes",
+        "Read Entries",
+        "Write Entries",
+    ] {
+        assert!(
+            stdout.contains(label),
+            "delta section should include {label}; got: {stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("Fee (stroops)"),
+        "delta section should include the fee row; got: {stdout}"
+    );
+}

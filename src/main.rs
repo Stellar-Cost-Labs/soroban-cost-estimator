@@ -6,7 +6,9 @@ use soroban_cost_estimator::cli;
 use soroban_cost_estimator::config_snapshot;
 use soroban_cost_estimator::error;
 use soroban_cost_estimator::report;
-use soroban_cost_estimator::report::formatter::{TableFormatter, formatter_by_name};
+use soroban_cost_estimator::report::formatter::{
+    ReportFormatter, TableFormatter, formatter_by_name,
+};
 use soroban_cost_estimator::rpc;
 use soroban_cost_estimator::wasm;
 use soroban_cost_estimator::xdr_helper;
@@ -622,6 +624,9 @@ enum EstimateRun {
     /// A fresh simulation produced a full [`report::cost_report::CostReport`].
     Simulated {
         report: report::cost_report::CostReport,
+        /// The estimate cached under the same key *before* this run, when
+        /// `--compare` asked for it. `None` means there was no baseline.
+        previous: Option<cache::CachedEstimate>,
     },
     /// A still-fresh cached estimate was reused and already printed by
     /// [`estimate_once`]; nothing more to render.
@@ -907,6 +912,7 @@ async fn cmd_estimate(
         fn_name,
         args,
         cache_ttl,
+        compare,
         clear_cache,
         format,
         precision,
@@ -927,7 +933,10 @@ async fn cmd_estimate(
         return Ok(());
     }
 
-    if let EstimateRun::Simulated { report, .. } = &mut run {
+    if let EstimateRun::Simulated {
+        report, previous, ..
+    } = &mut run
+    {
         // Attach batch cost projections before rendering so every output
         // format (table, markdown, json, csv) sees the same report.
         if let Some(ref counts) = projection_counts {
@@ -939,11 +948,15 @@ async fn cmd_estimate(
             )?);
         }
 
-        // The table formatter is the only one that renders the fee bar chart,
-        // and only when the terminal has room for it (>= MIN_CHART_WIDTH
-        // columns), stdout is a TTY, and `--quiet` was not passed. Machine
-        // formats never grow a human-only chart.
-        if format == "table" {
+        // `--compare` takes precedence over the plain render below: it prints
+        // the report *and* the delta section against the previous estimate.
+        if compare {
+            print_report_with_comparison(report, previous.as_ref(), format, format == "json")?;
+        } else if format == "table" {
+            // The table formatter is the only one that renders the fee bar
+            // chart, and only when the terminal has room for it
+            // (>= MIN_CHART_WIDTH columns), stdout is a TTY, and `--quiet` was
+            // not passed. Machine formats never grow a human-only chart.
             match cli::chart_width() {
                 Some(width) => {
                     println!(
@@ -1024,6 +1037,7 @@ async fn estimate_once(
     fn_name: Option<&str>,
     args: &[String],
     cache_ttl: Option<&str>,
+    compare: bool,
     clear_cache: bool,
     format: &str,
     precision: u32,
@@ -1190,7 +1204,9 @@ async fn estimate_once(
         })
         .await?;
 
-        let _ = cache::save_estimate(
+        // Persist the full footprint — including ledger I/O — so a later
+        // `--compare` run can diff entry counts against this one.
+        let _ = cache::save_estimate_with_io(
             &wasm_hash,
             function_name,
             args,
@@ -1199,6 +1215,12 @@ async fn estimate_once(
             report.fee.total_stroops,
             report.cpu_instructions,
             report.memory_bytes,
+            cache::IoFootprint {
+                read_entries: report.read_entries,
+                write_entries: report.write_entries,
+                read_bytes: report.read_bytes,
+                write_bytes: report.write_bytes,
+            },
             Some(report.rpc_latency_ms),
             true,
         );
@@ -1208,7 +1230,7 @@ async fn estimate_once(
             "estimate complete"
         );
 
-        Ok(EstimateRun::Simulated { report })
+        Ok(EstimateRun::Simulated { report, previous })
     }
     .instrument(span)
     .await
@@ -1360,6 +1382,9 @@ async fn emit_watch_estimate(
         fn_name,
         args,
         None,
+        // `--compare` is a single-shot flag; watch mode reports its own
+        // build-over-build delta in the per-build header instead.
+        false,
         false,
         format,
         precision,
