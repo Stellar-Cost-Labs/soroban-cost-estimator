@@ -6,7 +6,9 @@ use soroban_cost_estimator::cli;
 use soroban_cost_estimator::config_snapshot;
 use soroban_cost_estimator::error;
 use soroban_cost_estimator::report;
-use soroban_cost_estimator::report::formatter::{TableFormatter, formatter_by_name};
+use soroban_cost_estimator::report::formatter::{
+    ReportFormatter, TableFormatter, formatter_by_name,
+};
 use soroban_cost_estimator::rpc;
 use soroban_cost_estimator::wasm;
 use soroban_cost_estimator::xdr_helper;
@@ -66,6 +68,11 @@ pub struct EstimateAllResult {
     pub tx_size: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fee: Option<report::fee_calc::FeeBreakdown>,
+    /// Contract metadata parsed from the WASM `contractmeta` custom section
+    /// of the binary being estimated. Omitted when the binary carries no
+    /// decodable section.
+    #[serde(default, skip_serializing_if = "wasm::parser::ContractMeta::is_empty")]
+    pub contract_meta: wasm::parser::ContractMeta,
 }
 
 impl EstimateAllResult {
@@ -87,6 +94,7 @@ impl EstimateAllResult {
             write_bytes: None,
             tx_size: None,
             fee: None,
+            contract_meta: wasm::parser::ContractMeta::default(),
         }
     }
 
@@ -108,6 +116,7 @@ impl EstimateAllResult {
             write_bytes: None,
             tx_size: None,
             fee: None,
+            contract_meta: wasm::parser::ContractMeta::default(),
         }
     }
 }
@@ -243,7 +252,9 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             id,
             args: contract_args,
             cache_ttl,
+            compare,
             clear_cache,
+            no_cache,
             json,
             auto_snapshot,
             diff,
@@ -268,7 +279,9 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 r#fn.as_deref(),
                 &contract_args,
                 cache_ttl.as_deref(),
+                compare,
                 clear_cache,
+                no_cache,
                 format.as_str(),
                 rps,
                 timeout,
@@ -291,6 +304,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             network,
             rpc_url,
             id,
+            no_cache,
+            fn_names,
             json,
             auto_snapshot,
         } => {
@@ -305,6 +320,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 rpc_url.as_deref().or(default_rpc_url.as_deref()),
                 fallback,
                 id.as_deref(),
+                no_cache,
+                &fn_names,
                 format.as_str(),
                 rps,
                 timeout,
@@ -337,6 +354,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 action: None,
                 network,
                 out,
+                retain,
                 json,
             } => {
                 let format = match (args.format, json) {
@@ -348,6 +366,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     &env_string(network, &default_network, "SOROBAN_NETWORK"),
                     fallback,
                     out.as_deref(),
+                    retain,
                     format,
                     rps,
                     timeout,
@@ -367,10 +386,13 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 summary,
                 json,
             } => {
-                let json_flag = if args.format.is_some() {
-                    format == cli::OutputFormat::Json
+                // `--format` wins when supplied; otherwise the legacy
+                // `--json` flag selects JSON on top of the config-file
+                // default already resolved into `format`.
+                let diff_format = if args.format.is_none() && json {
+                    cli::OutputFormat::Json
                 } else {
-                    json || format == cli::OutputFormat::Json
+                    format
                 };
                 if against_previous {
                     cmd_config_diff_against_previous(
@@ -378,7 +400,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                         pricing_only,
                         threshold_percent,
                         summary,
-                        json_flag,
+                        diff_format == cli::OutputFormat::Json,
                     )
                 } else {
                     cmd_config_diff(
@@ -388,7 +410,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                         pricing_only,
                         threshold_percent,
                         summary,
-                        json_flag,
+                        diff_format,
                         rps,
                         timeout,
                         max_retries,
@@ -617,6 +639,9 @@ enum EstimateRun {
     /// A fresh simulation produced a full [`report::cost_report::CostReport`].
     Simulated {
         report: report::cost_report::CostReport,
+        /// The estimate cached under the same key *before* this run, when
+        /// `--compare` asked for it. `None` means there was no baseline.
+        previous: Option<cache::CachedEstimate>,
     },
     /// A still-fresh cached estimate was reused and already printed by
     /// [`estimate_once`]; nothing more to render.
@@ -670,6 +695,7 @@ struct SimulationRequest<'a> {
     wasm_hash: &'a str,
     wasm_size: u64,
     functions: &'a [wasm::parser::FunctionInfo],
+    contract_meta: &'a wasm::parser::ContractMeta,
     network: &'a str,
     rpc_url: Option<&'a str>,
     rpc_fallback_url: Option<&'a str>,
@@ -797,6 +823,7 @@ async fn simulate_report(
         rpc_latency_ms,
         rates: Some(fee_rates),
         projections: None,
+        contract_meta: req.contract_meta.clone(),
     })
 }
 
@@ -818,7 +845,9 @@ async fn cmd_estimate(
     fn_name: Option<&str>,
     args: &[String],
     cache_ttl: Option<&str>,
+    compare: bool,
     clear_cache: bool,
+    no_cache: bool,
     format: &str,
     rps: Option<u64>,
     timeout: u64,
@@ -899,7 +928,9 @@ async fn cmd_estimate(
         fn_name,
         args,
         cache_ttl,
+        compare,
         clear_cache,
+        no_cache,
         format,
         precision,
         extra_headers,
@@ -919,7 +950,10 @@ async fn cmd_estimate(
         return Ok(());
     }
 
-    if let EstimateRun::Simulated { report, .. } = &mut run {
+    if let EstimateRun::Simulated {
+        report, previous, ..
+    } = &mut run
+    {
         // Attach batch cost projections before rendering so every output
         // format (table, markdown, json, csv) sees the same report.
         if let Some(ref counts) = projection_counts {
@@ -931,11 +965,15 @@ async fn cmd_estimate(
             )?);
         }
 
-        // The table formatter is the only one that renders the fee bar chart,
-        // and only when the terminal has room for it (>= MIN_CHART_WIDTH
-        // columns), stdout is a TTY, and `--quiet` was not passed. Machine
-        // formats never grow a human-only chart.
-        if format == "table" {
+        // `--compare` takes precedence over the plain render below: it prints
+        // the report *and* the delta section against the previous estimate.
+        if compare {
+            print_report_with_comparison(report, previous.as_ref(), format, format == "json")?;
+        } else if format == "table" {
+            // The table formatter is the only one that renders the fee bar
+            // chart, and only when the terminal has room for it
+            // (>= MIN_CHART_WIDTH columns), stdout is a TTY, and `--quiet` was
+            // not passed. Machine formats never grow a human-only chart.
             match cli::chart_width() {
                 Some(width) => {
                     println!(
@@ -1016,7 +1054,9 @@ async fn estimate_once(
     fn_name: Option<&str>,
     args: &[String],
     cache_ttl: Option<&str>,
+    compare: bool,
     clear_cache: bool,
+    no_cache: bool,
     format: &str,
     precision: u32,
     extra_headers: &[String],
@@ -1080,10 +1120,25 @@ async fn estimate_once(
             println!("WASM SHA-256: {wasm_hash}");
         }
 
+        // With `--compare`, read the estimate cached by the *previous* run
+        // before the simulation below upserts this one away.
+        let previous = if compare {
+            cache::load_estimate(&wasm_hash, function_name, args)?
+        } else {
+            None
+        };
+
         // With --cache-ttl, reuse a still-fresh cached estimate and skip the
-        // (expensive) simulation entirely.
+        // (expensive) simulation entirely. `--no-cache` opts out of cache
+        // reads altogether, so the TTL never short-circuits the simulation.
         let ttl_secs = cache_ttl.map(parse_interval_secs);
-        if let Some(fresh) = fresh_cached_estimate(&wasm_hash, &function_name, args, ttl_secs)? {
+        let fresh = if no_cache {
+            // Bypass every cache read, even under `--cache-ttl`.
+            None
+        } else {
+            fresh_cached_estimate(&wasm_hash, &function_name, args, ttl_secs)?
+        };
+        if let Some(fresh) = fresh {
             let ttl_secs = ttl_secs.unwrap_or_default();
             info!(ttl_secs, function = %function_name, "cache hit — reusing fresh estimate");
             print_cached_estimate(&fresh, ttl_secs, json_flag, precision);
@@ -1158,6 +1213,7 @@ async fn estimate_once(
             wasm_hash: &wasm_hash,
             wasm_size,
             functions: &wasm_info.functions,
+            contract_meta: &wasm_info.contract_meta,
             network,
             rpc_url,
             rpc_fallback_url,
@@ -1173,25 +1229,29 @@ async fn estimate_once(
         })
         .await?;
 
-        let _ = cache::save_estimate(
-            &wasm_hash,
-            function_name,
-            args,
-            network,
-            report.ledger,
-            report.fee.total_stroops,
-            report.cpu_instructions,
-            report.memory_bytes,
-            Some(report.rpc_latency_ms),
-            true,
-        );
+        // `--no-cache` also suppresses the write, so a bypassed run leaves
+        // no trace in the local cache.
+        if !no_cache {
+            let _ = cache::save_estimate(
+                &wasm_hash,
+                function_name,
+                args,
+                network,
+                report.ledger,
+                report.fee.total_stroops,
+                report.cpu_instructions,
+                report.memory_bytes,
+                Some(report.rpc_latency_ms),
+                true,
+            );
+        }
         info!(
             total_stroops = report.fee.total_stroops,
             total_xlm = %report.fee.total_xlm,
             "estimate complete"
         );
 
-        Ok(EstimateRun::Simulated { report })
+        Ok(EstimateRun::Simulated { report, previous })
     }
     .instrument(span)
     .await
@@ -1343,6 +1403,12 @@ async fn emit_watch_estimate(
         fn_name,
         args,
         None,
+        // `--compare` is a single-shot flag; watch mode reports its own
+        // build-over-build delta in the per-build header instead.
+        false,
+        false,
+        // `--no-cache` is a single-shot flag; the watcher keeps using the
+        // cache so repeated polls stay cheap.
         false,
         format,
         precision,
@@ -1637,6 +1703,7 @@ async fn cmd_estimate_diff(
         wasm_hash: &old_hash,
         wasm_size: old_info.bytes.len() as u64,
         functions: &old_info.functions,
+        contract_meta: &old_info.contract_meta,
         network,
         rpc_url,
         rpc_fallback_url,
@@ -1657,6 +1724,7 @@ async fn cmd_estimate_diff(
         wasm_hash: &new_hash,
         wasm_size: new_info.bytes.len() as u64,
         functions: &new_info.functions,
+        contract_meta: &new_info.contract_meta,
         network,
         rpc_url,
         rpc_fallback_url,
@@ -1680,6 +1748,90 @@ async fn cmd_estimate_diff(
             "{}",
             report::diff::format_cost_report_diff(&old_report, &new_report)
         );
+    }
+
+    Ok(())
+}
+
+/// Prints a cost report using the formatter for `format`, falling back to the
+/// plain table for an unknown format.
+fn print_report(report: &report::cost_report::CostReport, format: &str) {
+    match formatter_by_name(format) {
+        Some(formatter) => println!("{}", formatter.format(report)),
+        None => println!("{}", TableFormatter.format(report)),
+    }
+}
+
+/// Builds the delta between `previous` and `report`, or `None` when there is
+/// no previous estimate to compare against.
+fn cost_delta(
+    previous: Option<&cache::CachedEstimate>,
+    report: &report::cost_report::CostReport,
+) -> Option<report::cost_report::CostDelta> {
+    previous.map(|prev| {
+        report::cost_report::CostDelta::compute(
+            prev.cpu_instructions,
+            prev.memory_bytes,
+            prev.total_stroops,
+            prev.io.map(|io| (io.read_entries, io.write_entries)),
+            report,
+        )
+    })
+}
+
+/// The report's JSON payload, identical to what the `json` formatter emits.
+fn report_json_value(
+    report: &report::cost_report::CostReport,
+) -> error::AppResult<serde_json::Value> {
+    let formatted = match formatter_by_name("json") {
+        Some(formatter) => formatter.format(report),
+        None => "{}".to_string(),
+    };
+    Ok(serde_json::from_str(&formatted)?)
+}
+
+/// Prints the report followed by its `--compare` section.
+///
+/// JSON gets a single merged payload (`previous_estimate` + `delta` keys) so
+/// the output stays one parseable document; the human-readable formats get the
+/// report first and then the delta table. With nothing cached to compare
+/// against, the notice replaces the table.
+fn print_report_with_comparison(
+    report: &report::cost_report::CostReport,
+    previous: Option<&cache::CachedEstimate>,
+    format: &str,
+    json_flag: bool,
+) -> error::AppResult<()> {
+    let delta = cost_delta(previous, report);
+
+    if json_flag {
+        let mut value = report_json_value(report)?;
+        let (previous_value, delta_value) = match (previous, &delta) {
+            (Some(prev), Some(delta)) => {
+                (serde_json::to_value(prev)?, serde_json::to_value(delta)?)
+            }
+            _ => (serde_json::Value::Null, serde_json::Value::Null),
+        };
+        if let serde_json::Value::Object(ref mut map) = value {
+            map.insert("previous_estimate".to_string(), previous_value);
+            map.insert("delta".to_string(), delta_value);
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+
+    print_report(report, format);
+
+    match delta {
+        Some(delta) => match format {
+            "markdown" => println!("{}", delta.format_markdown()),
+            "csv" => println!(
+                "\n# cost delta vs previous estimate\n{}",
+                delta.format_csv()
+            ),
+            _ => println!("{}", delta.format_text()),
+        },
+        None => println!("No previous estimate found for comparison"),
     }
 
     Ok(())
@@ -1718,12 +1870,15 @@ fn csv_row(r: &EstimateAllResult) -> String {
 /// envelope is built against an undeployed contract, or identical fee-rate
 /// lookups — transmit each distinct `(method, params)` pair only once.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::fn_params_excessive_bools)]
 async fn cmd_estimate_all(
     wasm_path: &str,
     network: &str,
     rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     contract_id: Option<&str>,
+    no_cache: bool,
+    fn_names: &[String],
     format: &str,
     rps: Option<u64>,
     timeout: u64,
@@ -1749,6 +1904,36 @@ async fn cmd_estimate_all(
         use sha2::Digest;
         let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
 
+        // `--fn` filter (#25): validate the requested names against the WASM
+        // and keep only the matching functions for simulation. A typo must
+        // fail loudly, not silently estimate nothing.
+        let selected: Vec<&wasm::parser::FunctionInfo> = if fn_names.is_empty() {
+            wasm_info.functions.iter().collect()
+        } else {
+            let missing: Vec<&str> = fn_names
+                .iter()
+                .map(String::as_str)
+                .filter(|name| !wasm_info.functions.iter().any(|f| f.name == *name))
+                .collect();
+            if !missing.is_empty() {
+                let available = wasm_info
+                    .functions
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(error::AppError::General(format!(
+                    "function(s) not found in WASM: {} (available functions: {available})",
+                    missing.join(", ")
+                )));
+            }
+            wasm_info
+                .functions
+                .iter()
+                .filter(|f| fn_names.iter().any(|n| n == &f.name))
+                .collect()
+        };
+
         let json_flag = format == "json";
         let text_mode = format == "table" || format == "markdown";
         if text_mode {
@@ -1761,7 +1946,18 @@ async fn cmd_estimate_all(
                 wasm_info.functions.len()
             );
             for (i, fn_info) in wasm_info.functions.iter().enumerate() {
-                println!("  {}. {}", i + 1, wasm::parser::format_function(fn_info));
+                let suffix = if fn_names.is_empty()
+                    || selected.iter().any(|s| s.name == fn_info.name)
+                {
+                    String::new()
+                } else {
+                    "  — Skipped: filtered out".to_string()
+                };
+                println!(
+                    "  {}. {}{suffix}",
+                    i + 1,
+                    wasm::parser::format_function(fn_info)
+                );
             }
             println!();
             println!(
@@ -1807,10 +2003,10 @@ async fn cmd_estimate_all(
         let mut csv_rows: Vec<String> = Vec::new();
 
         let mut json_results: Vec<EstimateAllResult> = Vec::new();
-        let total = wasm_info.functions.len();
+        let total = selected.len();
         debug!(total, "enumerated functions");
 
-        for (i, fn_info) in wasm_info.functions.iter().enumerate() {
+        for (i, fn_info) in selected.iter().enumerate() {
             if text_mode {
                 println!("[{}/{}] {}", i + 1, total, fn_info.name);
             }
@@ -1819,6 +2015,7 @@ async fn cmd_estimate_all(
                 &wasm_info,
                 fn_info,
                 contract_id,
+                no_cache,
                 &wasm_hash,
                 network,
                 json_flag,
@@ -1940,6 +2137,7 @@ async fn estimate_all_function(
     wasm_info: &wasm::parser::WasmInfo,
     fn_info: &wasm::parser::FunctionInfo,
     contract_id: Option<&str>,
+    no_cache: bool,
     wasm_hash: &str,
     network: &str,
     json_flag: bool,
@@ -2004,18 +2202,22 @@ async fn estimate_all_function(
 
                 debug!(cpu, mem, total_fee, ledger, "simulation complete");
 
-                let _ = cache::save_estimate(
-                    wasm_hash,
-                    &fn_info.name,
-                    &[],
-                    network,
-                    ledger,
-                    total_fee,
-                    cpu,
-                    mem,
-                    duration_ms,
-                    true,
-                );
+                // `--no-cache` suppresses the write so a bypassed batch run
+                // leaves the local cache untouched.
+                if !no_cache {
+                    let _ = cache::save_estimate(
+                        wasm_hash,
+                        &fn_info.name,
+                        &[],
+                        network,
+                        ledger,
+                        total_fee,
+                        cpu,
+                        mem,
+                        duration_ms,
+                        true,
+                    );
+                }
 
                 // Itemize the fee breakdown only when we have the network's fee
                 // rates (JSON mode). Otherwise emit a minimal breakdown with just
@@ -2066,6 +2268,7 @@ async fn estimate_all_function(
                     write_bytes: Some(write_bytes),
                     tx_size: Some(tx_xdr.len() as u32),
                     fee: Some(fee),
+                    contract_meta: wasm_info.contract_meta.clone(),
                 })
             }
             Err(e) => {
@@ -2159,6 +2362,8 @@ fn wasm_info_json(
             "name": wasm_info.contract_meta.name,
             "version": wasm_info.contract_meta.version,
             "description": wasm_info.contract_meta.description,
+            "author": wasm_info.contract_meta.author,
+            "sdk_version": wasm_info.contract_meta.sdk_version,
             "entries": wasm_info.contract_meta.entries.iter().map(|(key, value)| {
                 serde_json::json!({ "key": key, "value": value })
             }).collect::<Vec<_>>(),
@@ -2268,6 +2473,7 @@ async fn cmd_config_snapshot(
     network: &str,
     rpc_fallback_url: Option<&str>,
     out_path: Option<&str>,
+    retain_days: Option<u64>,
     format: cli::OutputFormat,
     rps: Option<u64>,
     timeout: u64,
@@ -2294,6 +2500,25 @@ async fn cmd_config_snapshot(
 
         let path = config_snapshot::store::save_snapshot(&snapshot, out_path)?;
         info!(path = %path.display(), ledger = snapshot.ledger, "snapshot saved");
+
+        // With `--retain N`, delete this network's snapshots whose files are
+        // older than N days (by modification time). Runs after the save, so
+        // the just-written snapshot is never at risk.
+        if let Some(retain_days) = retain_days {
+            let cleaned = config_snapshot::store::clean_old_snapshots(network, retain_days)?;
+            info!(cleaned, retain_days, "cleaned old snapshots");
+            if cleaned > 0 {
+                let message = format!(
+                    "Deleted {cleaned} snapshot(s) older than {retain_days} day(s) for {network}."
+                );
+                if format == cli::OutputFormat::Json {
+                    // Keep stdout machine-readable; announce on stderr.
+                    eprintln!("{message}");
+                } else {
+                    println!("{message}");
+                }
+            }
+        }
 
         if format == cli::OutputFormat::Json {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
@@ -2418,7 +2643,7 @@ async fn cmd_config_diff(
     pricing_only: bool,
     threshold_percent: Option<f64>,
     summary: bool,
-    json_flag: bool,
+    format: cli::OutputFormat,
     rps: Option<u64>,
     timeout: u64,
     max_retries: usize,
@@ -2427,6 +2652,12 @@ async fn cmd_config_diff(
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::{debug, info_span};
+
+    // Machine formats (JSON/CSV/Markdown) keep stdout parseable, so human
+    // extras like the stale-estimate list stay off it.
+    let json_flag = format == cli::OutputFormat::Json;
+    let machine =
+        json_flag || matches!(format, cli::OutputFormat::Csv | cli::OutputFormat::Markdown);
 
     let span = info_span!("cmd_config_diff", network);
     async {
@@ -2464,6 +2695,10 @@ async fn cmd_config_diff(
                 "stale_estimates": stale_estimates_for(network, new_snapshot.ledger),
             });
             println!("{}", serde_json::to_string_pretty(&json_output)?);
+        } else if format == cli::OutputFormat::Csv {
+            println!("{}", config_snapshot::diff::format_diff_csv(&diff));
+        } else if format == cli::OutputFormat::Markdown {
+            println!("{}", config_snapshot::diff::format_diff_markdown(&diff));
         } else if summary {
             println!("{}", config_snapshot::diff::format_diff_summary(&diff));
         } else {
@@ -2482,7 +2717,7 @@ async fn cmd_config_diff(
             match config_snapshot::store::save_snapshot(&new_snapshot, None) {
                 Ok(path) => {
                     info!(path = %path.display(), "auto-saved post-upgrade snapshot");
-                    if !json_flag && !summary {
+                    if !machine && !summary {
                         println!(
                             "  Protocol upgrade detected — new config auto-saved to {}",
                             path.display()
@@ -2491,14 +2726,14 @@ async fn cmd_config_diff(
                 }
                 Err(e) => {
                     warn!(error = %e, "could not auto-save post-upgrade snapshot");
-                    if !json_flag && !summary {
+                    if !machine && !summary {
                         eprintln!("  Warning: could not auto-save post-upgrade snapshot: {e}");
                     }
                 }
             }
         }
 
-        if !json_flag && !summary {
+        if !machine && !summary {
             print_stale_estimates(network, new_snapshot.ledger);
         }
 
@@ -3342,6 +3577,9 @@ async fn cmd_cache_warm(
         rpc_url,
         rpc_fallback_url,
         contract_id,
+        // `cache warm` exists to populate the cache, so it never bypasses it.
+        false,
+        &[],
         fmt,
         rps,
         timeout,
@@ -3532,6 +3770,11 @@ mod tests {
         assert_eq!(value["sha256"], "deadbeef");
         assert_eq!(value["has_spec"], true);
         assert_eq!(value["contract_meta"]["name"], serde_json::Value::Null);
+        assert_eq!(value["contract_meta"]["author"], serde_json::Value::Null);
+        assert_eq!(
+            value["contract_meta"]["sdk_version"],
+            serde_json::Value::Null
+        );
         assert_eq!(value["contract_meta"]["entries"], serde_json::json!([]));
         assert_eq!(value["functions"][0]["name"], "increment");
         assert_eq!(value["functions"][0]["params"][0]["name"], "step");
@@ -3567,6 +3810,18 @@ mod tests {
                     total_xlm: "0.0000003".to_string(),
                     fee_percentages: std::collections::BTreeMap::new(),
                 }),
+                contract_meta: ContractMeta {
+                    name: Some("MetaContract".to_string()),
+                    version: Some("9.9.9".to_string()),
+                    description: None,
+                    author: None,
+                    sdk_version: Some("25.3.2".to_string()),
+                    entries: vec![
+                        ("name".to_string(), "MetaContract".to_string()),
+                        ("version".to_string(), "9.9.9".to_string()),
+                        ("rssdkver".to_string(), "25.3.2".to_string()),
+                    ],
+                },
             },
             EstimateAllResult::skipped("needs_args", "needs --fn/--arg (1 param(s))"),
             EstimateAllResult::errored("bad", "boom"),
@@ -3584,6 +3839,9 @@ mod tests {
         assert_eq!(ok["fee"]["total_stroops"], 3);
         assert!(ok.get("reason").is_none());
         assert!(ok.get("error").is_none());
+        // Contract metadata rides along on successful estimates.
+        assert_eq!(ok["contract_meta"]["name"], "MetaContract");
+        assert_eq!(ok["contract_meta"]["sdk_version"], "25.3.2");
 
         // skipped entry carries status + reason, omits resources/fee.
         let skipped = &value[1];
@@ -3591,6 +3849,8 @@ mod tests {
         assert_eq!(skipped["reason"], "needs --fn/--arg (1 param(s))");
         assert!(skipped.get("cpu_instructions").is_none());
         assert!(skipped.get("fee").is_none());
+        // Absent contract meta is omitted entirely, not emitted as `{}`.
+        assert!(skipped.get("contract_meta").is_none());
 
         // error entry carries status + error.
         let errored = &value[2];
@@ -3626,6 +3886,7 @@ mod tests {
                 total_xlm: "0.0000003".to_string(),
                 fee_percentages: std::collections::BTreeMap::new(),
             }),
+            contract_meta: ContractMeta::default(),
         }];
         let distribution =
             soroban_cost_estimator::report::cost_report::FeeDistribution::from_samples(
@@ -3763,6 +4024,7 @@ mod tests {
             rpc_latency_ms: 87,
             rates: None,
             projections: None,
+            contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
         }
     }
 

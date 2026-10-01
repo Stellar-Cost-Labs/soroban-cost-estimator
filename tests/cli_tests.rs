@@ -167,7 +167,9 @@ fn test_estimate_help() {
         "--id",
         "--arg",
         "--cache-ttl",
+        "--compare",
         "--clear-cache",
+        "--no-cache",
         "--json",
     ] {
         assert!(
@@ -184,7 +186,14 @@ fn test_estimate_all_help() {
         code, 0,
         "estimate-all --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--wasm", "--network", "--id", "--json", "--format"] {
+    for flag in [
+        "--wasm",
+        "--network",
+        "--id",
+        "--no-cache",
+        "--json",
+        "--format",
+    ] {
         assert!(
             stdout.contains(flag),
             "estimate-all help should mention {flag}; got: {stdout}"
@@ -210,7 +219,7 @@ fn test_config_snapshot_help() {
         code, 0,
         "config snapshot --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--network", "--out", "--json"] {
+    for flag in ["--network", "--out", "--json", "--retain"] {
         assert!(
             stdout.contains(flag),
             "snapshot help should mention {flag}; got: {stdout}"
@@ -518,6 +527,87 @@ fn test_timeout_flag_accepted_before_subcommand() {
 }
 
 #[test]
+fn test_max_retries_flag_accepted() {
+    // Verify --max-retries is a recognized global argument for estimate.
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--max-retries", "5"]);
+    // Should fail because the file doesn't exist, NOT because --max-retries is unknown.
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--max-retries should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_max_retries_flag_accepted_before_subcommand() {
+    // Global flags must also be accepted before the subcommand.
+    let (_, stderr, code) = run_cli(&["--max-retries", "5", "estimate", "--wasm", "test.wasm"]);
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--max-retries before the subcommand should be recognized; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_max_retries_zero_accepted() {
+    // 0 is the documented "disable retries" value and must be accepted, not
+    // rejected as an out-of-range value.
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--max-retries", "0"]);
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument") && !stderr.contains("invalid value"),
+        "--max-retries 0 should be accepted; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_max_retries_negative_value_rejected() {
+    // The flag is unsigned, so a negative value must be rejected during
+    // argument parsing rather than silently wrapping to a huge retry count.
+    // clap rejects a bare `-1` as an unexpected argument, which is a
+    // non-zero exit before the command runs — the same convention the
+    // existing unknown-flag test asserts.
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--max-retries", "-1"]);
+    assert_ne!(code, 0, "a negative --max-retries must be rejected");
+    assert!(
+        stderr.contains("unexpected argument") || stderr.to_lowercase().contains("error"),
+        "--max-retries -1 should be rejected at parse time; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_max_retries_accepted_by_all_network_commands() {
+    // The flag is global, so every command that builds an RPC client must
+    // accept it — not just `estimate`. Each case below fails fast *before*
+    // any network call: `estimate-all`/`cache warm` on a missing WASM file,
+    // and the `config` subcommands on an unknown network name. That keeps the
+    // suite offline while still exercising argument parsing for each command.
+    for args in [
+        vec!["estimate-all", "--wasm", "test.wasm"],
+        vec!["cache", "warm", "--wasm", "test.wasm"],
+        vec!["config", "snapshot", "--network", "nosuchnet"],
+        vec!["config", "diff", "--network", "nosuchnet"],
+    ] {
+        let mut full = args.clone();
+        full.extend_from_slice(&["--max-retries", "5"]);
+
+        let (_, stderr, code) = run_cli(&full);
+        assert_ne!(
+            code,
+            0,
+            "`{}` should fail on its own validation, not on flag parsing",
+            args.join(" ")
+        );
+        assert!(
+            !stderr.contains("unexpected argument"),
+            "--max-retries should be accepted by `{}`; stderr: {stderr}",
+            args.join(" ")
+        );
+    }
+}
+
+#[test]
 fn test_help_lists_global_flags() {
     // Global flags (--rps, --timeout, --precision, --quiet) must appear in
     // subcommand help.
@@ -558,6 +648,35 @@ fn test_precision_out_of_range_rejected() {
             || stderr.contains("not in")
             || stderr.to_lowercase().contains("range"),
         "clap should reject precision 8; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_max_retries_help_documents_default_and_zero_behavior() {
+    // Acceptance criteria: the flag must be in --help with a clear description
+    // of both the default and the "0 disables retries" behavior.
+    let (stdout, stderr, code) = run_cli(&["--help"]);
+    assert_eq!(code, 0, "--help should exit 0; stderr: {stderr}");
+
+    // clap hard-wraps the doc comment to the terminal width, so a phrase can be
+    // split across lines. Collapse all whitespace before searching for the
+    // phrases the acceptance criteria require.
+    let help = stdout
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    assert!(
+        help.contains("--max-retries"),
+        "help should list --max-retries; got: {stdout}"
+    );
+    assert!(
+        help.contains("default 3"),
+        "help should state the default of 3; got: {stdout}"
+    );
+    assert!(
+        help.contains("0 disables retries"),
+        "help should explain that 0 disables retries; got: {stdout}"
     );
 }
 
@@ -969,6 +1088,50 @@ fn test_config_snapshot_unknown_network() {
             "Error: failed to locate RPC endpoint: not configured for network not-a-network"
         ),
         "the error should name the unknown network; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_retain_flag_accepted() {
+    // `--retain` must be a recognized argument: the run fails on the unknown
+    // network (before any RPC), not on the flag itself.
+    let (_, stderr, code) = run_cli(&[
+        "config",
+        "snapshot",
+        "--network",
+        "not-a-network",
+        "--retain",
+        "5",
+    ]);
+    assert_eq!(code, 1, "an unknown network should exit 1");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--retain should be a recognized argument; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
+        "the failure should come from the network, not the flag; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_retain_zero_rejected() {
+    // `--retain 0` would delete every snapshot, so clap must reject it before
+    // anything runs.
+    let (_, stderr, code) = run_cli(&[
+        "config",
+        "snapshot",
+        "--network",
+        "not-a-network",
+        "--retain",
+        "0",
+    ]);
+    assert_ne!(code, 0, "--retain 0 should be rejected");
+    assert!(
+        stderr.contains("is not in"),
+        "clap should explain the valid range; stderr: {stderr}"
     );
 }
 
@@ -1395,12 +1558,15 @@ fn custom_section(name: &str, payload: &[u8]) -> Vec<u8> {
 #[test]
 fn test_wasm_info_displays_contract_meta() {
     // Extend the bare fixture with a contractmeta section and point wasm-info
-    // at it: name/version/description must be shown (table and JSON modes).
+    // at it: name/version/description/author/SDK version must be shown
+    // (table and JSON modes).
     let mut bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
     let mut payload = Vec::new();
     payload.extend_from_slice(&xdr_meta_entry("name", "MetaContract"));
     payload.extend_from_slice(&xdr_meta_entry("version", "9.9.9"));
     payload.extend_from_slice(&xdr_meta_entry("description", "A meta description"));
+    payload.extend_from_slice(&xdr_meta_entry("author", "Stellar Dev"));
+    payload.extend_from_slice(&xdr_meta_entry("rs_sdk_version", "25.3.2"));
     bytes.extend_from_slice(&custom_section("contractmetav0", &payload));
 
     let home = temp_home("wasm-info-meta");
@@ -1416,6 +1582,8 @@ fn test_wasm_info_displays_contract_meta() {
     assert!(stdout.contains("name: MetaContract"));
     assert!(stdout.contains("version: 9.9.9"));
     assert!(stdout.contains("description: A meta description"));
+    assert!(stdout.contains("author: Stellar Dev"));
+    assert!(stdout.contains("sdk_version: 25.3.2"));
 
     let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
         .args(["wasm-info", "--wasm", path.to_str().unwrap(), "--json"])
@@ -1430,6 +1598,8 @@ fn test_wasm_info_displays_contract_meta() {
     assert_eq!(parsed["contract_meta"]["name"], "MetaContract");
     assert_eq!(parsed["contract_meta"]["version"], "9.9.9");
     assert_eq!(parsed["contract_meta"]["description"], "A meta description");
+    assert_eq!(parsed["contract_meta"]["author"], "Stellar Dev");
+    assert_eq!(parsed["contract_meta"]["sdk_version"], "25.3.2");
 }
 
 #[test]
@@ -2952,4 +3122,177 @@ fn test_estimate_project_invalid_input_error() {
         stderr.contains("duplicate projection count: 100"),
         "stderr should mention duplicate count: {stderr}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `estimate-all --fn` filter (Issue #25)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_estimate_all_fn_flag_accepted() {
+    let (_, stderr, code) = run_cli(&[
+        "estimate-all",
+        "--wasm",
+        "test.wasm",
+        "--fn",
+        "increment",
+        "--fn",
+        "transfer",
+    ]);
+    assert_ne!(code, 0, "missing WASM file should still error");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--fn should be a recognized, repeatable argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_all_fn_unknown_function_errors() {
+    // A typo must fail loudly, listing the available functions, before any
+    // RPC call.
+    let home = temp_home("estimate-all-fn-unknown");
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "estimate-all",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--fn",
+            "no_such_function",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "an unknown --fn should exit 1; stderr: {stderr}");
+    assert!(
+        stderr.contains("not found in WASM"),
+        "the error should say the function was not found; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("increment"),
+        "the error should list the available functions; got: {stderr}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `--no-cache` tests (Issue #271)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_estimate_no_cache_flag_accepted() {
+    // The flag must be recognized (failure is the missing file, not the arg).
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--no-cache"]);
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument") && !stderr.contains("unrecognized"),
+        "--no-cache should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_all_no_cache_flag_accepted() {
+    let (_, stderr, code) = run_cli(&["estimate-all", "--wasm", "test.wasm", "--no-cache"]);
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument") && !stderr.contains("unrecognized"),
+        "--no-cache should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+/// `--no-cache` skips both the cache read and the cache write:
+///
+/// 1. a run with `--no-cache --cache-ttl` always simulates (never returns a
+///    cache-hit payload) and leaves nothing behind on disk;
+/// 2. a normal run populates the cache;
+/// 3. a later `--cache-ttl` run *does* hit that cache entry — proving the
+///    first run would have too, had `--no-cache` not bypassed it.
+#[test]
+fn test_no_cache_bypasses_cache_reads_and_writes() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("no-cache-bypass");
+    let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+
+    let base: Vec<&str> = vec![
+        "estimate",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--id",
+        contract_id,
+        "--fn",
+        "increment",
+        "--arg",
+        "1",
+        "--rpc-url",
+        &rpc_url,
+        "--json",
+    ];
+
+    // 1. Bypassed run: fresh simulation even though --cache-ttl is set.
+    let mut args = base.clone();
+    args.extend_from_slice(&["--no-cache", "--cache-ttl", "1h"]);
+    let (stdout, stderr, code) = run_cli_quiet(&args, Some(&home));
+    assert_eq!(
+        code, 0,
+        "no-cache estimate should succeed; stderr: {stderr}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("fresh JSON report; got: {stdout}");
+    assert!(
+        parsed.get("cache").is_none(),
+        "--no-cache must not return a cache-hit payload; got: {stdout}"
+    );
+    assert_eq!(parsed["cpu_instructions"], 532_502);
+
+    // ...and nothing was written to the cache.
+    let (stdout, stderr, code) = run_cli_quiet(
+        &["cache", "query", "--network", "testnet", "--json"],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "cache query should succeed; stderr: {stderr}");
+    assert_eq!(
+        stdout.trim(),
+        "[]",
+        "--no-cache must not persist an estimate; got: {stdout}"
+    );
+
+    // 2. A normal run does populate the cache.
+    let (_, stderr, code) = run_cli_quiet(&base, Some(&home));
+    assert_eq!(
+        code, 0,
+        "populating estimate should succeed; stderr: {stderr}"
+    );
+    let (stdout, _, _) = run_cli_quiet(
+        &["cache", "query", "--network", "testnet", "--json"],
+        Some(&home),
+    );
+    assert!(
+        stdout.contains("increment"),
+        "normal run should cache the estimate; got: {stdout}"
+    );
+
+    // 3. The cached entry is now visible to --cache-ttl...
+    let mut cached_args = base.clone();
+    cached_args.extend_from_slice(&["--cache-ttl", "1h"]);
+    let (stdout, stderr, code) = run_cli_quiet(&cached_args, Some(&home));
+    assert_eq!(code, 0, "cached estimate should succeed; stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("cache-hit JSON; got: {stdout}");
+    assert_eq!(
+        parsed["cache"], "hit",
+        "expected a cache hit; got: {stdout}"
+    );
+
+    // ...but `--no-cache` ignores it and simulates anyway.
+    let mut bypassed_args = base.clone();
+    bypassed_args.extend_from_slice(&["--no-cache", "--cache-ttl", "1h"]);
+    let (stdout, stderr, code) = run_cli_quiet(&bypassed_args, Some(&home));
+    assert_eq!(
+        code, 0,
+        "bypassed estimate should succeed; stderr: {stderr}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("fresh JSON report; got: {stdout}");
+    assert!(
+        parsed.get("cache").is_none(),
+        "--no-cache must ignore the cached entry; got: {stdout}"
+    );
+    assert_eq!(parsed["cpu_instructions"], 532_502);
 }
