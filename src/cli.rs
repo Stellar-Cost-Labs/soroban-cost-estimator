@@ -211,6 +211,11 @@ pub enum Command {
         #[arg(long)]
         id: Option<String>,
 
+        /// Bypass the estimate cache entirely: never read cached estimates
+        /// and never write fresh results back to disk.
+        #[arg(long)]
+        no_cache: bool,
+
         /// Restrict estimation to these function names (repeatable). When
         /// omitted, every exported function is estimated.
         #[arg(long = "fn", value_name = "NAME")]
