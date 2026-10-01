@@ -256,6 +256,9 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             clear_cache,
             no_cache,
             json,
+            diff,
+            format,
+            precision,
             auto_snapshot,
             diff,
             wasm_new,
@@ -284,6 +287,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 no_cache,
                 format.as_str(),
                 rps,
+                diff.as_deref(),
                 timeout,
                 max_retries,
                 precision,
@@ -711,6 +715,9 @@ struct SimulationRequest<'a> {
 /// callers decide their own caching policy.
 ///
 /// All RPC traffic (simulation and fee-rate fetches) goes through one
+/// Simulate a single contract invocation (or compare two contract versions) and print the cost report.
+///
+/// All RPC traffic (simulation and fee-rate fetches) goes through one
 /// `RpcClient`, which deduplicates identical requests — the same method with
 /// the same params — so identical fee-rate fetches transmit at most once.
 async fn simulate_report(
@@ -842,6 +849,7 @@ async fn cmd_estimate(
     no_cache: bool,
     format: &str,
     rps: Option<u64>,
+    diff_wasm_path: Option<&str>,
     timeout: u64,
     max_retries: usize,
     precision: u32,
@@ -1071,8 +1079,47 @@ async fn estimate_once(
         network,
         fn = fn_name.unwrap_or("(upload)"),
         has_contract_id = contract_id.is_some(),
+        has_diff = diff_wasm_path.is_some(),
     );
     async {
+        if let Some(diff_path) = diff_wasm_path {
+            info!("running estimate diff between baseline and target WASM files");
+            let _ = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
+            let _ = wasm::parser::load_wasm(std::path::Path::new(diff_path))?;
+
+            let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
+            let client = rpc::client::RpcClient::with_rate_limit(&endpoint, rps);
+
+            let baseline_report = estimate_single_file(
+                wasm_path,
+                network,
+                contract_id,
+                fn_name,
+                args,
+                &client,
+            )
+            .await?;
+
+            let target_report = estimate_single_file(
+                diff_path,
+                network,
+                contract_id,
+                fn_name,
+                args,
+                &client,
+            )
+            .await?;
+
+            let diff_report =
+                report::cost_report::CostReportDiff::compute(&baseline_report, &target_report);
+
+            if json_flag {
+                println!("{}", report::cost_report::format_diff_json(&diff_report));
+            } else {
+                println!("{}", report::cost_report::format_diff_table(&diff_report));
+            }
+
+            return Ok(());
         // With `--clear-cache`, wipe every cached estimate for this network
         // before anything else runs, so the `--cache-ttl` lookup and the
         // simulation below both start from an empty slate. Human-readable
@@ -1221,6 +1268,22 @@ async fn estimate_once(
         })
         .await?;
 
+        let _ = cache::save_estimate(
+            &wasm_hash,
+            function_name,
+            args,
+            network,
+            report.ledger,
+            report.fee.total_stroops,
+            report.cpu_instructions,
+            report.memory_bytes,
+            Some(report.rpc_latency_ms),
+            true,
+        );
+
+        match formatter_by_name(format) {
+            Some(formatter) => println!("{}", formatter.format(&report)),
+            None => println!("{}", TableFormatter.format(&report)),
         // `--no-cache` also suppresses the write, so a bypassed run leaves
         // no trace in the local cache.
         if !no_cache {
@@ -1249,6 +1312,129 @@ async fn estimate_once(
     .await
 }
 
+/// Helper to simulate a single WASM file and construct its `CostReport`.
+async fn estimate_single_file(
+    wasm_path: &str,
+    network: &str,
+    contract_id: Option<&str>,
+    fn_name: Option<&str>,
+    args: &[String],
+    client: &rpc::client::RpcClient,
+) -> error::AppResult<report::cost_report::CostReport> {
+    use sha2::Digest;
+
+    info!("loading WASM");
+    let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
+    debug!(
+        functions = wasm_info.functions.len(),
+        has_spec = wasm_info.has_spec,
+        "WASM loaded"
+    );
+
+    let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
+    let function_name = fn_name.unwrap_or("(wasm upload)");
+
+    let sc_vals: Vec<stellar_xdr::ScVal> = args
+        .iter()
+        .map(|a| xdr_helper::parse_arg_scval(a))
+        .collect();
+    debug!(arg_count = sc_vals.len(), "parsed arguments");
+
+    let tx_xdr = xdr_helper::build_simulation_tx_envelope(
+        &wasm_info.bytes,
+        contract_id,
+        fn_name,
+        &sc_vals,
+    )?;
+
+    xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
+    debug!(
+        arg_count = args.len(),
+        "validated arguments against contract spec"
+    );
+
+    let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
+    debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
+
+    let rpc_start = std::time::Instant::now();
+    let response = rpc::simulate::simulate_transaction(client, &tx_b64).await?;
+    let rpc_latency_ms = rpc_start.elapsed().as_millis() as u64;
+
+    if missing_simulation_data(&response) {
+        return Err(error::AppError::SimulationFailed(
+            "simulation returned no cost data and no latest ledger — check --id, --fn, and the RPC endpoint".to_string(),
+        ));
+    }
+
+    let (cpu_instructions, memory_bytes, read_entries, write_entries, read_bytes, write_bytes) =
+        response_resources(&response)?;
+
+    let latest_ledger: u32 = response
+        .latest_ledger
+        .and_then(|l| u32::try_from(l).ok())
+        .unwrap_or(0);
+
+    let total_fee_stroops = rpc::simulate::parse_resource_fee(&response.min_resource_fee)
+        .unwrap_or(None)
+        .or(rpc::simulate::parse_transaction_data_resource_fee(
+            &response.transaction_data,
+        )?)
+        .unwrap_or(0);
+
+    debug!(
+        cpu_instructions,
+        memory_bytes,
+        latest_ledger,
+        total_fee_stroops,
+        "simulation complete"
+    );
+
+    let fee_rates = fetch_fee_rates(client).await;
+
+    let fee = report::fee_calc::compute_fee_breakdown(
+        total_fee_stroops,
+        cpu_instructions,
+        read_entries,
+        write_entries,
+        read_bytes,
+        tx_xdr.len() as u32,
+        fee_rates,
+    );
+
+    let report = report::cost_report::CostReport {
+        function: function_name.to_string(),
+        wasm_hash: wasm_hash.clone(),
+        cpu_instructions,
+        memory_bytes,
+        tx_size: tx_xdr.len() as u32,
+        read_entries,
+        write_entries,
+        read_bytes,
+        write_bytes,
+        fee: fee.clone(),
+        ledger: latest_ledger,
+        network: network.to_string(),
+        rpc_latency_ms,
+        rates: Some(fee_rates),
+    };
+
+    let _ = cache::save_estimate(
+        &wasm_hash,
+        function_name,
+        args,
+        network,
+        latest_ledger,
+        fee.total_stroops,
+        cpu_instructions,
+        memory_bytes,
+    );
+    info!(
+        total_stroops = fee.total_stroops,
+        total_xlm = %fee.total_xlm,
+        "estimate complete"
+    );
+
+    Ok(report)
 /// Poll interval for `estimate --watch`.
 const WATCH_POLL_DURATION: std::time::Duration = std::time::Duration::from_millis(500);
 

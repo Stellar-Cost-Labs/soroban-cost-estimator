@@ -166,6 +166,13 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
+        /// Path to second `.wasm` file to compare against (estimates both and shows cost delta).
+        #[arg(long, value_name = "WASM")]
+        diff: Option<String>,
+        /// Output format: table (default), json, csv, or markdown.
+        /// Overrides `--json` when both are supplied.
+        #[arg(long, value_parser = ["table", "json", "csv", "markdown"])]
+        format: Option<String>,
         /// Automatically save a new config snapshot if network pricing
         /// configuration has changed since the last snapshot.
         #[arg(long)]
