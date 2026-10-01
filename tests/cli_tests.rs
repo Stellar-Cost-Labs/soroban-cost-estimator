@@ -58,11 +58,17 @@ fn temp_home(label: &str) -> PathBuf {
 
 /// A minimal but structurally valid config snapshot, matching `ConfigSnapshot`.
 fn snapshot_json(network: &str, ledger: u32) -> String {
+    snapshot_json_at(network, ledger, "2026-01-01T00:00:00+00:00")
+}
+
+/// As [`snapshot_json`], but with an explicit RFC 3339 timestamp so a test can
+/// lay out several snapshots in a known chronological order.
+fn snapshot_json_at(network: &str, ledger: u32, timestamp: &str) -> String {
     format!(
         r#"{{
   "network": "{network}",
   "ledger": {ledger},
-  "timestamp": "2026-01-01T00:00:00+00:00",
+  "timestamp": "{timestamp}",
   "contract_compute": null,
   "contract_ledger_cost": null,
   "contract_historical_data": null,
@@ -71,6 +77,40 @@ fn snapshot_json(network: &str, ledger: u32) -> String {
   "state_archival": null
 }}"#
     )
+}
+
+/// Writes one snapshot into the isolated home's snapshots directory.
+///
+/// The filename mirrors `save_snapshot`: `{network}-{timestamp}.json` with
+/// `:` replaced by `-`. That naming is what orders snapshots on disk, so a
+/// test has to reproduce it to exercise the real lookup path.
+fn write_snapshot(home: &Path, network: &str, timestamp: &str, ledger: u32) -> PathBuf {
+    let dir = home.join(".soroban-cost-estimator").join("snapshots");
+    std::fs::create_dir_all(&dir).expect("create snapshots dir");
+    let path = dir.join(format!("{network}-{}.json", timestamp.replace(':', "-")));
+    std::fs::write(&path, snapshot_json_at(network, ledger, timestamp)).expect("write snapshot");
+    path
+}
+
+/// Runs the CLI with `HOME` isolated and tracing silenced.
+///
+/// `tracing`'s `info!` lines go to stdout in this binary, so `RUST_LOG=error`
+/// is what makes stdout exactly the command's own output for JSON assertions.
+fn run_cli_quiet(args: &[&str], home: Option<&Path>) -> (String, String, i32) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"));
+    cmd.args(args).env("RUST_LOG", "error");
+    if let Some(home) = home {
+        cmd.env("HOME", home);
+        cmd.env("USERPROFILE", home);
+    }
+
+    let output = cmd.output().expect("failed to run CLI");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let code = output.status.code().unwrap_or(-1);
+
+    (stdout, stderr, code)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -186,7 +226,7 @@ fn test_config_diff_help() {
         code, 0,
         "config diff --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--network", "--against", "--summary"] {
+    for flag in ["--network", "--against", "--against-previous", "--summary"] {
         assert!(
             stdout.contains(flag),
             "diff help should mention {flag}; got: {stdout}"
@@ -260,6 +300,52 @@ fn test_cache_verify_empty_cache_succeeds() {
     assert!(
         stdout.contains("empty") || stdout.contains("nothing to verify"),
         "should report an empty cache: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_stats_help() {
+    let (stdout, stderr, code) = run_cli(&["cache", "stats", "--help"]);
+    assert_eq!(
+        code, 0,
+        "cache stats --help should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("cache health") || stdout.contains("breakdown"),
+        "cache stats help should describe the command; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_stats_on_empty_cache_succeeds() {
+    let home = temp_home("cache-stats-empty");
+    let (stdout, stderr, code) = run_cli_in_home(&["cache", "stats"], Some(&home));
+    assert_eq!(
+        code, 0,
+        "cache stats on an empty cache should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Cache is empty"),
+        "should report an empty cache; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_stats_reports_seeded_entries() {
+    let home = temp_home("cache-stats-seeded");
+    let now = chrono::Utc::now().to_rfc3339();
+    seed_cache_entry_for(&home, "testnet", "(wasm upload)", 42, &now);
+    seed_cache_entry_for(&home, "mainnet", "mainnet_fn", 77, &now);
+
+    let (stdout, stderr, code) = run_cli_in_home(&["cache", "stats"], Some(&home));
+    assert_eq!(code, 0, "cache stats should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("Total entries:  2"),
+        "should count both seeded entries; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("testnet") && stdout.contains("mainnet"),
+        "should break entries down by network; got: {stdout}"
     );
 }
 
@@ -434,17 +520,62 @@ fn test_timeout_flag_accepted_before_subcommand() {
 
 #[test]
 fn test_help_lists_global_flags() {
-    // Global flags (--rps, --timeout) must appear in subcommand help.
+    // Global flags (--rps, --timeout, --precision, --quiet) must appear in
+    // subcommand help.
     let (stdout, stderr, code) = run_cli(&["estimate", "--help"]);
     assert_eq!(code, 0, "estimate --help should exit 0; stderr: {stderr}");
+    for flag in ["--timeout", "--rps", "--precision", "--quiet"] {
+        assert!(
+            stdout.contains(flag),
+            "help should list {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_precision_flag_accepted() {
+    // `--precision` is a global flag, so it must parse both before and after
+    // the subcommand; failure here is a missing file, not a bad argument.
+    for args in [
+        vec!["estimate", "--wasm", "test.wasm", "--precision", "2"],
+        vec!["--precision", "4", "estimate", "--wasm", "test.wasm"],
+    ] {
+        let (_, stderr, code) = run_cli(&args);
+        assert_ne!(code, 0, "should error on missing file");
+        assert!(
+            !stderr.contains("unrecognized") && !stderr.contains("invalid value"),
+            "--precision should be a recognized argument; stderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_precision_out_of_range_rejected() {
+    // The flag is documented as 0..=7; clap must reject 8 with a clear error.
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--precision", "8"]);
+    assert_ne!(code, 0, "out-of-range precision should error");
     assert!(
-        stdout.contains("--timeout"),
-        "help should list --timeout; got: {stdout}"
+        stderr.to_lowercase().contains("invalid value")
+            || stderr.contains("not in")
+            || stderr.to_lowercase().contains("range"),
+        "clap should reject precision 8; stderr: {stderr}"
     );
-    assert!(
-        stdout.contains("--rps"),
-        "help should list --rps; got: {stdout}"
-    );
+}
+
+#[test]
+fn test_quiet_flag_accepted() {
+    // `--quiet` / `-q` is a global flag used to suppress the fee bar chart.
+    for args in [
+        vec!["estimate", "--wasm", "test.wasm", "--quiet"],
+        vec!["estimate", "--wasm", "test.wasm", "-q"],
+    ] {
+        let (_, stderr, code) = run_cli(&args);
+        assert_ne!(code, 0, "should error on missing file");
+        assert!(
+            !stderr.contains("unrecognized") && !stderr.contains("unexpected argument"),
+            "--quiet should be a recognized argument; stderr: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -1034,6 +1165,158 @@ fn test_config_diff_loads_valid_snapshot_before_network() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// `config diff --against-previous`
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_config_diff_against_previous_no_snapshots_errors() {
+    // Scenario 0: nothing on disk to compare. The network name is
+    // deliberately unresolvable, so if the command reached for the RPC
+    // endpoint at all the failure would name the network instead.
+    let home = temp_home("diff-prev-none");
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against-previous",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "0 snapshots should exit 1");
+    assert!(
+        stderr.contains("need at least 2 for network not-a-network") && stderr.contains("found 0"),
+        "the error should report the snapshot count; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("failed to locate RPC endpoint"),
+        "--against-previous must never contact the network; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_diff_against_previous_one_snapshot_errors() {
+    // Scenario 1: a single point in time has nothing to diff against.
+    let home = temp_home("diff-prev-one");
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:01+00:00", 100);
+
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against-previous",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "1 snapshot should exit 1");
+    assert!(
+        stderr.contains("need at least 2 for network not-a-network") && stderr.contains("found 1"),
+        "the error should report the snapshot count; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("failed to locate RPC endpoint"),
+        "--against-previous must never contact the network; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_diff_against_previous_diffs_two_newest_snapshots() {
+    // Scenario 2+: three snapshots on disk, so the command must compare the
+    // two newest (ledgers 200 → 300) and leave the oldest (100) alone. The
+    // network is unresolvable on purpose: this command is purely local, so a
+    // network failure here would mean it leaked past the snapshot store.
+    let home = temp_home("diff-prev-two");
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:01+00:00", 100);
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:02+00:00", 200);
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:03+00:00", 300);
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against-previous",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(
+        code, 0,
+        "identical consecutive snapshots should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("(ledger 200) → 2026-01-01T00:00:03+00:00 (ledger 300)"),
+        "the two newest snapshots must be the ones compared; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("(ledger 100)"),
+        "the oldest snapshot must not take part in the diff; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("No changes detected"),
+        "identical snapshots should report no changes; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_diff_against_previous_summary_output() {
+    let home = temp_home("diff-prev-summary");
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:01+00:00", 100);
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:02+00:00", 200);
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against-previous",
+            "--summary",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 0, "--summary should exit 0 here; stderr: {stderr}");
+    assert!(
+        stdout.contains("0 pricing changes, 0 non-pricing changes"),
+        "--summary should emit exactly the one-line summary; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_diff_against_previous_json_uses_the_live_envelope() {
+    // Both diff modes emit `{ diff, stale_estimates }`, so a consumer sees one
+    // schema whether the newer side came from the network or from disk.
+    let home = temp_home("diff-prev-json");
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:01+00:00", 100);
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:02+00:00", 200);
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against-previous",
+            "--json",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 0, "--json should exit 0 here; stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("valid JSON; {e}: {stdout}"));
+    assert_eq!(parsed["diff"]["old_snapshot"]["ledger"], 100);
+    assert_eq!(parsed["diff"]["new_snapshot"]["ledger"], 200);
+    assert_eq!(parsed["diff"]["has_pricing_changes"], false);
+    assert_eq!(parsed["stale_estimates"].as_array().map(Vec::len), Some(0));
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // `watch`
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -1113,12 +1396,15 @@ fn custom_section(name: &str, payload: &[u8]) -> Vec<u8> {
 #[test]
 fn test_wasm_info_displays_contract_meta() {
     // Extend the bare fixture with a contractmeta section and point wasm-info
-    // at it: name/version/description must be shown (table and JSON modes).
+    // at it: name/version/description/author/SDK version must be shown
+    // (table and JSON modes).
     let mut bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
     let mut payload = Vec::new();
     payload.extend_from_slice(&xdr_meta_entry("name", "MetaContract"));
     payload.extend_from_slice(&xdr_meta_entry("version", "9.9.9"));
     payload.extend_from_slice(&xdr_meta_entry("description", "A meta description"));
+    payload.extend_from_slice(&xdr_meta_entry("author", "Stellar Dev"));
+    payload.extend_from_slice(&xdr_meta_entry("rs_sdk_version", "25.3.2"));
     bytes.extend_from_slice(&custom_section("contractmetav0", &payload));
 
     let home = temp_home("wasm-info-meta");
@@ -1134,6 +1420,8 @@ fn test_wasm_info_displays_contract_meta() {
     assert!(stdout.contains("name: MetaContract"));
     assert!(stdout.contains("version: 9.9.9"));
     assert!(stdout.contains("description: A meta description"));
+    assert!(stdout.contains("author: Stellar Dev"));
+    assert!(stdout.contains("sdk_version: 25.3.2"));
 
     let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
         .args(["wasm-info", "--wasm", path.to_str().unwrap(), "--json"])
@@ -1148,6 +1436,8 @@ fn test_wasm_info_displays_contract_meta() {
     assert_eq!(parsed["contract_meta"]["name"], "MetaContract");
     assert_eq!(parsed["contract_meta"]["version"], "9.9.9");
     assert_eq!(parsed["contract_meta"]["description"], "A meta description");
+    assert_eq!(parsed["contract_meta"]["author"], "Stellar Dev");
+    assert_eq!(parsed["contract_meta"]["sdk_version"], "25.3.2");
 }
 
 #[test]
@@ -1264,6 +1554,281 @@ fn test_cache_query_json_flag_accepted() {
     assert!(
         serde_json::from_str::<serde_json::Value>(trimmed).is_ok(),
         "output should be valid JSON; got: {stdout}"
+    );
+}
+
+fn seed_cache_estimate(
+    home: &Path,
+    wasm_hash: &str,
+    function: &str,
+    network: &str,
+    fee: i64,
+    cpu: u64,
+    timestamp: &str,
+) {
+    let args_hash = hex::encode(sha2::Sha256::digest(function.as_bytes()));
+    let dir = home.join(".soroban-cost-estimator");
+    std::fs::create_dir_all(&dir).expect("create data dir");
+    let db = dir.join("cache.db");
+    let conn = rusqlite::Connection::open(&db).expect("open cache db");
+    cache::ensure_cache_schema(&conn).expect("ensure cache schema");
+
+    conn.execute(
+        "INSERT OR REPLACE INTO estimates \
+         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            cache::CACHE_SCHEMA_VERSION as i64,
+            wasm_hash,
+            function,
+            args_hash,
+            network,
+            42i64,
+            fee,
+            cpu as i64,
+            1024i64,
+            timestamp,
+        ],
+    )
+    .expect("insert test cache estimate");
+}
+
+#[test]
+fn test_config_cache_query_help() {
+    let (stdout, stderr, code) = run_cli(&["config", "cache", "query", "--help"]);
+    assert_eq!(
+        code, 0,
+        "config cache query --help should exit 0; stderr: {stderr}"
+    );
+    for flag in [
+        "--network",
+        "--fn",
+        "--wasm-hash",
+        "--min-fee",
+        "--max-fee",
+        "--since",
+        "--json",
+    ] {
+        assert!(
+            stdout.contains(flag),
+            "config cache query help should mention {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_config_cache_query_empty_cache() {
+    let home = temp_home("config-cache-query-empty");
+    let (stdout, stderr, code) = run_cli_in_home(&["config", "cache", "query"], Some(&home));
+    assert_eq!(
+        code, 0,
+        "config cache query on empty cache should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("No cached estimates match the query."),
+        "empty cache should report no results; got: {stdout}"
+    );
+}
+
+fn run_cli_json_in_home(args: &[&str], home: &Path) -> (String, String, i32) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"));
+    cmd.args(args);
+    cmd.env("HOME", home);
+    cmd.env("USERPROFILE", home);
+    cmd.env("RUST_LOG", "error");
+    let output = cmd.output().expect("failed to run CLI");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let code = output.status.code().unwrap_or(-1);
+    (stdout, stderr, code)
+}
+
+#[test]
+fn test_config_cache_query_empty_json() {
+    let home = temp_home("config-cache-query-empty-json");
+    let (stdout, stderr, code) =
+        run_cli_json_in_home(&["config", "cache", "query", "--json"], &home);
+    assert_eq!(
+        code, 0,
+        "config cache query --json should exit 0; stderr: {stderr}"
+    );
+    assert_eq!(
+        stdout.trim(),
+        "[]",
+        "empty JSON should be []; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_cache_query_with_filters_table() {
+    let home = temp_home("config-cache-query-table");
+    seed_cache_estimate(
+        &home,
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        "transfer",
+        "testnet",
+        150_000,
+        12_000,
+        "2026-02-01T10:00:00Z",
+    );
+    seed_cache_estimate(
+        &home,
+        "2222222222222222222222222222222222222222222222222222222222222222",
+        "approve",
+        "testnet",
+        250_000,
+        24_000,
+        "2026-02-02T10:00:00Z",
+    );
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &["config", "cache", "query", "--fn", "transfer"],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "query should succeed; stderr: {stderr}");
+    assert!(
+        stdout.contains("Timestamp"),
+        "table should contain Timestamp"
+    );
+    assert!(stdout.contains("Function"), "table should contain Function");
+    assert!(stdout.contains("CPU"), "table should contain CPU");
+    assert!(stdout.contains("Fee"), "table should contain Fee");
+    assert!(stdout.contains("transfer"), "table should contain transfer");
+    assert!(
+        !stdout.contains("approve"),
+        "table should NOT contain approve"
+    );
+}
+
+#[test]
+fn test_config_cache_query_with_filters_json() {
+    let home = temp_home("config-cache-query-json");
+    seed_cache_estimate(
+        &home,
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        "transfer",
+        "testnet",
+        150_000,
+        12_000,
+        "2026-02-01T10:00:00Z",
+    );
+    seed_cache_estimate(
+        &home,
+        "2222222222222222222222222222222222222222222222222222222222222222",
+        "approve",
+        "testnet",
+        250_000,
+        24_000,
+        "2026-02-02T10:00:00Z",
+    );
+
+    let (stdout, stderr, code) = run_cli_json_in_home(
+        &["config", "cache", "query", "--fn", "transfer", "--json"],
+        &home,
+    );
+    assert_eq!(code, 0, "query --json should succeed; stderr: {stderr}");
+    let val: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json output");
+    let arr = val.as_array().expect("json array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["function"], "transfer");
+    assert_eq!(arr[0]["total_stroops"], 150_000);
+}
+
+#[test]
+fn test_config_cache_query_no_filters_returns_all_networks() {
+    let home = temp_home("config-cache-query-all");
+    seed_cache_estimate(
+        &home,
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        "fn_testnet",
+        "testnet",
+        150_000,
+        12_000,
+        "2026-02-01T10:00:00Z",
+    );
+    seed_cache_estimate(
+        &home,
+        "2222222222222222222222222222222222222222222222222222222222222222",
+        "fn_mainnet",
+        "mainnet",
+        250_000,
+        24_000,
+        "2026-02-02T10:00:00Z",
+    );
+
+    let (stdout, stderr, code) =
+        run_cli_json_in_home(&["config", "cache", "query", "--json"], &home);
+    assert_eq!(code, 0, "query --json should succeed; stderr: {stderr}");
+    let val: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json output");
+    let arr = val.as_array().expect("json array");
+    assert_eq!(
+        arr.len(),
+        2,
+        "query without filters should return all cached entries"
+    );
+}
+
+#[test]
+fn test_config_cache_query_invalid_network_error() {
+    let home = temp_home("config-cache-query-inv-net");
+    let (_stdout, stderr, code) = run_cli_in_home(
+        &["config", "cache", "query", "--network", "invalid_net_xyz"],
+        Some(&home),
+    );
+    assert_ne!(code, 0, "invalid network must fail");
+    assert!(
+        stderr.contains("not configured for network") || stderr.contains("invalid_net_xyz"),
+        "stderr should mention invalid network; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_cache_query_invalid_fee_range_error() {
+    let home = temp_home("config-cache-query-inv-fee");
+    let (_stdout, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "cache",
+            "query",
+            "--min-fee",
+            "200000",
+            "--max-fee",
+            "100000",
+        ],
+        Some(&home),
+    );
+    assert_ne!(code, 0, "invalid fee range must fail");
+    assert!(
+        stderr.contains("cannot exceed max-fee"),
+        "stderr should mention invalid fee range; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_cache_query_invalid_since_error() {
+    let home = temp_home("config-cache-query-inv-since");
+    let (_stdout, stderr, code) = run_cli_in_home(
+        &["config", "cache", "query", "--since", "bad-date-format"],
+        Some(&home),
+    );
+    assert_ne!(code, 0, "invalid since date must fail");
+    assert!(
+        stderr.contains("invalid timestamp or date"),
+        "stderr should mention invalid timestamp or date; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_cache_query_invalid_wasm_hash_error() {
+    let home = temp_home("config-cache-query-inv-hash");
+    let (_stdout, stderr, code) = run_cli_in_home(
+        &["config", "cache", "query", "--wasm-hash", "xyz_not_hex"],
+        Some(&home),
+    );
+    assert_ne!(code, 0, "invalid wasm hash must fail");
+    assert!(
+        stderr.contains("hexadecimal"),
+        "stderr should mention hexadecimal; got: {stderr}"
     );
 }
 
@@ -1453,19 +2018,29 @@ fn start_mock_rpc_server(
                             Ok(0) => break,
                             Ok(n) => {
                                 req_str.push_str(&String::from_utf8_lossy(&buf[..n]));
-                                if req_str.contains("\r\n\r\n") {
-                                    if let Some(pos) = req_str.find("Content-Length: ") {
-                                        let cl_str = &req_str[pos + 16..];
-                                        let end = cl_str.find("\r\n").unwrap_or(cl_str.len());
-                                        if let Ok(cl) = cl_str[..end].trim().parse::<usize>() {
-                                            let body_start = req_str.find("\r\n\r\n").unwrap() + 4;
-                                            if req_str.len() - body_start >= cl {
-                                                break;
+                                if let Some(header_end) = req_str.find("\r\n\r\n") {
+                                    let body_start = header_end + 4;
+                                    // HTTP clients serialize header names in
+                                    // lowercase (`content-length`), so the
+                                    // length must be matched
+                                    // case-insensitively. Reading the whole
+                                    // body before replying is essential:
+                                    // closing the socket while the client is
+                                    // still writing a large body (e.g. a WASM
+                                    // upload envelope) surfaces as a failed
+                                    // HTTP send.
+                                    let content_length = req_str[..header_end]
+                                        .lines()
+                                        .find_map(|line| {
+                                            let (name, value) = line.split_once(':')?;
+                                            if name.trim().eq_ignore_ascii_case("content-length") {
+                                                value.trim().parse::<usize>().ok()
+                                            } else {
+                                                None
                                             }
-                                        } else {
-                                            break;
-                                        }
-                                    } else {
+                                        })
+                                        .unwrap_or(0);
+                                    if req_str.len().saturating_sub(body_start) >= content_length {
                                         break;
                                     }
                                 }
@@ -1567,7 +2142,7 @@ fn test_estimate_fn_contract_fixture_populates_footprint_json() {
     assert_eq!(parsed["read_bytes"], 0, "expected 0 read bytes");
     assert_eq!(parsed["write_bytes"], 136, "expected 136 write bytes");
     assert_eq!(parsed["cpu_instructions"], 532_502);
-    assert_eq!(parsed["fee"]["total_stroops"], 15_427);
+    assert_eq!(parsed["fee"]["total_stroops"], 15_527);
 }
 
 #[test]
@@ -1613,8 +2188,8 @@ fn test_estimate_fn_contract_fixture_populates_footprint_table() {
         "table should display 136 write bytes"
     );
     assert!(
-        stdout.contains("15427"),
-        "table should display total fee 15427"
+        stdout.contains("15527"),
+        "table should display total fee 15527"
     );
 }
 
@@ -1656,183 +2231,733 @@ fn test_estimate_minimal_wasm_upload_zero_footprint() {
     assert_eq!(parsed["write_bytes"], 0);
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// `estimate --compare` tests (Issue #278)
-// ─────────────────────────────────────────────────────────────────────────
+/// Regression: the mock server must read the *entire* request body before
+/// answering. HTTP clients serialize header names in lowercase
+/// (`content-length`), and a large body — such as a WASM upload envelope —
+/// spans several reads. Replying early closes the socket while the client is
+/// still writing, which surfaces as "failed to send HTTP request" (observed
+/// on Windows CI for the `--diff` and cache-quota end-to-end tests).
+#[test]
+fn test_mock_rpc_server_drains_full_request_body() {
+    use std::io::{Read, Write};
 
-/// The contract ID used by the footprint fixtures below.
-const FIXTURE_CONTRACT_ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+    let (rpc_url, _stop) = start_mock_rpc_server("", "1000", 100);
+    let addr = rpc_url.strip_prefix("http://").expect("http url");
+    let mut stream = std::net::TcpStream::connect(addr).expect("connect mock server");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("set read timeout");
 
-/// Runs the CLI with logging quieted (so stdout carries only the command's
-/// own output) and `HOME` redirected into `home`.
-fn run_cli_quiet(args: &[&str], home: &Path) -> (String, String, i32) {
-    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
-        .args(args)
-        .env("HOME", home)
-        .env("USERPROFILE", home)
-        .env("RUST_LOG", "error")
-        .output()
-        .expect("failed to run CLI");
-    (
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
-        output.status.code().unwrap_or(-1),
-    )
+    // A body much larger than the server's read buffer, carrying the method
+    // name in the body (as JSON-RPC does) rather than in the request path.
+    let body = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"simulateTransaction\",\"params\":{{\"padding\":\"{}\"}}}}",
+        "x".repeat(8_000)
+    );
+    let headers = format!(
+        "POST / HTTP/1.1\r\nHost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+
+    // Headers and body are written separately so the server cannot observe
+    // the complete request in its first read.
+    stream.write_all(headers.as_bytes()).expect("write headers");
+    let _ = stream.flush();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    stream.write_all(body.as_bytes()).expect("write body");
+    let _ = stream.flush();
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read response");
+
+    assert!(
+        response.contains("minResourceFee"),
+        "server must answer simulateTransaction once the full body is read; got: {response}"
+    );
+    assert!(
+        !response.contains("Method not found"),
+        "answering before draining the body yields a bogus method-not-found reply; got: {response}"
+    );
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// `estimate --diff` — side-by-side comparison (Issue #332)
+// ─────────────────────────────────────────────────────────────────────────
+
 #[test]
-fn test_estimate_compare_flag_accepted() {
-    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--compare"]);
-    assert_ne!(code, 0, "should error on missing file, not invalid args");
-    assert!(
-        !stderr.contains("unexpected argument"),
-        "--compare should be a recognized argument; stderr: {stderr}"
-    );
-}
-
-/// The first `--compare` run has nothing to diff against; the second diffs
-/// against the entry the first run cached.
-#[test]
-fn test_estimate_compare_reports_previous_estimate_and_delta() {
-    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
-    let home = temp_home("estimate-compare-json");
-    let args = [
-        "estimate",
-        "--wasm",
-        "tests/fixtures/contract.wasm",
-        "--id",
-        FIXTURE_CONTRACT_ID,
-        "--fn",
-        "increment",
-        "--arg",
-        "1",
-        "--rpc-url",
-        &rpc_url,
-        "--compare",
-        "--json",
-    ];
-
-    // 1. No previous estimate yet.
-    let (stdout, stderr, code) = run_cli_quiet(&args, &home);
-    assert_eq!(
-        code, 0,
-        "first --compare run should succeed; stderr: {stderr}"
-    );
-    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON output");
-    assert_eq!(parsed["cpu_instructions"], 532_502);
-    assert!(
-        parsed["previous_estimate"].is_null(),
-        "first run has no baseline; got: {stdout}"
-    );
-    assert!(
-        parsed["delta"].is_null(),
-        "first run has no delta; got: {stdout}"
-    );
-
-    // 2. The cached first run is now the baseline.
-    let (stdout, stderr, code) = run_cli_quiet(&args, &home);
-    assert_eq!(
-        code, 0,
-        "second --compare run should succeed; stderr: {stderr}"
-    );
-    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON output");
-
-    assert_eq!(parsed["previous_estimate"]["cpu_instructions"], 532_502);
-    assert_eq!(parsed["previous_estimate"]["total_stroops"], 15_427);
-    assert_eq!(parsed["previous_estimate"]["io"]["read_entries"], 1);
-    assert_eq!(parsed["previous_estimate"]["io"]["write_entries"], 1);
-
-    // Same simulation both times: every delta is zero.
-    for metric in [
-        "cpu_instructions",
-        "memory_bytes",
-        "read_entries",
-        "write_entries",
-        "fee_stroops",
-    ] {
-        assert_eq!(
-            parsed["delta"][metric]["absolute"], 0,
-            "{metric} should have a zero delta; got: {stdout}"
-        );
-        assert_eq!(
-            parsed["delta"][metric]["previous"],
-            parsed["delta"][metric]["current"]
+fn test_estimate_help_lists_diff_flags() {
+    let (stdout, stderr, code) = run_cli(&["estimate", "--help"]);
+    assert_eq!(code, 0, "estimate --help should exit 0; stderr: {stderr}");
+    for flag in ["--diff", "--wasm-new"] {
+        assert!(
+            stdout.contains(flag),
+            "estimate help should mention {flag}; got: {stdout}"
         );
     }
 }
 
 #[test]
-fn test_estimate_compare_without_previous_prints_notice() {
-    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
-    let home = temp_home("estimate-compare-notice");
+fn test_estimate_diff_requires_wasm_new() {
+    let (_, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "tests/fixtures/minimal.wasm",
+        "--diff",
+    ]);
+    assert_ne!(code, 0, "--diff without --wasm-new must be rejected");
+    assert!(
+        stderr.contains("--wasm-new") || stderr.contains("required"),
+        "stderr should name the missing flag; got: {stderr}"
+    );
+}
 
-    let (stdout, stderr, code) = run_cli_quiet(
+#[test]
+fn test_estimate_wasm_new_requires_diff() {
+    let (_, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "tests/fixtures/minimal.wasm",
+        "--wasm-new",
+        "tests/fixtures/contract.wasm",
+    ]);
+    assert_ne!(code, 0, "--wasm-new without --diff must be rejected");
+    assert!(
+        stderr.contains("--wasm-new requires --diff"),
+        "stderr should explain the pairing; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_diff_table_end_to_end() {
+    let (rpc_url, _stop) = start_mock_rpc_server("", "1000", 100);
+    let home = temp_home("estimate-diff-table");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--wasm-new",
+            "tests/fixtures/contract.wasm",
+            "--diff",
+            "--rpc-url",
+            &rpc_url,
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate --diff");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate --diff should succeed; stderr: {stderr}"
+    );
+
+    // The 4-column comparison table and every required resource row.
+    for label in [
+        "Resource",
+        "Old",
+        "New",
+        "Change (+/- %)",
+        "WASM Size",
+        "CPU Instructions",
+        "RAM Bytes",
+        "Read Entries",
+        "Write Entries",
+        "Read Bytes",
+        "Write Bytes",
+        "Total Fee",
+    ] {
+        assert!(
+            stdout.contains(label),
+            "diff output should include {label}; got: {stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("Old WASM SHA-256") && stdout.contains("New WASM SHA-256"),
+        "diff should name both artifacts; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_estimate_diff_json_structure() {
+    let (rpc_url, _stop) = start_mock_rpc_server("", "1000", 100);
+    let home = temp_home("estimate-diff-json");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--wasm-new",
+            "tests/fixtures/contract.wasm",
+            "--diff",
+            "--rpc-url",
+            &rpc_url,
+            "--json",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate --diff --json");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate --diff --json should succeed; stderr: {stderr}"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    assert_eq!(parsed["identity"]["function"], "(wasm upload)");
+    assert_eq!(parsed["identity"]["network"], "testnet");
+
+    let rows = parsed["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 8, "one row per compared resource");
+    assert_eq!(rows[0]["resource"], "WASM Size");
+    // The two fixtures differ in size, so the WASM row must carry a delta.
+    assert!(
+        rows[0]["delta"].as_i64().unwrap_or(0) != 0,
+        "WASM Size should differ between the fixtures: {}",
+        rows[0]
+    );
+    assert!(
+        rows[0]["direction"].is_string(),
+        "each row carries a direction: {}",
+        rows[0]
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Cache quotas & maintenance (Issues #333 / #334)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_cache_quota_flags_are_accepted() {
+    // Global quota flags must parse in both positions and reach the run.
+    let home = temp_home("cache-quota-flags");
+    let (stdout, stderr, code) = run_cli_in_home(
         &[
+            "--max-cache-size-mb",
+            "1",
+            "cache",
+            "stats",
+            "--max-cache-entries",
+            "25",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "cache stats should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("Byte quota:") && stdout.contains("1.0 MB"),
+        "stats should report the configured byte quota; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("25"),
+        "stats should report the configured entry quota; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_prune_empty_cache_reports_zero() {
+    let home = temp_home("cache-prune-empty");
+    let (stdout, stderr, code) = run_cli_in_home(&["cache", "prune"], Some(&home));
+    assert_eq!(code, 0, "cache prune should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("Evicted 0 cached estimate(s)."),
+        "an under-quota cache should evict nothing; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_help_lists_stats_and_prune() {
+    let (stdout, stderr, code) = run_cli(&["cache", "--help"]);
+    assert_eq!(code, 0, "cache --help should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("stats"),
+        "cache help should list stats; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("prune"),
+        "cache help should list prune; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_estimate_evicts_when_entry_quota_exceeded() {
+    // With a 1-entry quota, two estimates on distinct keys leave exactly one
+    // cached row behind — proven through the CLI surface, not the library.
+    let (rpc_url, _stop) = start_mock_rpc_server("", "1000", 100);
+    let home = temp_home("estimate-evict-quota");
+
+    for wasm in [
+        "tests/fixtures/minimal.wasm",
+        "tests/fixtures/contract.wasm",
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+            .args([
+                "--max-cache-entries",
+                "1",
+                "estimate",
+                "--wasm",
+                wasm,
+                "--rpc-url",
+                &rpc_url,
+                "--json",
+            ])
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("RUST_LOG", "error")
+            .output()
+            .expect("failed to run estimate");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "estimate should succeed; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // RUST_LOG=error keeps tracing output off stdout so the JSON parses.
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(["cache", "query", "--json"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run cache query");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "cache query should exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON; got: {stdout}");
+    assert_eq!(
+        parsed.as_array().map(Vec::len),
+        Some(1),
+        "the entry quota should leave exactly one cached estimate; got: {stdout}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Shell completions
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_completions_help() {
+    let (stdout, stderr, code) = run_cli(&["completions", "--help"]);
+    assert_eq!(
+        code, 0,
+        "completions --help should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("bash"),
+        "completions help should list bash option"
+    );
+    assert!(
+        stdout.contains("zsh"),
+        "completions help should list zsh option"
+    );
+    assert!(
+        stdout.contains("fish"),
+        "completions help should list fish option"
+    );
+    assert!(
+        stdout.contains("powershell"),
+        "completions help should list powershell option"
+    );
+}
+
+#[test]
+fn test_completions_bash() {
+    let (stdout, stderr, code) = run_cli(&["completions", "bash"]);
+    assert_eq!(code, 0, "completions bash should exit 0; stderr: {stderr}");
+    assert!(!stdout.is_empty(), "completion script should not be empty");
+    assert!(
+        stdout.contains("soroban-cost-estimator"),
+        "bash completion script should contain binary name"
+    );
+    assert!(
+        stdout.contains("estimate"),
+        "bash completion script should contain subcommand names"
+    );
+}
+
+#[test]
+fn test_completions_zsh() {
+    let (stdout, stderr, code) = run_cli(&["completions", "zsh"]);
+    assert_eq!(code, 0, "completions zsh should exit 0; stderr: {stderr}");
+    assert!(!stdout.is_empty(), "completion script should not be empty");
+    assert!(
+        stdout.contains("soroban-cost-estimator"),
+        "zsh completion script should contain binary name"
+    );
+    assert!(
+        stdout.contains("estimate"),
+        "zsh completion script should contain subcommand names"
+    );
+}
+
+#[test]
+fn test_completions_fish() {
+    let (stdout, stderr, code) = run_cli(&["completions", "fish"]);
+    assert_eq!(code, 0, "completions fish should exit 0; stderr: {stderr}");
+    assert!(!stdout.is_empty(), "completion script should not be empty");
+    assert!(
+        stdout.contains("soroban-cost-estimator"),
+        "fish completion script should contain binary name"
+    );
+    assert!(
+        stdout.contains("estimate"),
+        "fish completion script should contain subcommand names"
+    );
+}
+
+#[test]
+fn test_completions_powershell() {
+    let (stdout, stderr, code) = run_cli(&["completions", "powershell"]);
+    assert_eq!(
+        code, 0,
+        "completions powershell should exit 0; stderr: {stderr}"
+    );
+    assert!(!stdout.is_empty(), "completion script should not be empty");
+    assert!(
+        stdout.contains("soroban-cost-estimator"),
+        "powershell completion script should contain binary name"
+    );
+    assert!(
+        stdout.contains("estimate"),
+        "powershell completion script should contain subcommand names"
+    );
+}
+
+#[test]
+fn test_completions_unsupported_shell() {
+    let (_stdout, stderr, code) = run_cli(&["completions", "invalid_shell"]);
+    assert_ne!(code, 0, "unsupported shell should exit non-zero");
+    assert!(
+        stderr.contains("invalid value 'invalid_shell'") || stderr.contains("unexpected argument"),
+        "stderr should state invalid shell value; got: {stderr}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Cost projections (`--project`)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_estimate_project_flag_custom_counts_table() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-project-table");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
             "estimate",
             "--wasm",
             "tests/fixtures/contract.wasm",
             "--id",
-            FIXTURE_CONTRACT_ID,
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
             "--fn",
             "increment",
             "--arg",
             "1",
             "--rpc-url",
             &rpc_url,
-            "--compare",
-        ],
-        &home,
+            "--project",
+            "100,1000,10000",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate should succeed; stderr: {stderr}"
     );
-    assert_eq!(code, 0, "estimate should succeed; stderr: {stderr}");
-    assert!(
-        stdout.contains("No previous estimate found for comparison"),
-        "the notice should be printed; got: {stdout}"
-    );
+
+    assert!(stdout.contains("Cost Projections:"));
+    assert!(stdout.contains("Invocations"));
+    assert!(stdout.contains("Total Stroops"));
+    assert!(stdout.contains("Total XLM"));
+    assert!(stdout.contains("USD"));
+    assert!(stdout.contains("100"));
+    assert!(stdout.contains("1,552,700"));
+    assert!(stdout.contains("0.1552700"));
+    assert!(stdout.contains("1,000"));
+    assert!(stdout.contains("15,527,000"));
+    assert!(stdout.contains("1.5527000"));
+    assert!(stdout.contains("10,000"));
+    assert!(stdout.contains("155,270,000"));
+    assert!(stdout.contains("15.5270000"));
+    assert!(stdout.contains('-'));
 }
 
 #[test]
-fn test_estimate_compare_table_shows_delta_section() {
+fn test_estimate_project_flag_default_counts() {
     let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
-    let home = temp_home("estimate-compare-table");
-    let base = [
+    let home = temp_home("estimate-project-default");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+            "--project",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate should succeed; stderr: {stderr}"
+    );
+
+    assert!(stdout.contains("Cost Projections:"));
+    assert!(stdout.contains("100"));
+    assert!(stdout.contains("1,000"));
+    assert!(stdout.contains("10,000"));
+}
+
+#[test]
+fn test_estimate_project_flag_preserves_order() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-project-order");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+            "--project",
+            "10000,100,1000",
+            "--json",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate should succeed; stderr: {stderr}"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    let projections = parsed["projections"].as_array().expect("projections array");
+    assert_eq!(projections.len(), 3);
+    assert_eq!(projections[0]["invocations"], 10000);
+    assert_eq!(projections[1]["invocations"], 100);
+    assert_eq!(projections[2]["invocations"], 1000);
+}
+
+#[test]
+fn test_estimate_no_project_flag_omits_projections() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-no-project");
+
+    // Table mode without --project
+    let output_table = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout_table = String::from_utf8_lossy(&output_table.stdout);
+    assert!(!stdout_table.contains("Cost Projections:"));
+
+    // JSON mode without --project
+    let output_json = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+            "--json",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout_json = String::from_utf8_lossy(&output_json.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout_json.trim()).expect("valid JSON output; got: {stdout_json}");
+    assert!(parsed.get("projections").is_none());
+}
+
+#[test]
+fn test_estimate_project_json_structure() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-project-json");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+            "--project",
+            "100,1000,10000",
+            "--json",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate should succeed; stderr: {stderr}"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    let projections = parsed["projections"].as_array().expect("projections array");
+    assert_eq!(projections.len(), 3);
+
+    assert_eq!(projections[0]["invocations"], 100);
+    assert_eq!(projections[0]["total_stroops"], 1_552_700);
+    assert_eq!(projections[0]["total_xlm"], "0.1552700");
+    assert!(projections[0].get("usd").is_none());
+
+    assert_eq!(projections[1]["invocations"], 1000);
+    assert_eq!(projections[1]["total_stroops"], 15_527_000);
+    assert_eq!(projections[1]["total_xlm"], "1.5527000");
+
+    assert_eq!(projections[2]["invocations"], 10000);
+    assert_eq!(projections[2]["total_stroops"], 155_270_000);
+    assert_eq!(projections[2]["total_xlm"], "15.5270000");
+}
+
+#[test]
+fn test_estimate_project_invalid_input_error() {
+    let (_stdout, stderr, code) = run_cli(&[
         "estimate",
         "--wasm",
         "tests/fixtures/contract.wasm",
-        "--id",
-        FIXTURE_CONTRACT_ID,
-        "--fn",
-        "increment",
-        "--arg",
-        "1",
-        "--rpc-url",
-        &rpc_url,
-    ];
-
-    // Populate the cache, then compare against it in table mode.
-    let (_, stderr, code) = run_cli_quiet(&base, &home);
-    assert_eq!(code, 0, "populating run should succeed; stderr: {stderr}");
-    let mut args = base.to_vec();
-    args.push("--compare");
-    let (stdout, stderr, code) = run_cli_quiet(&args, &home);
-
-    assert_eq!(code, 0, "--compare run should succeed; stderr: {stderr}");
+        "--project",
+        "abc",
+    ]);
+    assert_ne!(code, 0, "invalid projection count 'abc' should fail");
     assert!(
-        stdout.contains("Cost delta vs previous estimate"),
-        "table mode should render the delta section; got: {stdout}"
+        stderr.contains("invalid projection count 'abc'"),
+        "stderr should mention invalid count: {stderr}"
     );
-    for label in [
-        "CPU Instructions",
-        "Memory Bytes",
-        "Read Entries",
-        "Write Entries",
-    ] {
-        assert!(
-            stdout.contains(label),
-            "delta section should include {label}; got: {stdout}"
-        );
-    }
+
+    let (_, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--project",
+        "100,abc,1000",
+    ]);
+    assert_ne!(
+        code, 0,
+        "invalid projection count '100,abc,1000' should fail"
+    );
     assert!(
-        stdout.contains("Fee (stroops)"),
-        "delta section should include the fee row; got: {stdout}"
+        stderr.contains("invalid projection count 'abc'"),
+        "stderr should mention invalid count: {stderr}"
+    );
+
+    let (_, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--project",
+        "0",
+    ]);
+    assert_ne!(code, 0, "projection count 0 should fail");
+    assert!(
+        stderr.contains("greater than zero"),
+        "stderr should mention greater than zero: {stderr}"
+    );
+
+    let (_, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--project",
+        "100,100",
+    ]);
+    assert_ne!(code, 0, "duplicate projection count should fail");
+    assert!(
+        stderr.contains("duplicate projection count: 100"),
+        "stderr should mention duplicate count: {stderr}"
     );
 }

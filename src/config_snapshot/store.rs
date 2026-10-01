@@ -78,6 +78,38 @@ pub fn load_latest_snapshot(network: &str) -> AppResult<ConfigSnapshot> {
     Ok(snapshot)
 }
 
+/// Loads the two most recent snapshots for a network, oldest first.
+///
+/// Returns `(previous, latest)` — the pair that `config diff
+/// --against-previous` compares. [`list_snapshots`] already orders files
+/// oldest → newest, so the last two entries are snapshot N-1 and snapshot N.
+///
+/// # Errors
+/// [`AppError::NotEnoughSnapshots`] when the network has fewer than two
+/// snapshots on disk — a diff needs two points in time to be meaningful.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn load_last_two_snapshots(network: &str) -> AppResult<(ConfigSnapshot, ConfigSnapshot)> {
+    debug!(network, "loading the two most recent snapshots");
+    let paths = list_snapshots(network)?;
+    if paths.len() < 2 {
+        return Err(AppError::NotEnoughSnapshots {
+            network: network.to_string(),
+            found: paths.len(),
+        });
+    }
+
+    let previous = load_snapshot_from_path(&paths[paths.len() - 2].to_string_lossy())?;
+    let latest = load_snapshot_from_path(&paths[paths.len() - 1].to_string_lossy())?;
+    trace!(
+        previous = paths[paths.len() - 2].display().to_string(),
+        latest = paths[paths.len() - 1].display().to_string(),
+        "loaded snapshot pair"
+    );
+    Ok((previous, latest))
+}
+
 /// Loads a specific snapshot from an explicit path.
 ///
 /// # Network calls
@@ -213,4 +245,61 @@ fn validate_single_snapshot(path: &std::path::Path) -> AppResult<()> {
     }
 
     Ok(())
+}
+
+/// A bundle of config snapshots for export/import.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotBundle {
+    pub snapshots: Vec<ConfigSnapshot>,
+}
+
+/// Exports snapshots to a single JSON bundle file.
+pub fn export_snapshots(network: Option<&str>, output_path: &str) -> AppResult<()> {
+    let dir = snapshots_dir()?;
+    let mut snapshots = Vec::new();
+
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let name_str = entry.file_name().to_string_lossy().into_owned();
+        if !name_str.ends_with(".json") {
+            continue;
+        }
+        if let Some(net) = network {
+            if !name_str.starts_with(&format!("{}-", net)) {
+                continue;
+            }
+        }
+        let content = std::fs::read_to_string(entry.path())?;
+        if let Ok(snapshot) = serde_json::from_str::<ConfigSnapshot>(&content) {
+            snapshots.push(snapshot);
+        }
+    }
+
+    let bundle = SnapshotBundle { snapshots };
+    let json = serde_json::to_string_pretty(&bundle)
+        .map_err(|e| AppError::General(format!("Failed to serialize bundle: {}", e)))?;
+    std::fs::write(output_path, json)?;
+    Ok(())
+}
+
+/// Imports snapshots from a JSON bundle file.
+pub fn import_snapshots(bundle_path: &str) -> AppResult<usize> {
+    let content = std::fs::read_to_string(bundle_path)?;
+    let bundle: SnapshotBundle = serde_json::from_str(&content)
+        .map_err(|e| AppError::SnapshotParse(format!("Invalid bundle: {}", e)))?;
+
+    let mut imported = 0;
+    for snapshot in bundle.snapshots {
+        let ts_safe = snapshot.timestamp.replace(':', "-");
+        let filename = format!("{}-{}.json", snapshot.network, ts_safe);
+        let path = snapshots_dir()?.join(&filename);
+        if !path.exists() {
+            let json = serde_json::to_string_pretty(&snapshot)
+                .map_err(|e| AppError::General(format!("Failed to serialize snapshot: {}", e)))?;
+            std::fs::write(&path, json)?;
+            imported += 1;
+            println!("  Imported snapshot: {}", filename);
+        }
+    }
+    Ok(imported)
 }
