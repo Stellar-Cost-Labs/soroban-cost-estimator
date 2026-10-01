@@ -96,15 +96,12 @@ soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
   other flag — including `--cache-ttl`, which then starts from an empty
   cache. Useful after upgrading the tool, after a network upgrade, or after
   debugging a bad estimate.
-- **`--compare`** diffs the fresh simulation against the estimate previously
-  cached for the same function and arguments, appending a section with the
-  absolute **and** percentage change for CPU instructions, memory bytes,
-  ledger read/write entries, and the total fee — e.g. `+12400 (+5.2%)`.
-  I/O rows appear only when the previous estimate recorded its footprint
-  (entries cached by older builds did not). When nothing was cached for the
-  key yet, it prints `No previous estimate found for comparison`. With
-  `--json`, the payload gains `previous_estimate` and `delta` objects
-  (`null` when there is no baseline).
+- **`--no-cache`** bypasses the cache on both sides: the `--cache-ttl` lookup
+  never short-circuits the run (a live RPC simulation always executes) and the
+  fresh result is **not** written back to disk, so the run leaves no trace in
+  the cache. Unlike `--clear-cache`, it deletes nothing — use it to benchmark
+  network changes or debug transient state differences without disturbing the
+  entries you already have.
 - **Exit codes**: 0 on success, 1 on any error (simulation failure, missing
   WASM file, network error, etc.).
 
@@ -230,6 +227,7 @@ soroban-cost-estimator estimate-all [OPTIONS] --wasm <WASM>
 | `--wasm <WASM>` | `-w` | ✅ | — | Path to the compiled Soroban contract `.wasm` file |
 | `--network <NETWORK>` | | | `testnet` | Network to simulate against |
 | `--id <ID>` | | | — | Deployed contract ID (64 hex chars) to invoke each function against |
+| `--no-cache` | | | `false` | Bypass the cache entirely: never read cached estimates, never write fresh results |
 | `--json` | | | `false` | Output as JSON instead of a human-readable list |
 | `--help` | `-h` | | | Print help |
 

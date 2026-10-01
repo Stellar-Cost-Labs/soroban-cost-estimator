@@ -254,6 +254,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cache_ttl,
             compare,
             clear_cache,
+            no_cache,
             json,
             auto_snapshot,
             diff,
@@ -280,6 +281,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 cache_ttl.as_deref(),
                 compare,
                 clear_cache,
+                no_cache,
                 format.as_str(),
                 rps,
                 timeout,
@@ -302,6 +304,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             network,
             rpc_url,
             id,
+            no_cache,
             fn_names,
             json,
             auto_snapshot,
@@ -317,6 +320,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 rpc_url.as_deref().or(default_rpc_url.as_deref()),
                 fallback,
                 id.as_deref(),
+                no_cache,
                 &fn_names,
                 format.as_str(),
                 rps,
@@ -832,6 +836,7 @@ async fn cmd_estimate(
     cache_ttl: Option<&str>,
     compare: bool,
     clear_cache: bool,
+    no_cache: bool,
     format: &str,
     rps: Option<u64>,
     timeout: u64,
@@ -914,6 +919,7 @@ async fn cmd_estimate(
         cache_ttl,
         compare,
         clear_cache,
+        no_cache,
         format,
         precision,
         extra_headers,
@@ -1039,6 +1045,7 @@ async fn estimate_once(
     cache_ttl: Option<&str>,
     compare: bool,
     clear_cache: bool,
+    no_cache: bool,
     format: &str,
     precision: u32,
     extra_headers: &[String],
@@ -1111,9 +1118,16 @@ async fn estimate_once(
         };
 
         // With --cache-ttl, reuse a still-fresh cached estimate and skip the
-        // (expensive) simulation entirely.
+        // (expensive) simulation entirely. `--no-cache` opts out of cache
+        // reads altogether, so the TTL never short-circuits the simulation.
         let ttl_secs = cache_ttl.map(parse_interval_secs);
-        if let Some(fresh) = fresh_cached_estimate(&wasm_hash, &function_name, args, ttl_secs)? {
+        let fresh = if no_cache {
+            // Bypass every cache read, even under `--cache-ttl`.
+            None
+        } else {
+            fresh_cached_estimate(&wasm_hash, &function_name, args, ttl_secs)?
+        };
+        if let Some(fresh) = fresh {
             let ttl_secs = ttl_secs.unwrap_or_default();
             info!(ttl_secs, function = %function_name, "cache hit — reusing fresh estimate");
             print_cached_estimate(&fresh, ttl_secs, json_flag, precision);
@@ -1204,26 +1218,22 @@ async fn estimate_once(
         })
         .await?;
 
-        // Persist the full footprint — including ledger I/O — so a later
-        // `--compare` run can diff entry counts against this one.
-        let _ = cache::save_estimate_with_io(
-            &wasm_hash,
-            function_name,
-            args,
-            network,
-            report.ledger,
-            report.fee.total_stroops,
-            report.cpu_instructions,
-            report.memory_bytes,
-            cache::IoFootprint {
-                read_entries: report.read_entries,
-                write_entries: report.write_entries,
-                read_bytes: report.read_bytes,
-                write_bytes: report.write_bytes,
-            },
-            Some(report.rpc_latency_ms),
-            true,
-        );
+        // `--no-cache` also suppresses the write, so a bypassed run leaves
+        // no trace in the local cache.
+        if !no_cache {
+            let _ = cache::save_estimate(
+                &wasm_hash,
+                function_name,
+                args,
+                network,
+                report.ledger,
+                report.fee.total_stroops,
+                report.cpu_instructions,
+                report.memory_bytes,
+                Some(report.rpc_latency_ms),
+                true,
+            );
+        }
         info!(
             total_stroops = report.fee.total_stroops,
             total_xlm = %report.fee.total_xlm,
@@ -1385,6 +1395,9 @@ async fn emit_watch_estimate(
         // `--compare` is a single-shot flag; watch mode reports its own
         // build-over-build delta in the per-build header instead.
         false,
+        false,
+        // `--no-cache` is a single-shot flag; the watcher keeps using the
+        // cache so repeated polls stay cheap.
         false,
         format,
         precision,
@@ -1846,12 +1859,14 @@ fn csv_row(r: &EstimateAllResult) -> String {
 /// envelope is built against an undeployed contract, or identical fee-rate
 /// lookups — transmit each distinct `(method, params)` pair only once.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::fn_params_excessive_bools)]
 async fn cmd_estimate_all(
     wasm_path: &str,
     network: &str,
     rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     contract_id: Option<&str>,
+    no_cache: bool,
     fn_names: &[String],
     format: &str,
     rps: Option<u64>,
@@ -1989,6 +2004,7 @@ async fn cmd_estimate_all(
                 &wasm_info,
                 fn_info,
                 contract_id,
+                no_cache,
                 &wasm_hash,
                 network,
                 json_flag,
@@ -2110,6 +2126,7 @@ async fn estimate_all_function(
     wasm_info: &wasm::parser::WasmInfo,
     fn_info: &wasm::parser::FunctionInfo,
     contract_id: Option<&str>,
+    no_cache: bool,
     wasm_hash: &str,
     network: &str,
     json_flag: bool,
@@ -2174,18 +2191,22 @@ async fn estimate_all_function(
 
                 debug!(cpu, mem, total_fee, ledger, "simulation complete");
 
-                let _ = cache::save_estimate(
-                    wasm_hash,
-                    &fn_info.name,
-                    &[],
-                    network,
-                    ledger,
-                    total_fee,
-                    cpu,
-                    mem,
-                    duration_ms,
-                    true,
-                );
+                // `--no-cache` suppresses the write so a bypassed batch run
+                // leaves the local cache untouched.
+                if !no_cache {
+                    let _ = cache::save_estimate(
+                        wasm_hash,
+                        &fn_info.name,
+                        &[],
+                        network,
+                        ledger,
+                        total_fee,
+                        cpu,
+                        mem,
+                        duration_ms,
+                        true,
+                    );
+                }
 
                 // Itemize the fee breakdown only when we have the network's fee
                 // rates (JSON mode). Otherwise emit a minimal breakdown with just
@@ -3481,6 +3502,8 @@ async fn cmd_cache_warm(
         rpc_url,
         rpc_fallback_url,
         contract_id,
+        // `cache warm` exists to populate the cache, so it never bypasses it.
+        false,
         &[],
         fmt,
         rps,
