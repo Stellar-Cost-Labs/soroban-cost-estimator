@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when fewer than two exist for the network.
 - `--timeout` global flag — configurable HTTP request timeout for RPC calls
   in seconds (default 30).
+- `--rpc-url` override on `config snapshot`, `config diff`, and `watch` —
+  fetch/monitor network config from a custom RPC endpoint (e.g. a local
+  `stellar/quickstart` node) instead of the well-known testnet/mainnet/
+  futurenet URLs.
 - `config diff --summary` — print a single-line summary
   (`X pricing changes, Y non-pricing changes`) instead of the full diff, for CI
   status lines. Exit code and auto-save side effects are unchanged.
