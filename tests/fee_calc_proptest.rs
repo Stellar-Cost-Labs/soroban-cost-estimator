@@ -106,6 +106,7 @@ fn maximum_resource_values_do_not_panic_or_overflow() {
         DEFAULT_PRECISION,
     );
 
+    assert_eq!(breakdown.non_refundable_stroops, i64::MAX);
     assert!(breakdown.refundable_stroops >= 0);
     assert_eq!(breakdown.total_stroops, i64::MAX);
     assert!(!breakdown.total_xlm.is_empty());
@@ -203,6 +204,51 @@ proptest! {
         prop_assert_eq!(
             xlm_to_stroops(&breakdown.total_xlm).unwrap(),
             expected_total_stroops
+        );
+    }
+
+    /// For valid simulations, the authoritative resource fee covers the
+    /// rate-derived non-refundable portion. Adding the refundable remainder
+    /// and base inclusion fee must reconcile with the total without overflow.
+    #[test]
+    fn valid_total_fee_covers_its_parts(
+        quantities in realistic_quantities(),
+        rates in realistic_rates(),
+        extra_resource_fee in 0..1_000_000i64,
+    ) {
+        let (cpu_insns, read_entries, write_entries, read_bytes, tx_size) = quantities;
+        let preliminary = compute_fee_breakdown(
+            0,
+            cpu_insns,
+            read_entries,
+            write_entries,
+            read_bytes,
+            tx_size,
+            rates,
+            DEFAULT_PRECISION,
+        );
+        let total_resource_fee = preliminary
+            .non_refundable_stroops
+            .saturating_add(extra_resource_fee);
+        let breakdown = compute_fee_breakdown(
+            total_resource_fee,
+            cpu_insns,
+            read_entries,
+            write_entries,
+            read_bytes,
+            tx_size,
+            rates,
+            DEFAULT_PRECISION,
+        );
+        let resource_parts = breakdown
+            .non_refundable_stroops
+            .saturating_add(breakdown.refundable_stroops);
+
+        prop_assert!(breakdown.refundable_stroops >= 0);
+        prop_assert!(breakdown.total_stroops >= resource_parts);
+        prop_assert_eq!(
+            breakdown.total_stroops,
+            resource_parts.saturating_add(breakdown.base_fee_stroops)
         );
     }
 
