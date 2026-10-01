@@ -542,7 +542,10 @@ pub fn format_batch_report_table(report: &BatchCostReport) -> String {
 
     output.push_str(&table.to_string());
     output.push('\n');
-    output.push_str(&format!("\n{} succeeded, {} failed.\n", report.succeeded, report.failed));
+    output.push_str(&format!(
+        "\n{} succeeded, {} failed.\n",
+        report.succeeded, report.failed
+    ));
 
     let errors: Vec<&ContractCostSummary> = report
         .contracts
