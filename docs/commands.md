@@ -49,6 +49,7 @@ soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
 | `--id <ID>` | | | — | Deployed contract ID (64 hex chars). Required when `--fn` is used |
 | `--arg <KEY=VAL>` | | | — | Function arguments as `key=value` pairs (value is type-inferred; repeatable) |
 | `--cache-ttl <DURATION>` | | | — | Skip re-simulation when a cached estimate is still fresh (e.g. `30m`, `1h`, `7d`) |
+| `--compare` | | | `false` | Show the cost delta against the previous cached estimate for the same function and arguments |
 | `--clear-cache` | | | `false` | Wipe every cached estimate for `--network` before running the simulation |
 | `--diff` | | | `false` | Compare two WASM builds side by side. Requires `--wasm-new` |
 | `--wasm-new <PATH>` | | | — | The "new" WASM build to compare against when `--diff` is set |
