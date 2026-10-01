@@ -360,6 +360,26 @@ mod tests {
         }
     }
 
+    /// Issue #354: `scaled_fee` keeps the intermediate multiplication in
+    /// `i128`, so extreme unit counts and rates saturate at the stroop
+    /// boundary instead of wrapping (or panicking) in `i64`.
+    #[test]
+    fn test_scaled_fee_saturates_at_i64_bounds() {
+        // Ordinary `(units * rate) / divisor` scaling, floor-divided.
+        assert_eq!(scaled_fee(100_000, 1024, 10_000), 10_240);
+        assert_eq!(scaled_fee(9_999, 1, 10_000), 0);
+        // Negative rates stay negative (division truncates toward zero).
+        assert_eq!(scaled_fee(1, -10_000, 10_000), -1);
+        // `u64::MAX * i64::MAX` overflows `i64` but not `i128`, so the fee is
+        // clamped to the representable maximum rather than wrapping.
+        assert_eq!(scaled_fee(u64::MAX, i64::MAX, 1), i64::MAX);
+        // Negative products clamp to the representable minimum.
+        assert_eq!(scaled_fee(u64::MAX, i64::MIN, 1), i64::MIN);
+        // Zero units always cost zero, whatever the rate.
+        assert_eq!(scaled_fee(0, i64::MAX, 10_000), 0);
+        assert_eq!(scaled_fee(0, i64::MIN, 1024), 0);
+    }
+
     #[test]
     fn test_zero_resource_fee_does_not_produce_negative_refundable() {
         // Regression: this input used to produce a negative refundable
