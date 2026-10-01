@@ -8,6 +8,7 @@ Simulate a single contract invocation and print the cost report.
 Usage: soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
 
 Options:
+      --format <FORMAT>    Output format: table, json, csv, or markdown [default: table]
   -w, --wasm <WASM>        Path to the compiled Soroban contract `.wasm` file
       --network <NETWORK>  Network to simulate against [default: testnet]
       --rpc-url <RPC_URL>  Explicit RPC URL (overrides network-based resolution)
@@ -61,6 +62,7 @@ This is the exact invocation cross-checked against the native Stellar CLI
 ```text
 Function: increment
 Network: testnet (ledger 3961551)
+Simulated at ledger sequence: 3,961,551
 WASM hash: ea14bca998e98f0ddb338e8e5cef6e19f07378a3b71e8b4f8868cedc857e4ecd
 
 +------------------+----------+---------------+
@@ -118,10 +120,15 @@ soroban-cost-estimator estimate \
     "total_stroops": 17122,
     "total_xlm": "0.0017122"
   },
-  "ledger": 3961544,
+  "ledger_sequence": 3961544,
   "network": "testnet"
 }
 ```
 
-Use `--json` when feeding the result into a CI pipeline or another tool. The
+The `ledger_sequence` field records the ledger the simulation ran against,
+so consumers can tell how fresh an estimate is. The human-readable header
+renders the same value with thousands separators as
+`Simulated at ledger sequence: 3,961,544`.
+
+Use `--format json`, `--format csv`, or `--format markdown` when feeding the result into CI, spreadsheets, or documentation. `--json` remains a backward-compatible alias for `--format json`. The
 result is also written to the estimate cache(see [Caching](../concepts/caching.md)).

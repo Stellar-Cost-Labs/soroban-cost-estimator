@@ -1,20 +1,121 @@
 use crate::config_snapshot::model::{
     ConfigSnapshot, ContractBandwidthV0, ContractComputeV0, ContractEventsV0,
-    ContractHistoricalDataV0, ContractLedgerCostV0, StateArchivalV0,
+    ContractHistoricalDataV0, ContractLedgerCostV0, StateArchivalV0, config_setting_human_name,
+    config_setting_id_for_prefix,
 };
+
+/// Returns a human-readable explanation for a given config setting field path.
+///
+/// Each explanation describes what the setting controls and the unit of
+/// its value (stroops, bytes, instructions, etc.).
+pub fn setting_explanation(field_path: &str) -> Option<&'static str> {
+    match field_path {
+        "contract_compute.ledger_max_instructions" => {
+            Some("Maximum CPU instructions a single ledger can execute across all transactions")
+        }
+        "contract_compute.tx_max_instructions" => {
+            Some("Maximum CPU instructions a single transaction can execute")
+        }
+        "contract_compute.fee_rate_per_instructions_increment" => {
+            Some("Stroops charged per 10,000 CPU instructions (non-refundable fee)")
+        }
+        "contract_compute.tx_memory_limit" => {
+            Some("Maximum memory (in bytes) a single transaction can allocate")
+        }
+        "contract_ledger_cost.ledger_max_disk_read_entries" => {
+            Some("Maximum ledger entries readable per ledger")
+        }
+        "contract_ledger_cost.ledger_max_disk_read_bytes" => {
+            Some("Maximum bytes readable from disk per ledger")
+        }
+        "contract_ledger_cost.ledger_max_write_ledger_entries" => {
+            Some("Maximum ledger entries writable per ledger")
+        }
+        "contract_ledger_cost.ledger_max_write_bytes" => {
+            Some("Maximum bytes writable to disk per ledger")
+        }
+        "contract_ledger_cost.fee_disk_read_ledger_entry" => {
+            Some("Stroops charged per ledger entry read (non-refundable fee)")
+        }
+        "contract_ledger_cost.fee_write_ledger_entry" => {
+            Some("Stroops charged per ledger entry written (non-refundable fee)")
+        }
+        "contract_ledger_cost.fee_disk_read1_kb" => {
+            Some("Stroops charged per 1 KB read from disk (non-refundable fee)")
+        }
+        "contract_ledger_cost.soroban_state_target_size_bytes" => {
+            Some("Target total Soroban state size in bytes for rent fee calculation")
+        }
+        "contract_ledger_cost.rent_fee1_kb_soroban_state_size_low" => {
+            Some("Rent fee per 1 KB when Soroban state is below the target size")
+        }
+        "contract_ledger_cost.rent_fee1_kb_soroban_state_size_high" => {
+            Some("Rent fee per 1 KB when Soroban state is above the target size")
+        }
+        "contract_ledger_cost.soroban_state_rent_fee_growth_factor" => {
+            Some("Growth factor applied to rent fees as state grows")
+        }
+        "contract_historical_data.fee_historical1_kb" => {
+            Some("Stroops charged per 1 KB of historical (archive) data")
+        }
+        "contract_events.tx_max_contract_events_size_bytes" => {
+            Some("Maximum total size of events (in bytes) per transaction")
+        }
+        "contract_events.fee_contract_events1_kb" => {
+            Some("Stroops charged per 1 KB of events (refundable fee)")
+        }
+        "contract_bandwidth.ledger_max_txs_size_bytes" => {
+            Some("Maximum total transaction size (in bytes) per ledger")
+        }
+        "contract_bandwidth.tx_max_size_bytes" => {
+            Some("Maximum size (in bytes) of a single transaction")
+        }
+        "contract_bandwidth.fee_tx_size1_kb" => {
+            Some("Stroops charged per 1 KB of transaction size (non-refundable fee)")
+        }
+        "state_archival.max_entry_ttl" => {
+            Some("Maximum time-to-live (in ledgers) for a contract data entry")
+        }
+        "state_archival.min_temporary_ttl" => {
+            Some("Minimum TTL (in ledgers) for temporary contract data entries")
+        }
+        "state_archival.min_persistent_ttl" => {
+            Some("Minimum TTL (in ledgers) for persistent contract data entries")
+        }
+        "state_archival.persistent_rent_rate_denominator" => {
+            Some("Denominator for the persistent entry rent rate formula")
+        }
+        "state_archival.temp_rent_rate_denominator" => {
+            Some("Denominator for the temporary entry rent rate formula")
+        }
+        "state_archival.max_entries_to_archive" => {
+            Some("Maximum entries archived in a single archival sweep")
+        }
+        "state_archival.live_soroban_state_size_window_sample_size" => {
+            Some("Number of samples in the live Soroban state size window")
+        }
+        "state_archival.live_soroban_state_size_window_sample_period" => {
+            Some("Period (in ledgers) between Soroban state size samples")
+        }
+        "state_archival.eviction_scan_size" => Some("Number of entries scanned per eviction sweep"),
+        "state_archival.starting_eviction_scan_level" => {
+            Some("B-tree level at which eviction scanning begins")
+        }
+        _ => None,
+    }
+}
 
 /// Maps a config setting prefix to its human-readable name.
 ///
-/// Matches the XDR enum variant names from `ConfigSettingId`.
+/// Names come from [`config_setting_human_name`] (resolved through
+/// [`config_setting_id_for_prefix`]) so diff tables, diff headers, and
+/// `--json` payloads always agree. Unknown prefixes fall back to the raw
+/// field path.
 pub fn setting_display_name(field_path: &str) -> &str {
-    match field_path.split('.').next() {
-        Some("contract_compute") => "Contract Compute V0",
-        Some("contract_ledger_cost") => "Contract Ledger Cost V0",
-        Some("contract_historical_data") => "Contract Historical Data V0",
-        Some("contract_events") => "Contract Events V0",
-        Some("contract_bandwidth") => "Contract Bandwidth V0",
-        Some("state_archival") => "State Archival",
-        _ => field_path,
+    let prefix = field_path.split('.').next().unwrap_or(field_path);
+    match config_setting_id_for_prefix(prefix) {
+        Some(id) => config_setting_human_name(&id),
+        None => field_path,
     }
 }
 
@@ -67,16 +168,52 @@ pub fn field_display_name(field_path: &str) -> String {
 }
 
 /// A single changed field between two snapshots.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct FieldDiff {
     pub field_path: String,
+    /// Raw `ConfigSettingId` number (e.g. `0` for contract compute), or
+    /// `None` when the path's setting prefix is unknown.
+    pub setting_id: Option<u32>,
+    /// Friendly setting name (e.g. `Contract Compute V0`) for `field_path`.
+    pub setting_name: String,
     pub old_value: String,
     pub new_value: String,
     pub is_pricing_change: bool,
+    pub explanation: Option<&'static str>,
+}
+
+impl FieldDiff {
+    /// Builds one change entry, deriving the raw setting id and the
+    /// friendly setting name from `field_path` so `--json` output carries
+    /// both alongside the machine path and always matches the table text.
+    fn new(
+        field_path: &str,
+        old_value: String,
+        new_value: String,
+        is_pricing_change: bool,
+        explanation: Option<&'static str>,
+    ) -> Self {
+        let prefix = field_path.split('.').next().unwrap_or(field_path);
+        let id = config_setting_id_for_prefix(prefix);
+        let setting_id = id.map(|id| id as u32);
+        let setting_name = match id {
+            Some(id) => config_setting_human_name(&id).to_string(),
+            None => field_path.to_string(),
+        };
+        Self {
+            field_path: field_path.to_string(),
+            setting_id,
+            setting_name,
+            old_value,
+            new_value,
+            is_pricing_change,
+            explanation,
+        }
+    }
 }
 
 /// The result of comparing two config snapshots.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ConfigDiff {
     pub old_snapshot: SnapshotInfo,
     pub new_snapshot: SnapshotInfo,
@@ -84,7 +221,28 @@ pub struct ConfigDiff {
     pub has_pricing_changes: bool,
 }
 
-#[derive(Debug, Clone)]
+impl ConfigDiff {
+    /// Returns true if any pricing change exceeds the given percentage threshold.
+    /// Non-numeric changes are considered significant.
+    pub fn has_significant_pricing_changes(&self, threshold_percent: f64) -> bool {
+        self.changes.iter().any(|change| {
+            if !change.is_pricing_change {
+                return false;
+            }
+            let (Ok(old), Ok(new)) = (
+                change.old_value.parse::<f64>(),
+                change.new_value.parse::<f64>(),
+            ) else {
+                return true;
+            };
+            let denominator = old.abs().max(f64::EPSILON);
+            let ratio = (new - old).abs() / denominator;
+            ratio * 100.0 >= threshold_percent
+        })
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SnapshotInfo {
     pub network: String,
     pub timestamp: String,
@@ -168,18 +326,20 @@ fn compare_contract_compute(
                 false,
             );
         }
-        (None, Some(_)) => diffs.push(FieldDiff {
-            field_path: "contract_compute".to_string(),
-            old_value: "(missing)".to_string(),
-            new_value: "(present)".to_string(),
-            is_pricing_change: true,
-        }),
-        (Some(_), None) => diffs.push(FieldDiff {
-            field_path: "contract_compute".to_string(),
-            old_value: "(present)".to_string(),
-            new_value: "(missing)".to_string(),
-            is_pricing_change: true,
-        }),
+        (None, Some(_)) => diffs.push(FieldDiff::new(
+            "contract_compute",
+            "(missing)".to_string(),
+            "(present)".to_string(),
+            true,
+            None,
+        )),
+        (Some(_), None) => diffs.push(FieldDiff::new(
+            "contract_compute",
+            "(present)".to_string(),
+            "(missing)".to_string(),
+            true,
+            None,
+        )),
         _ => {}
     }
 }
@@ -269,18 +429,20 @@ fn compare_ledger_cost(
                 false,
             );
         }
-        (None, Some(_)) => diffs.push(FieldDiff {
-            field_path: "contract_ledger_cost".to_string(),
-            old_value: "(missing)".to_string(),
-            new_value: "(present)".to_string(),
-            is_pricing_change: true,
-        }),
-        (Some(_), None) => diffs.push(FieldDiff {
-            field_path: "contract_ledger_cost".to_string(),
-            old_value: "(present)".to_string(),
-            new_value: "(missing)".to_string(),
-            is_pricing_change: true,
-        }),
+        (None, Some(_)) => diffs.push(FieldDiff::new(
+            "contract_ledger_cost",
+            "(missing)".to_string(),
+            "(present)".to_string(),
+            true,
+            None,
+        )),
+        (Some(_), None) => diffs.push(FieldDiff::new(
+            "contract_ledger_cost",
+            "(present)".to_string(),
+            "(missing)".to_string(),
+            true,
+            None,
+        )),
         _ => {}
     }
 }
@@ -300,18 +462,20 @@ fn compare_historical_data(
                 true,
             );
         }
-        (None, Some(_)) => diffs.push(FieldDiff {
-            field_path: "contract_historical_data".to_string(),
-            old_value: "(missing)".to_string(),
-            new_value: "(present)".to_string(),
-            is_pricing_change: true,
-        }),
-        (Some(_), None) => diffs.push(FieldDiff {
-            field_path: "contract_historical_data".to_string(),
-            old_value: "(present)".to_string(),
-            new_value: "(missing)".to_string(),
-            is_pricing_change: true,
-        }),
+        (None, Some(_)) => diffs.push(FieldDiff::new(
+            "contract_historical_data",
+            "(missing)".to_string(),
+            "(present)".to_string(),
+            true,
+            None,
+        )),
+        (Some(_), None) => diffs.push(FieldDiff::new(
+            "contract_historical_data",
+            "(present)".to_string(),
+            "(missing)".to_string(),
+            true,
+            None,
+        )),
         _ => {}
     }
 }
@@ -338,18 +502,20 @@ fn compare_events(
                 true,
             );
         }
-        (None, Some(_)) => diffs.push(FieldDiff {
-            field_path: "contract_events".to_string(),
-            old_value: "(missing)".to_string(),
-            new_value: "(present)".to_string(),
-            is_pricing_change: true,
-        }),
-        (Some(_), None) => diffs.push(FieldDiff {
-            field_path: "contract_events".to_string(),
-            old_value: "(present)".to_string(),
-            new_value: "(missing)".to_string(),
-            is_pricing_change: true,
-        }),
+        (None, Some(_)) => diffs.push(FieldDiff::new(
+            "contract_events",
+            "(missing)".to_string(),
+            "(present)".to_string(),
+            true,
+            None,
+        )),
+        (Some(_), None) => diffs.push(FieldDiff::new(
+            "contract_events",
+            "(present)".to_string(),
+            "(missing)".to_string(),
+            true,
+            None,
+        )),
         _ => {}
     }
 }
@@ -383,18 +549,20 @@ fn compare_bandwidth(
                 true,
             );
         }
-        (None, Some(_)) => diffs.push(FieldDiff {
-            field_path: "contract_bandwidth".to_string(),
-            old_value: "(missing)".to_string(),
-            new_value: "(present)".to_string(),
-            is_pricing_change: true,
-        }),
-        (Some(_), None) => diffs.push(FieldDiff {
-            field_path: "contract_bandwidth".to_string(),
-            old_value: "(present)".to_string(),
-            new_value: "(missing)".to_string(),
-            is_pricing_change: true,
-        }),
+        (None, Some(_)) => diffs.push(FieldDiff::new(
+            "contract_bandwidth",
+            "(missing)".to_string(),
+            "(present)".to_string(),
+            true,
+            None,
+        )),
+        (Some(_), None) => diffs.push(FieldDiff::new(
+            "contract_bandwidth",
+            "(present)".to_string(),
+            "(missing)".to_string(),
+            true,
+            None,
+        )),
         _ => {}
     }
 }
@@ -477,18 +645,20 @@ fn compare_state_archival(
                 false,
             );
         }
-        (None, Some(_)) => diffs.push(FieldDiff {
-            field_path: "state_archival".to_string(),
-            old_value: "(missing)".to_string(),
-            new_value: "(present)".to_string(),
-            is_pricing_change: true,
-        }),
-        (Some(_), None) => diffs.push(FieldDiff {
-            field_path: "state_archival".to_string(),
-            old_value: "(present)".to_string(),
-            new_value: "(missing)".to_string(),
-            is_pricing_change: true,
-        }),
+        (None, Some(_)) => diffs.push(FieldDiff::new(
+            "state_archival",
+            "(missing)".to_string(),
+            "(present)".to_string(),
+            true,
+            None,
+        )),
+        (Some(_), None) => diffs.push(FieldDiff::new(
+            "state_archival",
+            "(present)".to_string(),
+            "(missing)".to_string(),
+            true,
+            None,
+        )),
         _ => {}
     }
 }
@@ -501,12 +671,13 @@ fn check<T: PartialEq + std::fmt::Display>(
     is_pricing: bool,
 ) {
     if old != new {
-        diffs.push(FieldDiff {
-            field_path: path.to_string(),
-            old_value: old.to_string(),
-            new_value: new.to_string(),
-            is_pricing_change: is_pricing,
-        });
+        diffs.push(FieldDiff::new(
+            path,
+            old.to_string(),
+            new.to_string(),
+            is_pricing,
+            setting_explanation(path),
+        ));
     }
 }
 
@@ -535,7 +706,10 @@ const ANSI_RESET: &str = "\u{1b}[0m";
 ///
 /// Non-numeric transitions (e.g. a setting appearing or disappearing) cannot
 /// be quantified and are treated as major changes, colored red.
-pub fn pricing_change_color(old_value: &str, new_value: &str) -> &'static str {
+pub fn pricing_change_color(old_value: &str, new_value: &str, colorize: bool) -> &'static str {
+    if !colorize {
+        return "";
+    }
     let (Ok(old), Ok(new)) = (old_value.parse::<f64>(), new_value.parse::<f64>()) else {
         return ANSI_RED;
     };
@@ -557,7 +731,13 @@ pub fn pricing_change_color(old_value: &str, new_value: &str) -> &'static str {
 /// Pricing changes are colored red/yellow/green by the magnitude of the
 /// value change (see [`pricing_change_color`]); non-pricing changes are
 /// left uncolored.
-pub fn format_diff(diff: &ConfigDiff) -> String {
+pub fn format_diff(
+    diff: &ConfigDiff,
+    colorize: bool,
+    pricing_only: bool,
+    threshold_percent: Option<f64>,
+) -> String {
+    let reset_code = if colorize { ANSI_RESET } else { "" };
     let mut output = String::new();
 
     output.push_str(&format!(
@@ -569,8 +749,26 @@ pub fn format_diff(diff: &ConfigDiff) -> String {
     ));
     output.push_str(&format!("Network: {}\n\n", diff.new_snapshot.network));
 
-    if diff.changes.is_empty() {
-        output.push_str("✅ No changes detected.\n");
+    let mut omitted_count = 0;
+    let mut visible_changes: Vec<&FieldDiff> = Vec::new();
+
+    for change in &diff.changes {
+        if pricing_only && !change.is_pricing_change {
+            omitted_count += 1;
+        } else {
+            visible_changes.push(change);
+        }
+    }
+
+    if visible_changes.is_empty() {
+        if omitted_count > 0 {
+            output.push_str(&format!(
+                "  (... omitted {} non-pricing changes)\n",
+                omitted_count
+            ));
+        } else {
+            output.push_str("✅ No changes detected.\n");
+        }
         return output;
     }
 
@@ -579,23 +777,49 @@ pub fn format_diff(diff: &ConfigDiff) -> String {
         diff.changes.len()
     ));
 
-    for change in &diff.changes {
+    for change in visible_changes {
+        let is_exceeding = match threshold_percent {
+            Some(t) if change.is_pricing_change => {
+                if let (Ok(old), Ok(new)) = (
+                    change.old_value.parse::<f64>(),
+                    change.new_value.parse::<f64>(),
+                ) {
+                    let denominator = old.abs().max(f64::EPSILON);
+                    let ratio = (new - old).abs() / denominator;
+                    ratio * 100.0 >= t
+                } else {
+                    true
+                }
+            }
+            _ => false,
+        };
+
         let icon = if change.is_pricing_change {
-            "💰"
+            "📈"
         } else {
-            "📋"
+            "🔄"
         };
         let display = field_display_name(&change.field_path);
         if change.is_pricing_change {
-            let color = pricing_change_color(&change.old_value, &change.new_value);
-            output.push_str(&format!("  {color}{icon} {display}{ANSI_RESET}\n"));
+            let color = if is_exceeding {
+                if colorize { ANSI_RED } else { "" }
+            } else {
+                pricing_change_color(&change.old_value, &change.new_value, colorize)
+            };
+            output.push_str(&format!("  {color}{icon} {display}{reset_code}\n"));
+            if let Some(explanation) = change.explanation {
+                output.push_str(&format!("      ℹ️  {explanation}\n"));
+            }
             output.push_str(&format!("      Old: {}\n", change.old_value));
             output.push_str(&format!(
-                "      New: {color}{}{ANSI_RESET}\n",
+                "      New: {color}{}{reset_code}\n",
                 change.new_value
             ));
         } else {
             output.push_str(&format!("  {icon} {display}\n"));
+            if let Some(explanation) = change.explanation {
+                output.push_str(&format!("      ℹ️  {explanation}\n"));
+            }
             output.push_str(&format!("      Old: {}\n", change.old_value));
             output.push_str(&format!("      New: {}\n", change.new_value));
         }
@@ -697,7 +921,7 @@ mod tests {
         let old = make_snapshot(100, 5);
         let new = make_snapshot(200, 5);
         let diff = diff_snapshots(&old, &new);
-        let output = format_diff(&diff);
+        let output = format_diff(&diff, false, false, None);
         // Should show human-readable setting name, not raw prefix
         assert!(output.contains("Contract Compute V0"));
         assert!(
@@ -739,52 +963,120 @@ mod tests {
         let old = make_snapshot(100, 5);
         let new = make_snapshot(200, 10);
         let diff = diff_snapshots(&old, &new);
-        let output = format_diff(&diff);
+        let output = format_diff(&diff, false, false, None);
         assert!(output.contains("Contract Compute V0"));
         assert!(output.contains("Contract Bandwidth V0"));
+    }
+
+    /// AC: `--json` carries the friendly setting name alongside the raw
+    /// `ConfigSettingId` number, not just the machine field path.
+    #[test]
+    fn test_json_has_friendly_name_alongside_raw_id() {
+        use crate::rpc::config::ConfigSettingId;
+
+        let old = make_snapshot(100, 5);
+        let new = make_snapshot(200, 5);
+        let diff = diff_snapshots(&old, &new);
+        let json = serde_json::to_value(&diff).expect("diff should serialize to JSON");
+        let change = &json["changes"][0];
+
+        assert_eq!(
+            change["field_path"],
+            "contract_compute.fee_rate_per_instructions_increment"
+        );
+        assert_eq!(change["setting_name"], "Contract Compute V0");
+        assert_eq!(
+            change["setting_name"],
+            config_setting_human_name(&ConfigSettingId::ContractComputeV0)
+        );
+        assert_eq!(change["setting_id"], 0);
+
+        // The in-memory struct exposes the same pair the JSON does.
+        assert_eq!(diff.changes[0].setting_name, "Contract Compute V0");
+        assert_eq!(diff.changes[0].setting_id, Some(0));
+    }
+
+    /// Missing-section entries (bare prefix paths) also carry name + id.
+    #[test]
+    fn test_missing_section_entry_carries_setting_name_and_id() {
+        let mut old = make_snapshot(100, 5);
+        old.contract_bandwidth = None;
+        let new = make_snapshot(100, 5);
+        let diff = diff_snapshots(&old, &new);
+        assert_eq!(diff.changes.len(), 1);
+        assert_eq!(diff.changes[0].field_path, "contract_bandwidth");
+        assert_eq!(diff.changes[0].setting_name, "Contract Bandwidth V0");
+        assert_eq!(diff.changes[0].setting_id, Some(4));
+    }
+
+    /// AC: diff tables render names from the shared helper, so table text,
+    /// header text, and JSON can never drift apart.
+    #[test]
+    fn test_format_diff_uses_config_setting_human_name() {
+        use crate::rpc::config::ConfigSettingId;
+
+        let old = make_snapshot(100, 5);
+        let new = make_snapshot(200, 5);
+        let diff = diff_snapshots(&old, &new);
+        let output = format_diff(&diff, false, false, None);
+        let expected = config_setting_human_name(&ConfigSettingId::ContractComputeV0);
+        assert!(
+            output.contains(expected),
+            "diff table should show `{expected}`: {output}"
+        );
+        assert_eq!(
+            field_display_name("contract_compute.fee_rate_per_instructions_increment"),
+            format!("{expected} > Fee Rate Per Instructions Increment")
+        );
     }
 
     // ── ANSI pricing-change colors (#81) ──────────────────────────────
 
     #[test]
     fn test_pricing_change_color_small_change_is_green() {
-        assert_eq!(pricing_change_color("100", "105"), ANSI_GREEN);
+        assert_eq!(pricing_change_color("100", "105", true), ANSI_GREEN);
     }
 
     #[test]
     fn test_pricing_change_color_moderate_change_is_yellow() {
         // 120/100 = 20% change → yellow band
-        assert_eq!(pricing_change_color("100", "120"), ANSI_YELLOW);
+        assert_eq!(pricing_change_color("100", "120", true), ANSI_YELLOW);
     }
 
     #[test]
     fn test_pricing_change_color_large_change_is_red() {
         // 160/100 = 60% change → red band
-        assert_eq!(pricing_change_color("100", "160"), ANSI_RED);
+        assert_eq!(pricing_change_color("100", "160", true), ANSI_RED);
     }
 
     #[test]
     fn test_pricing_change_color_boundary_10_percent_is_yellow() {
         // Exactly 10% is no longer green (green is strictly < 10%)
-        assert_eq!(pricing_change_color("100", "110"), ANSI_YELLOW);
+        assert_eq!(pricing_change_color("100", "110", true), ANSI_YELLOW);
     }
 
     #[test]
     fn test_pricing_change_color_boundary_50_percent_is_red() {
         // Exactly 50% is no longer yellow (yellow is strictly < 50%)
-        assert_eq!(pricing_change_color("100", "150"), ANSI_RED);
+        assert_eq!(pricing_change_color("100", "150", true), ANSI_RED);
     }
 
     #[test]
     fn test_pricing_change_color_zero_to_nonzero_is_red() {
         // Division-by-zero guard: 0 → any nonzero value is a major repricing
-        assert_eq!(pricing_change_color("0", "50"), ANSI_RED);
+        assert_eq!(pricing_change_color("0", "50", true), ANSI_RED);
     }
 
     #[test]
     fn test_pricing_change_color_non_numeric_is_red() {
-        assert_eq!(pricing_change_color("(missing)", "(present)"), ANSI_RED);
-        assert_eq!(pricing_change_color("(present)", "(missing)"), ANSI_RED);
+        assert_eq!(
+            pricing_change_color("(missing)", "(present)", true),
+            ANSI_RED
+        );
+        assert_eq!(
+            pricing_change_color("(present)", "(missing)", true),
+            ANSI_RED
+        );
     }
 
     #[test]
@@ -792,7 +1084,7 @@ mod tests {
         let old = make_snapshot(100, 5);
         let new = make_snapshot(160, 5); // +60% compute fee → red
         let diff = diff_snapshots(&old, &new);
-        let output = format_diff(&diff);
+        let output = format_diff(&diff, true, false, None);
         assert!(
             output.contains(ANSI_RED),
             "large pricing change should be red: {output}"
@@ -808,7 +1100,7 @@ mod tests {
         let old = make_snapshot(100, 5);
         let new = make_snapshot(105, 5); // +5% compute fee → green
         let diff = diff_snapshots(&old, &new);
-        let output = format_diff(&diff);
+        let output = format_diff(&diff, true, false, None);
         assert!(
             output.contains(ANSI_GREEN),
             "small pricing change should be green: {output}"
@@ -824,7 +1116,7 @@ mod tests {
             compute.ledger_max_instructions = 2_000_000;
         }
         let diff = diff_snapshots(&old, &new);
-        let output = format_diff(&diff);
+        let output = format_diff(&diff, false, false, None);
         assert!(
             !output.contains(ANSI_RED)
                 && !output.contains(ANSI_GREEN)
@@ -837,7 +1129,7 @@ mod tests {
     fn test_format_diff_no_changes_no_ansi() {
         let snap = make_snapshot(100, 5);
         let diff = diff_snapshots(&snap, &snap);
-        let output = format_diff(&diff);
+        let output = format_diff(&diff, false, false, None);
         assert!(
             !output.contains("\u{1b}["),
             "no-change output should have no ANSI codes: {output}"

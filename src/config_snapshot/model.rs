@@ -1,5 +1,47 @@
 use serde::{Deserialize, Serialize};
 
+use crate::rpc::config::ConfigSettingId;
+
+/// Maps a [`ConfigSettingId`] to a friendly, human-readable setting name.
+///
+/// Every user-facing rendering of a config setting (diff tables, diff
+/// headers, `--json` payloads) goes through this helper so raw enum
+/// numbers like `0`, `1`, `4` never reach an output on their own.
+///
+/// Examples
+/// --------
+/// - `ConfigSettingId::ContractComputeV0` → `Contract Compute V0`
+/// - `ConfigSettingId::ContractLedgerCostV0` → `Contract Ledger Cost V0`
+/// - `ConfigSettingId::StateArchival` → `State Archival`
+pub fn config_setting_human_name(id: &ConfigSettingId) -> &'static str {
+    match id {
+        ConfigSettingId::ContractComputeV0 => "Contract Compute V0",
+        ConfigSettingId::ContractLedgerCostV0 => "Contract Ledger Cost V0",
+        ConfigSettingId::ContractHistoricalDataV0 => "Contract Historical Data V0",
+        ConfigSettingId::ContractEventsV0 => "Contract Events V0",
+        ConfigSettingId::ContractBandwidthV0 => "Contract Bandwidth V0",
+        ConfigSettingId::StateArchival => "State Archival",
+    }
+}
+
+/// Maps a snapshot field-path prefix (e.g. `contract_compute`) to its
+/// [`ConfigSettingId`], or `None` when the prefix names no known setting.
+///
+/// This is the inverse bridge from stored snapshot paths (which carry no
+/// enum value) back to the id so [`config_setting_human_name`] can label
+/// them consistently.
+pub fn config_setting_id_for_prefix(prefix: &str) -> Option<ConfigSettingId> {
+    match prefix {
+        "contract_compute" => Some(ConfigSettingId::ContractComputeV0),
+        "contract_ledger_cost" => Some(ConfigSettingId::ContractLedgerCostV0),
+        "contract_historical_data" => Some(ConfigSettingId::ContractHistoricalDataV0),
+        "contract_events" => Some(ConfigSettingId::ContractEventsV0),
+        "contract_bandwidth" => Some(ConfigSettingId::ContractBandwidthV0),
+        "state_archival" => Some(ConfigSettingId::StateArchival),
+        _ => None,
+    }
+}
+
 /// A complete snapshot of the network's Soroban resource-pricing configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigSnapshot {
@@ -77,4 +119,23 @@ pub struct StateArchivalV0 {
     pub live_soroban_state_size_window_sample_period: u32,
     pub eviction_scan_size: u32,
     pub starting_eviction_scan_level: u32,
+}
+
+pub fn setting_unit_description(field_path: &str) -> Option<&'static str> {
+    match field_path {
+        "contract_compute.fee_rate_per_instructions_increment" => {
+            Some("stroops per 10,000 CPU instructions")
+        }
+        "contract_ledger_cost.fee_disk_read_ledger_entry"
+        | "contract_ledger_cost.fee_write_ledger_entry" => Some("stroops per entry"),
+        "contract_ledger_cost.fee_disk_read1_kb"
+        | "contract_ledger_cost.rent_fee1_kb_soroban_state_size_low"
+        | "contract_ledger_cost.rent_fee1_kb_soroban_state_size_high"
+        | "contract_historical_data.fee_historical1_kb"
+        | "contract_events.fee_contract_events1_kb"
+        | "contract_bandwidth.fee_tx_size1_kb" => Some("stroops per 1KB"),
+        "state_archival.persistent_rent_rate_denominator"
+        | "state_archival.temp_rent_rate_denominator" => Some("fractional fee scaling"),
+        _ => None,
+    }
 }
