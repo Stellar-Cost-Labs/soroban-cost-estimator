@@ -2447,10 +2447,15 @@ fn test_estimate_diff_json_structure() {
 
     let parsed: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
-    assert_eq!(parsed["identity"]["function"], "(wasm upload)");
-    assert_eq!(parsed["identity"]["network"], "testnet");
+    assert_eq!(parsed["wasm_a"]["function"], "(wasm upload)");
+    assert_eq!(parsed["wasm_b"]["function"], "(wasm upload)");
+    assert_eq!(parsed["wasm_a"]["network"], "testnet");
+    assert_eq!(parsed["wasm_b"]["network"], "testnet");
+    assert!(parsed["wasm_a"]["fee"]["total_stroops"].is_number());
+    assert!(parsed["wasm_b"]["fee"]["total_stroops"].is_number());
 
-    let rows = parsed["rows"].as_array().expect("rows array");
+    assert_eq!(parsed["diff"]["identity"]["network"], "testnet");
+    let rows = parsed["diff"]["rows"].as_array().expect("diff rows array");
     assert_eq!(rows.len(), 8, "one row per compared resource");
     assert_eq!(rows[0]["resource"], "WASM Size");
     // The two fixtures differ in size, so the WASM row must carry a delta.

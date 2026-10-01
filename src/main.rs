@@ -1685,7 +1685,12 @@ async fn cmd_estimate_diff(
 
     if format == "json" {
         let diff = report::diff::build_cost_report_diff(&old_report, &new_report);
-        println!("{}", serde_json::to_string_pretty(&diff)?);
+        let output = serde_json::json!({
+            "wasm_a": old_report,
+            "wasm_b": new_report,
+            "diff": diff,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         println!(
             "{}",
