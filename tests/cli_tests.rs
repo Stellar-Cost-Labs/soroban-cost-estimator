@@ -527,6 +527,87 @@ fn test_timeout_flag_accepted_before_subcommand() {
 }
 
 #[test]
+fn test_max_retries_flag_accepted() {
+    // Verify --max-retries is a recognized global argument for estimate.
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--max-retries", "5"]);
+    // Should fail because the file doesn't exist, NOT because --max-retries is unknown.
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--max-retries should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_max_retries_flag_accepted_before_subcommand() {
+    // Global flags must also be accepted before the subcommand.
+    let (_, stderr, code) = run_cli(&["--max-retries", "5", "estimate", "--wasm", "test.wasm"]);
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--max-retries before the subcommand should be recognized; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_max_retries_zero_accepted() {
+    // 0 is the documented "disable retries" value and must be accepted, not
+    // rejected as an out-of-range value.
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--max-retries", "0"]);
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument") && !stderr.contains("invalid value"),
+        "--max-retries 0 should be accepted; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_max_retries_negative_value_rejected() {
+    // The flag is unsigned, so a negative value must be rejected during
+    // argument parsing rather than silently wrapping to a huge retry count.
+    // clap rejects a bare `-1` as an unexpected argument, which is a
+    // non-zero exit before the command runs — the same convention the
+    // existing unknown-flag test asserts.
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--max-retries", "-1"]);
+    assert_ne!(code, 0, "a negative --max-retries must be rejected");
+    assert!(
+        stderr.contains("unexpected argument") || stderr.to_lowercase().contains("error"),
+        "--max-retries -1 should be rejected at parse time; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_max_retries_accepted_by_all_network_commands() {
+    // The flag is global, so every command that builds an RPC client must
+    // accept it — not just `estimate`. Each case below fails fast *before*
+    // any network call: `estimate-all`/`cache warm` on a missing WASM file,
+    // and the `config` subcommands on an unknown network name. That keeps the
+    // suite offline while still exercising argument parsing for each command.
+    for args in [
+        vec!["estimate-all", "--wasm", "test.wasm"],
+        vec!["cache", "warm", "--wasm", "test.wasm"],
+        vec!["config", "snapshot", "--network", "nosuchnet"],
+        vec!["config", "diff", "--network", "nosuchnet"],
+    ] {
+        let mut full = args.clone();
+        full.extend_from_slice(&["--max-retries", "5"]);
+
+        let (_, stderr, code) = run_cli(&full);
+        assert_ne!(
+            code,
+            0,
+            "`{}` should fail on its own validation, not on flag parsing",
+            args.join(" ")
+        );
+        assert!(
+            !stderr.contains("unexpected argument"),
+            "--max-retries should be accepted by `{}`; stderr: {stderr}",
+            args.join(" ")
+        );
+    }
+}
+
+#[test]
 fn test_help_lists_global_flags() {
     // Global flags (--rps, --timeout, --precision, --quiet) must appear in
     // subcommand help.
@@ -567,6 +648,35 @@ fn test_precision_out_of_range_rejected() {
             || stderr.contains("not in")
             || stderr.to_lowercase().contains("range"),
         "clap should reject precision 8; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_max_retries_help_documents_default_and_zero_behavior() {
+    // Acceptance criteria: the flag must be in --help with a clear description
+    // of both the default and the "0 disables retries" behavior.
+    let (stdout, stderr, code) = run_cli(&["--help"]);
+    assert_eq!(code, 0, "--help should exit 0; stderr: {stderr}");
+
+    // clap hard-wraps the doc comment to the terminal width, so a phrase can be
+    // split across lines. Collapse all whitespace before searching for the
+    // phrases the acceptance criteria require.
+    let help = stdout
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    assert!(
+        help.contains("--max-retries"),
+        "help should list --max-retries; got: {stdout}"
+    );
+    assert!(
+        help.contains("default 3"),
+        "help should state the default of 3; got: {stdout}"
+    );
+    assert!(
+        help.contains("0 disables retries"),
+        "help should explain that 0 disables retries; got: {stdout}"
     );
 }
 
