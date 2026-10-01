@@ -31,6 +31,29 @@ pub trait ReportFormatter {
 /// This is the default output format used by the CLI.
 pub struct TableFormatter;
 
+fn build_resource_table(report: &CostReport) -> comfy_table::Table {
+    let mut table = comfy_table::Table::new();
+    if crate::cli::should_colorize() {
+        table.enforce_styling();
+    } else {
+        table.force_no_tty();
+    }
+    table.set_header(vec!["Resource", "Consumed", "Fee (stroops)"]);
+
+    table.add_row(vec![
+        "CPU Instructions",
+        &report.cpu_instructions.to_string(),
+        "",
+    ]);
+    table.add_row(vec!["Memory Bytes", &report.memory_bytes.to_string(), ""]);
+    table.add_row(vec!["Read Entries", &report.read_entries.to_string(), ""]);
+    table.add_row(vec!["Write Entries", &report.write_entries.to_string(), ""]);
+    table.add_row(vec!["Read Bytes", &report.read_bytes.to_string(), ""]);
+    table.add_row(vec!["Write Bytes", &report.write_bytes.to_string(), ""]);
+    table.add_row(vec!["Transaction Size", &report.tx_size.to_string(), ""]);
+    table
+}
+
 impl TableFormatter {
     /// Format a report as a human-readable table, choosing whether to append
     /// the fee-distribution bar chart.
@@ -41,6 +64,7 @@ impl TableFormatter {
     /// always renders the chart at the default width so output stays
     /// deterministic for snapshot tests and libraries that call it directly.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn format_with_options(
         &self,
         report: &CostReport,
@@ -54,28 +78,22 @@ impl TableFormatter {
             "Network: {} (ledger {})\n",
             report.network, report.ledger
         ));
+        output.push_str(&format!(
+            "Simulated at ledger sequence: {}\n",
+            crate::report::cost_report::format_ledger_sequence(report.ledger)
+        ));
+        output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
         output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
 
-        let mut table = comfy_table::Table::new();
-        if crate::cli::should_colorize() {
-            table.enforce_styling();
-        } else {
-            table.force_no_tty();
-        }
-        table.set_header(vec!["Resource", "Consumed", "Fee (stroops)"]);
+        // Contract metadata from the WASM `contractmeta` section: always
+        // rendered (present or absent) so the report states whether the
+        // binary carried one.
+        output.push_str(&crate::wasm::parser::format_contract_meta(
+            &report.contract_meta,
+        ));
+        output.push_str("\n\n");
 
-        table.add_row(vec![
-            "CPU Instructions",
-            &report.cpu_instructions.to_string(),
-            "",
-        ]);
-        table.add_row(vec!["Memory Bytes", &report.memory_bytes.to_string(), ""]);
-        table.add_row(vec!["Read Entries", &report.read_entries.to_string(), ""]);
-        table.add_row(vec!["Write Entries", &report.write_entries.to_string(), ""]);
-        table.add_row(vec!["Read Bytes", &report.read_bytes.to_string(), ""]);
-        table.add_row(vec!["Write Bytes", &report.write_bytes.to_string(), ""]);
-        table.add_row(vec!["Transaction Size", &report.tx_size.to_string(), ""]);
-
+        let table = build_resource_table(report);
         output.push_str(&table.to_string());
         output.push('\n');
 
@@ -148,6 +166,12 @@ impl TableFormatter {
             output.push_str(&crate::report::cost_report::render_fee_bar_chart(
                 &report.fee,
                 chart_width,
+            ));
+        }
+
+        if let Some(ref projections) = report.projections {
+            output.push_str(&crate::report::cost_report::format_projections_table(
+                projections,
             ));
         }
 
@@ -278,6 +302,10 @@ impl ReportFormatter for MarkdownFormatter {
             "- **Network:** {} (ledger {})\n",
             report.network, report.ledger
         ));
+        output.push_str(&format!(
+            "- **Simulated at ledger sequence:** `{}`\n",
+            crate::report::cost_report::format_ledger_sequence(report.ledger)
+        ));
         output.push_str(&format!("- **WASM hash:** `{}`\n", report.wasm_hash));
         output.push_str(&format!(
             "- **Simulation latency:** {} ms\n\n",
@@ -339,6 +367,25 @@ impl ReportFormatter for MarkdownFormatter {
             "| **Total** | **{}** ({}) | **100.0%** |\n",
             report.fee.total_stroops, report.fee.total_xlm,
         ));
+
+        if let Some(ref projections) = report.projections {
+            output.push_str("\n### Cost Projections\n\n");
+            output.push_str("| Invocations | Total Stroops | Total XLM | USD |\n");
+            output.push_str("| ---: | ---: | ---: | ---: |\n");
+            for p in projections {
+                let usd_str = p
+                    .usd
+                    .map(|u| format!("${u:.2}"))
+                    .unwrap_or_else(|| "-".to_string());
+                output.push_str(&format!(
+                    "| {} | {} | {} | {} |\n",
+                    crate::report::cost_report::format_thousands_u64(p.invocations),
+                    crate::report::cost_report::format_thousands(p.total_stroops),
+                    p.total_xlm,
+                    usd_str
+                ));
+            }
+        }
 
         // Optimization suggestions
         output.push_str("\n### Optimization Suggestions\n\n");
@@ -415,6 +462,7 @@ mod tests {
         CostReport {
             function: "increment".to_string(),
             wasm_hash: "abc123def456".to_string(),
+            wasm_size: 4_096,
             cpu_instructions: 532_502,
             memory_bytes: 0,
             tx_size: 156,
@@ -437,6 +485,8 @@ mod tests {
             network: "testnet".to_string(),
             simulation_duration_ms: 87,
             rates: None,
+            projections: None,
+            contract_meta: crate::wasm::parser::ContractMeta::default(),
         }
     }
 
@@ -444,6 +494,7 @@ mod tests {
         CostReport {
             function: "(wasm upload)".to_string(),
             wasm_hash: "0000000000000000".to_string(),
+            wasm_size: 0,
             cpu_instructions: 0,
             memory_bytes: 0,
             tx_size: 0,
@@ -466,6 +517,8 @@ mod tests {
             network: "mainnet".to_string(),
             simulation_duration_ms: 0,
             rates: None,
+            projections: None,
+            contract_meta: crate::wasm::parser::ContractMeta::default(),
         }
     }
 
@@ -487,7 +540,17 @@ mod tests {
     }
 
     #[test]
-    fn test_table_formatter_footer_contains_simulation_latency() {
+    fn test_table_formatter_shows_grouped_ledger_sequence() {
+        let formatter = TableFormatter;
+        let output = formatter.format(&sample_report());
+        assert!(
+            output.contains("Simulated at ledger sequence: 3,894,195"),
+            "got: {output}"
+        );
+    }
+
+    #[test]
+    fn test_table_formatter_contains_rpc_latency() {
         let formatter = TableFormatter;
         let output = formatter.format(&sample_report());
         assert!(output.contains("Simulation latency: 87 ms"));
@@ -576,6 +639,44 @@ mod tests {
         assert!(output.contains("Optimization Suggestions:"));
     }
 
+    #[test]
+    fn test_table_formatter_contract_meta() {
+        let formatter = TableFormatter;
+        let mut report = sample_report();
+        report.contract_meta = crate::wasm::parser::ContractMeta {
+            name: Some("MetaContract".to_string()),
+            version: Some("9.9.9".to_string()),
+            description: None,
+            author: None,
+            sdk_version: Some("25.3.2".to_string()),
+            entries: vec![
+                ("name".to_string(), "MetaContract".to_string()),
+                ("version".to_string(), "9.9.9".to_string()),
+                ("rssdkver".to_string(), "25.3.2".to_string()),
+            ],
+        };
+        let output = formatter.format(&report);
+        assert!(output.contains("Contract meta: present"));
+        assert!(output.contains("name: MetaContract"));
+        assert!(output.contains("version: 9.9.9"));
+        assert!(output.contains("sdk_version: 25.3.2"));
+        // Recognized keys are folded into typed fields, not repeated below.
+        assert!(!output.contains("  rssdkver:"));
+
+        // JSON payload carries the same metadata.
+        let json = JsonFormatter.format(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(parsed["contract_meta"]["name"], "MetaContract");
+        assert_eq!(parsed["contract_meta"]["sdk_version"], "25.3.2");
+    }
+
+    #[test]
+    fn test_table_formatter_contract_meta_absent() {
+        let formatter = TableFormatter;
+        let output = formatter.format(&empty_report());
+        assert!(output.contains("Contract meta: absent"));
+    }
+
     // ── JSON formatter ───────────────────────────────────────────────
 
     #[test]
@@ -593,7 +694,7 @@ mod tests {
         let output = formatter.format(&sample_report());
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["wasm_hash"], "abc123def456");
-        assert_eq!(parsed["ledger"], 3_894_195);
+        assert_eq!(parsed["ledger_sequence"], 3_894_195);
         assert_eq!(parsed["network"], "testnet");
         assert_eq!(parsed["rpc_latency_ms"], 87);
         assert_eq!(parsed["fee"]["total_stroops"], 15_527);
@@ -727,6 +828,7 @@ mod tests {
         let formatter = MarkdownFormatter;
         let output = formatter.format(&sample_report());
         assert!(output.contains("**Network:** testnet (ledger 3894195)"));
+        assert!(output.contains("- **Simulated at ledger sequence:** `3,894,195`"));
         assert!(output.contains("**WASM hash:** `abc123def456`"));
         assert!(output.contains("**Simulation latency:** 87 ms"));
     }
@@ -787,5 +889,32 @@ mod tests {
                 formatter.name()
             );
         }
+    }
+
+    #[test]
+    fn test_formatters_with_projections() {
+        use crate::report::cost_report::CostProjection;
+        let mut report = sample_report();
+        report.projections = Some(vec![CostProjection {
+            invocations: 100,
+            total_stroops: 1_552_700,
+            total_xlm: "0.1552700".to_string(),
+            usd: Some(0.18),
+        }]);
+
+        let table_out = TableFormatter.format(&report);
+        assert!(table_out.contains("Cost Projections:"));
+        assert!(table_out.contains("100"));
+        assert!(table_out.contains("1,552,700"));
+        assert!(table_out.contains("$0.18"));
+
+        let json_out = JsonFormatter.format(&report);
+        assert!(json_out.contains("\"projections\""));
+        assert!(json_out.contains("1552700"));
+        assert!(json_out.contains("0.18"));
+
+        let md_out = MarkdownFormatter.format(&report);
+        assert!(md_out.contains("### Cost Projections"));
+        assert!(md_out.contains("| 100 | 1,552,700 | 0.1552700 | $0.18 |"));
     }
 }
