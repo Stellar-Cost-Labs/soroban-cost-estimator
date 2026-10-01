@@ -314,7 +314,6 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 fallback,
                 id.as_deref(),
                 &fn_names,
-                &format,
                 format.as_str(),
                 rps,
                 timeout,
