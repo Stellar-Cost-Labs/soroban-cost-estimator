@@ -454,6 +454,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
         } => {
             cmd_watch(
                 &network,
+                rpc_url.as_deref(),
                 fallback,
                 &interval,
                 threshold_percent,
@@ -2374,10 +2375,14 @@ fn wasm_info_json(
 ///
 /// Shared by `config snapshot`, `config diff`, and `watch`.
 ///
+/// `rpc_url` overrides network-based endpoint resolution (used by `watch`,
+/// which may point at a local or private node).
+///
 /// # Network calls
 /// Makes one batched `getLedgerEntries` RPC call.
 async fn fetch_config_snapshot(
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     rps: Option<u64>,
     timeout: u64,
@@ -2390,7 +2395,7 @@ async fn fetch_config_snapshot(
 
     let span = info_span!("fetch_config_snapshot", network);
     async {
-        let endpoint = rpc::client::resolve_endpoint(network, None)?;
+        let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
         let client = rpc::client::RpcClient::with_fallback_headers(
             &endpoint,
             rpc_fallback_url,
@@ -2468,6 +2473,7 @@ async fn cmd_config_snapshot(
         info!("taking config snapshot");
         let snapshot = fetch_config_snapshot(
             network,
+            None,
             rpc_fallback_url,
             rps,
             timeout,
@@ -2603,6 +2609,7 @@ async fn cmd_config_diff(
 
         let new_snapshot = fetch_config_snapshot(
             network,
+            None,
             rpc_fallback_url,
             rps,
             timeout,
@@ -2952,10 +2959,14 @@ async fn shutdown_signal() -> error::AppResult<()> {
 /// the previous snapshot, print changes and stale-estimate info, then save
 /// the new snapshot.
 ///
+/// `rpc_url` overrides network-based endpoint resolution so `watch` can be
+/// pointed at the same node it subscribes to.
+///
 /// # Network calls
 /// Makes one batched `getLedgerEntries` RPC call.
 async fn watch_poll_once(
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     first: &mut bool,
     threshold_percent: Option<f64>,
@@ -2969,6 +2980,7 @@ async fn watch_poll_once(
 
     let snapshot_result = fetch_config_snapshot(
         network,
+        rpc_url,
         rpc_fallback_url,
         rps,
         timeout,
@@ -3011,13 +3023,17 @@ async fn watch_poll_once(
     Ok(())
 }
 
-/// `watch` command: poll network config and print diffs.
+/// `watch` command: re-check the network config whenever a ledger closes and
+/// print diffs.
 ///
-/// Polls immediately, then on `interval`, until SIGINT (Ctrl-C) or SIGTERM
-/// is received — then exits cleanly with code 0. The in-flight poll is
-/// cancelled rather than writing a partial snapshot.
+/// Prefers real-time WebSocket ledger-close notifications; the connection is
+/// (re)established with exponential backoff, and if the endpoint is
+/// unreachable or does not support subscriptions the command falls back to
+/// polling every `interval`. Either way it runs until SIGINT (Ctrl-C) or
+/// SIGTERM, then exits cleanly with code 0.
 async fn cmd_watch(
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     interval: &str,
     threshold_percent: Option<f64>,
@@ -3037,6 +3053,57 @@ async fn cmd_watch(
         network, interval_secs
     );
 
+    // One `--rpc-url` drives both halves: the WebSocket subscription and the
+    // request/response config fetches.
+    let http_rpc_url = rpc_url.map(rpc::client::to_http_url).transpose()?;
+
+    match watch_over_websocket(
+        network,
+        rpc_url,
+        http_rpc_url.as_deref(),
+        rpc_fallback_url,
+        rps,
+        timeout,
+        max_retries,
+        extra_headers,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            warn!(error = %e, "WebSocket watch unavailable — falling back to HTTP polling");
+            println!("WebSocket watch unavailable ({e}) — polling every {interval_secs}s instead.");
+            poll_watch(
+                network,
+                http_rpc_url.as_deref(),
+                rpc_fallback_url,
+                interval_secs,
+                rps,
+                timeout,
+                max_retries,
+                extra_headers,
+            )
+            .await
+        }
+    }
+}
+
+/// HTTP polling fallback for `watch`: poll immediately, then every
+/// `interval_secs`, until SIGINT (Ctrl-C) or SIGTERM is received — then exit
+/// cleanly with code 0. The in-flight poll is cancelled rather than writing a
+/// partial snapshot.
+async fn poll_watch(
+    network: &str,
+    rpc_url: Option<&str>,
+    rpc_fallback_url: Option<&str>,
+    interval_secs: u64,
+    rps: Option<u64>,
+    timeout: u64,
+    max_retries: usize,
+    extra_headers: &[String],
+) -> error::AppResult<()> {
+    use tracing::info;
+
     let mut first = true;
     loop {
         tokio::select! {
@@ -3049,6 +3116,7 @@ async fn cmd_watch(
             () = async {
                 let _ = watch_poll_once(
                     network,
+                    rpc_url,
                     rpc_fallback_url,
                     &mut first,
                     threshold_percent,

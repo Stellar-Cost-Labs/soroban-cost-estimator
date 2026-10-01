@@ -174,6 +174,33 @@ pub struct StreamedEvent {
     pub raw: Value,
 }
 
+/// JSON-RPC method carrying the subscription request for server-push
+/// notifications.
+pub const SUBSCRIBE_METHOD: &str = "subscribe";
+
+/// Subscription `type` for real-time ledger-close notifications.
+pub const LEDGER_CLOSE_TYPE: &str = "ledgerClose";
+
+/// A live ledger-close subscription.
+#[derive(Debug, Clone)]
+pub struct LedgerCloseSubscription {
+    /// Ledger the subscription starts from.
+    pub start_ledger: u32,
+    /// Raw acknowledgement payload returned by the server.
+    pub ack_raw: Value,
+}
+
+/// One ledger-close notification pushed by the server.
+#[derive(Debug, Clone)]
+pub struct LedgerClose {
+    /// Sequence number of the ledger that just closed, or `0` when the
+    /// payload carried no recognizable ledger number.
+    pub ledger: u32,
+    /// The full notification `params` object. Kept raw because the upstream
+    /// payload shape is still settling.
+    pub raw: Value,
+}
+
 /// A minimal JSON-RPC 2.0 client over a WebSocket connection.
 ///
 /// Unlike the HTTP [`RpcClient`](crate::rpc::client::RpcClient) the
@@ -314,6 +341,62 @@ impl WsRpcClient {
         }
     }
 
+    /// Subscribe to ledger-close notifications from `start_ledger` onward.
+    ///
+    /// Ledger closes then arrive through [`Self::next_ledger_close`], letting a
+    /// long-running command (e.g. `watch`) re-check the network config the
+    /// moment a new ledger lands instead of polling on a fixed interval.
+    ///
+    /// # Network calls
+    /// Sends one subscription request and reads frames until the ack.
+    pub async fn subscribe_ledger_closes(
+        &mut self,
+        start_ledger: u32,
+    ) -> AppResult<LedgerCloseSubscription> {
+        debug!(start_ledger, "subscribing to ledger closes");
+        let ack_raw = self
+            .call_raw(
+                SUBSCRIBE_METHOD,
+                serde_json::json!({
+                    "type": LEDGER_CLOSE_TYPE,
+                    "startLedger": start_ledger,
+                }),
+            )
+            .await?;
+        trace!("ledger-close subscription acknowledged");
+        Ok(LedgerCloseSubscription {
+            start_ledger,
+            ack_raw,
+        })
+    }
+
+    /// Read the next ledger-close notification.
+    ///
+    /// Notifications for other subscriptions (e.g. contract `events`) and
+    /// stray responses are skipped. Returns `Ok(None)` when the server closed
+    /// the connection, which the caller should treat as "reconnect".
+    ///
+    /// # Network calls
+    /// Reads WebSocket frames until a ledger-close notification or a close.
+    pub async fn next_ledger_close(&mut self) -> AppResult<Option<LedgerClose>> {
+        loop {
+            match self.next_message().await? {
+                WsMessage::Notification { method, params, .. } if method == LEDGER_CLOSE_TYPE => {
+                    let ledger = ledger_from_params(&params).unwrap_or(0);
+                    trace!(ledger, "received ledger-close notification");
+                    return Ok(Some(LedgerClose {
+                        ledger,
+                        raw: params,
+                    }));
+                }
+                WsMessage::Notification { .. } | WsMessage::Response { .. } => {
+                    // Another subscription's notification, or a stray response.
+                }
+                WsMessage::Closed => return Ok(None),
+            }
+        }
+    }
+
     /// Read the next WebSocket frame, classified as an RPC message.
     ///
     /// Control frames (ping/pong) are handled transparently and are never
@@ -385,6 +468,54 @@ impl WsRpcClient {
             .await
             .map_err(|e| AppError::WsProtocol(e.to_string()))
     }
+}
+
+/// Extract the ledger sequence from a ledger-close notification payload.
+///
+/// The upstream v2 payload shape is still settling, so the ledger number is
+/// looked for in the places it is known to appear: `ledger`,
+/// `ledgerSequence`, and a nested `ledgerClose.ledger` / `ledger.sequence`.
+fn ledger_from_params(params: &Value) -> Option<u32> {
+    [
+        params.get("ledger"),
+        params.get("ledgerSequence"),
+        params
+            .get("ledgerClose")
+            .and_then(|close| close.get("ledger")),
+        params
+            .get("ledger")
+            .and_then(|ledger| ledger.get("sequence")),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(ledger_number)
+}
+
+/// Coerce a JSON number or decimal string into a ledger sequence.
+fn ledger_number(value: &Value) -> Option<u32> {
+    match value {
+        Value::Number(number) => u32::try_from(number.as_u64()?).ok(),
+        Value::String(text) => text.parse::<u32>().ok(),
+        _ => None,
+    }
+}
+
+/// First reconnect delay after a dropped WebSocket connection, in ms.
+pub const RECONNECT_BASE_MS: u64 = 1_000;
+
+/// Upper bound on the exponential reconnect delay, in ms.
+pub const RECONNECT_MAX_MS: u64 = 30_000;
+
+/// Delay before the `attempt`-th (1-based) consecutive reconnect attempt.
+///
+/// Doubles each time — 1s, 2s, 4s, 8s, … — and is capped at
+/// [`RECONNECT_MAX_MS`] so a long outage does not back off without bound.
+#[must_use]
+pub fn reconnect_delay_ms(attempt: u32) -> u64 {
+    let shift = attempt.saturating_sub(1).min(31);
+    RECONNECT_BASE_MS
+        .saturating_mul(1_u64 << shift)
+        .min(RECONNECT_MAX_MS)
 }
 
 /// Extract the JSON-RPC `result` from a response body, mapping `error`
@@ -653,5 +784,123 @@ mod tests {
             result.is_err() || matches!(result, Ok(WsMessage::Closed)),
             "expected closed or error, got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_ledger_close_subscription_streams_notifications() {
+        let url = spawn_mock_server(|request| {
+            let body: Value = serde_json::from_str(&request).unwrap();
+            let method = body.get("method").and_then(Value::as_str).unwrap();
+            let id = request_id(&request);
+            if method != SUBSCRIBE_METHOD {
+                return vec![];
+            }
+            let params = body.get("params").cloned().unwrap_or(Value::Null);
+            vec![
+                // Acknowledgement echoes the requested subscription params so
+                // the test can assert what was sent.
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "latestLedger": 1_200, "params": params },
+                })
+                .to_string(),
+                // An unrelated notification must be skipped.
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "events",
+                    "params": { "subscriptionId": 1, "event": { "type": "contract" } },
+                })
+                .to_string(),
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": LEDGER_CLOSE_TYPE,
+                    "params": { "ledger": 1_201 },
+                })
+                .to_string(),
+                // Nested/string variants must decode too (payload shape is
+                // still settling upstream).
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": LEDGER_CLOSE_TYPE,
+                    "params": { "ledgerClose": { "ledger": "1202" } },
+                })
+                .to_string(),
+                CLOSE_MARKER.to_string(),
+            ]
+        })
+        .await;
+
+        let mut client = WsRpcClient::connect(&url).await.unwrap();
+        let subscription = client.subscribe_ledger_closes(1_200).await.unwrap();
+        assert_eq!(subscription.start_ledger, 1_200);
+        assert_eq!(
+            subscription
+                .ack_raw
+                .get("params")
+                .and_then(|p| p.get("type")),
+            Some(&Value::from(LEDGER_CLOSE_TYPE))
+        );
+        assert_eq!(
+            subscription
+                .ack_raw
+                .get("params")
+                .and_then(|p| p.get("startLedger")),
+            Some(&Value::from(1_200))
+        );
+
+        let first = client
+            .next_ledger_close()
+            .await
+            .unwrap()
+            .expect("first ledger close");
+        assert_eq!(first.ledger, 1_201);
+        assert_eq!(first.raw.get("ledger"), Some(&Value::from(1_201)));
+
+        let second = client
+            .next_ledger_close()
+            .await
+            .unwrap()
+            .expect("second ledger close");
+        assert_eq!(second.ledger, 1_202);
+
+        // Server closes after the notifications: the stream ends.
+        assert!(client.next_ledger_close().await.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_ledger_from_params_reads_known_shapes() {
+        assert_eq!(
+            ledger_from_params(&serde_json::json!({ "ledger": 42 })),
+            Some(42)
+        );
+        assert_eq!(
+            ledger_from_params(&serde_json::json!({ "ledgerSequence": "43" })),
+            Some(43)
+        );
+        assert_eq!(
+            ledger_from_params(&serde_json::json!({ "ledgerClose": { "ledger": 44 } })),
+            Some(44)
+        );
+        assert_eq!(
+            ledger_from_params(&serde_json::json!({ "ledger": { "sequence": 45 } })),
+            Some(45)
+        );
+        assert_eq!(ledger_from_params(&serde_json::json!({})), None);
+        assert_eq!(
+            ledger_from_params(&serde_json::json!({ "ledger": -1 })),
+            None
+        );
+    }
+
+    #[test]
+    fn test_reconnect_delay_is_exponential_and_capped() {
+        assert_eq!(reconnect_delay_ms(1), 1_000);
+        assert_eq!(reconnect_delay_ms(2), 2_000);
+        assert_eq!(reconnect_delay_ms(3), 4_000);
+        assert_eq!(reconnect_delay_ms(4), 8_000);
+        assert_eq!(reconnect_delay_ms(5), 16_000);
+        assert_eq!(reconnect_delay_ms(6), RECONNECT_MAX_MS);
+        assert_eq!(reconnect_delay_ms(100), RECONNECT_MAX_MS);
     }
 }
