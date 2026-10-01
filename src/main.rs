@@ -370,10 +370,13 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 summary,
                 json,
             } => {
-                let json_flag = if args.format.is_some() {
-                    format == cli::OutputFormat::Json
+                // `--format` wins when supplied; otherwise the legacy
+                // `--json` flag selects JSON on top of the config-file
+                // default already resolved into `format`.
+                let diff_format = if args.format.is_none() && json {
+                    cli::OutputFormat::Json
                 } else {
-                    json || format == cli::OutputFormat::Json
+                    format
                 };
                 if against_previous {
                     cmd_config_diff_against_previous(
@@ -381,7 +384,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                         pricing_only,
                         threshold_percent,
                         summary,
-                        json_flag,
+                        diff_format == cli::OutputFormat::Json,
                     )
                 } else {
                     cmd_config_diff(
@@ -391,7 +394,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                         pricing_only,
                         threshold_percent,
                         summary,
-                        json_flag,
+                        diff_format,
                         rps,
                         timeout,
                         max_retries,
@@ -2402,38 +2405,6 @@ fn cmd_config_snapshot_list(network: &str) -> error::AppResult<()> {
     Ok(())
 }
 
-/// True when JSON output was requested, either through the legacy `--json`
-/// flag or the unified `--format json`.
-fn wants_json(json_flag: bool, format: Option<cli::OutputFormat>) -> bool {
-    json_flag || format == Some(cli::OutputFormat::Json)
-}
-
-/// Rejects a `--format` value a command cannot render.
-///
-/// `--format` is a global flag, so without this check a command that only
-/// knows table/JSON output would silently ignore `--format csv` instead of
-/// telling the user their request cannot be honored.
-fn reject_unsupported_format(
-    format: Option<cli::OutputFormat>,
-    supported: &[cli::OutputFormat],
-    command: &str,
-) -> error::AppResult<()> {
-    let Some(requested) = format else {
-        return Ok(());
-    };
-    if supported.contains(&requested) {
-        return Ok(());
-    }
-    let supported = supported
-        .iter()
-        .map(|f| f.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(error::AppError::General(format!(
-        "--format {requested} is not supported by `{command}` (supported: {supported})"
-    )))
-}
-
 /// True when a config diff signals a network protocol/config upgrade.
 ///
 /// Pricing changes are the tool's proxy for "the network changed its
@@ -2521,6 +2492,10 @@ async fn cmd_config_diff(
                 "stale_estimates": stale_estimates_for(network, new_snapshot.ledger),
             });
             println!("{}", serde_json::to_string_pretty(&json_output)?);
+        } else if format == cli::OutputFormat::Csv {
+            println!("{}", config_snapshot::diff::format_diff_csv(&diff));
+        } else if format == cli::OutputFormat::Markdown {
+            println!("{}", config_snapshot::diff::format_diff_markdown(&diff));
         } else if summary {
             println!("{}", config_snapshot::diff::format_diff_summary(&diff));
         } else {

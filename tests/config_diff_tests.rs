@@ -1223,6 +1223,8 @@ fn single_change_diff() -> diff::ConfigDiff {
         },
         changes: vec![diff::FieldDiff {
             field_path: "contract_compute.fee_rate_per_instructions_increment".to_string(),
+            setting_id: Some(0),
+            setting_name: "Contract Compute V0".to_string(),
             old_value: "10".to_string(),
             new_value: "25".to_string(),
             is_pricing_change: true,
