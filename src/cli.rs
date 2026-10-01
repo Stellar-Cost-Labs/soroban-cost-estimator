@@ -151,6 +151,12 @@ pub enum Command {
         #[arg(long)]
         clear_cache: bool,
 
+        /// Bypass the estimate cache entirely: never read a cached estimate
+        /// (including under `--cache-ttl`) and never write the fresh result
+        /// back to disk.
+        #[arg(long)]
+        no_cache: bool,
+
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
         json: bool,
@@ -204,6 +210,11 @@ pub enum Command {
         /// Deployed contract ID (64 hex chars) to invoke each function against.
         #[arg(long)]
         id: Option<String>,
+
+        /// Bypass the estimate cache entirely: never read cached estimates
+        /// and never write fresh results back to disk.
+        #[arg(long)]
+        no_cache: bool,
 
         /// Restrict estimation to these function names (repeatable). When
         /// omitted, every exported function is estimated.
