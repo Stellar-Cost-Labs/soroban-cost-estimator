@@ -200,6 +200,11 @@ pub struct CostReport {
     /// decodable section; deserialized as empty from older payloads.
     #[serde(default)]
     pub contract_meta: ContractMeta,
+    /// Aggregated statistics from `estimate --repeat N`. Absent (`None`) for a
+    /// normal single-run estimate, so the default report serializes exactly as
+    /// before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benchmark: Option<BenchmarkSummary>,
 }
 
 /// A cost projection for a specific batch invocation count.
@@ -214,6 +219,155 @@ pub struct CostProjection {
     /// Projected fee in USD, if an XLM price was available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usd: Option<f64>,
+}
+
+/// Aggregated statistics across the repeated simulations of `estimate --repeat
+/// N` (#48).
+///
+/// Latency figures are the RPC round-trip of each `simulateTransaction` call,
+/// in milliseconds; fee figures are the total fee each run reported, in
+/// stroops. The percentile is a **nearest-rank** p95, and the variance is a
+/// population variance computed with integer arithmetic (no floating point).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BenchmarkSummary {
+    /// Number of runs the statistics were computed over.
+    pub runs: usize,
+    /// Lowest RPC latency, in milliseconds.
+    pub min_latency_ms: u64,
+    /// Highest RPC latency, in milliseconds.
+    pub max_latency_ms: u64,
+    /// Arithmetic mean RPC latency, in milliseconds (integer division).
+    pub avg_latency_ms: u64,
+    /// Nearest-rank 95th-percentile RPC latency, in milliseconds.
+    pub p95_latency_ms: u64,
+    /// Lowest total fee, in stroops.
+    pub min_fee_stroops: i64,
+    /// Highest total fee, in stroops.
+    pub max_fee_stroops: i64,
+    /// Arithmetic mean total fee, in stroops (integer division, truncated).
+    pub avg_fee_stroops: i64,
+    /// Population variance of the total fees, in squared stroops (floored).
+    pub fee_variance_stroops: i64,
+}
+
+/// Compute [`BenchmarkSummary`] from parallel latency (ms) and fee (stroops)
+/// samples collected by `estimate --repeat N`.
+///
+/// The `runs` count is the shorter of the two slices; when either is empty,
+/// every statistic is zero and `runs` is `0`. The p95 uses the nearest-rank
+/// method over the ascending latency samples.
+///
+/// # Network calls
+/// None — pure computation.
+#[must_use]
+pub fn compute_benchmark_summary(latencies_ms: &[u64], fees_stroops: &[i64]) -> BenchmarkSummary {
+    let runs = latencies_ms.len().min(fees_stroops.len());
+    if runs == 0 {
+        return BenchmarkSummary {
+            runs: 0,
+            min_latency_ms: 0,
+            max_latency_ms: 0,
+            avg_latency_ms: 0,
+            p95_latency_ms: 0,
+            min_fee_stroops: 0,
+            max_fee_stroops: 0,
+            avg_fee_stroops: 0,
+            fee_variance_stroops: 0,
+        };
+    }
+
+    let mut sorted_latencies: Vec<u64> = latencies_ms[..runs].to_vec();
+    sorted_latencies.sort_unstable();
+    let min_latency_ms = sorted_latencies[0];
+    let max_latency_ms = sorted_latencies[runs - 1];
+    let sum_latency: u128 = sorted_latencies.iter().map(|&v| u128::from(v)).sum();
+    let avg_latency_ms = (sum_latency / runs as u128) as u64;
+
+    // Nearest-rank percentile: rank = ceil(0.95 * n), index = rank - 1.
+    // Computed with integer arithmetic so there is no rounding ambiguity.
+    let rank = (95 * runs).div_ceil(100).max(1);
+    let p95_latency_ms = sorted_latencies[(rank - 1).min(runs - 1)];
+
+    let mut min_fee = i64::MAX;
+    let mut max_fee = i64::MIN;
+    let mut sum_fee: i128 = 0;
+    let mut sum_fee_sq: i128 = 0;
+    for &fee in &fees_stroops[..runs] {
+        min_fee = min_fee.min(fee);
+        max_fee = max_fee.max(fee);
+        sum_fee += i128::from(fee);
+        sum_fee_sq += i128::from(fee) * i128::from(fee);
+    }
+
+    let n = runs as i128;
+    let avg_fee_stroops = (sum_fee / n) as i64;
+    // Population variance = (n·Σx² − (Σx)²) / n², exact integer arithmetic.
+    let variance_numerator = (n * sum_fee_sq - sum_fee * sum_fee).max(0);
+    let fee_variance_stroops = (variance_numerator / (n * n)) as i64;
+
+    BenchmarkSummary {
+        runs,
+        min_latency_ms,
+        max_latency_ms,
+        avg_latency_ms,
+        p95_latency_ms,
+        min_fee_stroops: min_fee,
+        max_fee_stroops: max_fee,
+        avg_fee_stroops,
+        fee_variance_stroops,
+    }
+}
+
+/// Render a [`BenchmarkSummary`] as a human-readable block, matching the style
+/// of the projection and distribution boxes.
+#[must_use]
+pub fn format_benchmark_table(benchmark: &BenchmarkSummary) -> String {
+    let mut output = String::from("\nBenchmark Summary:\n\n");
+    let mut table = Table::new();
+    if crate::cli::should_colorize() {
+        table.enforce_styling();
+    } else {
+        table.force_no_tty();
+    }
+
+    table.set_header(vec!["Metric", "Value"]);
+    table.add_row(vec!["Runs", &benchmark.runs.to_string()]);
+    table.add_row(vec![
+        "Latency min (ms)",
+        &benchmark.min_latency_ms.to_string(),
+    ]);
+    table.add_row(vec![
+        "Latency max (ms)",
+        &benchmark.max_latency_ms.to_string(),
+    ]);
+    table.add_row(vec![
+        "Latency avg (ms)",
+        &benchmark.avg_latency_ms.to_string(),
+    ]);
+    table.add_row(vec![
+        "Latency p95 (ms)",
+        &benchmark.p95_latency_ms.to_string(),
+    ]);
+    table.add_row(vec![
+        "Fee min (stroops)",
+        &format_thousands(benchmark.min_fee_stroops),
+    ]);
+    table.add_row(vec![
+        "Fee max (stroops)",
+        &format_thousands(benchmark.max_fee_stroops),
+    ]);
+    table.add_row(vec![
+        "Fee avg (stroops)",
+        &format_thousands(benchmark.avg_fee_stroops),
+    ]);
+    table.add_row(vec![
+        "Fee variance (stroops²)",
+        &format_thousands(benchmark.fee_variance_stroops),
+    ]);
+
+    output.push_str(&table.to_string());
+    output.push('\n');
+    output
 }
 
 /// A concrete, actionable cost-optimization suggestion derived from a report.
@@ -573,6 +727,7 @@ pub fn format_distribution_box(distribution: &FeeDistribution, precision: u32) -
 }
 
 /// Formats a cost report as a human-readable table.
+#[allow(clippy::too_many_lines)] // benchmark block pushed this just over 100
 pub fn format_report_table(report: &CostReport) -> String {
     let mut output = String::new();
 
@@ -683,6 +838,10 @@ pub fn format_report_table(report: &CostReport) -> String {
 
     if let Some(ref projections) = report.projections {
         output.push_str(&format_projections_table(projections));
+    }
+
+    if let Some(ref benchmark) = report.benchmark {
+        output.push_str(&format_benchmark_table(benchmark));
     }
 
     output
@@ -1027,6 +1186,7 @@ mod tests {
             rates: Some(rates),
             projections: None,
             contract_meta: ContractMeta::default(),
+            benchmark: None,
         }
     }
 
@@ -1145,6 +1305,7 @@ mod tests {
             rates: None,
             projections: None,
             contract_meta: ContractMeta::default(),
+            benchmark: None,
         };
 
         let table_out = format_report_table(&report);
@@ -1390,6 +1551,80 @@ mod tests {
         assert_eq!(parsed["projections"][0]["total_stroops"], 1_552_700);
         assert_eq!(parsed["projections"][0]["total_xlm"], "0.1552700");
         assert!(parsed["projections"][0].get("usd").is_none());
+    }
+
+    // ── Benchmark summary (#48) ─────────────────────────────────────────
+
+    #[test]
+    fn test_compute_benchmark_summary_empty() {
+        let s = compute_benchmark_summary(&[], &[]);
+        assert_eq!(s.runs, 0);
+        assert_eq!(s.min_latency_ms, 0);
+        assert_eq!(s.p95_latency_ms, 0);
+        assert_eq!(s.fee_variance_stroops, 0);
+    }
+
+    #[test]
+    fn test_compute_benchmark_summary_single() {
+        let s = compute_benchmark_summary(&[120], &[15_527]);
+        assert_eq!(s.runs, 1);
+        assert_eq!(s.min_latency_ms, 120);
+        assert_eq!(s.max_latency_ms, 120);
+        assert_eq!(s.avg_latency_ms, 120);
+        assert_eq!(s.p95_latency_ms, 120);
+        assert_eq!(s.min_fee_stroops, 15_527);
+        assert_eq!(s.max_fee_stroops, 15_527);
+        assert_eq!(s.avg_fee_stroops, 15_527);
+        assert_eq!(s.fee_variance_stroops, 0);
+    }
+
+    #[test]
+    fn test_compute_benchmark_summary_latency_stats_and_p95() {
+        // 20 samples 1..=20 -> nearest-rank p95 = ceil(0.95*20) = 19 -> 19.
+        let latencies: Vec<u64> = (1..=20).collect();
+        let fees: Vec<i64> = vec![100; 20];
+        let s = compute_benchmark_summary(&latencies, &fees);
+        assert_eq!(s.runs, 20);
+        assert_eq!(s.min_latency_ms, 1);
+        assert_eq!(s.max_latency_ms, 20);
+        assert_eq!(s.avg_latency_ms, 10); // 210 / 20
+        assert_eq!(s.p95_latency_ms, 19);
+    }
+
+    #[test]
+    fn test_compute_benchmark_summary_fee_population_variance() {
+        // Fees 100 and 200: mean 150; population variance (50² + 50²)/2 = 2500.
+        let s = compute_benchmark_summary(&[10, 20], &[100, 200]);
+        assert_eq!(s.min_fee_stroops, 100);
+        assert_eq!(s.max_fee_stroops, 200);
+        assert_eq!(s.avg_fee_stroops, 150);
+        assert_eq!(s.fee_variance_stroops, 2_500);
+    }
+
+    #[test]
+    fn test_compute_benchmark_summary_mismatched_slices() {
+        let s = compute_benchmark_summary(&[1, 2, 3], &[10, 20]);
+        assert_eq!(s.runs, 2);
+        assert_eq!(s.max_latency_ms, 2);
+    }
+
+    #[test]
+    fn test_format_benchmark_table_contents() {
+        let s = compute_benchmark_summary(&[100, 120, 140], &[10, 20, 30]);
+        let out = format_benchmark_table(&s);
+        assert!(out.contains("Benchmark Summary:"));
+        assert!(out.contains("Runs"));
+        assert!(out.contains("Latency p95 (ms)"));
+        assert!(out.contains("Fee variance (stroops²)"));
+        assert!(out.contains("120")); // avg latency
+    }
+
+    #[test]
+    fn test_report_table_includes_benchmark_only_when_present() {
+        let mut report = report_with_rates(sample_rates());
+        assert!(!format_report_table(&report).contains("Benchmark Summary:"));
+        report.benchmark = Some(compute_benchmark_summary(&[100, 200], &[10, 20]));
+        assert!(format_report_table(&report).contains("Benchmark Summary:"));
     }
 
     // ── Cost delta math (#278) ──────────────────────────────────────────

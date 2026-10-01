@@ -262,6 +262,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             watch,
             dry_run,
             project,
+            repeat,
         } => {
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
@@ -296,6 +297,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 wasm_new.as_deref(),
                 dry_run,
                 project.as_deref(),
+                repeat,
             )
             .await
         }
@@ -816,6 +818,7 @@ async fn simulate_report(
         rates: Some(fee_rates),
         projections: None,
         contract_meta: req.contract_meta.clone(),
+        benchmark: None,
     })
 }
 
@@ -854,6 +857,7 @@ async fn cmd_estimate(
     wasm_new: Option<&str>,
     dry_run: bool,
     project: Option<&str>,
+    repeat: u32,
 ) -> error::AppResult<()> {
     // Parse the requested projection counts up front so an invalid list is
     // rejected before any RPC traffic, regardless of the output format.
@@ -933,6 +937,7 @@ async fn cmd_estimate(
         wasm_info_flag,
         verbose,
         dry_run,
+        repeat,
     )
     .await?;
 
@@ -1059,9 +1064,13 @@ async fn estimate_once(
     wasm_info_flag: bool,
     verbose: bool,
     dry_run: bool,
+    repeat: u32,
 ) -> error::AppResult<EstimateRun> {
     let json_flag = format == "json";
     let table_mode = format == "table";
+    // Benchmark runs (`--repeat > 1`) always re-simulate: the cache is bypassed
+    // for both read and write so every run is a fresh round-trip.
+    let no_cache = no_cache || repeat > 1;
     use sha2::Digest;
     use tracing::{Instrument, info_span};
 
@@ -1200,7 +1209,7 @@ async fn estimate_once(
             return Ok(EstimateRun::DryRun);
         }
 
-        let report = simulate_report(&SimulationRequest {
+        let request = SimulationRequest {
             wasm_bytes: &wasm_info.bytes,
             wasm_hash: &wasm_hash,
             wasm_size,
@@ -1218,8 +1227,25 @@ async fn estimate_once(
             precision,
             extra_headers,
             verbose,
-        })
-        .await?;
+        };
+        let mut report = simulate_report(&request).await?;
+
+        // `--repeat N` benchmarks the RPC round-trip and fee stability by
+        // re-simulating N times (the cache was bypassed above) and aggregating
+        // the samples into a `BenchmarkSummary` on the report.
+        if repeat > 1 {
+            let mut latencies_ms = vec![report.rpc_latency_ms];
+            let mut fees_stroops = vec![report.fee.total_stroops];
+            for _ in 1..repeat {
+                let extra = simulate_report(&request).await?;
+                latencies_ms.push(extra.rpc_latency_ms);
+                fees_stroops.push(extra.fee.total_stroops);
+            }
+            report.benchmark = Some(report::cost_report::compute_benchmark_summary(
+                &latencies_ms,
+                &fees_stroops,
+            ));
+        }
 
         // `--no-cache` also suppresses the write, so a bypassed run leaves
         // no trace in the local cache.
@@ -1415,6 +1441,8 @@ async fn emit_watch_estimate(
         verbose,
         // `--watch` wins over `--dry-run`: watching exists to re-simulate.
         false,
+        // `--repeat` is single-shot; watch mode reports its own per-build data.
+        1,
     )
     .await
     {
@@ -3962,6 +3990,7 @@ mod tests {
             rates: None,
             projections: None,
             contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
+            benchmark: None,
         }
     }
 

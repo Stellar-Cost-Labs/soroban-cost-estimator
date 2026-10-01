@@ -300,6 +300,7 @@ mod tests {
             rates: None,
             projections: None,
             contract_meta: crate::wasm::parser::ContractMeta::default(),
+            benchmark: None,
         }
     }
 

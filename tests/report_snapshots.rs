@@ -34,6 +34,7 @@ fn sample_report() -> CostReport {
         rates: None,
         projections: None,
         contract_meta: ContractMeta::default(),
+        benchmark: None,
     }
 }
 
@@ -66,6 +67,7 @@ fn empty_report() -> CostReport {
         rates: None,
         projections: None,
         contract_meta: ContractMeta::default(),
+        benchmark: None,
     }
 }
 

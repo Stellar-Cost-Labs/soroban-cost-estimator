@@ -201,6 +201,17 @@ pub enum Command {
             default_missing_value = "100,1000,10000"
         )]
         project: Option<String>,
+
+        /// Run the simulation N times and report min/max/avg/p95 RPC latency
+        /// and fee variance across the runs (performance benchmarking).
+        /// `--repeat 1` (the default) is the existing single-run behavior.
+        #[arg(
+            long,
+            value_name = "N",
+            default_value_t = 1,
+            value_parser = clap::value_parser!(u32).range(1..)
+        )]
+        repeat: u32,
     },
     EstimateAll {
         #[arg(long, short)]
