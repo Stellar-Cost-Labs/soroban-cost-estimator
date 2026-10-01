@@ -846,8 +846,20 @@ async fn batch_contract_summary(
     }
 
     let candidates: Vec<&wasm::parser::FunctionInfo> = fn_name.map_or_else(
-        || wasm_info.functions.iter().filter(|f| f.param_count == 0).collect(),
-        |name| wasm_info.functions.iter().filter(|f| f.name == name).collect(),
+        || {
+            wasm_info
+                .functions
+                .iter()
+                .filter(|f| f.param_count == 0)
+                .collect()
+        },
+        |name| {
+            wasm_info
+                .functions
+                .iter()
+                .filter(|f| f.name == name)
+                .collect()
+        },
     );
 
     let mut fees: Vec<i64> = Vec::new();
@@ -981,7 +993,10 @@ async fn cmd_batch(
         match format {
             "json" => println!("{}", report::cost_report::format_batch_report_json(&batch)),
             "csv" => print!("{}", report::cost_report::format_batch_report_csv(&batch)),
-            "markdown" => println!("{}", report::cost_report::format_batch_report_markdown(&batch)),
+            "markdown" => println!(
+                "{}",
+                report::cost_report::format_batch_report_markdown(&batch)
+            ),
             _ => println!("{}", report::cost_report::format_batch_report_table(&batch)),
         }
 
