@@ -3,6 +3,7 @@ source: tests/report_snapshots.rs
 expression: JsonFormatter.format(&empty)
 ---
 {
+  "contract_meta": {},
   "cpu_instructions": 0,
   "fee": {
     "bandwidth_fee_stroops": 0,
