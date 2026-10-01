@@ -414,9 +414,25 @@ pub enum ConfigAction {
         #[arg(long)]
         json: bool,
     },
+    /// Show the chronological change history of every config setting.
+    ///
+    /// Builds a timeline across all saved snapshots, printing one row per
+    /// changed setting with its date, ledger, old value, new value, and
+    /// delta percentage.
     History {
         #[arg(long, default_value = "testnet")]
         network: String,
+
+        /// Filter the timeline to a single setting (matches the raw field
+        /// path, e.g. `contract_compute.fee_rate_per_instructions_increment`,
+        /// or a fragment of it, e.g. `fee_rate_per_instructions_increment`).
+        #[arg(long, value_name = "SETTING")]
+        setting: Option<String>,
+
+        /// Output the timeline as a structured JSON array instead of a
+        /// human-readable table.
+        #[arg(long)]
+        json: bool,
     },
     LastChanged {
         #[arg(long, default_value = "testnet")]

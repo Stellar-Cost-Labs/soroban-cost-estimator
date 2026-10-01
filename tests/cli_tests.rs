@@ -1136,6 +1136,253 @@ fn test_config_snapshot_retain_zero_rejected() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// `config history` — timeline across multiple snapshots
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Writes a snapshot with a non-empty `contract_compute` section so a change
+/// to `fee_rate_per_instructions_increment` between two snapshots produces a
+/// timeline entry.
+fn write_compute_snapshot(
+    home: &Path,
+    network: &str,
+    timestamp: &str,
+    ledger: u32,
+    compute_fee: i64,
+) {
+    let dir = home.join(".soroban-cost-estimator").join("snapshots");
+    std::fs::create_dir_all(&dir).expect("create snapshots dir");
+    let json = format!(
+        r#"{{
+  "network": "{network}",
+  "ledger": {ledger},
+  "timestamp": "{timestamp}",
+  "contract_compute": {{
+    "ledger_max_instructions": 1000000,
+    "tx_max_instructions": 100000,
+    "fee_rate_per_instructions_increment": {compute_fee},
+    "tx_memory_limit": 100
+  }},
+  "contract_ledger_cost": null,
+  "contract_historical_data": null,
+  "contract_events": null,
+  "contract_bandwidth": null,
+  "state_archival": null
+}}"#
+    );
+    let path = dir.join(format!("{network}-{}.json", timestamp.replace(':', "-")));
+    std::fs::write(&path, json).expect("write snapshot");
+}
+
+#[test]
+fn test_config_history_empty_network_reports_no_changes() {
+    let home = temp_home("history-empty");
+    let (stdout, stderr, code) = run_cli_quiet(
+        &["config", "history", "--network", "not-a-network"],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 0,
+        "history on an unknown network is local-only and must exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("no changes recorded"),
+        "an empty timeline should say so; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_history_timeline_across_snapshots() {
+    let home = temp_home("history-timeline");
+    write_compute_snapshot(
+        &home,
+        "not-a-network",
+        "2026-01-01T00:00:01+00:00",
+        100,
+        100,
+    );
+    write_compute_snapshot(
+        &home,
+        "not-a-network",
+        "2026-01-02T00:00:02+00:00",
+        200,
+        150,
+    );
+    write_compute_snapshot(
+        &home,
+        "not-a-network",
+        "2026-01-03T00:00:03+00:00",
+        300,
+        150,
+    );
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &["config", "history", "--network", "not-a-network"],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "history should exit 0; stderr: {stderr}");
+    // Exactly one transition (100 → 150); the third snapshot is unchanged.
+    assert!(
+        stdout.contains("1 change(s)"),
+        "one transition should be reported; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Fee Rate Per Instructions Increment"),
+        "the human-readable field name should be shown; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("+50.0%"),
+        "delta should be shown; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("2026-01-02T00:00:02+00:00"),
+        "the change date should be the newer snapshot's; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("2026-01-03"),
+        "no entry for the unchanged third snapshot; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_history_setting_filter() {
+    let home = temp_home("history-filter");
+    write_compute_snapshot(
+        &home,
+        "not-a-network",
+        "2026-01-01T00:00:01+00:00",
+        100,
+        100,
+    );
+    write_compute_snapshot(
+        &home,
+        "not-a-network",
+        "2026-01-02T00:00:02+00:00",
+        200,
+        200,
+    );
+
+    // A matching fragment shows the row.
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "config",
+            "history",
+            "--network",
+            "not-a-network",
+            "--setting",
+            "fee_rate_per_instructions_increment",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 0,
+        "--setting with a match should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("1 change(s)"),
+        "the filtered timeline should keep the row; got: {stdout}"
+    );
+
+    // A non-matching setting shows an empty timeline.
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "config",
+            "history",
+            "--network",
+            "not-a-network",
+            "--setting",
+            "no_such_setting",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 0,
+        "--setting with no match should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("no changes recorded"),
+        "a non-matching filter should produce an empty timeline; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_history_json_output() {
+    let home = temp_home("history-json");
+    write_compute_snapshot(
+        &home,
+        "not-a-network",
+        "2026-01-01T00:00:01+00:00",
+        100,
+        100,
+    );
+    write_compute_snapshot(
+        &home,
+        "not-a-network",
+        "2026-01-02T00:00:02+00:00",
+        200,
+        250,
+    );
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &["config", "history", "--network", "not-a-network", "--json"],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "--json should exit 0; stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("valid JSON; {e}: {stdout}"));
+    let entries = parsed
+        .as_array()
+        .unwrap_or_else(|| panic!("JSON array; got: {stdout}"));
+    assert_eq!(entries.len(), 1, "one transition expected; got: {stdout}");
+    assert_eq!(
+        entries[0]["field_path"],
+        "contract_compute.fee_rate_per_instructions_increment"
+    );
+    assert_eq!(entries[0]["ledger"], 200);
+    assert_eq!(entries[0]["old_value"], "100");
+    assert_eq!(entries[0]["new_value"], "250");
+    assert_eq!(entries[0]["delta_percent"], 150.0);
+    assert_eq!(entries[0]["is_pricing_change"], true);
+}
+
+#[test]
+fn test_config_history_json_setting_filter() {
+    let home = temp_home("history-json-filter");
+    write_compute_snapshot(
+        &home,
+        "not-a-network",
+        "2026-01-01T00:00:01+00:00",
+        100,
+        100,
+    );
+    write_compute_snapshot(
+        &home,
+        "not-a-network",
+        "2026-01-02T00:00:02+00:00",
+        200,
+        200,
+    );
+
+    // Filtered JSON stays a (possibly empty) array, so consumers need no
+    // special-casing for "nothing matched".
+    let (stdout, _, code) = run_cli_quiet(
+        &[
+            "config",
+            "history",
+            "--network",
+            "not-a-network",
+            "--json",
+            "--setting",
+            "no_such_setting",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 0);
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("valid JSON; {e}: {stdout}"));
+    assert_eq!(parsed.as_array().map(Vec::len), Some(0));
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // `config diff`
 // ─────────────────────────────────────────────────────────────────────────
 

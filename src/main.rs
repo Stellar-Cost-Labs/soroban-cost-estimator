@@ -412,7 +412,15 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     .await
                 }
             }
-            cli::ConfigAction::History { network } => cmd_config_history(&network),
+            cli::ConfigAction::History {
+                network,
+                setting,
+                json,
+            } => cmd_config_history(
+                &env_string(network, &default_network, "SOROBAN_NETWORK"),
+                setting.as_deref(),
+                json,
+            ),
             cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network),
             cli::ConfigAction::Validate { network } => cmd_config_validate(&network),
             cli::ConfigAction::Export { network, output } => {
@@ -2750,12 +2758,29 @@ fn cmd_config_diff_against_previous(
     Ok(())
 }
 
-/// `config history` command: print the full chronological change log.
-fn cmd_config_history(network: &str) -> error::AppResult<()> {
+/// `config history` command: print the full chronological change timeline.
+///
+/// Purely local — it only reads stored snapshots, never the network. The
+/// timeline aggregates every setting change across consecutive snapshots,
+/// optionally narrowed to one setting with `--setting`, and renders as a
+/// table or a structured JSON array with `--json`.
+fn cmd_config_history(
+    network: &str,
+    setting: Option<&str>,
+    json_flag: bool,
+) -> error::AppResult<()> {
     let log = config_snapshot::history::load_change_log(network)?;
+    let filtered = config_snapshot::history::filter_change_log(&log, setting);
+    if json_flag {
+        println!("{}", serde_json::to_string_pretty(&filtered)?);
+        return Ok(());
+    }
+    if let Some(needle) = setting.map(str::trim).filter(|s| !s.is_empty()) {
+        println!("Filter: {needle}");
+    }
     println!(
         "{}",
-        config_snapshot::history::format_change_log(network, &log)
+        config_snapshot::history::format_timeline_table(network, &filtered)
     );
     Ok(())
 }
