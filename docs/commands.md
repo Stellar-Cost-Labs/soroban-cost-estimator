@@ -411,6 +411,8 @@ soroban-cost-estimator config diff [OPTIONS]
 | `--against <AGAINST>` | | latest snapshot | Explicit snapshot path to compare against |
 | `--against-previous` | | `false` | Diff the two most recent on-disk snapshots against each other instead of the live network (conflicts with `--against`) |
 | `--summary` | | `false` | Print a single-line count summary instead of the full diff (for CI status lines) |
+| `--format <FORMAT>` | | `table` | Output format: `table`, `json`, `csv`, or `markdown` |
+| `--json` | | `false` | Legacy alias for `--format json` |
 | `--help` `-h` | | | Print help |
 
 **Behavior**
@@ -834,6 +836,7 @@ All commands accept:
 |------|-------------|
 | `--rps <N>` | Cap RPC requests at N per second (0 disables) |
 | `--timeout <SECS>` | HTTP request timeout for RPC calls in seconds (default `30`) |
+| `--format <FORMAT>` | Report format for commands that support it: `table`, `json`, `csv`, or `markdown` |
 | `--help` / `-h` | Print command-specific help |
 
 `--format` applies to report-producing commands. The legacy `--json` flag remains supported as an alias for `--format json` where it was previously available.

@@ -378,10 +378,13 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 summary,
                 json,
             } => {
-                let json_flag = if args.format.is_some() {
-                    format == cli::OutputFormat::Json
+                // `--format` wins when supplied; otherwise the legacy
+                // `--json` flag selects JSON on top of the config-file
+                // default already resolved into `format`.
+                let diff_format = if args.format.is_none() && json {
+                    cli::OutputFormat::Json
                 } else {
-                    json || format == cli::OutputFormat::Json
+                    format
                 };
                 if against_previous {
                     cmd_config_diff_against_previous(
@@ -389,7 +392,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                         pricing_only,
                         threshold_percent,
                         summary,
-                        json_flag,
+                        diff_format == cli::OutputFormat::Json,
                     )
                 } else {
                     cmd_config_diff(
@@ -399,7 +402,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                         pricing_only,
                         threshold_percent,
                         summary,
-                        json_flag,
+                        diff_format,
                         rps,
                         timeout,
                         max_retries,
@@ -2578,7 +2581,7 @@ async fn cmd_config_diff(
     pricing_only: bool,
     threshold_percent: Option<f64>,
     summary: bool,
-    json_flag: bool,
+    format: cli::OutputFormat,
     rps: Option<u64>,
     timeout: u64,
     max_retries: usize,
@@ -2587,6 +2590,12 @@ async fn cmd_config_diff(
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::{debug, info_span};
+
+    // Machine formats (JSON/CSV/Markdown) keep stdout parseable, so human
+    // extras like the stale-estimate list stay off it.
+    let json_flag = format == cli::OutputFormat::Json;
+    let machine =
+        json_flag || matches!(format, cli::OutputFormat::Csv | cli::OutputFormat::Markdown);
 
     let span = info_span!("cmd_config_diff", network);
     async {
@@ -2624,6 +2633,10 @@ async fn cmd_config_diff(
                 "stale_estimates": stale_estimates_for(network, new_snapshot.ledger),
             });
             println!("{}", serde_json::to_string_pretty(&json_output)?);
+        } else if format == cli::OutputFormat::Csv {
+            println!("{}", config_snapshot::diff::format_diff_csv(&diff));
+        } else if format == cli::OutputFormat::Markdown {
+            println!("{}", config_snapshot::diff::format_diff_markdown(&diff));
         } else if summary {
             println!("{}", config_snapshot::diff::format_diff_summary(&diff));
         } else {
@@ -2642,7 +2655,7 @@ async fn cmd_config_diff(
             match config_snapshot::store::save_snapshot(&new_snapshot, None) {
                 Ok(path) => {
                     info!(path = %path.display(), "auto-saved post-upgrade snapshot");
-                    if !json_flag && !summary {
+                    if !machine && !summary {
                         println!(
                             "  Protocol upgrade detected — new config auto-saved to {}",
                             path.display()
@@ -2651,14 +2664,14 @@ async fn cmd_config_diff(
                 }
                 Err(e) => {
                     warn!(error = %e, "could not auto-save post-upgrade snapshot");
-                    if !json_flag && !summary {
+                    if !machine && !summary {
                         eprintln!("  Warning: could not auto-save post-upgrade snapshot: {e}");
                     }
                 }
             }
         }
 
-        if !json_flag && !summary {
+        if !machine && !summary {
             print_stale_estimates(network, new_snapshot.ledger);
         }
 
