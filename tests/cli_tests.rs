@@ -210,7 +210,7 @@ fn test_config_snapshot_help() {
         code, 0,
         "config snapshot --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--network", "--rpc-url", "--out", "--json"] {
+    for flag in ["--network", "--out", "--json", "--retain"] {
         assert!(
             stdout.contains(flag),
             "snapshot help should mention {flag}; got: {stdout}"
@@ -973,32 +973,46 @@ fn test_config_snapshot_unknown_network() {
 }
 
 #[test]
-fn test_config_snapshot_rpc_url_overrides_unknown_network() {
-    // `--rpc-url` must bypass network-name resolution: with an otherwise
-    // unknown network name, the failure has to come from the RPC call itself
-    // (the dead endpoint), not from endpoint resolution.
-    let home = temp_home("snapshot-rpc-url-override");
-    let (_, stderr, code) = run_cli_in_home(
-        &[
-            "--max-retries",
-            "0",
-            "config",
-            "snapshot",
-            "--network",
-            "not-a-network",
-            "--rpc-url",
-            DEAD_RPC,
-        ],
-        Some(&home),
-    );
-    assert_eq!(code, 1, "the dead endpoint should still fail");
+fn test_config_snapshot_retain_flag_accepted() {
+    // `--retain` must be a recognized argument: the run fails on the unknown
+    // network (before any RPC), not on the flag itself.
+    let (_, stderr, code) = run_cli(&[
+        "config",
+        "snapshot",
+        "--network",
+        "not-a-network",
+        "--retain",
+        "5",
+    ]);
+    assert_eq!(code, 1, "an unknown network should exit 1");
     assert!(
-        !stderr.contains("not configured for network"),
-        "--rpc-url should override network resolution; got: {stderr}"
+        !stderr.contains("unexpected argument"),
+        "--retain should be a recognized argument; stderr: {stderr}"
     );
     assert!(
-        stderr.contains("failed to send HTTP request"),
-        "the failure should come from the HTTP call; got: {stderr}"
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
+        "the failure should come from the network, not the flag; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_retain_zero_rejected() {
+    // `--retain 0` would delete every snapshot, so clap must reject it before
+    // anything runs.
+    let (_, stderr, code) = run_cli(&[
+        "config",
+        "snapshot",
+        "--network",
+        "not-a-network",
+        "--retain",
+        "0",
+    ]);
+    assert_ne!(code, 0, "--retain 0 should be rejected");
+    assert!(
+        stderr.contains("is not in"),
+        "clap should explain the valid range; stderr: {stderr}"
     );
 }
 

@@ -364,6 +364,13 @@ pub enum ConfigAction {
         /// Explicit output path (defaults to ~/.soroban-cost-estimator/snapshots/).
         #[arg(long)]
         out: Option<String>,
+        /// Automatically delete snapshots older than N days.
+        #[arg(
+            long,
+            value_name = "N",
+            value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..)
+        )]
+        retain: Option<u64>,
         #[arg(long)]
         json: bool,
     },

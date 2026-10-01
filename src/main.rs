@@ -337,14 +337,20 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot {
                 network,
-                rpc_url,
                 out,
+                retain,
                 json,
             } => {
+                let format = match (args.format, json) {
+                    (Some(fmt), _) => fmt,
+                    (None, true) => cli::OutputFormat::Json,
+                    (None, false) => cli::OutputFormat::Table,
+                };
                 cmd_config_snapshot(
                     &env_string(network, &default_network, "SOROBAN_NETWORK"),
                     fallback,
                     out.as_deref(),
+                    retain,
                     format,
                     rps,
                     timeout,
@@ -2309,6 +2315,7 @@ async fn cmd_config_snapshot(
     rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     out_path: Option<&str>,
+    retain_days: Option<u64>,
     format: cli::OutputFormat,
     rps: Option<u64>,
     timeout: u64,
@@ -2336,6 +2343,25 @@ async fn cmd_config_snapshot(
 
         let path = config_snapshot::store::save_snapshot(&snapshot, out_path)?;
         info!(path = %path.display(), ledger = snapshot.ledger, "snapshot saved");
+
+        // With `--retain N`, delete this network's snapshots whose files are
+        // older than N days (by modification time). Runs after the save, so
+        // the just-written snapshot is never at risk.
+        if let Some(retain_days) = retain_days {
+            let cleaned = config_snapshot::store::clean_old_snapshots(network, retain_days)?;
+            info!(cleaned, retain_days, "cleaned old snapshots");
+            if cleaned > 0 {
+                let message = format!(
+                    "Deleted {cleaned} snapshot(s) older than {retain_days} day(s) for {network}."
+                );
+                if format == cli::OutputFormat::Json {
+                    // Keep stdout machine-readable; announce on stderr.
+                    eprintln!("{message}");
+                } else {
+                    println!("{message}");
+                }
+            }
+        }
 
         if format == cli::OutputFormat::Json {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
