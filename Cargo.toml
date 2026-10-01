@@ -45,6 +45,8 @@ single_match_else = { level = "allow", priority = 1 }
 map_unwrap_or = { level = "allow", priority = 1 }
 useless_format = { level = "allow", priority = 1 }
 too_many_arguments = { level = "allow", priority = 1 }
+# New in Rust 1.99; noise for boolean emptiness assertions in tests.
+assert_is_empty = { level = "allow", priority = 1 }
 
 [dependencies]
 # CLI

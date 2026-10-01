@@ -149,6 +149,13 @@ upgrade, or after debugging a bad estimate. It prints
 `Cleared N cached estimate(s) for <network>.` and can be combined with any
 other `estimate` flags (including `--cache-ttl`).
 
+Pass `--compare` to diff the fresh simulation against the estimate previously
+cached for the same function and arguments. The report is followed by a delta
+section covering CPU instructions, memory bytes, ledger read/write entries and
+the total fee (`+12400 (+5.2%)`). If no previous estimate is cached yet, it
+prints `No previous estimate found for comparison`; with `--json` the payload
+gains `previous_estimate` and `delta` objects instead.
+
 The read/write entry counts and byte sizes in the report are decoded from the
 simulation response's resource **footprint** — real values from the ledger
 footprint, not zero-filled placeholders. If a fee-rate source
