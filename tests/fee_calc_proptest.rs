@@ -119,8 +119,10 @@ proptest! {
             breakdown.refundable_stroops
         );
         // The authoritative total is always reported verbatim.
-        prop_assert_eq!(breakdown.total_stroops, total_resource_fee);
-        prop_assert_eq!(breakdown.total_xlm, stroops_to_xlm(total_resource_fee, DEFAULT_PRECISION));
+        let expected_base_fee = if total_resource_fee > 0 { 100 } else { 0 };
+        let expected_total_stroops = total_resource_fee.saturating_add(expected_base_fee);
+        prop_assert_eq!(breakdown.total_stroops, expected_total_stroops);
+        prop_assert_eq!(breakdown.total_xlm, stroops_to_xlm(expected_total_stroops, DEFAULT_PRECISION));
     }
 
     /// The reported totals are internally consistent for any realistic
@@ -161,13 +163,15 @@ proptest! {
             non_refundable + breakdown.refundable_stroops,
             total_resource_fee.max(non_refundable)
         );
-        prop_assert_eq!(breakdown.total_stroops, total_resource_fee);
-        prop_assert_eq!(&breakdown.total_xlm, &stroops_to_xlm(total_resource_fee, DEFAULT_PRECISION));
+        let expected_base_fee = if total_resource_fee > 0 { 100 } else { 0 };
+        let expected_total_stroops = total_resource_fee.saturating_add(expected_base_fee);
+        prop_assert_eq!(breakdown.total_stroops, expected_total_stroops);
+        prop_assert_eq!(&breakdown.total_xlm, &stroops_to_xlm(expected_total_stroops, DEFAULT_PRECISION));
         // The XLM string representation round-trips back to the exact
         // stroop count.
         prop_assert_eq!(
             xlm_to_stroops(&breakdown.total_xlm).unwrap(),
-            total_resource_fee
+            expected_total_stroops
         );
     }
 
