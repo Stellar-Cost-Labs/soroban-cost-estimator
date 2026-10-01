@@ -370,8 +370,8 @@ mod tests {
     fn age_snapshot_file(path: &std::path::Path, days_ago: u64) {
         let old =
             std::time::SystemTime::now() - std::time::Duration::from_secs(days_ago * 24 * 60 * 60);
-        let file = std::fs::File::open(path).expect("failed to open snapshot");
-        file.set_modified(old).expect("failed to set mtime");
+        filetime::set_file_mtime(path, filetime::FileTime::from_system_time(old))
+            .expect("failed to set mtime");
     }
 
     #[test]
