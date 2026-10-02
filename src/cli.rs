@@ -420,6 +420,11 @@ pub enum CacheAction {
 
 #[derive(Subcommand, Debug)]
 pub enum ConfigAction {
+    /// Fetch all ConfigSetting entries and save a timestamped snapshot.
+    ///
+    /// Subcommands manage snapshots already on disk instead of fetching a new
+    /// one, so they are mutually exclusive with this command's own flags.
+    #[command(args_conflicts_with_subcommands = true)]
     Snapshot {
         #[command(subcommand)]
         action: Option<SnapshotAction>,
@@ -427,15 +432,16 @@ pub enum ConfigAction {
         network: String,
         #[arg(long)]
         out: Option<String>,
-        /// Automatically delete snapshots older than N days.
-        #[arg(
-            long,
-            value_name = "N",
-            value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..)
-        )]
-        retain: Option<u64>,
         #[arg(long)]
         json: bool,
+
+        /// Keep only the N most recent snapshots for the network, deleting
+        /// older ones once the new snapshot is safely on disk.
+        #[arg(long, value_name = "COUNT")]
+        retain: Option<usize>,
+
+        #[command(subcommand)]
+        action: Option<SnapshotAction>,
     },
     /// List all saved config snapshots with their timestamp and ledger.
     List {
@@ -521,24 +527,30 @@ pub enum ConfigAction {
     },
 }
 
+/// Retention sub-actions under `config snapshot`.
+///
+/// These operate purely on snapshots already on disk and never fetch a new
+/// one, which is why they carry their own `--network` rather than inheriting
+/// the parent command's.
 #[derive(Subcommand, Debug)]
 pub enum SnapshotAction {
-    /// Validate one snapshot file or all saved snapshot files.
-    Validate {
-        /// Snapshot file to validate.
-        #[arg(
-            value_name = "PATH",
-            required_unless_present = "all",
-            conflicts_with = "all"
-        )]
-        path: Option<std::path::PathBuf>,
+    /// Delete stored snapshots older than a number of days.
+    ///
+    /// The newest snapshot is always kept, however old it is.
+    Prune {
+        /// Network whose snapshots should be pruned.
+        #[arg(long, default_value = "testnet")]
+        network: String,
 
-        /// Validate every saved snapshot file.
-        #[arg(long, required_unless_present = "path", conflicts_with = "path")]
-        all: bool,
+        /// Delete snapshots recorded more than this many days ago.
+        #[arg(long, value_name = "DAYS")]
+        older_than: u32,
+
+        /// Output as JSON instead of a human-readable summary.
+        #[arg(long)]
+        json: bool,
     },
 }
-
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 pub static COLOR_CHOICE: AtomicU8 = AtomicU8::new(0);
