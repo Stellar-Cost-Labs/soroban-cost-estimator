@@ -2775,6 +2775,10 @@ fn test_completions_help() {
         stdout.contains("powershell"),
         "completions help should list powershell option"
     );
+    assert!(
+        stdout.contains("elvish"),
+        "completions help should list elvish option"
+    );
 }
 
 #[test]
@@ -2790,6 +2794,12 @@ fn test_completions_bash() {
         stdout.contains("estimate"),
         "bash completion script should contain subcommand names"
     );
+    for network in ["testnet", "mainnet", "futurenet", "local"] {
+        assert!(
+            stdout.contains(network),
+            "bash completion script should include {network}"
+        );
+    }
 }
 
 #[test]
@@ -2837,6 +2847,24 @@ fn test_completions_powershell() {
     assert!(
         stdout.contains("estimate"),
         "powershell completion script should contain subcommand names"
+    );
+}
+
+#[test]
+fn test_completions_elvish() {
+    let (stdout, stderr, code) = run_cli(&["completions", "elvish"]);
+    assert_eq!(
+        code, 0,
+        "completions elvish should exit 0; stderr: {stderr}"
+    );
+    assert!(!stdout.is_empty(), "completion script should not be empty");
+    assert!(
+        stdout.contains("soroban-cost-estimator"),
+        "elvish completion script should contain binary name"
+    );
+    assert!(
+        stdout.contains("estimate"),
+        "elvish completion script should contain subcommand names"
     );
 }
 
