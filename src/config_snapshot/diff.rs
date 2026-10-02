@@ -222,6 +222,20 @@ pub struct ConfigDiff {
 }
 
 impl ConfigDiff {
+    /// True when any config setting changed, pricing or not.
+    pub fn has_any_changes(&self) -> bool {
+        !self.changes.is_empty()
+    }
+
+    /// True when at least one pricing change was detected.
+    ///
+    /// Provided as a method so callers (e.g. `cmd_config_diff` exit-code
+    /// evaluation) can use `ConfigDiff::has_pricing_changes()` without
+    /// touching the serialized `has_pricing_changes` field directly.
+    pub fn has_pricing_changes(&self) -> bool {
+        self.has_pricing_changes
+    }
+
     /// Returns true if any pricing change exceeds the given percentage threshold.
     /// Non-numeric changes are considered significant.
     pub fn has_significant_pricing_changes(&self, threshold_percent: f64) -> bool {
@@ -240,6 +254,39 @@ impl ConfigDiff {
             ratio * 100.0 >= threshold_percent
         })
     }
+}
+
+/// Resolve the process exit code for `config diff` from the diff and the
+/// CI-oriented flags.
+///
+/// Semantics (for CI drift detection):
+/// - default: `0` when no pricing changes, `1` when pricing changes detected.
+///   When `threshold_percent` is `Some(t)`, only pricing changes of at least
+///   `t` percent count.
+/// - `ignore_pricing_exit`: always `0`, even when pricing changed. Takes
+///   precedence over `fail_on_any_change` for informative reports that must
+///   not fail the build.
+/// - `fail_on_any_change`: `1` when any setting changed (pricing or not),
+///   `0` otherwise.
+///
+/// Returns `0` or `1`.
+pub fn resolve_exit_code(
+    diff: &ConfigDiff,
+    ignore_pricing_exit: bool,
+    fail_on_any_change: bool,
+    threshold_percent: Option<f64>,
+) -> i32 {
+    if ignore_pricing_exit {
+        return 0;
+    }
+    if fail_on_any_change {
+        return i32::from(diff.has_any_changes());
+    }
+    let pricing_changed = match threshold_percent {
+        Some(t) => diff.has_significant_pricing_changes(t),
+        None => diff.has_pricing_changes(),
+    };
+    i32::from(pricing_changed)
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1213,5 +1260,97 @@ mod tests {
             !output.contains("\u{1b}["),
             "no-change output should have no ANSI codes: {output}"
         );
+    }
+
+    // ── CI exit-code semantics (#112) ────────────────────────────────
+
+    fn non_pricing_only_diff() -> ConfigDiff {
+        let old = make_snapshot(100, 5);
+        let mut new = make_snapshot(100, 5);
+        if let Some(compute) = &mut new.contract_compute {
+            compute.ledger_max_instructions = 2_000_000;
+        }
+        diff_snapshots(&old, &new)
+    }
+
+    #[test]
+    fn test_resolve_exit_code_default_no_changes_is_zero() {
+        let snap = make_snapshot(100, 5);
+        let diff = diff_snapshots(&snap, &snap);
+        assert!(!diff.has_any_changes());
+        assert!(!diff.has_pricing_changes());
+        assert_eq!(resolve_exit_code(&diff, false, false, None), 0);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_default_pricing_change_is_one() {
+        let old = make_snapshot(100, 5);
+        let new = make_snapshot(200, 5);
+        let diff = diff_snapshots(&old, &new);
+        assert!(diff.has_pricing_changes());
+        assert_eq!(resolve_exit_code(&diff, false, false, None), 1);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_default_non_pricing_only_is_zero() {
+        let diff = non_pricing_only_diff();
+        assert!(diff.has_any_changes());
+        assert!(!diff.has_pricing_changes());
+        assert_eq!(resolve_exit_code(&diff, false, false, None), 0);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_ignore_pricing_exit_forces_zero() {
+        let old = make_snapshot(100, 5);
+        let new = make_snapshot(200, 5);
+        let diff = diff_snapshots(&old, &new);
+        assert_eq!(resolve_exit_code(&diff, true, false, None), 0);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_fail_on_any_change_catches_non_pricing() {
+        let diff = non_pricing_only_diff();
+        assert_eq!(resolve_exit_code(&diff, false, true, None), 1);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_fail_on_any_change_no_changes_is_zero() {
+        let snap = make_snapshot(100, 5);
+        let diff = diff_snapshots(&snap, &snap);
+        assert_eq!(resolve_exit_code(&diff, false, true, None), 0);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_ignore_takes_precedence_over_fail_on_any() {
+        let old = make_snapshot(100, 5);
+        let new = make_snapshot(200, 5);
+        let diff = diff_snapshots(&old, &new);
+        assert_eq!(resolve_exit_code(&diff, true, true, None), 0);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_threshold_below_significance_is_zero() {
+        // 100 → 200 is a 100% jump; a 500% threshold must not trigger exit 1.
+        let old = make_snapshot(100, 5);
+        let new = make_snapshot(200, 5);
+        let diff = diff_snapshots(&old, &new);
+        assert!(diff.has_pricing_changes());
+        assert_eq!(resolve_exit_code(&diff, false, false, Some(500.0)), 0);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_threshold_above_significance_is_one() {
+        let old = make_snapshot(100, 5);
+        let new = make_snapshot(200, 5);
+        let diff = diff_snapshots(&old, &new);
+        assert_eq!(resolve_exit_code(&diff, false, false, Some(10.0)), 1);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_ignore_wins_over_threshold() {
+        let old = make_snapshot(100, 5);
+        let new = make_snapshot(200, 5);
+        let diff = diff_snapshots(&old, &new);
+        assert_eq!(resolve_exit_code(&diff, true, false, Some(10.0)), 0);
     }
 }

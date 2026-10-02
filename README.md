@@ -188,6 +188,7 @@ Fetch all 6 `ConfigSetting` ledger entries, decode them via XDR, timestamp,
 and save to disk.
 
 ```bash
+soroban-cost-estimator config snapshot --network testnet [--out /custom/path.json] [--json] [--retain <N>]
 soroban-cost-estimator config snapshot --network testnet [--out /custom/path.json] [--json] [--retain N]
 ```
 
@@ -197,6 +198,18 @@ also records the network protocol version from `getLatestLedger`.
 `--retain N` is a retention policy: snapshots for the network whose files are
 older than N days are deleted after saving, so the snapshots directory doesn't
 grow without bound.
+
+`--retain <N>` keeps only the N most recent snapshots, deleting older ones
+after the new snapshot is safely on disk. To drop stale files by age, or on a
+schedule:
+
+```bash
+soroban-cost-estimator config snapshot prune --network testnet --older-than 30
+```
+
+`prune` makes no RPC call and never deletes the newest snapshot, however old it
+is — so there is always a pair left for `config diff --against-previous`. Both
+retention paths log how many snapshots they pruned.
 
 ### `config snapshot list`
 
@@ -231,16 +244,19 @@ instead of the full diff, handy for CI status lines:
 soroban-cost-estimator config diff --network testnet --summary
 ```
 
-Add `--against-previous` to diff the **two newest snapshots on disk** against
-each other instead of the live network. It makes no network calls, so it works
-offline and stays meaningful after the endpoint has moved on:
+- Exits **0** if no pricing changes, **1** with a detailed field-by-field
+  diff if pricing changed (default behavior)
+- `--ignore-pricing-exit` forces exit **0** even if pricing changed
+  (informative CI reports that must not fail the build)
+- `--fail-on-any-change` exits **1** if *any* config setting changed, even
+  non-pricing settings
+- Add `--against-previous` to diff the **two newest snapshots on disk** against
+  each other instead of the live network. It makes no network calls, so it works
+  offline and stays meaningful after the endpoint has moved on:
 
-```bash
-soroban-cost-estimator config diff --network testnet --against-previous
-```
-
-- Exits **0** if no changes detected
-- Exits **1** with a detailed field-by-field diff if pricing changed
+  ```bash
+  soroban-cost-estimator config diff --network testnet --against-previous
+  ```
 - **Auto-saves a snapshot of the new config** when a protocol upgrade is
   detected (pricing changed), so it becomes the baseline for future diffs —
   no separate `config snapshot` run needed
@@ -338,6 +354,23 @@ soroban-cost-estimator cache clear --network mainnet
   untouched
 - The same clearing logic backs the `estimate --clear-cache` flag, so both
   paths behave identically
+
+### `cache export`
+
+Dump cached estimates to a single versioned JSON document (schema version,
+export timestamp, and estimate records) for backup or sharing across
+workstations.
+
+```bash
+soroban-cost-estimator cache export --out backup.json
+# → Exported 12 cache entries to backup.json.
+
+soroban-cost-estimator cache export --network testnet --out testnet-backup.json
+```
+
+- Without `--out`, the export is printed to standard output
+- `--network` restricts the export to one network (default: all networks)
+- An unwritable destination fails with an error naming the path
 
 ### `config cache query`
 
