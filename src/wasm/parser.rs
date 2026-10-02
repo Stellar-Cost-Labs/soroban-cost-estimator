@@ -1,6 +1,7 @@
 use std::io::Cursor;
 use std::path::Path;
 
+use sha2::Digest;
 use stellar_xdr::ReadXdr;
 use tracing::{debug, trace, warn};
 
@@ -27,6 +28,20 @@ pub const WASM_PAGE_SIZE_BYTES: u64 = 65_536;
 
 /// Import module used by Soroban contracts for host functions (`env._` imports).
 pub const HOST_IMPORT_MODULE: &str = "env";
+
+/// Computes the lowercase-hex SHA-256 of a contract's raw WASM bytes.
+///
+/// This is the hash the Stellar network uses to identify a build, and the
+/// key this tool's estimate cache is keyed on, so it is computed once per
+/// run over the whole binary. It lives here rather than being inlined at
+/// each CLI call site so the `wasm_benchmark` Criterion target measures this
+/// exact code path rather than re-implementing it.
+///
+/// Pure CPU work — no I/O, no allocation beyond the 64-char hex string.
+#[must_use]
+pub fn wasm_sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(sha2::Sha256::digest(bytes))
+}
 
 /// Loads a compiled Soroban contract `.wasm` file from disk.
 ///
