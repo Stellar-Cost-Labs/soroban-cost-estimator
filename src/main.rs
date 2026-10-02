@@ -187,8 +187,6 @@ fn env_or_file_bool(value: bool, file: Option<bool>) -> bool {
 async fn main() {
     let args = cli::Cli::parse();
 
-    let default_level = if args.quiet {
-        "error"
     cli::init_color(args.color);
     cli::init_quiet(args.quiet);
 
@@ -344,20 +342,13 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             )
             .await
         }
-        cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(&wasm, json, quiet),
-                args.wasm_info,
-                args.verbose,
-                auto_snapshot,
-            )
-            .await
-        }
         cli::Command::WasmInfo { wasm, json } => {
             let format = match (args.format, json) {
                 (Some(fmt), _) => fmt,
                 (None, true) => cli::OutputFormat::Json,
                 (None, false) => cli::OutputFormat::Table,
             };
-            cmd_wasm_info(&wasm, format)
+            cmd_wasm_info(&wasm, format, quiet)
         }
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot {
@@ -376,21 +367,6 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     json,
                 }) => cmd_config_snapshot_prune(
                     &env_string(network, &default_network, "SOROBAN_NETWORK"),
-                    fallback,
-                    out.as_deref(),
-                    retain,
-                    format,
-                    rps,
-                    timeout,
-                    connect_timeout,
-                    max_retries,
-                    &headers,
-                    quiet,
-                    verbose,
-                )
-                .await
-            }
-            cli::ConfigAction::List { network } => cmd_config_snapshot_list(&network, quiet),
                     older_than,
                     json,
                 ),
@@ -411,12 +387,13 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                         connect_timeout,
                         max_retries,
                         &headers,
+                        quiet,
                         verbose,
                     )
                     .await
                 }
             },
-            cli::ConfigAction::List { network } => cmd_config_snapshot_list(&network),
+            cli::ConfigAction::List { network } => cmd_config_snapshot_list(&network, quiet),
             cli::ConfigAction::Diff {
                 network,
                 against,
@@ -487,11 +464,6 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     max_retries,
                     &headers,
                     quiet,
-                )
-                .await
-            }
-            cli::CacheAction::Verify => cmd_cache_verify(quiet),
-            cli::CacheAction::Clear { network } => cmd_cache_clear(&network, quiet),
                     verbose,
                 )
                 .await
@@ -509,6 +481,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 connect_timeout,
                 max_retries,
                 &headers,
+                quiet,
                 verbose,
             )
             .await
@@ -2424,8 +2397,7 @@ async fn estimate_all_function(
 ///
 /// # Network calls
 /// None — pure file I/O + parsing.
-fn cmd_wasm_info(wasm_path: &str, json_flag: bool, quiet: bool) -> error::AppResult<()> {
-fn cmd_wasm_info(wasm_path: &str, format: cli::OutputFormat) -> error::AppResult<()> {
+fn cmd_wasm_info(wasm_path: &str, format: cli::OutputFormat, quiet: bool) -> error::AppResult<()> {
     use sha2::Digest;
 
     let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
@@ -3398,11 +3370,7 @@ async fn cmd_watch(
 /// `--max-cache-entries` quotas).
 ///
 #[allow(dead_code)]
-fn cmd_cache_stats(quiet: bool) -> error::AppResult<()> {
-/// # Network calls
-/// None — pure SQLite I/O.
-#[allow(dead_code)] // wired once the `config cache stats` subcommand (#41) lands
-fn cmd_cache_stats(json: bool) -> error::AppResult<()> {
+fn cmd_cache_stats(json: bool, quiet: bool) -> error::AppResult<()> {
     let stats = cache::cache_stats()?;
     let limits = cache::cache_limits();
 
@@ -3432,6 +3400,7 @@ fn cmd_cache_stats(json: bool) -> error::AppResult<()> {
     );
     print_cache_quota(limits);
 
+    if !quiet {
         if !stats.per_network.is_empty() {
             println!("\nPer-network breakdown:");
             for (network, count) in &stats.per_network {
@@ -3656,11 +3625,12 @@ async fn handle_cache_action(
     connect_timeout: u64,
     max_retries: usize,
     headers: &[String],
+    quiet: bool,
     verbose: bool,
 ) -> error::AppResult<()> {
     match action {
         cli::CacheAction::Export { out, network } => {
-            cmd_cache_export(out.as_deref(), network.as_deref())
+            cmd_cache_export(out.as_deref(), network.as_deref(), quiet)
         }
         cli::CacheAction::Warm {
             wasm,
@@ -3691,8 +3661,8 @@ async fn handle_cache_action(
             .await
         }
         cli::CacheAction::List { network, json } => cmd_cache_list(&network, json),
-        cli::CacheAction::Verify => cmd_cache_verify(),
-        cli::CacheAction::Clear { network } => cmd_cache_clear(&network),
+        cli::CacheAction::Verify => cmd_cache_verify(quiet),
+        cli::CacheAction::Clear { network } => cmd_cache_clear(&network, quiet),
         cli::CacheAction::Prune => cmd_cache_prune(),
         cli::CacheAction::Query {
             network,
@@ -3713,7 +3683,7 @@ async fn handle_cache_action(
             to.as_deref(),
             json,
         ),
-        cli::CacheAction::Stats { json } => cmd_cache_stats(json),
+        cli::CacheAction::Stats { json } => cmd_cache_stats(json, quiet),
     }
 }
 
@@ -3774,44 +3744,27 @@ fn cmd_cache_query(
 
     if !quiet {
         let mut table = Table::new();
+        if crate::cli::should_colorize() {
+            table.enforce_styling();
+        } else {
+            table.force_no_tty();
+        }
         table.set_header(vec![
+            "Timestamp",
             "Function",
             "Network",
             "WASM Hash",
-            "Stroops",
-            "Ledger",
-            "Timestamp",
-    let mut table = Table::new();
-    if crate::cli::should_colorize() {
-        table.enforce_styling();
-    } else {
-        table.force_no_tty();
-    }
-    table.set_header(vec![
-        "Timestamp",
-        "Function",
-        "Network",
-        "WASM Hash",
-        "CPU",
-        "Fee (stroops)",
-    ]);
-    for e in &estimates {
-        table.add_row(vec![
-            Cell::new(e.timestamp.as_str()),
-            Cell::new(e.function.as_str()),
-            Cell::new(e.network.as_str()),
-            Cell::new(e.wasm_hash.as_str()),
-            Cell::new(e.cpu_instructions),
-            Cell::new(e.total_stroops),
+            "CPU",
+            "Fee (stroops)",
         ]);
         for e in &estimates {
             table.add_row(vec![
+                Cell::new(e.timestamp.as_str()),
                 Cell::new(e.function.as_str()),
                 Cell::new(e.network.as_str()),
                 Cell::new(e.wasm_hash.as_str()),
+                Cell::new(e.cpu_instructions),
                 Cell::new(e.total_stroops),
-                Cell::new(e.ledger),
-                Cell::new(e.timestamp.as_str()),
             ]);
         }
         println!("{table}");
@@ -3820,21 +3773,6 @@ fn cmd_cache_query(
     Ok(())
 }
 
-/// `cache export` command: print or save every cached estimate as a JSON array.
-fn cmd_cache_export(out_path: Option<&str>, quiet: bool) -> error::AppResult<()> {
-    let estimates = cache::export_cached_estimates()?;
-    let json = serde_json::to_string_pretty(&estimates)?;
-
-    if let Some(out_path) = out_path {
-        std::fs::write(out_path, json)?;
-        if !quiet {
-            println!(
-                "Exported {} cache entr{} to {}.",
-                estimates.len(),
-                if estimates.len() == 1 { "y" } else { "ies" },
-                out_path
-            );
-        }
 /// `cache export` command: print or save cached estimates as a versioned
 /// JSON export document (schema version, export timestamp, records).
 ///
@@ -3845,7 +3783,11 @@ fn cmd_cache_export(out_path: Option<&str>, quiet: bool) -> error::AppResult<()>
 ///
 /// # Network calls
 /// None — pure SQLite I/O.
-fn cmd_cache_export(out_path: Option<&str>, network: Option<&str>) -> error::AppResult<()> {
+fn cmd_cache_export(
+    out_path: Option<&str>,
+    network: Option<&str>,
+    quiet: bool,
+) -> error::AppResult<()> {
     let export = cache::export_cache(network)?;
     let json = serde_json::to_string_pretty(&export)?;
 
