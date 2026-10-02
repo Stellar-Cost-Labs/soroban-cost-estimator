@@ -300,6 +300,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 max_retries,
                 precision,
                 &headers,
+                quiet,
                 watch,
                 args.wasm_info,
                 args.verbose,
@@ -896,6 +897,7 @@ async fn cmd_estimate(
     max_retries: usize,
     precision: u32,
     extra_headers: &[String],
+    quiet: bool,
     watch: bool,
     wasm_info_flag: bool,
     verbose: bool,
@@ -958,6 +960,7 @@ async fn cmd_estimate(
             max_retries,
             precision,
             extra_headers,
+            quiet,
             verbose,
         )
         .await;
@@ -979,6 +982,7 @@ async fn cmd_estimate(
         format,
         precision,
         extra_headers,
+        quiet,
         rps,
         timeout,
         connect_timeout,
@@ -1108,6 +1112,7 @@ async fn estimate_once(
     format: &str,
     precision: u32,
     extra_headers: &[String],
+    quiet: bool,
     rps: Option<u64>,
     timeout: u64,
     connect_timeout: u64,
@@ -1468,6 +1473,7 @@ async fn emit_watch_estimate(
     precision: u32,
     extra_headers: &[String],
     human: bool,
+    quiet: bool,
     verbose: bool,
 ) {
     match estimate_once(
@@ -1491,6 +1497,7 @@ async fn emit_watch_estimate(
         format,
         precision,
         extra_headers,
+        quiet,
         rps,
         timeout,
         connect_timeout,
@@ -1562,6 +1569,7 @@ async fn estimate_watch_poll_once(
     precision: u32,
     extra_headers: &[String],
     human: bool,
+    quiet: bool,
     verbose: bool,
 ) -> error::AppResult<()> {
     let path = std::path::Path::new(wasm_path);
@@ -1605,6 +1613,7 @@ async fn estimate_watch_poll_once(
         precision,
         extra_headers,
         human,
+        quiet,
         verbose,
     )
     .await;
@@ -1641,6 +1650,7 @@ async fn cmd_estimate_watch(
     max_retries: usize,
     precision: u32,
     extra_headers: &[String],
+    quiet: bool,
     verbose: bool,
 ) -> error::AppResult<()> {
     use tracing::info;
@@ -1684,6 +1694,7 @@ async fn cmd_estimate_watch(
                 precision,
                 extra_headers,
                 human,
+                quiet,
                 verbose,
             )
             .await;
@@ -1727,6 +1738,7 @@ async fn cmd_estimate_watch(
                     precision,
                     extra_headers,
                     human,
+                    quiet,
                     verbose,
                 ).await;
                 tokio::time::sleep(WATCH_POLL_DURATION).await;
