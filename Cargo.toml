@@ -102,7 +102,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 governor = "0.10.4"
 
 [dev-dependencies]
-filetime = "0.2"
 insta = "1.40.0"
 proptest = "1.11.0"
 # `html_reports` is listed explicitly for the bench targets. It pulls in no
@@ -111,6 +110,7 @@ proptest = "1.11.0"
 # Naming it keeps the intent obvious if the `default` feature set ever changes.
 criterion = { version = "0.5", features = ["html_reports"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
+wiremock = "0.6.0"
 
 [profile.release]
 lto = true
