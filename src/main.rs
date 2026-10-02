@@ -185,8 +185,6 @@ fn env_or_file_bool(value: bool, file: Option<bool>) -> bool {
 async fn main() {
     let args = cli::Cli::parse();
 
-    let default_level = if args.quiet {
-        "error"
     cli::init_color(args.color);
     cli::init_quiet(args.quiet);
 
@@ -337,10 +335,6 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 precision,
                 &headers,
                 quiet,
-            )
-            .await
-        }
-        cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(&wasm, json, quiet),
                 args.wasm_info,
                 args.verbose,
                 auto_snapshot,
@@ -451,12 +445,6 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 )
                 .await
             }
-            cli::CacheAction::Verify => cmd_cache_verify(quiet),
-            cli::CacheAction::Clear { network } => cmd_cache_clear(&network, quiet),
-                    verbose,
-                )
-                .await
-            }
         },
         cli::Command::Cache { action } => {
             handle_cache_action(
@@ -470,7 +458,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 connect_timeout,
                 max_retries,
                 &headers,
-                verbose,
+                quiet,
             )
             .await
         }
@@ -2339,7 +2327,6 @@ async fn estimate_all_function(
 ///
 /// # Network calls
 /// None — pure file I/O + parsing.
-fn cmd_wasm_info(wasm_path: &str, json_flag: bool, quiet: bool) -> error::AppResult<()> {
 fn cmd_wasm_info(wasm_path: &str, format: cli::OutputFormat) -> error::AppResult<()> {
     use sha2::Digest;
 
@@ -3204,8 +3191,6 @@ async fn cmd_watch(
 /// how much disk space it consumes (against the `--max-cache-size-mb` and
 /// `--max-cache-entries` quotas).
 ///
-#[allow(dead_code)]
-fn cmd_cache_stats(quiet: bool) -> error::AppResult<()> {
 /// # Network calls
 /// None — pure SQLite I/O.
 #[allow(dead_code)] // wired once the `config cache stats` subcommand (#41) lands
@@ -3239,14 +3224,13 @@ fn cmd_cache_stats(json: bool) -> error::AppResult<()> {
     );
     print_cache_quota(limits);
 
-        if !stats.per_network.is_empty() {
-            println!("\nPer-network breakdown:");
-            for (network, count) in &stats.per_network {
-                println!(
-                    "  {network}: {count} entr{}",
-                    if *count == 1 { "y" } else { "ies" }
-                );
-            }
+    if !stats.per_network.is_empty() {
+        println!("\nPer-network breakdown:");
+        for (network, count) in &stats.per_network {
+            println!(
+                "  {network}: {count} entr{}",
+                if *count == 1 { "y" } else { "ies" }
+            );
         }
     }
 
@@ -3579,44 +3563,27 @@ fn cmd_cache_query(
 
     if !quiet {
         let mut table = Table::new();
+        if crate::cli::should_colorize() {
+            table.enforce_styling();
+        } else {
+            table.force_no_tty();
+        }
         table.set_header(vec![
+            "Timestamp",
             "Function",
             "Network",
             "WASM Hash",
-            "Stroops",
-            "Ledger",
-            "Timestamp",
-    let mut table = Table::new();
-    if crate::cli::should_colorize() {
-        table.enforce_styling();
-    } else {
-        table.force_no_tty();
-    }
-    table.set_header(vec![
-        "Timestamp",
-        "Function",
-        "Network",
-        "WASM Hash",
-        "CPU",
-        "Fee (stroops)",
-    ]);
-    for e in &estimates {
-        table.add_row(vec![
-            Cell::new(e.timestamp.as_str()),
-            Cell::new(e.function.as_str()),
-            Cell::new(e.network.as_str()),
-            Cell::new(e.wasm_hash.as_str()),
-            Cell::new(e.cpu_instructions),
-            Cell::new(e.total_stroops),
+            "CPU",
+            "Fee (stroops)",
         ]);
         for e in &estimates {
             table.add_row(vec![
+                Cell::new(e.timestamp.as_str()),
                 Cell::new(e.function.as_str()),
                 Cell::new(e.network.as_str()),
                 Cell::new(e.wasm_hash.as_str()),
+                Cell::new(e.cpu_instructions),
                 Cell::new(e.total_stroops),
-                Cell::new(e.ledger),
-                Cell::new(e.timestamp.as_str()),
             ]);
         }
         println!("{table}");
