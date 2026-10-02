@@ -301,6 +301,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 &headers,
                 watch,
                 args.wasm_info,
+                quiet,
                 args.verbose,
                 auto_snapshot,
                 diff,
@@ -426,6 +427,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                         summary,
                         diff_format == cli::OutputFormat::Json,
                         ignore_pricing_exit,
+                        quiet,
                         fail_on_any_change,
                     )
                 } else {
@@ -470,6 +472,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     max_retries,
                     &headers,
                     quiet,
+                    verbose,
                 )
                 .await
             }
@@ -487,6 +490,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 max_retries,
                 &headers,
                 quiet,
+                verbose,
             )
             .await
         }
@@ -763,7 +767,6 @@ struct SimulationRequest<'a> {
 /// `RpcClient`, which deduplicates identical requests â€” the same method with
 /// the same params â€” so identical fee-rate fetches transmit at most once.
 async fn simulate_report(
-    quiet: bool,
     req: &SimulationRequest<'_>,
 ) -> error::AppResult<report::cost_report::CostReport> {
     let endpoint = rpc::client::resolve_endpoint(req.network, req.rpc_url)?;
@@ -836,7 +839,7 @@ async fn simulate_report(
         memory_bytes, latest_ledger, total_fee_stroops, "simulation complete"
     );
 
-    let fee_rates = fetch_fee_rates(&client).await;
+    let fee_rates = fetch_fee_rates(&client, quiet).await;
 
     let fee = report::fee_calc::compute_fee_breakdown(
         total_fee_stroops,
@@ -991,6 +994,7 @@ async fn cmd_estimate(
         max_retries,
         format == "table",
         wasm_info_flag,
+        quiet,
         verbose,
         dry_run,
     )
@@ -1508,6 +1512,7 @@ async fn emit_watch_estimate(
         // `--wasm-info` is a one-shot report; the watcher prints its own
         // per-build header instead.
         false,
+        quiet,
         verbose,
         // `--watch` wins over `--dry-run`: watching exists to re-simulate.
         false,
@@ -1650,6 +1655,7 @@ async fn cmd_estimate_watch(
     max_retries: usize,
     precision: u32,
     extra_headers: &[String],
+    quiet: bool,
     verbose: bool,
 ) -> error::AppResult<()> {
     use tracing::info;
@@ -2102,7 +2108,6 @@ async fn cmd_estimate_all(
             std::time::Duration::from_secs(connect_timeout),
             max_retries,
             extra_headers,
-            quiet,
             verbose,
         );
 
@@ -2537,7 +2542,6 @@ async fn fetch_config_snapshot(
             std::time::Duration::from_secs(connect_timeout),
             max_retries,
             extra_headers,
-            quiet,
             verbose,
         );
         debug!("fetching all config settings");
