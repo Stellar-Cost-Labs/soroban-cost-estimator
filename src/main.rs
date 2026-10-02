@@ -432,6 +432,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                         diff_format == cli::OutputFormat::Json,
                         ignore_pricing_exit,
                         fail_on_any_change,
+                        quiet,
                     )
                 } else {
                     cmd_config_diff(
