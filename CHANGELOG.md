@@ -9,24 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `wasm info <file.wasm>` — fully offline contract inspection: file size,
-  SHA-256, exported functions with spec-derived argument *and return* types,
-  embedded contract/SDK metadata, a per-section size summary, and (with
-  `--json`) the full parsed `contractspecv0` AST. The existing flat
-  `wasm-info --wasm <file.wasm>` form is unchanged.
-- Per-section byte sizes and names for every WASM section, including custom
-  sections such as `contractspecv0`, `contractmetav0`, and `name`.
-- WASM section size breakdown — each section's full footprint (contents plus
-  its own header) and its share of the file, largest first, with the 8-byte
-  module header as its own row so the sizes add up exactly to the file length.
-  Shown by `wasm info`, repeated in `estimate` cost reports, and exposed as a
-  `section_sizes` map in `--json` output.
-- SDK version detection from the `contractmetav0` section (`rssdkver` and
-  common aliases), surfaced in both report modes.
-- `docs/commands/wasm-info.md` plus `wasm info` / `cache stats` sections in
-  `docs/commands.md`.
+- `config diff --against-previous` — diff the two most recent on-disk
+  snapshots against each other without contacting the live network. Works
+  offline, honors `--summary` and `--json`, and errors with the snapshot count
+  when fewer than two exist for the network.
+- `config snapshot --retain <N>` — keep only the N most recent snapshots for a
+  network, pruning older ones after the new snapshot is safely on disk.
+- `config snapshot prune --older-than <DAYS>` — delete snapshots recorded more
+  than D days ago. Pure file I/O, so it is safe offline and in a cron job.
+
+### Fixed
+
+- Snapshot retention never deletes the newest snapshot for a network, however
+  old it is or however small `--retain` is, so a `config diff` always has a
+  pair left to compare.
+
+### Added
+
 - `--timeout` global flag — configurable HTTP request timeout for RPC calls
   in seconds (default 30).
+- `--max-retries` global flag — configurable maximum number of retry attempts
+  for transient RPC failures (default 3). 0 disables retries, so CI runs can
+  opt into aggressive retries while interactive use can fail fast.
 - `config diff --summary` — print a single-line summary
   (`X pricing changes, Y non-pricing changes`) instead of the full diff, for CI
   status lines. Exit code and auto-save side effects are unchanged.
@@ -37,6 +41,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   command, its flags, and its offline error paths.
 - CI build matrix running fmt, clippy, build, and tests on Linux, macOS, and
   Windows for cross-platform compatibility.
+- `estimate-all` prints a fee/CPU **distribution box** (min/max/mean/median/
+  standard deviation of fees and min/max/mean CPU instructions) and exposes the
+  same statistics as a `fee_distribution` object in `--json` output.
+- Report headers show `Simulated at ledger sequence: <n>` and JSON reports
+  serialize the ledger as `ledger_sequence`.
+
+### Changed
+
+- `estimate-all --json` now emits an object (`{ "functions": [...],
+  "fee_distribution": { ... } }`) instead of a bare array; the per-function
+  records moved under the `functions` key.
 
 ### Fixed
 

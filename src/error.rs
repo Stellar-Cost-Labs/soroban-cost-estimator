@@ -17,8 +17,24 @@ pub enum AppError {
     #[error("failed to execute RPC: status {status} - {message}")]
     Rpc { status: i64, message: String },
 
+    /// The endpoint answered with a transient gateway status (502/503/504),
+    /// meaning it is briefly unavailable rather than misconfigured. Treated
+    /// as retryable and as a trigger for failover to `--rpc-fallback-url`.
+    #[error("RPC endpoint temporarily unavailable (HTTP {status})")]
+    RpcUnavailable { status: u16 },
+
     #[error("failed to send HTTP request: {0}")]
     Http(#[from] reqwest::Error),
+
+    /// The TCP connection could not be established within the configured
+    /// connect timeout (distinct from a whole-request timeout). Wraps the
+    /// underlying reqwest error so the original context is preserved.
+    #[error("Failed to establish connection to RPC host within {seconds} seconds")]
+    ConnectTimeout {
+        seconds: u64,
+        #[source]
+        source: reqwest::Error,
+    },
 
     // ── WebSocket ────────────────────────────────────────────────
     #[error("WebSocket connection failed: {0}")]
@@ -60,6 +76,12 @@ pub enum AppError {
     #[error("failed to load snapshots: none available for network {0}")]
     NoSnapshots(String),
 
+    #[error(
+        "failed to load snapshots: need at least 2 for network {network}, found {found} \
+         (run `config snapshot --network {network}` to capture another)"
+    )]
+    NotEnoughSnapshots { network: String, found: usize },
+
     // ── Simulation ──────────────────────────────────────────────────
     #[error("failed to simulate transaction: {0}")]
     SimulationFailed(String),
@@ -72,6 +94,9 @@ pub enum AppError {
     FeeCalc(String),
 
     // ── Config ──────────────────────────────────────────────────────
+    #[error("failed to process config: {0}")]
+    Config(String),
+
     #[error("failed to fetch config: {0}")]
     ConfigFetch(String),
 
