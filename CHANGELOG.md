@@ -9,8 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `config diff --against-previous` — diff the two most recent on-disk
+  snapshots against each other without contacting the live network. Works
+  offline, honors `--summary` and `--json`, and errors with the snapshot count
+  when fewer than two exist for the network.
 - `--timeout` global flag — configurable HTTP request timeout for RPC calls
   in seconds (default 30).
+- `--max-retries` global flag — configurable maximum number of retry attempts
+  for transient RPC failures (default 3). 0 disables retries, so CI runs can
+  opt into aggressive retries while interactive use can fail fast.
 - `config diff --summary` — print a single-line summary
   (`X pricing changes, Y non-pricing changes`) instead of the full diff, for CI
   status lines. Exit code and auto-save side effects are unchanged.

@@ -66,6 +66,13 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "SECS", default_value_t = 30)]
     pub timeout: u64,
 
+    /// TCP connection establishment timeout for RPC calls, in seconds. Bounds
+    /// only the initial connect — a dead or unreachable host fails within
+    /// this window instead of hanging for the full --timeout. 0 disables it
+    /// (connect attempts then fall under --timeout alone).
+    #[arg(long, global = true, value_name = "SECS", default_value_t = 5)]
+    pub connect_timeout: u64,
+
     /// Enable debug-level logging, including full RPC request payloads and
     /// response summaries.
     #[arg(long, short, global = true)]
@@ -155,10 +162,21 @@ pub enum Command {
         #[arg(long, value_name = "DURATION")]
         cache_ttl: Option<String>,
 
+        /// Show the cost difference against the previous cached estimate for
+        /// the same function and arguments (CPU, memory, ledger I/O, and fee).
+        #[arg(long)]
+        compare: bool,
+
         /// Wipe this network's cached estimates before running the
         /// simulation (e.g. after upgrading the tool or a network upgrade).
         #[arg(long)]
         clear_cache: bool,
+
+        /// Bypass the estimate cache entirely: never read a cached estimate
+        /// (including under `--cache-ttl`) and never write the fresh result
+        /// back to disk.
+        #[arg(long)]
+        no_cache: bool,
 
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
@@ -213,6 +231,17 @@ pub enum Command {
         /// Deployed contract ID (64 hex chars) to invoke each function against.
         #[arg(long)]
         id: Option<String>,
+
+        /// Bypass the estimate cache entirely: never read cached estimates
+        /// and never write fresh results back to disk.
+        #[arg(long)]
+        no_cache: bool,
+
+        /// Restrict estimation to these function names (repeatable). When
+        /// omitted, every exported function is estimated.
+        #[arg(long = "fn", value_name = "NAME")]
+        fn_names: Vec<String>,
+
         #[arg(long)]
         json: bool,
 
@@ -315,28 +344,28 @@ pub enum CacheAction {
     /// Query cached estimates with optional filters.
     Query {
         /// Network to filter by.
-        #[arg(long, default_value = "testnet")]
-        network: String,
-
-        /// Filter by function name (case-insensitive substring match).
         #[arg(long)]
-        function: Option<String>,
+        network: Option<String>,
 
-        /// Filter by WASM hash prefix.
+        /// Filter by function name (--function, --fn).
+        #[arg(long = "fn", visible_alias = "function")]
+        r#fn: Option<String>,
+
+        /// Filter by WASM hash.
         #[arg(long)]
         wasm_hash: Option<String>,
 
-        /// Minimum total fee in stroops.
-        #[arg(long, value_name = "STROOPS")]
-        min_stroops: Option<i64>,
+        /// Minimum total fee in stroops (--min-stroops, --min-fee).
+        #[arg(long = "min-fee", visible_alias = "min-stroops", value_name = "FEE")]
+        min_fee: Option<i64>,
 
-        /// Maximum total fee in stroops.
-        #[arg(long, value_name = "STROOPS")]
-        max_stroops: Option<i64>,
+        /// Maximum total fee in stroops (--max-stroops, --max-fee).
+        #[arg(long = "max-fee", visible_alias = "max-stroops", value_name = "FEE")]
+        max_fee: Option<i64>,
 
-        /// Earliest timestamp (ISO-8601, e.g. "2024-06-01T00:00:00Z").
-        #[arg(long, value_name = "TIMESTAMP")]
-        from: Option<String>,
+        /// Earliest timestamp or date (--from, --since).
+        #[arg(long = "since", visible_alias = "from", value_name = "DATE/TIME")]
+        since: Option<String>,
 
         /// Latest timestamp (ISO-8601, e.g. "2024-12-31T23:59:59Z").
         #[arg(long, value_name = "TIMESTAMP")]
@@ -362,6 +391,13 @@ pub enum ConfigAction {
         network: String,
         #[arg(long)]
         out: Option<String>,
+        /// Automatically delete snapshots older than N days.
+        #[arg(
+            long,
+            value_name = "N",
+            value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..)
+        )]
+        retain: Option<u64>,
         #[arg(long)]
         json: bool,
     },
@@ -380,6 +416,10 @@ pub enum ConfigAction {
         #[arg(long)]
         against: Option<String>,
 
+        /// Diff the two most recent on-disk snapshots against each other
+        /// instead of the live network. Never contacts the RPC endpoint.
+        #[arg(long, conflicts_with = "against")]
+        against_previous: bool,
         /// Hide non-pricing changes and display only fee-rate adjustments.
         #[arg(long)]
         pricing_only: bool,
@@ -437,6 +477,12 @@ pub enum ConfigAction {
     Import {
         /// Path to the snapshot bundle file.
         bundle: String,
+    },
+
+    /// Query or manage the estimate cache.
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
     },
 }
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};

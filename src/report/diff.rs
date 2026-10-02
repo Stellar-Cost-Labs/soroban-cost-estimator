@@ -240,6 +240,8 @@ pub fn format_cost_report_diff_sized(
     }
     if color {
         table.enforce_styling();
+    } else {
+        table.force_no_tty();
     }
     table.set_header(vec!["Resource", "Old", "New", "Change (+/- %)"]);
 
@@ -297,6 +299,7 @@ mod tests {
             rpc_latency_ms: 42,
             rates: None,
             projections: None,
+            contract_meta: crate::wasm::parser::ContractMeta::default(),
         }
     }
 

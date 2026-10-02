@@ -1059,6 +1059,7 @@ fn test_migrate_to_latest_current_version_is_identity() {
             timestamp: "t".to_string(),
             duration_ms: Some(42),
             success: true,
+            io: None,
         };
         let migrated = cache::migrate_to_latest(entry.clone()).expect("migrate");
         assert_eq!(migrated.version, current_schema_version());
@@ -1084,6 +1085,7 @@ fn test_migrate_to_latest_rejects_future_version() {
             timestamp: "t".to_string(),
             duration_ms: None,
             success: true,
+            io: None,
         };
         let err = cache::migrate_to_latest(entry).expect_err("future version must be rejected");
         assert!(err.to_string().contains("newer"), "unhelpful error: {err}");
@@ -1660,6 +1662,7 @@ fn test_v2_entry_migrates_to_v3_preserving_fields() {
         timestamp: "2026-01-01T00:00:00Z".to_string(),
         duration_ms: Some(1_234),
         success: false,
+        io: None,
     };
     let migrated = cache::migrate_to_latest(entry).expect("migrate v2 to v3");
     assert_eq!(migrated.version, cache::CACHE_SCHEMA_VERSION);
@@ -1685,6 +1688,7 @@ fn test_schema_version_serialization_key() {
         timestamp: "2026-01-01T00:00:00Z".to_string(),
         duration_ms: None,
         success: true,
+        io: None,
     };
     let json = serde_json::to_string(&entry).expect("serialize");
     assert!(
@@ -1736,6 +1740,7 @@ fn test_future_schema_error_names_version_and_remedy() {
         timestamp: "2026-01-01T00:00:00Z".to_string(),
         duration_ms: None,
         success: true,
+        io: None,
     };
     let err = cache::migrate_to_latest(entry).expect_err("future version must be rejected");
     let message = err.to_string();
@@ -1775,6 +1780,7 @@ fn save_with(
         1_000,
         100,
         50,
+        None,
         None,
         true,
         limits,
@@ -2028,6 +2034,696 @@ fn test_cache_stats_reports_populated_cache() {
             count("testnet"),
             Some(1),
             "testnet breakdown should count 1"
+        );
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// query_cache and CacheFilter tests (issue #335)
+// ─────────────────────────────────────────────────────────────────────────
+
+fn seed_query_test_entry(
+    home: &Path,
+    wasm_hash: &str,
+    function: &str,
+    args: &[&str],
+    network: &str,
+    total_stroops: i64,
+    cpu_instructions: u64,
+    timestamp: &str,
+) {
+    let dir = home.join(".soroban-cost-estimator");
+    std::fs::create_dir_all(&dir).expect("create data dir");
+    let db = dir.join("cache.db");
+    let conn = rusqlite::Connection::open(&db).expect("open cache db");
+    cache::ensure_cache_schema(&conn).expect("ensure cache schema");
+
+    let mut hasher = sha2::Sha256::new();
+    for a in args {
+        hasher.update(a.as_bytes());
+    }
+    let args_hash = hex::encode(hasher.finalize());
+
+    conn.execute(
+        "INSERT OR REPLACE INTO estimates \
+         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, duration_ms, success) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        rusqlite::params![
+            cache::CACHE_SCHEMA_VERSION as i64,
+            wasm_hash,
+            function,
+            args_hash,
+            network,
+            100i64,
+            total_stroops,
+            cpu_instructions as i64,
+            1024i64,
+            timestamp,
+            Some(50i64),
+            1i64,
+        ],
+    )
+    .expect("insert test estimate");
+}
+
+#[test]
+fn test_query_cache_wasm_hash_filter() {
+    with_temp_home(|tmp| {
+        seed_query_test_entry(
+            tmp,
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "func_a",
+            &[],
+            "testnet",
+            100_000,
+            10_000,
+            "2026-01-01T00:00:00Z",
+        );
+        seed_query_test_entry(
+            tmp,
+            "2222222222222222222222222222222222222222222222222222222222222222",
+            "func_b",
+            &[],
+            "testnet",
+            200_000,
+            20_000,
+            "2026-01-02T00:00:00Z",
+        );
+
+        // Exact match
+        let filter = cache::CacheFilter {
+            wasm_hash: Some(
+                "1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            ),
+            ..Default::default()
+        };
+        let res = cache::query_cache(&filter).expect("query");
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].function, "func_a");
+
+        // Case-insensitive prefix match
+        let filter_prefix = cache::CacheFilter {
+            wasm_hash: Some("2222".to_string()),
+            ..Default::default()
+        };
+        let res_prefix = cache::query_cache(&filter_prefix).expect("query");
+        assert_eq!(res_prefix.len(), 1);
+        assert_eq!(res_prefix[0].function, "func_b");
+
+        // Non-matching hash returns empty
+        let filter_none = cache::CacheFilter {
+            wasm_hash: Some(
+                "3333333333333333333333333333333333333333333333333333333333333333".to_string(),
+            ),
+            ..Default::default()
+        };
+        let res_none = cache::query_cache(&filter_none).expect("query");
+        assert!(res_none.is_empty());
+    });
+}
+
+#[test]
+fn test_query_cache_function_filter() {
+    with_temp_home(|tmp| {
+        seed_query_test_entry(
+            tmp,
+            "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000",
+            "transfer",
+            &[],
+            "testnet",
+            100_000,
+            10_000,
+            "2026-01-01T00:00:00Z",
+        );
+        seed_query_test_entry(
+            tmp,
+            "bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000",
+            "approve",
+            &[],
+            "testnet",
+            200_000,
+            20_000,
+            "2026-01-02T00:00:00Z",
+        );
+
+        let filter = cache::CacheFilter {
+            function: Some("transfer".to_string()),
+            ..Default::default()
+        };
+        let res = cache::query_cache(&filter).expect("query");
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].function, "transfer");
+
+        // Exact match semantics: substring should NOT match
+        let filter_sub = cache::CacheFilter {
+            function: Some("trans".to_string()),
+            ..Default::default()
+        };
+        let res_sub = cache::query_cache(&filter_sub).expect("query");
+        assert!(res_sub.is_empty());
+    });
+}
+
+#[test]
+fn test_query_cache_network_filter() {
+    with_temp_home(|tmp| {
+        seed_query_test_entry(
+            tmp,
+            "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000",
+            "fn1",
+            &[],
+            "testnet",
+            100_000,
+            10_000,
+            "2026-01-01T00:00:00Z",
+        );
+        seed_query_test_entry(
+            tmp,
+            "bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000",
+            "fn2",
+            &[],
+            "mainnet",
+            200_000,
+            20_000,
+            "2026-01-02T00:00:00Z",
+        );
+
+        let filter = cache::CacheFilter {
+            network: Some("testnet".to_string()),
+            ..Default::default()
+        };
+        let res = cache::query_cache(&filter).expect("query");
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].network, "testnet");
+
+        let filter_main = cache::CacheFilter {
+            network: Some("mainnet".to_string()),
+            ..Default::default()
+        };
+        let res_main = cache::query_cache(&filter_main).expect("query");
+        assert_eq!(res_main.len(), 1);
+        assert_eq!(res_main[0].network, "mainnet");
+    });
+}
+
+#[test]
+fn test_query_cache_min_fee_filter() {
+    with_temp_home(|tmp| {
+        seed_query_test_entry(
+            tmp,
+            "1111000011110000111100001111000011110000111100001111000011110000",
+            "low_fee",
+            &[],
+            "testnet",
+            50_000,
+            10_000,
+            "2026-01-01T00:00:00Z",
+        );
+        seed_query_test_entry(
+            tmp,
+            "2222000022220000222200002222000022220000222200002222000022220000",
+            "mid_fee",
+            &[],
+            "testnet",
+            100_000,
+            20_000,
+            "2026-01-02T00:00:00Z",
+        );
+        seed_query_test_entry(
+            tmp,
+            "3333000033330000333300003333000033330000333300003333000033330000",
+            "high_fee",
+            &[],
+            "testnet",
+            200_000,
+            30_000,
+            "2026-01-03T00:00:00Z",
+        );
+
+        let filter = cache::CacheFilter {
+            min_fee: Some(100_000),
+            ..Default::default()
+        };
+        let res = cache::query_cache(&filter).expect("query");
+        assert_eq!(res.len(), 2);
+        assert!(res.iter().all(|e| e.total_stroops >= 100_000));
+    });
+}
+
+#[test]
+fn test_query_cache_max_fee_filter() {
+    with_temp_home(|tmp| {
+        seed_query_test_entry(
+            tmp,
+            "1111000011110000111100001111000011110000111100001111000011110000",
+            "low_fee",
+            &[],
+            "testnet",
+            50_000,
+            10_000,
+            "2026-01-01T00:00:00Z",
+        );
+        seed_query_test_entry(
+            tmp,
+            "2222000022220000222200002222000022220000222200002222000022220000",
+            "mid_fee",
+            &[],
+            "testnet",
+            100_000,
+            20_000,
+            "2026-01-02T00:00:00Z",
+        );
+        seed_query_test_entry(
+            tmp,
+            "3333000033330000333300003333000033330000333300003333000033330000",
+            "high_fee",
+            &[],
+            "testnet",
+            200_000,
+            30_000,
+            "2026-01-03T00:00:00Z",
+        );
+
+        let filter = cache::CacheFilter {
+            max_fee: Some(100_000),
+            ..Default::default()
+        };
+        let res = cache::query_cache(&filter).expect("query");
+        assert_eq!(res.len(), 2);
+        assert!(res.iter().all(|e| e.total_stroops <= 100_000));
+    });
+}
+
+#[test]
+fn test_query_cache_fee_range_filter() {
+    with_temp_home(|tmp| {
+        seed_query_test_entry(
+            tmp,
+            "1111000011110000111100001111000011110000111100001111000011110000",
+            "low_fee",
+            &[],
+            "testnet",
+            50_000,
+            10_000,
+            "2026-01-01T00:00:00Z",
+        );
+        seed_query_test_entry(
+            tmp,
+            "2222000022220000222200002222000022220000222200002222000022220000",
+            "mid_fee",
+            &[],
+            "testnet",
+            100_000,
+            20_000,
+            "2026-01-02T00:00:00Z",
+        );
+        seed_query_test_entry(
+            tmp,
+            "3333000033330000333300003333000033330000333300003333000033330000",
+            "high_fee",
+            &[],
+            "testnet",
+            200_000,
+            30_000,
+            "2026-01-03T00:00:00Z",
+        );
+
+        let filter = cache::CacheFilter {
+            min_fee: Some(75_000),
+            max_fee: Some(150_000),
+            ..Default::default()
+        };
+        let res = cache::query_cache(&filter).expect("query");
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].function, "mid_fee");
+        assert_eq!(res[0].total_stroops, 100_000);
+    });
+}
+
+#[test]
+fn test_query_cache_since_filter() {
+    with_temp_home(|tmp| {
+        seed_query_test_entry(
+            tmp,
+            "1111000011110000111100001111000011110000111100001111000011110000",
+            "early",
+            &[],
+            "testnet",
+            100_000,
+            10_000,
+            "2025-12-31T23:59:59Z",
+        );
+        seed_query_test_entry(
+            tmp,
+            "2222000022220000222200002222000022220000222200002222000022220000",
+            "on_boundary",
+            &[],
+            "testnet",
+            100_000,
+            10_000,
+            "2026-01-01T00:00:00Z",
+        );
+        seed_query_test_entry(
+            tmp,
+            "3333000033330000333300003333000033330000333300003333000033330000",
+            "late",
+            &[],
+            "testnet",
+            100_000,
+            10_000,
+            "2026-01-02T12:00:00Z",
+        );
+
+        let since_dt = cache::parse_since_timestamp("2026-01-01").expect("parse since");
+        let filter = cache::CacheFilter {
+            since: Some(since_dt),
+            ..Default::default()
+        };
+        let res = cache::query_cache(&filter).expect("query");
+        assert_eq!(res.len(), 2);
+        assert!(res.iter().all(|e| e.function != "early"));
+    });
+}
+
+#[test]
+fn test_query_cache_multiple_filters_and_semantics() {
+    with_temp_home(|tmp| {
+        // Entry 1: matches ALL criteria
+        seed_query_test_entry(
+            tmp,
+            "deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000",
+            "transfer",
+            &["arg1"],
+            "testnet",
+            150_000,
+            10_000,
+            "2026-02-01T12:00:00Z",
+        );
+        // Entry 2: wrong function
+        seed_query_test_entry(
+            tmp,
+            "deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000",
+            "mint",
+            &["arg2"],
+            "testnet",
+            150_000,
+            10_000,
+            "2026-02-01T12:00:00Z",
+        );
+        // Entry 3: wrong network
+        seed_query_test_entry(
+            tmp,
+            "deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000",
+            "transfer",
+            &["arg3"],
+            "mainnet",
+            150_000,
+            10_000,
+            "2026-02-01T12:00:00Z",
+        );
+        // Entry 4: fee too low
+        seed_query_test_entry(
+            tmp,
+            "deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000",
+            "transfer",
+            &["arg4"],
+            "testnet",
+            50_000,
+            10_000,
+            "2026-02-01T12:00:00Z",
+        );
+        // Entry 5: timestamp too early
+        seed_query_test_entry(
+            tmp,
+            "deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000",
+            "transfer",
+            &["arg5"],
+            "testnet",
+            150_000,
+            10_000,
+            "2025-12-01T12:00:00Z",
+        );
+
+        let since_dt = cache::parse_since_timestamp("2026-01-01").expect("parse since");
+        let filter = cache::CacheFilter {
+            wasm_hash: Some("deadbeef".to_string()),
+            function: Some("transfer".to_string()),
+            network: Some("testnet".to_string()),
+            min_fee: Some(100_000),
+            max_fee: Some(200_000),
+            since: Some(since_dt),
+            to: None,
+        };
+
+        let res = cache::query_cache(&filter).expect("query");
+        assert_eq!(
+            res.len(),
+            1,
+            "only entry satisfying all AND filters should match"
+        );
+        assert_eq!(res[0].function, "transfer");
+        assert_eq!(res[0].network, "testnet");
+        assert_eq!(res[0].total_stroops, 150_000);
+    });
+}
+
+#[test]
+fn test_query_cache_no_filters_returns_all() {
+    with_temp_home(|tmp| {
+        seed_query_test_entry(
+            tmp,
+            "1111000011110000111100001111000011110000111100001111000011110000",
+            "fn1",
+            &[],
+            "testnet",
+            100_000,
+            10_000,
+            "2026-01-01T00:00:00Z",
+        );
+        seed_query_test_entry(
+            tmp,
+            "2222000022220000222200002222000022220000222200002222000022220000",
+            "fn2",
+            &[],
+            "mainnet",
+            200_000,
+            20_000,
+            "2026-01-02T00:00:00Z",
+        );
+
+        let filter = cache::CacheFilter::default();
+        let res = cache::query_cache(&filter).expect("query");
+        assert_eq!(
+            res.len(),
+            2,
+            "no filters should return all cached estimates across all networks"
+        );
+    });
+}
+
+#[test]
+fn test_query_cache_invalid_inputs_return_app_error() {
+    // Invalid network
+    let filter_net = cache::CacheFilter {
+        network: Some("nonexistent_network".to_string()),
+        ..Default::default()
+    };
+    assert!(cache::query_cache(&filter_net).is_err());
+
+    // Negative min fee
+    let filter_fee_neg = cache::CacheFilter {
+        min_fee: Some(-10),
+        ..Default::default()
+    };
+    assert!(cache::query_cache(&filter_fee_neg).is_err());
+
+    // Invalid fee range (min > max)
+    let filter_fee_range = cache::CacheFilter {
+        min_fee: Some(200_000),
+        max_fee: Some(100_000),
+        ..Default::default()
+    };
+    assert!(cache::query_cache(&filter_fee_range).is_err());
+
+    // Invalid wasm hash (non-hex)
+    let filter_hash = cache::CacheFilter {
+        wasm_hash: Some("not_hexadecimal!".to_string()),
+        ..Default::default()
+    };
+    assert!(cache::query_cache(&filter_hash).is_err());
+
+    // Empty function name
+    let filter_fn = cache::CacheFilter {
+        function: Some(String::new()),
+        ..Default::default()
+    };
+    assert!(cache::query_cache(&filter_fn).is_err());
+
+    // Invalid date parsing
+    assert!(cache::parse_since_timestamp("invalid-date-string").is_err());
+    assert!(cache::parse_to_timestamp("2026-99-99").is_err());
+}
+
+#[test]
+fn test_query_cache_read_only() {
+    with_temp_home(|tmp| {
+        seed_query_test_entry(
+            tmp,
+            "1111000011110000111100001111000011110000111100001111000011110000",
+            "fn1",
+            &[],
+            "testnet",
+            100_000,
+            10_000,
+            "2026-01-01T00:00:00Z",
+        );
+
+        let filter = cache::CacheFilter::default();
+        let _ = cache::query_cache(&filter).expect("first query");
+        let _ = cache::query_cache(&filter).expect("second query");
+
+        // Verify count and entry remains unaltered
+        let stats = cache::cache_stats().expect("cache stats");
+        assert_eq!(stats.total_entries, 1);
+        let entry = cache::load_estimate(
+            "1111000011110000111100001111000011110000111100001111000011110000",
+            "fn1",
+            &[],
+        )
+        .expect("load")
+        .expect("exists");
+        assert_eq!(entry.timestamp, "2026-01-01T00:00:00Z");
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Ledger I/O footprint (#278)
+// ─────────────────────────────────────────────────────────────────────────
+
+fn sample_io() -> cache::IoFootprint {
+    cache::IoFootprint {
+        read_entries: 3,
+        write_entries: 2,
+        read_bytes: 40,
+        write_bytes: 136,
+    }
+}
+
+#[test]
+fn test_save_estimate_with_io_roundtrip() {
+    with_temp_home(|_tmp| {
+        let io = sample_io();
+        cache::save_estimate_with_io("h", "f", &[], "testnet", 7, 500, 20, 10, io, Some(12), true)
+            .expect("save with io");
+
+        let loaded = cache::load_estimate("h", "f", &[])
+            .expect("load")
+            .expect("entry should exist");
+        assert_eq!(loaded.io, Some(io));
+        assert_eq!(loaded.duration_ms, Some(12));
+    });
+}
+
+#[test]
+fn test_save_estimate_without_io_leaves_footprint_absent() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h", "f", &[], "testnet", 1, 100, 10, 5, None, true).expect("save");
+
+        let loaded = cache::load_estimate("h", "f", &[])
+            .expect("load")
+            .expect("entry should exist");
+        assert!(
+            loaded.io.is_none(),
+            "save_estimate must not invent an I/O footprint"
+        );
+    });
+}
+
+/// Re-running the same key replaces the stored footprint along with the other
+/// metrics.
+#[test]
+fn test_save_estimate_with_io_updates_existing_entry() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h", "f", &[], "testnet", 1, 100, 10, 5, None, true).expect("first");
+
+        let io = sample_io();
+        cache::save_estimate_with_io("h", "f", &[], "testnet", 2, 200, 20, 10, io, None, true)
+            .expect("second");
+
+        let loaded = cache::load_estimate("h", "f", &[])
+            .expect("load")
+            .expect("entry should exist");
+        assert_eq!(loaded.ledger, 2);
+        assert_eq!(loaded.io, Some(io));
+    });
+}
+
+/// `export_cached_estimates` reads every column the row mapping needs,
+/// including the ones added after the initial schema.
+#[test]
+fn test_export_cached_estimates_includes_footprint() {
+    with_temp_home(|_tmp| {
+        let io = sample_io();
+        cache::save_estimate_with_io("h", "f", &[], "testnet", 3, 42, 7, 9, io, Some(5), true)
+            .expect("save");
+
+        let exported = cache::export_cached_estimates().expect("export");
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].io, Some(io));
+        assert_eq!(exported[0].duration_ms, Some(5));
+        assert!(exported[0].success);
+    });
+}
+
+/// A database written by a build that predates the `io_json` column is
+/// upgraded in place when the library opens it, and its rows still load.
+#[test]
+fn test_legacy_database_without_io_column_still_loads() {
+    with_temp_home(|home| {
+        let dir = home.join(".soroban-cost-estimator");
+        std::fs::create_dir_all(&dir).expect("create data dir");
+        let db = dir.join("cache.db");
+
+        // The schema exactly as it existed before `io_json` was added.
+        {
+            let conn = rusqlite::Connection::open(&db).expect("open cache db");
+            conn.execute_batch(
+                "CREATE TABLE estimates (
+                    version          INTEGER NOT NULL,
+                    wasm_hash        TEXT NOT NULL,
+                    function         TEXT NOT NULL,
+                    args_hash        TEXT NOT NULL,
+                    network          TEXT NOT NULL,
+                    ledger           INTEGER NOT NULL,
+                    total_stroops    INTEGER NOT NULL,
+                    cpu_instructions INTEGER NOT NULL,
+                    memory_bytes     INTEGER NOT NULL,
+                    timestamp        TEXT NOT NULL,
+                    duration_ms      INTEGER,
+                    success          INTEGER NOT NULL DEFAULT 1,
+                    PRIMARY KEY (wasm_hash, function, args_hash)
+                );",
+            )
+            .expect("create legacy schema");
+            conn.execute(
+                "INSERT INTO estimates \
+                 (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, success) \
+                 VALUES (?1, 'old', 'legacy_fn', ?2, 'testnet', 3, 100, 10, 5, '2026-01-01T00:00:00Z', 1)",
+                rusqlite::params![
+                    cache::CACHE_SCHEMA_VERSION as i64,
+                    args_hash_of(&["a"]),
+                ],
+            )
+            .expect("insert legacy row");
+        }
+
+        let loaded = cache::load_estimate("old", "legacy_fn", &["a".to_string()])
+            .expect("load legacy entry")
+            .expect("legacy entry should exist");
+        assert_eq!(loaded.total_stroops, 100);
+        assert!(
+            loaded.io.is_none(),
+            "a pre-io_json row has no footprint to report"
         );
     });
 }
