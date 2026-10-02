@@ -371,6 +371,8 @@ pub enum CacheAction {
 #[derive(Subcommand, Debug)]
 pub enum ConfigAction {
     Snapshot {
+        #[command(subcommand)]
+        action: Option<SnapshotAction>,
         #[arg(long, default_value = "testnet")]
         network: String,
         #[arg(long)]
@@ -385,7 +387,6 @@ pub enum ConfigAction {
         #[arg(long)]
         json: bool,
     },
-
     /// List all saved config snapshots with their timestamp and ledger.
     List {
         /// Network whose snapshots to list.
@@ -457,6 +458,25 @@ pub enum ConfigAction {
         action: CacheAction,
     },
 }
+
+#[derive(Subcommand, Debug)]
+pub enum SnapshotAction {
+    /// Validate one snapshot file or all saved snapshot files.
+    Validate {
+        /// Snapshot file to validate.
+        #[arg(
+            value_name = "PATH",
+            required_unless_present = "all",
+            conflicts_with = "all"
+        )]
+        path: Option<std::path::PathBuf>,
+
+        /// Validate every saved snapshot file.
+        #[arg(long, required_unless_present = "path", conflicts_with = "path")]
+        all: bool,
+    },
+}
+
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 pub static COLOR_CHOICE: AtomicU8 = AtomicU8::new(0);

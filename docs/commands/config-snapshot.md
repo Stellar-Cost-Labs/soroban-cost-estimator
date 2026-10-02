@@ -73,3 +73,17 @@ the fee rates used by `estimate` (see [Resource Fees](../concepts/resource-fees.
 Take a fresh snapshot after every protocol vote and keep them around:
 [`config diff`](config-diff.md) compares the current configuration against
 your most recent snapshot.
+
+## Validate an existing snapshot
+
+Check one saved or exported snapshot file, or validate every saved snapshot
+across networks. Validation is local and does not contact an RPC endpoint.
+
+```bash
+soroban-cost-estimator config snapshot validate <PATH>
+soroban-cost-estimator config snapshot validate --all
+```
+
+Each file is reported as valid or invalid after JSON parsing and deserialization
+into the current typed snapshot model. The command exits with status `1` if any
+file is invalid, and `0` when all checked files are valid.
