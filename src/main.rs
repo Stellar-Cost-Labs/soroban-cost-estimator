@@ -3468,6 +3468,7 @@ fn cmd_cache_prune() -> error::AppResult<()> {
 }
 
 /// Format a byte count as a human-readable string (KB, MB, GB).
+#[allow(dead_code)]
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
