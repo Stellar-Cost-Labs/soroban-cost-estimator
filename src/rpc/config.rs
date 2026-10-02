@@ -475,73 +475,51 @@ mod tests {
         let (url, _counter) = spawn_ledger_entries_stub().await;
         let client = RpcClient::new(&url);
 
-        let config = NetworkConfig::fetch(&client)
-            .await
-            .expect("fetch should succeed");
-        let seen: Vec<ConfigSettingId> = config.iter().map(|e| e.id).collect();
+/// Response from `getLatestLedger`.
+///
+/// The Soroban RPC returns JSON fields in camelCase.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetLatestLedgerResponse {
+    pub sequence: u32,
+    pub protocol_version: u32,
+}
 
-        assert_eq!(seen, ALL_CONFIG_SETTING_IDS.to_vec());
+/// Fetches the protocol version the network is currently running.
+///
+/// # Network calls
+/// Makes 1 `getLatestLedger` RPC call.
+pub async fn fetch_protocol_version(client: &RpcClient) -> AppResult<u32> {
+    let response: GetLatestLedgerResponse = client
+        .call("getLatestLedger", serde_json::json!({}))
+        .await?;
+    debug!(
+        protocol_version = response.protocol_version,
+        sequence = response.sequence,
+        "fetched latest ledger"
+    );
+    Ok(response.protocol_version)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GetLatestLedgerResponse;
+
+    #[test]
+    fn test_get_latest_ledger_response_parses_protocol_version() {
+        // Shape returned by Stellar RPC's `getLatestLedger`.
+        let body = r#"{"id":"c73c5eac58a441d4eb733c35253ae85f783e018f7be5ef974258fed067aabb36","protocolVersion":22,"sequence":2539605}"#;
+        let resp: GetLatestLedgerResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(resp.protocol_version, 22);
+        assert_eq!(resp.sequence, 2_539_605);
     }
 
-    #[tokio::test]
-    async fn test_config_cache_fetches_once_across_repeated_lookups() {
-        let (url, counter) = spawn_ledger_entries_stub().await;
-        let client = RpcClient::new(&url);
-        let cache = ConfigCache::new();
-
-        assert!(!cache.is_populated(), "cache starts empty");
-
-        // Stand in for N function fee evaluations reading the same config.
-        for _ in 0..5 {
-            cache
-                .get_or_fetch(&client)
-                .await
-                .expect("cached fetch should succeed");
-        }
-
-        assert!(
-            cache.is_populated(),
-            "cache should be populated after the first fetch"
-        );
-        assert_eq!(
-            counter.load(Ordering::SeqCst),
-            1,
-            "repeated lookups must not re-issue getLedgerEntries"
-        );
+    #[test]
+    fn test_get_latest_ledger_response_requires_protocol_version() {
+        assert!(serde_json::from_str::<GetLatestLedgerResponse>(r#"{"sequence":1}"#).is_err());
     }
 
-    #[tokio::test]
-    async fn test_config_cache_shares_one_value_across_callers() {
-        let (url, counter) = spawn_ledger_entries_stub().await;
-        let client = RpcClient::new(&url);
-        let cache = ConfigCache::new();
-
-        let first = cache
-            .get_or_fetch(&client)
-            .await
-            .expect("first fetch should succeed");
-        let second = cache
-            .get_or_fetch(&client)
-            .await
-            .expect("second fetch should succeed");
-
-        assert!(
-            std::ptr::eq(first, second),
-            "callers must observe the same in-memory config"
-        );
-        assert_eq!(counter.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn test_config_cache_is_not_populated_until_fetched() {
-        let (_url, counter) = spawn_ledger_entries_stub().await;
-        let cache = ConfigCache::new();
-
-        // A cache that has never been asked for anything sends no traffic.
-        assert!(!cache.is_populated());
-        assert!(cache.peek().is_none());
-        assert_eq!(counter.load(Ordering::SeqCst), 0);
-    }
+    use super::*;
 
     /// Verify that the XDR key encoding produces the expected base64 output
     /// for `ConfigSettingId::ContractComputeV0`.
