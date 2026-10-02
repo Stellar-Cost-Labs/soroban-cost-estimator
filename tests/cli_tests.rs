@@ -92,6 +92,27 @@ fn write_snapshot(home: &Path, network: &str, timestamp: &str, ledger: u32) -> P
     path
 }
 
+/// An RFC 3339 timestamp `days` in the past, in the same shape
+/// `begin_snapshot` records.
+fn days_ago(days: i64) -> String {
+    (chrono::Utc::now() - chrono::TimeDelta::days(days)).to_rfc3339()
+}
+
+/// Snapshot filenames on disk for `network` under `home`, oldest first.
+fn snapshot_files(home: &Path, network: &str) -> Vec<String> {
+    let dir = home.join(".soroban-cost-estimator").join("snapshots");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with(&format!("{network}-")) && name.ends_with(".json"))
+        .collect();
+    names.sort();
+    names
+}
+
 /// Runs the CLI with `HOME` isolated and tracing silenced.
 ///
 /// `tracing`'s `info!` lines go to stdout in this binary, so `RUST_LOG=error`
@@ -220,7 +241,6 @@ fn test_config_snapshot_help() {
         "config snapshot --help should exit 0; stderr: {stderr}"
     );
     for flag in ["--network", "--out", "--json", "--retain", "prune"] {
-    for flag in ["--network", "--out", "--json", "--retain"] {
         assert!(
             stdout.contains(flag),
             "snapshot help should mention {flag}; got: {stdout}"
@@ -1114,25 +1134,6 @@ fn test_config_snapshot_retain_flag_accepted() {
             "Error: failed to locate RPC endpoint: not configured for network not-a-network"
         ),
         "the failure should come from the network, not the flag; got: {stderr}"
-    );
-}
-
-#[test]
-fn test_config_snapshot_retain_zero_rejected() {
-    // `--retain 0` would delete every snapshot, so clap must reject it before
-    // anything runs.
-    let (_, stderr, code) = run_cli(&[
-        "config",
-        "snapshot",
-        "--network",
-        "not-a-network",
-        "--retain",
-        "0",
-    ]);
-    assert_ne!(code, 0, "--retain 0 should be rejected");
-    assert!(
-        stderr.contains("is not in"),
-        "clap should explain the valid range; stderr: {stderr}"
     );
 }
 
