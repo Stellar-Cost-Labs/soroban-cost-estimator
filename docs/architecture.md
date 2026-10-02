@@ -356,10 +356,12 @@ User invokes: soroban-cost-estimator estimate --wasm contract.wasm --fn incremen
    ├─ Read/write entries from footprint
    └─ Total fee from minResourceFee or transactionData.resource_fee
 
-7. Fetch fee rates               (main::fetch_fee_rates)
-   ├─ GET ConfigSettingContractComputeV0     → fee_per_10k_insns
-   ├─ GET ConfigSettingContractLedgerCostV0  → fee_per_read_entry, fee_per_write_entry, fee_per_read_1kb
-   └─ GET ConfigSettingContractBandwidthV0   → fee_per_1kb
+7. Fetch fee rates               (main::fetch_network_config + main::fee_rates_from_config)
+   ├─ One batched GET with all six ConfigSetting* keys (rpc::config::ConfigCache,
+   │  memoized for the run — `estimate-all` prices N functions for 1 fetch, not N)
+   ├─ ConfigSettingContractComputeV0     → fee_per_10k_insns
+   ├─ ConfigSettingContractLedgerCostV0  → fee_per_read_entry, fee_per_write_entry, fee_per_read_1kb
+   └─ ConfigSettingContractBandwidthV0   → fee_per_1kb
 
 8. Compute fee breakdown         (report::fee_calc::compute_fee_breakdown)
    ├─ Non-refundable = CPU + storage I/O + bandwidth (integer math)

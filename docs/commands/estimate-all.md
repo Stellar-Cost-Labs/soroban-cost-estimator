@@ -34,6 +34,20 @@ Options:
   counts across every successfully estimated function. The same statistics are
   emitted as the `fee_distribution` object in `--json` mode.
 
+## Network cost
+
+The network's config settings (`ConfigSettingContractComputeV0`,
+`ConfigSettingContractLedgerCostV0`, …) are the same for every function in a
+run, so they are fetched **once** — in a single batched `getLedgerEntries`
+call — and reused for every function's fee calculation. Over N functions a run
+costs `N` simulations plus `1` config fetch.
+
+The cache lives only for the duration of the command. It is never written to
+disk, so a later invocation always re-reads the network and reflects any
+pricing change since. See [Caching](../concepts/caching.md).
+
+Table output does not itemize fees, so it skips the config fetch entirely.
+
 ## Example
 
 ```bash
