@@ -28,14 +28,23 @@ impl std::fmt::Display for OutputFormat {
     }
 }
 
-/// Build version string with metadata from build.rs
+/// Build version string with metadata captured by `build.rs`.
+///
+/// Clap renders this for `--version` / `-V` as
+/// `soroban-cost-estimator <semver> (commit: <sha> built: <date> target: <triple> rustc: <ver>)`,
+/// where the git hash, build date, target triple, and rustc version each fall
+/// back to `clean` / `unknown` when they cannot be determined at build time.
 fn build_version() -> &'static str {
     concat!(
         env!("CARGO_PKG_VERSION"),
-        " (",
+        " (commit: ",
         env!("GIT_HASH"),
-        " ",
+        " built: ",
         env!("BUILD_DATE"),
+        " target: ",
+        env!("BUILD_TARGET"),
+        " rustc: ",
+        env!("RUSTC_VERSION"),
         ")"
     )
 }

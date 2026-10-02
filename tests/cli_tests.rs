@@ -3187,7 +3187,86 @@ fn test_estimate_no_cache_flag_accepted() {
     );
 }
 
+/// `--version` (and its `-V` alias) prints the crate semver followed by the
+/// build metadata captured in `build.rs`: the git commit, the UTC build date,
+/// the target triple, and the rustc version.
+///
+/// Clap renders the line as `<program name> <semver> (<fields>)`, so the test
+/// anchors on that exact envelope and then requires all four labelled fields to
+/// be present and non-empty. Field *values* are deliberately not asserted to a
+/// literal, because all four legitimately vary per build and fall back to
+/// `clean` / `unknown` outside a git checkout or on a host without `git`.
 #[test]
+fn test_version_flag_reports_extended_build_metadata() {
+    let (stdout, stderr, code) = run_cli(&["--version"]);
+    assert_eq!(code, 0, "--version should succeed; stderr: {stderr}");
+
+    let line = stdout.trim();
+    let prefix = format!("{} {} (", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+    let metadata = line
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("version line should be `{prefix}...)`; got: {line}"));
+
+    assert!(
+        !metadata.trim().is_empty(),
+        "version metadata should not be empty; got: {line}"
+    );
+
+    // Walk the fields in order, asserting each label is present and that the
+    // value after it is a non-empty, space-free token.
+    let mut rest = metadata;
+    for label in ["commit: ", "built: ", "target: ", "rustc: "] {
+        rest = rest
+            .split_once(label)
+            .unwrap_or_else(|| panic!("version metadata should report `{label}`; got: {line}"))
+            .1;
+        let value = rest.split(' ').next().unwrap_or_default();
+        assert!(
+            !value.is_empty(),
+            "`{label}` should never have an empty value; got: {line}"
+        );
+    }
+}
+
+/// `-V` is clap's short alias for `--version`, so it must print exactly the
+/// same line and exit successfully.
+#[test]
+fn test_version_short_flag_matches_long_flag() {
+    let (long_stdout, long_stderr, long_code) = run_cli(&["--version"]);
+    let (short_stdout, short_stderr, short_code) = run_cli(&["-V"]);
+
+    assert_eq!(
+        long_code, 0,
+        "--version should succeed; stderr: {long_stderr}"
+    );
+    assert_eq!(short_code, 0, "-V should succeed; stderr: {short_stderr}");
+    assert_eq!(
+        long_stdout, short_stdout,
+        "`-V` and `--version` must render the same version line"
+    );
+}
+
+/// `--version` is handled entirely by clap before any command dispatch, so it
+/// must not require a subcommand, must not touch the network, and must not
+/// fail when it is combined with unrelated global flags.
+#[test]
+fn test_version_flag_needs_no_subcommand_and_tolerates_global_flags() {
+    let (stdout, stderr, code) = run_cli(&["--version", "--verbose", "--no-cache"]);
+    assert_eq!(
+        code, 0,
+        "--version should ignore unrelated global flags; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains(env!("CARGO_PKG_VERSION")),
+        "--version should still print the semver; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Print help"),
+        "--version should not fall through to the help output; got: {stdout}"
+    );
+}
+
 fn test_estimate_all_no_cache_flag_accepted() {
     let (_, stderr, code) = run_cli(&["estimate-all", "--wasm", "test.wasm", "--no-cache"]);
     assert_ne!(code, 0, "should error on missing file, not invalid args");

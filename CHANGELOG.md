@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshots against each other without contacting the live network. Works
   offline, honors `--summary` and `--json`, and errors with the snapshot count
   when fewer than two exist for the network.
+- `--version` / `-V` now print extended build metadata alongside the crate
+  semver: the git commit hash, the UTC build timestamp, the target triple, and
+  the rustc version, e.g.
+  `soroban-cost-estimator 0.1.0 (commit: abc1234 built: 2026-10-01T22:36:04Z
+  target: x86_64-unknown-linux-gnu rustc: 1.85.0)`. Metadata that cannot be
+  determined at build time falls back to `clean` (no git checkout) or
+  `unknown`, so the flag never fails a build from a crates.io tarball.
 - `--timeout` global flag — configurable HTTP request timeout for RPC calls
   in seconds (default 30).
 - `--max-retries` global flag — configurable maximum number of retry attempts
