@@ -228,8 +228,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
     let fallback = args.rpc_fallback_url.as_deref();
     let cli_format = args.format;
     let headers = args.headers;
-    // Command handlers below take `quiet` as a plain bool; bind it once here
-    // rather than repeating `args.quiet` at every call site.
+    // `--quiet` is a single global flag; bind it once so every command in
+    // `run()` reads the same value.
     let quiet = args.quiet;
     // Bound the on-disk estimate cache before any command can write to it.
     // A `--max-cache-size-mb` of 0 disables the byte quota; 0 entries
@@ -302,6 +302,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 quiet,
                 watch,
                 args.wasm_info,
+                quiet,
                 args.verbose,
                 auto_snapshot,
                 diff,
@@ -431,6 +432,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                         summary,
                         diff_format == cli::OutputFormat::Json,
                         ignore_pricing_exit,
+                        quiet,
                         fail_on_any_change,
                         quiet,
                     )
@@ -909,6 +911,7 @@ async fn cmd_estimate(
     quiet: bool,
     watch: bool,
     wasm_info_flag: bool,
+    quiet: bool,
     verbose: bool,
     auto_snapshot: bool,
     diff: bool,
@@ -999,6 +1002,7 @@ async fn cmd_estimate(
         max_retries,
         format == "table",
         wasm_info_flag,
+        quiet,
         verbose,
         dry_run,
     )
@@ -1081,6 +1085,7 @@ async fn cmd_estimate(
             connect_timeout,
             max_retries,
             extra_headers,
+            quiet,
             verbose,
         )
         .await
@@ -1129,6 +1134,7 @@ async fn estimate_once(
     max_retries: usize,
     print_wasm_hash: bool,
     wasm_info_flag: bool,
+    quiet: bool,
     verbose: bool,
     dry_run: bool,
 ) -> error::AppResult<EstimateRun> {
@@ -1516,6 +1522,7 @@ async fn emit_watch_estimate(
         // `--wasm-info` is a one-shot report; the watcher prints its own
         // per-build header instead.
         false,
+        quiet,
         verbose,
         // `--watch` wins over `--dry-run`: watching exists to re-simulate.
         false,
@@ -2195,6 +2202,7 @@ async fn cmd_estimate_all(
                 connect_timeout,
                 max_retries,
                 extra_headers,
+                quiet,
                 verbose,
             )
             .await
@@ -3035,6 +3043,7 @@ fn cmd_config_diff_against_previous(
     summary: bool,
     json_flag: bool,
     ignore_pricing_exit: bool,
+    quiet: bool,
     fail_on_any_change: bool,
     quiet: bool,
 ) -> error::AppResult<()> {
@@ -3055,7 +3064,7 @@ fn cmd_config_diff_against_previous(
         println!("{}", serde_json::to_string_pretty(&json_output)?);
     } else if summary {
         println!("{}", config_snapshot::diff::format_diff_summary(&diff));
-    } else {
+    } else if !quiet {
         println!(
             "{}",
             config_snapshot::diff::format_diff(
@@ -3240,6 +3249,7 @@ async fn auto_snapshot_if_changed(
     connect_timeout: u64,
     max_retries: usize,
     extra_headers: &[String],
+    quiet: bool,
     verbose: bool,
 ) -> error::AppResult<()> {
     use tracing::{debug, info};
@@ -3448,8 +3458,10 @@ async fn cmd_watch(
 /// how much disk space it consumes (against the `--max-cache-size-mb` and
 /// `--max-cache-entries` quotas).
 ///
-#[allow(dead_code)]
-fn cmd_cache_stats(json: bool, quiet: bool) -> error::AppResult<()> {
+/// # Network calls
+/// None â€” pure SQLite I/O.
+#[allow(dead_code)] // wired once the `config cache stats` subcommand (#41) lands
+fn cmd_cache_stats(json: bool) -> error::AppResult<()> {
     let stats = cache::cache_stats()?;
     let limits = cache::cache_limits();
 
@@ -3863,11 +3875,7 @@ fn cmd_cache_query(
 ///
 /// # Network calls
 /// None â€” pure SQLite I/O.
-fn cmd_cache_export(
-    out_path: Option<&str>,
-    network: Option<&str>,
-    quiet: bool,
-) -> error::AppResult<()> {
+fn cmd_cache_export(out_path: Option<&str>, network: Option<&str>) -> error::AppResult<()> {
     let export = cache::export_cache(network)?;
     let json = serde_json::to_string_pretty(&export)?;
 
