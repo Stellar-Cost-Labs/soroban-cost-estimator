@@ -1,6 +1,7 @@
-use comfy_table::Table;
+use comfy_table::{Cell, CellAlignment, Table};
 
 use crate::report::fee_calc::{FeeBreakdown, FeeRates};
+use crate::wasm::parser::{ContractMeta, format_contract_meta};
 
 // fee_percentage removed since we now use the precalculated exact percentages
 
@@ -191,6 +192,28 @@ pub struct CostReport {
     /// serialized output; `None` when the rates were unavailable.
     #[serde(skip)]
     pub rates: Option<FeeRates>,
+    /// Optional batch invocation cost projections.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub projections: Option<Vec<CostProjection>>,
+    /// Contract metadata parsed from the WASM `contractmeta` custom
+    /// section. Empty (and rendered as absent) when the binary carries no
+    /// decodable section; deserialized as empty from older payloads.
+    #[serde(default)]
+    pub contract_meta: ContractMeta,
+}
+
+/// A cost projection for a specific batch invocation count.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CostProjection {
+    /// Number of simulated contract invocations.
+    pub invocations: u64,
+    /// Projected total fee in stroops (integer arithmetic).
+    pub total_stroops: i64,
+    /// Projected total fee in XLM.
+    pub total_xlm: String,
+    /// Projected fee in USD, if an XLM price was available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usd: Option<f64>,
 }
 
 /// A concrete, actionable cost-optimization suggestion derived from a report.
@@ -565,6 +588,11 @@ pub fn format_report_table(report: &CostReport) -> String {
     output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
     output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
 
+    // Contract metadata from the WASM `contractmeta` section: present or
+    // absent, always rendered so the reader knows the section was checked.
+    output.push_str(&format_contract_meta(&report.contract_meta));
+    output.push_str("\n\n");
+
     let mut table = Table::new();
     if crate::cli::should_colorize() {
         table.enforce_styling();
@@ -653,12 +681,317 @@ pub fn format_report_table(report: &CostReport) -> String {
     // ASCII bar chart for visual cost breakdown
     output.push_str(&render_fee_bar_chart(&report.fee, DEFAULT_CHART_WIDTH));
 
+    if let Some(ref projections) = report.projections {
+        output.push_str(&format_projections_table(projections));
+    }
+
     output
 }
 
 /// Formats a cost report as a JSON string.
 pub fn format_report_json(report: &CostReport) -> String {
     serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Signed change of a single metric between two estimate runs.
+///
+/// Fee arithmetic stays in integer stroops (`previous`, `current`,
+/// `absolute`); `percent` is derived for display only and is `None` when the
+/// baseline is zero, because a percentage change from zero is undefined.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct MetricDelta {
+    /// Baseline value from the previous estimate.
+    pub previous: i64,
+    /// Value from the current estimate.
+    pub current: i64,
+    /// `current - previous`, saturating rather than wrapping.
+    pub absolute: i64,
+    /// Percentage change, or `None` when `previous == 0`.
+    pub percent: Option<f64>,
+}
+
+impl MetricDelta {
+    /// Compute the delta between two values.
+    #[must_use]
+    pub fn new(previous: i64, current: i64) -> Self {
+        let absolute = current.saturating_sub(previous);
+        let percent = if previous == 0 {
+            None
+        } else {
+            Some(absolute as f64 / previous as f64 * 100.0)
+        };
+        Self {
+            previous,
+            current,
+            absolute,
+            percent,
+        }
+    }
+
+    /// Renders the signed change, e.g. `+12400 (+5.2%)`, `-100 (-1.0%)`,
+    /// `0 (0.0%)`, or just `+5` when the percentage is undefined.
+    #[must_use]
+    pub fn format_signed(&self) -> String {
+        let sign = if self.absolute > 0 { "+" } else { "" };
+        match self.percent {
+            Some(pct) => format!("{sign}{} ({sign}{pct:.1}%)", self.absolute),
+            None => format!("{sign}{}", self.absolute),
+        }
+    }
+}
+
+/// Cost deltas between a previous estimate and the current report.
+///
+/// CPU, memory, and fee are always present because every cached entry stores
+/// them. The ledger entry-count deltas are `None` when the previous estimate
+/// predates I/O recording.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct CostDelta {
+    /// CPU instruction delta.
+    pub cpu_instructions: MetricDelta,
+    /// Memory byte delta.
+    pub memory_bytes: MetricDelta,
+    /// Total fee delta, in stroops.
+    pub fee_stroops: MetricDelta,
+    /// Ledger read-entry delta, when the previous estimate recorded I/O.
+    pub read_entries: Option<MetricDelta>,
+    /// Ledger write-entry delta, when the previous estimate recorded I/O.
+    pub write_entries: Option<MetricDelta>,
+}
+
+impl CostDelta {
+    /// Computes the delta of `current` against a previous estimate's metrics.
+    ///
+    /// `previous_io` is `(read_entries, write_entries)` when the previous
+    /// estimate recorded its ledger I/O footprint.
+    #[must_use]
+    pub fn compute(
+        previous_cpu: u64,
+        previous_memory: u64,
+        previous_fee_stroops: i64,
+        previous_io: Option<(u32, u32)>,
+        current: &CostReport,
+    ) -> Self {
+        Self {
+            cpu_instructions: MetricDelta::new(
+                previous_cpu as i64,
+                current.cpu_instructions as i64,
+            ),
+            memory_bytes: MetricDelta::new(previous_memory as i64, current.memory_bytes as i64),
+            fee_stroops: MetricDelta::new(previous_fee_stroops, current.fee.total_stroops),
+            read_entries: previous_io.map(|(read, _)| {
+                MetricDelta::new(i64::from(read), i64::from(current.read_entries))
+            }),
+            write_entries: previous_io.map(|(_, write)| {
+                MetricDelta::new(i64::from(write), i64::from(current.write_entries))
+            }),
+        }
+    }
+
+    /// `(label, delta)` rows for every metric with a baseline to compare to.
+    fn rows(&self) -> Vec<(&'static str, MetricDelta)> {
+        let mut rows = vec![
+            ("CPU Instructions", self.cpu_instructions),
+            ("Memory Bytes", self.memory_bytes),
+        ];
+        if let Some(delta) = self.read_entries {
+            rows.push(("Read Entries", delta));
+        }
+        if let Some(delta) = self.write_entries {
+            rows.push(("Write Entries", delta));
+        }
+        rows.push(("Fee (stroops)", self.fee_stroops));
+        rows
+    }
+
+    /// Renders the comparison as a terminal table.
+    #[must_use]
+    pub fn format_text(&self) -> String {
+        let mut output = String::from("\nCost delta vs previous estimate:\n");
+        let mut table = Table::new();
+        table.set_header(vec!["Metric", "Previous", "Current", "Change"]);
+        for (label, delta) in self.rows() {
+            table.add_row(vec![
+                label.to_string(),
+                delta.previous.to_string(),
+                delta.current.to_string(),
+                delta.format_signed(),
+            ]);
+        }
+        output.push_str(&table.to_string());
+        output.push('\n');
+        output
+    }
+
+    /// Renders the comparison as a GitHub-flavored markdown table.
+    #[must_use]
+    pub fn format_markdown(&self) -> String {
+        let mut output = String::from("\n### Cost delta vs previous estimate\n\n");
+        output.push_str("| Metric | Previous | Current | Change |\n");
+        output.push_str("| --- | --- | --- | --- |\n");
+        for (label, delta) in self.rows() {
+            output.push_str(&format!(
+                "| {label} | {} | {} | {} |\n",
+                delta.previous,
+                delta.current,
+                delta.format_signed(),
+            ));
+        }
+        output
+    }
+
+    /// Renders the comparison as RFC 4180 CSV records.
+    ///
+    /// The percent column is empty when there is no baseline to divide by.
+    #[must_use]
+    pub fn format_csv(&self) -> String {
+        let mut output = String::from("metric,previous,current,absolute,percent\n");
+        for (label, delta) in self.rows() {
+            let percent = delta.percent.map(|p| format!("{p:.1}")).unwrap_or_default();
+            output.push_str(&format!(
+                "{label},{},{},{},{percent}\n",
+                delta.previous, delta.current, delta.absolute
+            ));
+        }
+        output
+    }
+}
+
+/// Parse a comma-separated list of invocation counts for cost projections.
+///
+/// Ensures each count is non-zero, unique, fits within `i64::MAX` so it can be
+/// multiplied by stroop fees safely, and maintains the order supplied by the user.
+pub fn parse_projection_counts(input: &str) -> crate::error::AppResult<Vec<u64>> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(crate::error::AppError::FeeCalc(
+            "projection counts cannot be empty".to_string(),
+        ));
+    }
+
+    let mut counts = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for raw_part in trimmed.split(',') {
+        let part = raw_part.trim();
+        if part.is_empty() {
+            return Err(crate::error::AppError::FeeCalc(
+                "projection counts contain an empty value".to_string(),
+            ));
+        }
+
+        if part.starts_with('-') {
+            return Err(crate::error::AppError::FeeCalc(format!(
+                "invalid projection count '{part}': count cannot be negative"
+            )));
+        }
+
+        let count: u64 = part.parse().map_err(|_| {
+            crate::error::AppError::FeeCalc(format!(
+                "invalid projection count '{part}': must be a positive integer"
+            ))
+        })?;
+
+        if count == 0 {
+            return Err(crate::error::AppError::FeeCalc(
+                "invalid projection count '0': count must be greater than zero".to_string(),
+            ));
+        }
+
+        if count > i64::MAX as u64 {
+            return Err(crate::error::AppError::FeeCalc(format!(
+                "invalid projection count '{part}': value exceeds maximum supported limit ({})",
+                i64::MAX
+            )));
+        }
+
+        if !seen.insert(count) {
+            return Err(crate::error::AppError::FeeCalc(format!(
+                "duplicate projection count: {count}"
+            )));
+        }
+
+        counts.push(count);
+    }
+
+    Ok(counts)
+}
+
+/// Calculate cost projections for given invocation counts.
+///
+/// Performs checked multiplication (`total_fee_stroops * count`) to prevent
+/// integer overflow. Stroop fees remain pure integers (`i64`), and XLM is
+/// formatted using the standard [`crate::report::fee_calc::stroops_to_xlm`] conversion.
+pub fn calculate_projections(
+    total_fee_stroops: i64,
+    counts: &[u64],
+    precision: u32,
+    xlm_usd_price: Option<f64>,
+) -> crate::error::AppResult<Vec<CostProjection>> {
+    let mut projections = Vec::with_capacity(counts.len());
+
+    for &count in counts {
+        let count_i64 = i64::try_from(count).map_err(|_| {
+            crate::error::AppError::FeeCalc(format!(
+                "projection count {count} exceeds maximum supported integer value"
+            ))
+        })?;
+
+        let projected_stroops = total_fee_stroops
+            .checked_mul(count_i64)
+            .ok_or_else(|| {
+                crate::error::AppError::FeeCalc(format!(
+                    "cost projection overflow: {total_fee_stroops} stroops * {count} invocations exceeds integer bounds"
+                ))
+            })?;
+
+        let total_xlm = crate::report::fee_calc::stroops_to_xlm(projected_stroops, precision);
+
+        let usd = xlm_usd_price.map(|price| (projected_stroops as f64 / 10_000_000.0) * price);
+
+        projections.push(CostProjection {
+            invocations: count,
+            total_stroops: projected_stroops,
+            total_xlm,
+            usd,
+        });
+    }
+
+    Ok(projections)
+}
+
+/// Formats a list of cost projections into a human-readable table.
+#[must_use]
+pub fn format_projections_table(projections: &[CostProjection]) -> String {
+    if projections.is_empty() {
+        return String::new();
+    }
+
+    let mut output = String::from("\nCost Projections:\n\n");
+    let mut table = Table::new();
+    if crate::cli::should_colorize() {
+        table.enforce_styling();
+    } else {
+        table.force_no_tty();
+    }
+
+    table.set_header(vec!["Invocations", "Total Stroops", "Total XLM", "USD"]);
+    for p in projections {
+        let usd_str = p
+            .usd
+            .map(|u| format!("${u:.2}"))
+            .unwrap_or_else(|| "-".to_string());
+        table.add_row(vec![
+            Cell::new(format_thousands_u64(p.invocations)).set_alignment(CellAlignment::Right),
+            Cell::new(format_thousands(p.total_stroops)).set_alignment(CellAlignment::Right),
+            Cell::new(&p.total_xlm).set_alignment(CellAlignment::Right),
+            Cell::new(usd_str).set_alignment(CellAlignment::Right),
+        ]);
+    }
+
+    output.push_str(&table.to_string());
+    output.push('\n');
+    output
 }
 
 #[cfg(test)]
@@ -692,6 +1025,8 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
             rates: Some(rates),
+            projections: None,
+            contract_meta: ContractMeta::default(),
         }
     }
 
@@ -808,6 +1143,8 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 0,
             rates: None,
+            projections: None,
+            contract_meta: ContractMeta::default(),
         };
 
         let table_out = format_report_table(&report);
@@ -891,165 +1228,268 @@ mod tests {
         );
     }
 
-    // ── #328: fee / CPU distribution statistics ─────────────────────
+    #[test]
+    fn test_parse_projection_counts_valid_and_ordered() {
+        let counts = parse_projection_counts("100, 1000, 10000").expect("valid counts");
+        assert_eq!(counts, vec![100, 1000, 10000]);
 
-    /// A report with the given fee and CPU figures, reusing a fully populated
-    /// base report so only the metrics under test vary.
-    fn report_with_metrics(fee_stroops: i64, cpu_instructions: u64) -> CostReport {
-        let mut report = report_with_rates(sample_rates());
-        report.fee.total_stroops = fee_stroops;
-        report.cpu_instructions = cpu_instructions;
-        report
+        // Order preserved
+        let reversed = parse_projection_counts("10000,100,1000").expect("valid counts");
+        assert_eq!(reversed, vec![10000, 100, 1000]);
     }
 
     #[test]
-    fn test_distribution_stats_single_function() {
-        let dist = FeeDistribution::from_samples(&[42], &[7]);
-        assert_eq!(dist.function_count, 1);
-        assert_eq!(dist.min_fee_stroops, 42);
-        assert_eq!(dist.max_fee_stroops, 42);
-        assert_eq!(dist.mean_fee_stroops, 42);
-        assert_eq!(dist.median_fee_stroops, 42);
-        assert_eq!(dist.std_dev_fee_stroops, 0);
-        assert_eq!(dist.min_cpu_instructions, 7);
-        assert_eq!(dist.max_cpu_instructions, 7);
-        assert_eq!(dist.mean_cpu_instructions, 7);
+    fn test_parse_projection_counts_invalid() {
+        assert!(parse_projection_counts("").is_err());
+        assert!(parse_projection_counts("   ").is_err());
+        assert!(parse_projection_counts("100,,1000").is_err());
+        assert!(parse_projection_counts("abc").is_err());
+        assert!(parse_projection_counts("100,abc,1000").is_err());
+        assert!(parse_projection_counts("0").is_err());
+        assert!(parse_projection_counts("100,0").is_err());
+        assert!(parse_projection_counts("-5").is_err());
+        assert!(parse_projection_counts("100,-5").is_err());
+        assert!(parse_projection_counts("100,1000,100").is_err());
+        let overflow_count = format!("{}0", u64::MAX);
+        assert!(parse_projection_counts(&overflow_count).is_err());
     }
 
     #[test]
-    fn test_distribution_stats_identical_fees_have_zero_spread() {
-        let dist = FeeDistribution::from_samples(&[500, 500, 500], &[10, 10, 10]);
-        assert_eq!(dist.function_count, 3);
-        assert_eq!(dist.min_fee_stroops, 500);
-        assert_eq!(dist.max_fee_stroops, 500);
-        assert_eq!(dist.mean_fee_stroops, 500);
-        assert_eq!(dist.median_fee_stroops, 500);
-        assert_eq!(dist.std_dev_fee_stroops, 0);
+    fn test_calculate_projections_multiplication() {
+        let per_invocation_fee: i64 = 15_527;
+        let counts = [100, 1_000, 10_000];
+        let projections = calculate_projections(per_invocation_fee, &counts, 7, None)
+            .expect("calculation should succeed");
+
+        assert_eq!(projections.len(), 3);
+        assert_eq!(projections[0].invocations, 100);
+        assert_eq!(projections[0].total_stroops, 1_552_700);
+        assert_eq!(projections[0].total_xlm, "0.1552700");
+        assert_eq!(projections[0].usd, None);
+
+        assert_eq!(projections[1].invocations, 1_000);
+        assert_eq!(projections[1].total_stroops, 15_527_000);
+        assert_eq!(projections[1].total_xlm, "1.5527000");
+
+        assert_eq!(projections[2].invocations, 10_000);
+        assert_eq!(projections[2].total_stroops, 155_270_000);
+        assert_eq!(projections[2].total_xlm, "15.5270000");
     }
 
     #[test]
-    fn test_distribution_stats_known_values() {
-        let dist = FeeDistribution::from_samples(&[100, 200, 300], &[10, 20, 30]);
-        assert_eq!(dist.min_fee_stroops, 100);
-        assert_eq!(dist.max_fee_stroops, 300);
-        assert_eq!(dist.mean_fee_stroops, 200);
-        assert_eq!(dist.median_fee_stroops, 200);
-        // Population variance = 60000 / 9 = 6666; floor(sqrt(6666)) = 81.
-        assert_eq!(dist.std_dev_fee_stroops, 81);
-        assert_eq!(dist.min_cpu_instructions, 10);
-        assert_eq!(dist.max_cpu_instructions, 30);
-        assert_eq!(dist.mean_cpu_instructions, 20);
+    fn test_calculate_projections_large_no_overflow() {
+        let fee: i64 = 10_000;
+        let counts = [10_000_000_000u64];
+        let projections =
+            calculate_projections(fee, &counts, 7, None).expect("large multiplication succeeds");
+        assert_eq!(projections[0].total_stroops, 100_000_000_000_000);
     }
 
     #[test]
-    fn test_distribution_stats_even_count_median_is_mean_of_middles() {
-        let dist = FeeDistribution::from_samples(&[300, 100, 200, 400], &[1, 2, 3, 4]);
-        assert_eq!(dist.median_fee_stroops, 250); // (200 + 300) / 2
-
-        let pair = FeeDistribution::from_samples(&[100, 200], &[1, 2]);
-        assert_eq!(pair.median_fee_stroops, 150);
-        assert_eq!(pair.mean_fee_stroops, 150);
-        // variance = (2*50000 - 300^2) / 4 = 2500; sqrt = 50
-        assert_eq!(pair.std_dev_fee_stroops, 50);
+    fn test_calculate_projections_overflow_error() {
+        let fee: i64 = i64::MAX / 2;
+        let counts = [3u64];
+        let err = calculate_projections(fee, &counts, 7, None).unwrap_err();
+        match err {
+            crate::error::AppError::FeeCalc(msg) => {
+                assert!(msg.contains('3'), "error must identify count: {msg}");
+                assert!(
+                    msg.contains("overflow"),
+                    "error must explain overflow: {msg}"
+                );
+            }
+            other => panic!("expected FeeCalc error, got: {other:?}"),
+        }
     }
 
     #[test]
-    fn test_distribution_stats_empty_is_zeroed() {
-        let dist = FeeDistribution::from_samples(&[], &[]);
-        assert_eq!(dist, FeeDistribution::from_samples(&[], &[]));
-        assert_eq!(dist.function_count, 0);
-        assert_eq!(dist.min_fee_stroops, 0);
-        assert_eq!(dist.max_fee_stroops, 0);
-        assert_eq!(dist.mean_fee_stroops, 0);
-        assert_eq!(dist.median_fee_stroops, 0);
-        assert_eq!(dist.std_dev_fee_stroops, 0);
-        assert_eq!(dist.mean_cpu_instructions, 0);
+    fn test_calculate_projections_usd_available() {
+        let fee: i64 = 10_000_000; // 1 XLM
+        let counts = [100];
+        let projections =
+            calculate_projections(fee, &counts, 7, Some(0.12)).expect("calculation succeeds");
+        assert_eq!(projections[0].usd, Some(12.0));
     }
 
     #[test]
-    fn test_calculate_distribution_stats_from_reports() {
-        let reports = vec![
-            report_with_metrics(5_000, 100),
-            report_with_metrics(500_000, 900),
-        ];
-        let dist = calculate_distribution_stats(&reports);
-        assert_eq!(dist.function_count, 2);
-        assert_eq!(dist.min_fee_stroops, 5_000);
-        assert_eq!(dist.max_fee_stroops, 500_000);
-        assert_eq!(dist.mean_fee_stroops, 252_500);
-        assert_eq!(dist.median_fee_stroops, 252_500);
-        assert_eq!(dist.min_cpu_instructions, 100);
-        assert_eq!(dist.max_cpu_instructions, 900);
-        assert_eq!(dist.mean_cpu_instructions, 500);
+    fn test_calculate_projections_usd_unavailable() {
+        let fee: i64 = 10_000_000;
+        let counts = [100];
+        let projections =
+            calculate_projections(fee, &counts, 7, None).expect("calculation succeeds");
+        assert_eq!(projections[0].usd, None);
     }
 
     #[test]
-    fn test_calculate_distribution_stats_empty_reports() {
-        let dist = calculate_distribution_stats(&[]);
-        assert_eq!(dist.function_count, 0);
-    }
-
-    #[test]
-    fn test_format_distribution_box_empty() {
-        let out = format_distribution_box(&FeeDistribution::from_samples(&[], &[]), 7);
-        assert_eq!(
-            out,
-            "No functions estimated; no fee distribution to report."
-        );
-    }
-
-    #[test]
-    fn test_format_distribution_box_contains_all_statistics() {
-        let dist = FeeDistribution::from_samples(&[5_000, 500_000], &[100_000, 5_000_000]);
-        let out = format_distribution_box(&dist, 7);
-        assert!(
-            out.contains("Fee distribution across 2 function(s):"),
-            "got: {out}"
-        );
-        assert!(out.contains("min     : 5,000"), "got: {out}");
-        assert!(out.contains("max     : 500,000"), "got: {out}");
-        assert!(out.contains("mean    : 252,500 (0.0252500)"), "got: {out}");
-        assert!(out.contains("median  : 252,500"), "got: {out}");
-        assert!(out.contains("std dev : 247,500"), "got: {out}");
-        assert!(out.contains("CPU instructions:"), "got: {out}");
-        assert!(out.contains("min     : 100,000"), "got: {out}");
-        assert!(out.contains("max     : 5,000,000"), "got: {out}");
-        assert!(out.contains("mean    : 2,550,000"), "got: {out}");
-    }
-
-    #[test]
-    fn test_format_thousands_groups_digits() {
+    fn test_format_thousands() {
         assert_eq!(format_thousands(0), "0");
         assert_eq!(format_thousands(999), "999");
         assert_eq!(format_thousands(1_000), "1,000");
+        assert_eq!(format_thousands(10_000), "10,000");
         assert_eq!(format_thousands(1_234_567), "1,234,567");
+
         assert_eq!(format_thousands(-1_234_567), "-1,234,567");
-        assert_eq!(format_thousands_u64(3_894_195), "3,894,195");
-        assert_eq!(format_ledger_sequence(1_234_567), "1,234,567");
-        assert_eq!(format_ledger_sequence(0), "0");
-    }
-
-    // ── #329: ledger sequence in output ────────────────────────────
-
-    #[test]
-    fn test_format_report_json_uses_ledger_sequence_field() {
-        let report = report_with_rates(sample_rates());
-        let parsed: serde_json::Value =
-            serde_json::from_str(&format_report_json(&report)).expect("valid json");
-        assert_eq!(parsed["ledger_sequence"], 3_894_195);
-        assert!(
-            parsed.get("ledger").is_none(),
-            "legacy `ledger` key should be renamed to `ledger_sequence`: {parsed}"
-        );
+        assert_eq!(format_thousands(500), "500");
     }
 
     #[test]
-    fn test_format_report_table_shows_grouped_ledger_sequence() {
+    fn test_format_projections_table() {
+        let projections = vec![
+            CostProjection {
+                invocations: 100,
+                total_stroops: 1_552_700,
+                total_xlm: "0.1552700".to_string(),
+                usd: None,
+            },
+            CostProjection {
+                invocations: 1_000,
+                total_stroops: 15_527_000,
+                total_xlm: "1.5527000".to_string(),
+                usd: Some(1.86),
+            },
+        ];
+
+        let table = format_projections_table(&projections);
+        assert!(table.contains("Cost Projections:"));
+        assert!(table.contains("Invocations"));
+        assert!(table.contains("Total Stroops"));
+        assert!(table.contains("Total XLM"));
+        assert!(table.contains("USD"));
+        assert!(table.contains("100"));
+        assert!(table.contains("1,552,700"));
+        assert!(table.contains("0.1552700"));
+        assert!(table.contains('-'));
+        assert!(table.contains("1,000"));
+        assert!(table.contains("15,527,000"));
+        assert!(table.contains("1.5527000"));
+        assert!(table.contains("$1.86"));
+    }
+
+    #[test]
+    fn test_format_report_table_and_json_projections() {
+        let mut report = report_with_rates(sample_rates());
+        assert!(!format_report_table(&report).contains("Cost Projections:"));
+        assert!(!format_report_json(&report).contains("\"projections\""));
+
+        report.projections = Some(vec![CostProjection {
+            invocations: 100,
+            total_stroops: 1_552_700,
+            total_xlm: "0.1552700".to_string(),
+            usd: None,
+        }]);
+
+        let table_out = format_report_table(&report);
+        assert!(table_out.contains("Cost Projections:"));
+        assert!(table_out.contains("100"));
+        assert!(table_out.contains("1,552,700"));
+
+        let json_out = format_report_json(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json_out).expect("valid json");
+        assert!(parsed["projections"].is_array());
+        assert_eq!(parsed["projections"][0]["invocations"], 100);
+        assert_eq!(parsed["projections"][0]["total_stroops"], 1_552_700);
+        assert_eq!(parsed["projections"][0]["total_xlm"], "0.1552700");
+        assert!(parsed["projections"][0].get("usd").is_none());
+    }
+
+    // ── Cost delta math (#278) ──────────────────────────────────────────
+
+    #[test]
+    fn test_metric_delta_positive() {
+        let delta = MetricDelta::new(100, 200);
+        assert_eq!(delta.absolute, 100);
+        assert_eq!(delta.percent, Some(100.0));
+        assert_eq!(delta.format_signed(), "+100 (+100.0%)");
+    }
+
+    #[test]
+    fn test_metric_delta_negative() {
+        let delta = MetricDelta::new(200, 100);
+        assert_eq!(delta.absolute, -100);
+        assert_eq!(delta.percent, Some(-50.0));
+        assert_eq!(delta.format_signed(), "-100 (-50.0%)");
+    }
+
+    #[test]
+    fn test_metric_delta_zero() {
+        let delta = MetricDelta::new(200, 200);
+        assert_eq!(delta.absolute, 0);
+        assert_eq!(delta.percent, Some(0.0));
+        assert_eq!(delta.format_signed(), "0 (0.0%)");
+    }
+
+    #[test]
+    fn test_metric_delta_zero_baseline_has_no_percentage() {
+        let delta = MetricDelta::new(0, 500);
+        assert_eq!(delta.absolute, 500);
+        assert_eq!(delta.percent, None);
+        assert_eq!(delta.format_signed(), "+500");
+    }
+
+    #[test]
+    fn test_metric_delta_saturates_instead_of_wrapping() {
+        assert_eq!(MetricDelta::new(i64::MIN, i64::MAX).absolute, i64::MAX);
+    }
+
+    #[test]
+    fn test_cost_delta_without_previous_io_omits_entry_deltas() {
         let report = report_with_rates(sample_rates());
-        let out = format_report_table(&report);
+        let delta = CostDelta::compute(500_000, 10, 10_000, None, &report);
+
+        assert_eq!(delta.cpu_instructions.absolute, 32_502);
+        assert_eq!(delta.memory_bytes.absolute, -10);
+        assert_eq!(delta.fee_stroops.absolute, 5_527);
+        assert!(delta.read_entries.is_none());
+        assert!(delta.write_entries.is_none());
+        assert!(!delta.format_markdown().contains("Read Entries"));
+    }
+
+    #[test]
+    fn test_cost_delta_with_previous_io_includes_entry_deltas() {
+        let report = report_with_rates(sample_rates());
+        let delta = CostDelta::compute(532_502, 0, 15_527, Some((3, 0)), &report);
+
+        assert_eq!(delta.read_entries.map(|d| d.absolute), Some(-2));
+        assert_eq!(delta.write_entries.map(|d| d.absolute), Some(1));
+        assert!(delta.format_text().contains("Read Entries"));
+        assert!(delta.format_markdown().contains("Write Entries"));
+    }
+
+    #[test]
+    fn test_cost_delta_is_json_serializable() {
+        let report = report_with_rates(sample_rates());
+        let delta = CostDelta::compute(1, 2, 3, Some((1, 1)), &report);
+        let value = serde_json::to_value(delta).expect("serialize");
+
+        assert_eq!(value["cpu_instructions"]["previous"], 1);
+        assert_eq!(value["cpu_instructions"]["current"], 532_502);
+        assert_eq!(value["memory_bytes"]["absolute"], -2);
+        assert_eq!(value["fee_stroops"]["absolute"], 15_524);
+    }
+
+    #[test]
+    fn test_cost_delta_csv_has_header_and_one_row_per_metric() {
+        let report = report_with_rates(sample_rates());
+        let delta = CostDelta::compute(532_502, 0, 15_527, Some((1, 1)), &report);
+        let csv = delta.format_csv();
+        let lines: Vec<&str> = csv.lines().collect();
+
+        assert_eq!(lines[0], "metric,previous,current,absolute,percent");
+        // cpu, memory, read entries, write entries, fee
+        assert_eq!(lines.len(), 6);
+        assert!(lines[1].starts_with("CPU Instructions,532502,532502,0,0.0"));
+    }
+
+    #[test]
+    fn test_cost_delta_csv_leaves_percent_empty_without_baseline() {
+        let report = report_with_rates(sample_rates());
+        let delta = CostDelta::compute(0, 0, 0, None, &report);
+        let csv = delta.format_csv();
+        let cpu_row = csv.lines().nth(1).expect("cpu row");
+
         assert!(
-            out.contains("Simulated at ledger sequence: 3,894,195"),
-            "header should show the grouped ledger sequence, got:\n{out}"
+            cpu_row.ends_with(','),
+            "percent column should be empty; got: {cpu_row}"
         );
     }
 }
