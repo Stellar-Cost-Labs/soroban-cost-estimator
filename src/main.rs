@@ -228,6 +228,9 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
     let fallback = args.rpc_fallback_url.as_deref();
     let cli_format = args.format;
     let headers = args.headers;
+    // Command handlers below take `quiet` as a plain bool; bind it once here
+    // rather than repeating `args.quiet` at every call site.
+    let quiet = args.quiet;
     // Bound the on-disk estimate cache before any command can write to it.
     // A `--max-cache-size-mb` of 0 disables the byte quota; 0 entries
     // disables the entry quota.
