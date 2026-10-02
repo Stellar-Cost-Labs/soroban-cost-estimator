@@ -418,12 +418,52 @@ pub enum CacheAction {
     },
 }
 
+/// Sub-actions under `config snapshot` that operate on snapshots already on
+/// disk rather than fetching a new one. Each carries its own `--network`
+/// rather than inheriting the parent command's.
+#[derive(Subcommand, Debug)]
+pub enum SnapshotAction {
+    /// List saved snapshots: filename, network, timestamp, ledger sequence
+    /// and protocol version.
+    List {
+        /// Only list snapshots for this network (default: testnet).
+        #[arg(long, default_value = "testnet", conflicts_with = "all")]
+        network: String,
+
+        /// List snapshots for every network.
+        #[arg(long)]
+        all: bool,
+
+        /// Output a JSON array instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Delete stored snapshots older than a number of days.
+    ///
+    /// The newest snapshot is always kept, however old it is.
+    Prune {
+        /// Network whose snapshots should be pruned.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+
+        /// Delete snapshots recorded more than this many days ago.
+        #[arg(long, value_name = "DAYS")]
+        older_than: u32,
+
+        /// Output as JSON instead of a human-readable summary.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 pub enum ConfigAction {
     /// Fetch all ConfigSetting entries and save a timestamped snapshot.
     ///
-    /// Subcommands manage snapshots already on disk instead of fetching a new
-    /// one, so they are mutually exclusive with this command's own flags.
+    /// Subcommands (`list`, `prune`) manage snapshots already on disk instead
+    /// of fetching a new one, so they are mutually exclusive with this
+    /// command's own flags.
     #[command(args_conflicts_with_subcommands = true)]
     Snapshot {
         #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
@@ -526,30 +566,6 @@ pub enum ConfigAction {
     },
 }
 
-/// Retention sub-actions under `config snapshot`.
-///
-/// These operate purely on snapshots already on disk and never fetch a new
-/// one, which is why they carry their own `--network` rather than inheriting
-/// the parent command's.
-#[derive(Subcommand, Debug)]
-pub enum SnapshotAction {
-    /// Delete stored snapshots older than a number of days.
-    ///
-    /// The newest snapshot is always kept, however old it is.
-    Prune {
-        /// Network whose snapshots should be pruned.
-        #[arg(long, default_value = "testnet")]
-        network: String,
-
-        /// Delete snapshots recorded more than this many days ago.
-        #[arg(long, value_name = "DAYS")]
-        older_than: u32,
-
-        /// Output as JSON instead of a human-readable summary.
-        #[arg(long)]
-        json: bool,
-    },
-}
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 pub static COLOR_CHOICE: AtomicU8 = AtomicU8::new(0);
