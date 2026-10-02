@@ -188,6 +188,7 @@ Fetch all 6 `ConfigSetting` ledger entries, decode them via XDR, timestamp,
 and save to disk.
 
 ```bash
+soroban-cost-estimator config snapshot --network testnet [--out /custom/path.json] [--json] [--retain <N>]
 soroban-cost-estimator config snapshot --network testnet [--out /custom/path.json] [--json] [--retain N]
 ```
 
@@ -196,6 +197,18 @@ Saved to `~/.soroban-cost-estimator/snapshots/<network>-<timestamp>.json`.
 `--retain N` is a retention policy: snapshots for the network whose files are
 older than N days are deleted after saving, so the snapshots directory doesn't
 grow without bound.
+
+`--retain <N>` keeps only the N most recent snapshots, deleting older ones
+after the new snapshot is safely on disk. To drop stale files by age, or on a
+schedule:
+
+```bash
+soroban-cost-estimator config snapshot prune --network testnet --older-than 30
+```
+
+`prune` makes no RPC call and never deletes the newest snapshot, however old it
+is — so there is always a pair left for `config diff --against-previous`. Both
+retention paths log how many snapshots they pruned.
 
 ### `config diff`
 
