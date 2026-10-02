@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use governor::{Quota, RateLimiter};
@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, Notify};
 use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
-use crate::rpc::retry::{DEFAULT_MAX_RETRIES, with_retry};
+use crate::rpc::retry::{with_retry, DEFAULT_MAX_RETRIES};
 
 /// Default per-request HTTP timeout applied to every RPC call. Matches the
 /// CLI's `--timeout` default (30 seconds).
@@ -778,8 +778,8 @@ fn parseheaders(rawheaders: &[String]) -> HeaderMap {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use serde_json::Value;
@@ -789,7 +789,7 @@ mod tests {
     use crate::error::{AppError, AppResult};
     use crate::rpc::retry::DEFAULT_MAX_RETRIES;
 
-    use super::{RpcClient, resolve_ws_endpoint};
+    use super::{resolve_ws_endpoint, RpcClient};
 
     /// Spawns a tiny HTTP server that answers JSON-RPC
     /// `simulateTransaction`-style calls with `{"result":{"pong":true}}`,
