@@ -228,6 +228,9 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
     let fallback = args.rpc_fallback_url.as_deref();
     let cli_format = args.format;
     let headers = args.headers;
+    // `--quiet` is a single global flag; bind it once so every command in
+    // `run()` reads the same value.
+    let quiet = args.quiet;
     // Bound the on-disk estimate cache before any command can write to it.
     // A `--max-cache-size-mb` of 0 disables the byte quota; 0 entries
     // disables the entry quota.
@@ -269,7 +272,6 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             dry_run,
             project,
         } => {
-            let format = format.unwrap_or_else(|| if json { "json" } else { "table" }.to_string());
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
             let format = match (args.format, json) {
@@ -351,7 +353,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 (None, true) => cli::OutputFormat::Json,
                 (None, false) => cli::OutputFormat::Table,
             };
-            cmd_wasm_info(&wasm, format)
+            cmd_wasm_info(&wasm, format, quiet)
         }
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot {
@@ -390,12 +392,13 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                         connect_timeout,
                         max_retries,
                         &headers,
+                        quiet,
                         verbose,
                     )
                     .await
                 }
             },
-            cli::ConfigAction::List { network } => cmd_config_snapshot_list(&network),
+            cli::ConfigAction::List { network } => cmd_config_snapshot_list(&network, quiet),
             cli::ConfigAction::Diff {
                 network,
                 against,
@@ -441,14 +444,15 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                         connect_timeout,
                         max_retries,
                         &headers,
+                        quiet,
                         verbose,
                     )
                     .await
                 }
             }
-            cli::ConfigAction::History { network } => cmd_config_history(&network),
-            cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network),
-            cli::ConfigAction::Validate { network } => cmd_config_validate(&network),
+            cli::ConfigAction::History { network } => cmd_config_history(&network, quiet),
+            cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network, quiet),
+            cli::ConfigAction::Validate { network } => cmd_config_validate(&network, quiet),
             cli::ConfigAction::Export { network, output } => {
                 cmd_config_export(network.as_deref(), &output)
             }
@@ -521,7 +525,7 @@ fn cmd_completions(shell: clap_complete::Shell) {
 }
 
 /// True when a simulation response carried neither cost data, nor
-/// transaction data, nor a latest ledger — the signature of a misconfigured
+/// transaction data, nor a latest ledger â€” the signature of a misconfigured
 /// request (bad `--id`, wrong network, or RPC schema drift), not a free
 /// transaction.
 fn missing_simulation_data(resp: &rpc::simulate::SimulateTransactionResponse) -> bool {
@@ -533,7 +537,7 @@ fn missing_simulation_data(resp: &rpc::simulate::SimulateTransactionResponse) ->
 /// Legacy RPC versions report CPU/memory in a `cost` object; modern versions
 /// dropped `cost` and carry the resources (CPU instructions, footprint entry
 /// counts, disk read/write bytes) inside `transactionData` XDR. Memory bytes
-/// are only reported by the legacy `cost` object — modern RPC responses do
+/// are only reported by the legacy `cost` object â€” modern RPC responses do
 /// not expose them, so they report 0.
 ///
 /// Returns (cpu_insns, mem_bytes, read_entries, write_entries, read_bytes,
@@ -566,7 +570,7 @@ fn response_resources(
 ///
 /// If any of the three `ConfigSetting*` sources cannot be fetched or
 /// decoded, its rate(s) fall back to 0 and a warning is printed to stderr
-/// — a silent zero rate would understate the non-refundable fee, so it must
+/// â€” a silent zero rate would understate the non-refundable fee, so it must
 /// never pass unannounced.
 async fn fetch_fee_rates(
     client: &rpc::client::RpcClient,
@@ -611,7 +615,7 @@ async fn fetch_fee_rates(
     };
 
     // ConfigSettingContractLedgerCostV0: per-entry read/write fees and the
-    // per-KB disk read fee — all part of the non-refundable fee in
+    // per-KB disk read fee â€” all part of the non-refundable fee in
     // stellar-core's resource fee model.
     let (read_entry, write_entry, read_1kb) = match raw_ledger_cost {
         Ok(raw) => match xdr_helper::decode_config_entry_xdr(&raw.config_xdr, client.verbose) {
@@ -648,10 +652,10 @@ async fn fetch_fee_rates(
     };
 
     if !degraded.is_empty() {
-        warn!(sources = ?degraded, "fee rate source(s) unavailable — affected rate(s) set to 0");
+        warn!(sources = ?degraded, "fee rate source(s) unavailable â€” affected rate(s) set to 0");
         if !quiet {
             eprintln!(
-                "Warning: fee rate source(s) {} unavailable — affected rate(s) set to 0 (non-refundable fee understated)",
+                "Warning: fee rate source(s) {} unavailable â€” affected rate(s) set to 0 (non-refundable fee understated)",
                 degraded.join(", ")
             );
         }
@@ -743,6 +747,7 @@ struct SimulationRequest<'a> {
     max_retries: usize,
     precision: u32,
     extra_headers: &'a [String],
+    quiet: bool,
     verbose: bool,
 }
 
@@ -755,8 +760,8 @@ struct SimulationRequest<'a> {
 /// callers decide their own caching policy.
 ///
 /// All RPC traffic (simulation and fee-rate fetches) goes through one
-/// `RpcClient`, which deduplicates identical requests — the same method with
-/// the same params — so identical fee-rate fetches transmit at most once.
+/// `RpcClient`, which deduplicates identical requests â€” the same method with
+/// the same params â€” so identical fee-rate fetches transmit at most once.
 async fn simulate_report(
     req: &SimulationRequest<'_>,
 ) -> error::AppResult<report::cost_report::CostReport> {
@@ -809,7 +814,7 @@ async fn simulate_report(
 
     if missing_simulation_data(&response) {
         return Err(error::AppError::SimulationFailed(
-            "simulation returned no cost data and no latest ledger — check --id, --fn, and the RPC endpoint".to_string(),
+            "simulation returned no cost data and no latest ledger â€” check --id, --fn, and the RPC endpoint".to_string(),
         ));
     }
 
@@ -934,6 +939,7 @@ async fn cmd_estimate(
             max_retries,
             precision,
             extra_headers,
+            quiet,
             verbose,
         )
         .await;
@@ -955,6 +961,7 @@ async fn cmd_estimate(
             max_retries,
             precision,
             extra_headers,
+            quiet,
             verbose,
         )
         .await;
@@ -1064,6 +1071,7 @@ async fn cmd_estimate(
             connect_timeout,
             max_retries,
             extra_headers,
+            quiet,
             verbose,
         )
         .await
@@ -1077,9 +1085,9 @@ async fn cmd_estimate(
 
 /// Run a single estimation for `estimate` (and each `estimate --watch` build).
 ///
-/// Performs the full pipeline — WASM load + hash, cache lookup, transaction
+/// Performs the full pipeline â€” WASM load + hash, cache lookup, transaction
 /// construction, argument validation, endpoint health check, simulation,
-/// fee-rate fetch, fee breakdown, and cache write — and returns the outcome
+/// fee-rate fetch, fee breakdown, and cache write â€” and returns the outcome
 /// for the caller to render. Only the `WASM SHA-256` preamble (when
 /// `print_wasm_hash` is set, i.e. human single-shot runs) and the cache-hit
 /// message are emitted inline.
@@ -1183,7 +1191,7 @@ async fn estimate_once(
         let wasm_size = wasm_info.bytes.len() as u64;
         let function_name = fn_name.unwrap_or("(wasm upload)");
 
-        // Show the hash before anything else — the user can verify they are
+        // Show the hash before anything else â€” the user can verify they are
         // simulating the intended file before any RPC traffic is sent. Only
         // the human-readable table mode gets this preamble; watch mode prints
         // the hash inside its own per-build header instead.
@@ -1211,7 +1219,7 @@ async fn estimate_once(
         };
         if let Some(fresh) = fresh {
             let ttl_secs = ttl_secs.unwrap_or_default();
-            info!(ttl_secs, function = %function_name, "cache hit — reusing fresh estimate");
+            info!(ttl_secs, function = %function_name, "cache hit â€” reusing fresh estimate");
             print_cached_estimate(&fresh, ttl_secs, json_flag, precision);
             return Ok(EstimateRun::Cached);
         }
@@ -1243,7 +1251,7 @@ async fn estimate_once(
             debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
 
             let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
-            println!("Dry run — planned simulation payload (no network calls):");
+            println!("Dry run â€” planned simulation payload (no network calls):");
             println!();
             println!("  Resolved RPC endpoint: {endpoint}");
             println!(
@@ -1269,7 +1277,7 @@ async fn estimate_once(
             println!();
             println!("  Arguments ({}):", args.len());
             for (i, (arg, sc_val)) in args.iter().zip(&sc_vals).enumerate() {
-                println!("    [{i}] {arg} → {sc_val:?}");
+                println!("    [{i}] {arg} â†’ {sc_val:?}");
             }
             println!();
             println!("  Transaction envelope:");
@@ -1297,6 +1305,7 @@ async fn estimate_once(
             max_retries,
             precision,
             extra_headers,
+            quiet,
             verbose,
         })
         .await?;
@@ -1347,7 +1356,7 @@ struct EstimateWatchState {
 /// Decide whether a poll observing `observed` signals a finished rebuild.
 ///
 /// A build is accepted only once its SHA-256 is seen on **two consecutive
-/// polls** — the double-sample that lets watch mode ignore the transient,
+/// polls** â€” the double-sample that lets watch mode ignore the transient,
 /// possibly partial bytes a compiler leaves behind while actively writing
 /// the binary. Once accepted, `pending` is cleared so the same content is
 /// not re-triggered; the caller records the accepted hash as
@@ -1383,7 +1392,7 @@ fn wasm_content_hash(path: &std::path::Path) -> std::io::Result<Option<String>> 
 }
 
 /// Print a watch-status line to stdout for human formats and to stderr for
-/// machine formats, keeping structured output (e.g. JSON) clean — the same
+/// machine formats, keeping structured output (e.g. JSON) clean â€” the same
 /// convention as the `--clear-cache` announcement.
 fn watch_say(human: bool, line: impl std::fmt::Display) {
     if human {
@@ -1415,7 +1424,7 @@ fn watch_cost_delta(current: i64, previous: i64, precision: u32) -> String {
 }
 
 /// Render the clean header printed before each watch-mode report: build
-/// number, timestamp, WASM hash, total fee, and — from the second build on —
+/// number, timestamp, WASM hash, total fee, and â€” from the second build on â€”
 /// the fee change versus the previous build.
 fn watch_build_header(
     report: &report::cost_report::CostReport,
@@ -1424,7 +1433,7 @@ fn watch_build_header(
     now: &str,
     precision: u32,
 ) -> String {
-    let mut out = format!("── Build #{build} — {now} ──\n");
+    let mut out = format!("â”€â”€ Build #{build} â€” {now} â”€â”€\n");
     out.push_str(&format!("  WASM SHA-256: {}\n", report.wasm_hash));
     out.push_str(&format!(
         "  Total fee: {} stroops ({} XLM)\n",
@@ -1609,7 +1618,7 @@ async fn estimate_watch_poll_once(
 }
 
 /// `estimate --watch` command: poll the WASM file and re-estimate on every
-/// settled rebuild until SIGINT (Ctrl-C) or SIGTERM is received — then exit
+/// settled rebuild until SIGINT (Ctrl-C) or SIGTERM is received â€” then exit
 /// cleanly with code 0.
 ///
 /// Change detection fingerprint-polls the file every 500ms; a rebuild is
@@ -1659,7 +1668,7 @@ async fn cmd_estimate_watch(
     };
 
     // Baseline estimation before polling so the user gets immediate output.
-    // A missing or unreadable file is tolerated — the watcher fires when a
+    // A missing or unreadable file is tolerated â€” the watcher fires when a
     // readable build appears.
     match wasm_content_hash(path) {
         Ok(Some(hash)) => {
@@ -1703,7 +1712,7 @@ async fn cmd_estimate_watch(
             signal = shutdown_signal() => {
                 signal?;
                 info!("received stop signal");
-                watch_say(human, "Received stop signal — exiting cleanly.");
+                watch_say(human, "Received stop signal â€” exiting cleanly.");
                 return Ok(());
             }
             () = async {
@@ -1809,6 +1818,7 @@ async fn cmd_estimate_diff(
         max_retries,
         precision,
         extra_headers,
+        quiet,
         verbose,
     })
     .await?;
@@ -1831,6 +1841,7 @@ async fn cmd_estimate_diff(
         max_retries,
         precision,
         extra_headers,
+        quiet,
         verbose,
     })
     .await?;
@@ -1966,9 +1977,9 @@ fn csv_row(r: &EstimateAllResult) -> String {
 /// `estimate-all` command: enumerate all functions and estimate each.
 ///
 /// Every function shares a single deduplicating `RpcClient`. Batch runs that
-/// hit the same request twice — the shared WASM-upload path when a function
+/// hit the same request twice â€” the shared WASM-upload path when a function
 /// envelope is built against an undeployed contract, or identical fee-rate
-/// lookups — transmit each distinct `(method, params)` pair only once.
+/// lookups â€” transmit each distinct `(method, params)` pair only once.
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::fn_params_excessive_bools)]
 async fn cmd_estimate_all(
@@ -2000,7 +2011,7 @@ async fn cmd_estimate_all(
         let json_flag = format == "json";
         emit_wasm_structure(&wasm_info, verbose, wasm_info_flag, json_flag);
 
-        // Confirm the exact file being estimated up front — printed before any
+        // Confirm the exact file being estimated up front â€” printed before any
         // endpoint resolution or simulation, so the hash is visible even when
         // the network cannot be reached.
         use sha2::Digest;
@@ -2053,7 +2064,7 @@ async fn cmd_estimate_all(
                 {
                     String::new()
                 } else {
-                    "  — Skipped: filtered out".to_string()
+                    "  â€” Skipped: filtered out".to_string()
                 };
                 println!(
                     "  {}. {}{suffix}",
@@ -2087,6 +2098,7 @@ async fn cmd_estimate_all(
             std::time::Duration::from_secs(connect_timeout),
             max_retries,
             extra_headers,
+            quiet,
             verbose,
         );
 
@@ -2135,7 +2147,7 @@ async fn cmd_estimate_all(
                 println!("### {}\n", r.function);
                 if r.status == EstimateAllStatus::Ok {
                     println!("| Metric | Value |\n|--------|-------|");
-                    println!("| Status | ✅ ok |");
+                    println!("| Status | âœ… ok |");
                     println!("| CPU Instructions | {} |", r.cpu_instructions.unwrap_or(0));
                     println!("| Memory Bytes | {} |", r.memory_bytes.unwrap_or(0));
                     if let Some(fee) = &r.fee {
@@ -2167,6 +2179,7 @@ async fn cmd_estimate_all(
                 connect_timeout,
                 max_retries,
                 extra_headers,
+                quiet,
                 verbose,
             )
             .await
@@ -2259,7 +2272,7 @@ async fn estimate_all_function(
             let reason = format!("needs --fn/--arg ({} param(s))", fn_info.param_count);
             debug!(reason, "skipping function");
             if !json_flag && !quiet {
-                println!("── Estimating '{}' ── Skipped: {reason}", fn_info.name);
+                println!("â”€â”€ Estimating '{}' â”€â”€ Skipped: {reason}", fn_info.name);
             }
             return Ok(EstimateAllResult::skipped(&fn_info.name, reason));
         }
@@ -2274,7 +2287,7 @@ async fn estimate_all_function(
             Err(e) => {
                 debug!(error = %e, "tx construction failed");
                 if !json_flag && !quiet {
-                    eprintln!("── Estimating '{}' ── Skipped: {e}", fn_info.name);
+                    eprintln!("â”€â”€ Estimating '{}' â”€â”€ Skipped: {e}", fn_info.name);
                 }
                 return Ok(EstimateAllResult::skipped(&fn_info.name, e.to_string()));
             }
@@ -2287,10 +2300,10 @@ async fn estimate_all_function(
             Ok(resp) => {
                 let duration_ms = Some(sim_start.elapsed().as_millis() as u64);
                 if missing_simulation_data(&resp) {
-                    let msg = "simulation returned no cost data and no latest ledger — check --id and the RPC endpoint";
+                    let msg = "simulation returned no cost data and no latest ledger â€” check --id and the RPC endpoint";
                     debug!(msg, "simulation missing data");
                     if !json_flag && !quiet {
-                        eprintln!("── Estimating '{}' ── Error: {msg}", fn_info.name);
+                        eprintln!("â”€â”€ Estimating '{}' â”€â”€ Error: {msg}", fn_info.name);
                     }
                     return Ok(EstimateAllResult::errored(&fn_info.name, msg));
                 }
@@ -2380,7 +2393,7 @@ async fn estimate_all_function(
             Err(e) => {
                 debug!(error = %e, "simulation failed");
                 if !json_flag && !quiet {
-                    eprintln!("Skipped — simulation failed: {e}");
+                    eprintln!("Skipped â€” simulation failed: {e}");
                 }
                 Ok(EstimateAllResult::errored(&fn_info.name, e.to_string()))
             }
@@ -2393,11 +2406,11 @@ async fn estimate_all_function(
 /// `wasm-info` command: print WASM metadata without making any RPC calls.
 ///
 /// Shows the exported functions, contract-spec presence, binary size, and
-/// SHA-256 hash — everything "cheap" to derive from the file itself.
+/// SHA-256 hash â€” everything "cheap" to derive from the file itself.
 ///
 /// # Network calls
-/// None — pure file I/O + parsing.
-fn cmd_wasm_info(wasm_path: &str, format: cli::OutputFormat) -> error::AppResult<()> {
+/// None â€” pure file I/O + parsing.
+fn cmd_wasm_info(wasm_path: &str, format: cli::OutputFormat, quiet: bool) -> error::AppResult<()> {
     use sha2::Digest;
 
     let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
@@ -2519,6 +2532,7 @@ async fn fetch_config_snapshot(
             std::time::Duration::from_secs(connect_timeout),
             max_retries,
             extra_headers,
+            quiet,
             verbose,
         );
         debug!("fetching all config settings");
@@ -2553,7 +2567,7 @@ fn print_stale_estimates(network: &str, ledger: u32, quiet: bool) {
                     println!("  All cached estimates are current (ledger {ledger}).");
                 } else {
                     println!(
-                        "  {} cached estimate(s) from earlier ledger(s) — may be stale:",
+                        "  {} cached estimate(s) from earlier ledger(s) â€” may be stale:",
                         stale.len()
                     );
                     for est in &stale {
@@ -2675,6 +2689,7 @@ async fn cmd_config_snapshot(
             connect_timeout,
             max_retries,
             extra_headers,
+            quiet,
             verbose,
         )
         .await?;
@@ -2728,7 +2743,7 @@ async fn cmd_config_snapshot(
 /// `older_than_days` days ago, always keeping the newest one.
 ///
 /// # Network calls
-/// None — pure file I/O, so it is safe to run offline and in a cron job.
+/// None â€” pure file I/O, so it is safe to run offline and in a cron job.
 fn cmd_config_snapshot_prune(
     network: &str,
     older_than_days: u32,
@@ -2778,8 +2793,8 @@ fn cmd_config_snapshot_list(network: &str, quiet: bool) -> error::AppResult<()> 
 /// True when a config diff signals a network protocol/config upgrade.
 ///
 /// Pricing changes are the tool's proxy for "the network changed its
-/// resource-pricing configuration under us" — e.g. what a protocol vote
-/// produces — so they trigger the automatic post-upgrade snapshot.
+/// resource-pricing configuration under us" â€” e.g. what a protocol vote
+/// produces â€” so they trigger the automatic post-upgrade snapshot.
 fn upgrade_detected(diff: &config_snapshot::diff::ConfigDiff) -> bool {
     diff.has_pricing_changes
 }
@@ -2857,6 +2872,7 @@ async fn cmd_config_diff(
             connect_timeout,
             max_retries,
             extra_headers,
+            quiet,
             verbose,
         )
         .await?;
@@ -2902,7 +2918,7 @@ async fn cmd_config_diff(
                     info!(path = %path.display(), "auto-saved post-upgrade snapshot");
                     if !machine && !summary {
                         println!(
-                            "  Protocol upgrade detected — new config auto-saved to {}",
+                            "  Protocol upgrade detected â€” new config auto-saved to {}",
                             path.display()
                         );
                     }
@@ -2947,7 +2963,7 @@ async fn cmd_config_diff(
 /// already the one on disk.
 ///
 /// # Network calls
-/// None — pure file I/O.
+/// None â€” pure file I/O.
 #[allow(clippy::fn_params_excessive_bools)]
 fn cmd_config_diff_against_previous(
     network: &str,
@@ -3028,10 +3044,10 @@ fn cmd_config_last_changed(network: &str, quiet: bool) -> error::AppResult<()> {
 /// Look up a cached estimate that is still fresh under `--cache-ttl`.
 ///
 /// Returns `Ok(None)` when the flag is absent (nothing to do), no entry
-/// exists, or the entry has expired — all of which mean "re-simulate".
+/// exists, or the entry has expired â€” all of which mean "re-simulate".
 ///
 /// # Network calls
-/// None — pure file I/O.
+/// None â€” pure file I/O.
 fn fresh_cached_estimate(
     wasm_hash: &str,
     function: &str,
@@ -3053,7 +3069,7 @@ fn fresh_cached_estimate(
 /// re-simulating.
 ///
 /// # Network calls
-/// None — pure output.
+/// None â€” pure output.
 fn print_cached_estimate(
     fresh: &cache::CachedEstimate,
     ttl_secs: u64,
@@ -3079,7 +3095,7 @@ fn print_cached_estimate(
         );
     } else {
         println!(
-            "Cache hit — estimate from {} is still fresh (TTL {ttl_secs}s); skipping simulation.",
+            "Cache hit â€” estimate from {} is still fresh (TTL {ttl_secs}s); skipping simulation.",
             fresh.timestamp
         );
         println!(
@@ -3175,6 +3191,7 @@ async fn auto_snapshot_if_changed(
         connect_timeout,
         max_retries,
         extra_headers,
+        quiet,
         verbose,
     )
     .await?;
@@ -3211,7 +3228,7 @@ async fn auto_snapshot_if_changed(
 /// long-running command can stop gracefully.
 ///
 /// # Network calls
-/// None — waits on OS signals.
+/// None â€” waits on OS signals.
 async fn shutdown_signal() -> error::AppResult<()> {
     #[cfg(unix)]
     {
@@ -3258,6 +3275,7 @@ async fn watch_poll_once(
         connect_timeout,
         max_retries,
         extra_headers,
+        quiet,
         verbose,
     )
     .await;
@@ -3303,7 +3321,7 @@ async fn watch_poll_once(
 /// `watch` command: poll network config and print diffs.
 ///
 /// Polls immediately, then on `interval`, until SIGINT (Ctrl-C) or SIGTERM
-/// is received — then exits cleanly with code 0. The in-flight poll is
+/// is received â€” then exits cleanly with code 0. The in-flight poll is
 /// cancelled rather than writing a partial snapshot.
 async fn cmd_watch(
     network: &str,
@@ -3337,7 +3355,7 @@ async fn cmd_watch(
                 signal?;
                 info!("received stop signal");
                 if !quiet {
-                    println!("Received stop signal — exiting cleanly.");
+                    println!("Received stop signal â€” exiting cleanly.");
                 }
                 return Ok(());
             }
@@ -3370,7 +3388,7 @@ async fn cmd_watch(
 /// `--max-cache-entries` quotas).
 ///
 /// # Network calls
-/// None — pure SQLite I/O.
+/// None â€” pure SQLite I/O.
 #[allow(dead_code)] // wired once the `config cache stats` subcommand (#41) lands
 fn cmd_cache_stats(json: bool) -> error::AppResult<()> {
     let stats = cache::cache_stats()?;
@@ -3382,7 +3400,7 @@ fn cmd_cache_stats(json: bool) -> error::AppResult<()> {
     }
 
     if stats.total_entries == 0 {
-        println!("Cache is empty — no cached estimates.");
+        println!("Cache is empty â€” no cached estimates.");
         print_cache_quota(limits);
         return Ok(());
     }
@@ -3444,7 +3462,7 @@ fn print_cache_quota(limits: cache::CacheLimits) {
 /// it on a cache already within quota is a no-op that reports zero.
 ///
 /// # Network calls
-/// None — pure SQLite I/O.
+/// None â€” pure SQLite I/O.
 fn cmd_cache_prune() -> error::AppResult<()> {
     let limits = cache::cache_limits();
     let before = cache::cache_stats()?;
@@ -3453,7 +3471,7 @@ fn cmd_cache_prune() -> error::AppResult<()> {
 
     println!("Evicted {evicted} cached estimate(s).");
     println!(
-        "Cache: {} entr{} ({}) → {} entr{} ({})",
+        "Cache: {} entr{} ({}) â†’ {} entr{} ({})",
         before.total_entries,
         if before.total_entries == 1 {
             "y"
@@ -3497,7 +3515,7 @@ fn format_bytes(bytes: u64) -> String {
 /// error. A healthy (or empty) cache exits 0.
 ///
 /// # Network calls
-/// None — pure file I/O.
+/// None â€” pure file I/O.
 fn cmd_cache_verify(quiet: bool) -> error::AppResult<()> {
     use tracing::debug;
 
@@ -3506,7 +3524,7 @@ fn cmd_cache_verify(quiet: bool) -> error::AppResult<()> {
 
     if statuses.is_empty() {
         if !quiet {
-            println!("Cache is empty — nothing to verify.");
+            println!("Cache is empty â€” nothing to verify.");
         }
         return Ok(());
     }
@@ -3544,7 +3562,7 @@ fn cmd_cache_verify(quiet: bool) -> error::AppResult<()> {
 /// passed), newest estimate first. An empty cache prints a friendly message.
 ///
 /// # Network calls
-/// None — pure SQLite I/O.
+/// None â€” pure SQLite I/O.
 fn cmd_cache_list(network: &str, json: bool) -> error::AppResult<()> {
     let estimates = cache::list_cached_estimates(network)?;
 
@@ -3584,7 +3602,7 @@ fn cmd_cache_list(network: &str, json: bool) -> error::AppResult<()> {
 fn truncate_hash(hash: &str) -> String {
     if hash.chars().count() > 12 {
         let prefix: String = hash.chars().take(12).collect();
-        format!("{prefix}…")
+        format!("{prefix}â€¦")
     } else {
         hash.to_string()
     }
@@ -3593,11 +3611,11 @@ fn truncate_hash(hash: &str) -> String {
 /// `cache clear` command: delete every cached estimate for a network.
 ///
 /// Defaults to `testnet`; pass `--network` to target another network. Only
-/// entries recorded for that network are removed — other networks' entries
+/// entries recorded for that network are removed â€” other networks' entries
 /// are untouched.
 ///
 /// # Network calls
-/// None — pure SQLite I/O.
+/// None â€” pure SQLite I/O.
 fn cmd_cache_clear(network: &str, quiet: bool) -> error::AppResult<()> {
     let cleared = cache::clear_cache(network)?;
     if !quiet {
@@ -3612,7 +3630,7 @@ fn cmd_cache_clear(network: &str, quiet: bool) -> error::AppResult<()> {
 /// friendly message instead of an empty table.
 ///
 /// # Network calls
-/// None — pure file I/O.
+/// None â€” pure file I/O.
 /// Dispatch cache actions for either `cache <action>` or `config cache <action>`.
 async fn handle_cache_action(
     action: cli::CacheAction,
@@ -3655,13 +3673,14 @@ async fn handle_cache_action(
                 connect_timeout,
                 max_retries,
                 headers,
+                quiet,
                 verbose,
             )
             .await
         }
         cli::CacheAction::List { network, json } => cmd_cache_list(&network, json),
         cli::CacheAction::Verify => cmd_cache_verify(),
-        cli::CacheAction::Clear { network } => cmd_cache_clear(&network),
+        cli::CacheAction::Clear { network } => cmd_cache_clear(&network, quiet),
         cli::CacheAction::Prune => cmd_cache_prune(),
         cli::CacheAction::Query {
             network,
@@ -3681,6 +3700,7 @@ async fn handle_cache_action(
             since.as_deref(),
             to.as_deref(),
             json,
+            quiet,
         ),
         cli::CacheAction::Stats { json } => cmd_cache_stats(json),
     }
@@ -3692,7 +3712,7 @@ async fn handle_cache_action(
 /// friendly message instead of an empty table.
 ///
 /// # Network calls
-/// None — pure file I/O.
+/// None â€” pure file I/O.
 #[allow(clippy::too_many_arguments)]
 fn cmd_cache_query(
     network: Option<&str>,
@@ -3781,7 +3801,7 @@ fn cmd_cache_query(
 /// An unwritable destination fails with an error naming the path.
 ///
 /// # Network calls
-/// None — pure SQLite I/O.
+/// None â€” pure SQLite I/O.
 fn cmd_cache_export(out_path: Option<&str>, network: Option<&str>) -> error::AppResult<()> {
     let export = cache::export_cache(network)?;
     let json = serde_json::to_string_pretty(&export)?;
@@ -4161,7 +4181,7 @@ mod tests {
         assert_eq!(value["fee_distribution"]["mean_cpu_instructions"], 100);
     }
 
-    // ── estimate --watch detection & header helpers ────────────────────
+    // â”€â”€ estimate --watch detection & header helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_settled_new_build_detected_unchanged_build_is_quiescent() {
@@ -4284,7 +4304,7 @@ mod tests {
     #[test]
     fn test_watch_build_header_first_build_has_no_delta() {
         let header = watch_build_header(&watch_report(), None, 1, "2026-09-24 14:00:00 UTC", 7);
-        assert!(header.contains("── Build #1 — 2026-09-24 14:00:00 UTC ──"));
+        assert!(header.contains("â”€â”€ Build #1 â€” 2026-09-24 14:00:00 UTC â”€â”€"));
         assert!(header.contains("WASM SHA-256: deadbeef"));
         assert!(header.contains("Total fee: 15427 stroops (0.0015427 XLM)"));
         assert!(!header.contains("Change vs previous build"));
@@ -4299,7 +4319,7 @@ mod tests {
             "2026-09-24 14:05:00 UTC",
             7,
         );
-        assert!(header.contains("── Build #2 — 2026-09-24 14:05:00 UTC ──"));
+        assert!(header.contains("â”€â”€ Build #2 â€” 2026-09-24 14:05:00 UTC â”€â”€"));
         assert!(header.contains("+1427 stroops (+0.0001427 XLM)"));
     }
 }
