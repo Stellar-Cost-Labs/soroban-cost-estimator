@@ -1,8 +1,9 @@
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, FromArgMatches};
 use comfy_table::Cell;
 use comfy_table::Table;
 use soroban_cost_estimator::cache;
 use soroban_cost_estimator::cli;
+use soroban_cost_estimator::config;
 use soroban_cost_estimator::config_snapshot;
 use soroban_cost_estimator::error;
 use soroban_cost_estimator::interactive;
@@ -138,31 +139,40 @@ struct EstimateAllJsonReport {
     fee_distribution: report::cost_report::FeeDistribution,
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
-struct FileConfig {
-    network: Option<String>,
-    rpc_url: Option<String>,
-    json: Option<bool>,
+/// Parses the command line with `config.toml` values installed as clap
+/// defaults, so explicit arguments always beat the config file.
+///
+/// The `--config` path has to be known before the real parse, so a first,
+/// error-tolerant pass extracts it. A config that fails to load is returned
+/// rather than reported here, so `--help` and argument errors still work.
+fn parse_cli() -> (cli::Cli, error::AppResult<config::UserConfig>) {
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let explicit = cli::Cli::command()
+        .ignore_errors(true)
+        .try_get_matches_from(&argv)
+        .ok()
+        .and_then(|m| m.get_one::<String>("config").cloned());
+    let file = config::UserConfig::load(explicit.as_deref().map(std::path::Path::new));
+    let command = match &file {
+        Ok(cfg) => cfg.apply_cli_defaults(cli::Cli::command()),
+        Err(_) => cli::Cli::command(),
+    };
+    let matches = command.get_matches_from(&argv);
+    let args = cli::Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    (args, file)
 }
 
-fn config_path(cli_path: Option<&str>) -> std::path::PathBuf {
-    cli_path.map(std::path::PathBuf::from).unwrap_or_else(|| {
-        dirs::config_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("soroban-cost-estimator")
-            .join("config.toml")
-    })
-}
-
-fn load_config(cli_path: Option<&str>) -> error::AppResult<FileConfig> {
-    let path = config_path(cli_path);
-    if !path.exists() {
-        return Ok(FileConfig::default());
+/// Output format used when `--format` is not given: `SOROBAN_JSON`, then the
+/// config's `format`, then its legacy `json` key, then table.
+fn default_format(file: &config::UserConfig) -> cli::OutputFormat {
+    let env_json = std::env::var("SOROBAN_JSON")
+        .ok()
+        .and_then(|v| v.parse::<bool>().ok());
+    match (env_json, file.format, file.json) {
+        (Some(true), _, _) | (None, None, Some(true)) => cli::OutputFormat::Json,
+        (Some(false), _, _) | (None, None, _) => cli::OutputFormat::Table,
+        (None, Some(fmt), _) => fmt,
     }
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| error::AppError::Config(format!("{}: {e}", path.display())))?;
-    toml::from_str(&content)
-        .map_err(|e| error::AppError::Config(format!("{}: {e}", path.display())))
 }
 
 fn env_string(cli_value: String, file_value: &str, env: &str) -> String {
@@ -175,17 +185,9 @@ fn env_string(cli_value: String, file_value: &str, env: &str) -> String {
     }
 }
 
-fn env_or_file_bool(value: bool, file: Option<bool>) -> bool {
-    std::env::var("SOROBAN_JSON")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .or(file)
-        .unwrap_or(value)
-}
-
 #[tokio::main]
 async fn main() {
-    let args = cli::Cli::parse();
+    let (args, file) = parse_cli();
 
     cli::init_color(args.color);
     cli::init_quiet(args.quiet);
@@ -207,7 +209,7 @@ async fn main() {
         info!(command = ?args.command, verbose = args.verbose, quiet = args.quiet, "starting soroban-cost-estimator");
     }
 
-    if let Err(err) = run(args).await {
+    if let Err(err) = run(args, file).await {
         error!(error = %err, "command failed");
         eprintln!("Error: {err}");
         std::process::exit(1);
@@ -215,8 +217,9 @@ async fn main() {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run(args: cli::Cli) -> error::AppResult<()> {
-    let file = load_config(args.config.as_deref())?;
+async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> error::AppResult<()> {
+    let file = file?;
+    rpc::client::set_endpoint_overrides(file.rpc_urls.clone())?;
     let rps = args.rps;
     let timeout = args.timeout;
     let connect_timeout = args.connect_timeout;
@@ -239,17 +242,13 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
         max_entries: args.max_cache_entries,
     })?;
 
-    let format = match cli_format {
-        Some(fmt) => fmt,
-        None => {
-            if env_or_file_bool(false, file.json) {
-                cli::OutputFormat::Json
-            } else {
-                cli::OutputFormat::Table
-            }
-        }
-    };
-    let default_network = file.network.unwrap_or_else(|| "testnet".to_string());
+    let format = cli_format.unwrap_or_else(|| default_format(&file));
+    // Commands with their own `--json` flag fall back to the config file's
+    // `format` when neither `--format` nor `--json` is given.
+    let config_format = file.format.unwrap_or_default();
+    let default_network = file
+        .default_network
+        .unwrap_or_else(|| "testnet".to_string());
     let default_rpc_url = file.rpc_url;
     match args.command {
         cli::Command::Estimate {
@@ -277,7 +276,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             let format = match (args.format, json) {
                 (Some(fmt), _) => fmt,
                 (None, true) => cli::OutputFormat::Json,
-                (None, false) => cli::OutputFormat::Table,
+                (None, false) => config_format,
             };
             cmd_estimate(
                 &wasm,
@@ -324,7 +323,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             let format = match (args.format, json) {
                 (Some(fmt), _) => fmt,
                 (None, true) => cli::OutputFormat::Json,
-                (None, false) => cli::OutputFormat::Table,
+                (None, false) => config_format,
             };
             cmd_estimate_all(
                 &wasm,
@@ -352,7 +351,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             let format = match (args.format, json) {
                 (Some(fmt), _) => fmt,
                 (None, true) => cli::OutputFormat::Json,
-                (None, false) => cli::OutputFormat::Table,
+                (None, false) => config_format,
             };
             cmd_wasm_info(&wasm, format, quiet)
         }
@@ -384,7 +383,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     let format = match (args.format, json) {
                         (Some(fmt), _) => fmt,
                         (None, true) => cli::OutputFormat::Json,
-                        (None, false) => cli::OutputFormat::Table,
+                        (None, false) => config_format,
                     };
                     cmd_config_snapshot(
                         &env_string(network, &default_network, "SOROBAN_NETWORK"),
@@ -467,6 +466,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 handle_cache_action(
                     action,
                     cli_format,
+                    config_format,
                     &default_network,
                     default_rpc_url.as_deref(),
                     fallback,
@@ -485,6 +485,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             handle_cache_action(
                 action,
                 cli_format,
+                config_format,
                 &default_network,
                 default_rpc_url.as_deref(),
                 fallback,
@@ -3281,10 +3282,12 @@ async fn auto_snapshot_if_changed(
     if has_changes {
         let path = config_snapshot::store::save_snapshot(&new_snapshot, None)?;
         info!(path = %path.display(), ledger = new_snapshot.ledger, "auto-snapshot saved");
-        println!(
-            "Network configuration updated: saved snapshot {}",
-            path.display()
-        );
+        if !quiet {
+            println!(
+                "Network configuration updated: saved snapshot {}",
+                path.display()
+            );
+        }
     }
 
     Ok(())
@@ -3700,6 +3703,7 @@ fn cmd_cache_clear(network: &str, quiet: bool) -> error::AppResult<()> {
 async fn handle_cache_action(
     action: cli::CacheAction,
     cli_format: Option<cli::OutputFormat>,
+    config_format: cli::OutputFormat,
     default_network: &str,
     default_rpc_url: Option<&str>,
     fallback: Option<&str>,
@@ -3725,7 +3729,7 @@ async fn handle_cache_action(
             let format = match (cli_format, json) {
                 (Some(fmt), _) => fmt,
                 (None, true) => cli::OutputFormat::Json,
-                (None, false) => cli::OutputFormat::Table,
+                (None, false) => config_format,
             };
             cmd_cache_warm(
                 &wasm,
