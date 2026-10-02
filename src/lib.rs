@@ -9,6 +9,7 @@ pub mod cli;
 pub mod config;
 pub mod config_snapshot;
 pub mod error;
+pub mod interactive;
 pub mod paths;
 pub mod report;
 pub mod rpc;

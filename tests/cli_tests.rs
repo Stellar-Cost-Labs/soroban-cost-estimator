@@ -92,6 +92,27 @@ fn write_snapshot(home: &Path, network: &str, timestamp: &str, ledger: u32) -> P
     path
 }
 
+/// An RFC 3339 timestamp `days` in the past, in the same shape
+/// `begin_snapshot` records.
+fn days_ago(days: i64) -> String {
+    (chrono::Utc::now() - chrono::TimeDelta::days(days)).to_rfc3339()
+}
+
+/// Snapshot filenames on disk for `network` under `home`, oldest first.
+fn snapshot_files(home: &Path, network: &str) -> Vec<String> {
+    let dir = home.join(".soroban-cost-estimator").join("snapshots");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with(&format!("{network}-")) && name.ends_with(".json"))
+        .collect();
+    names.sort();
+    names
+}
+
 /// Runs the CLI with `HOME` isolated and tracing silenced.
 ///
 /// `tracing`'s `info!` lines go to stdout in this binary, so `RUST_LOG=error`
@@ -166,6 +187,7 @@ fn test_estimate_help() {
         "--fn",
         "--id",
         "--arg",
+        "--interactive",
         "--cache-ttl",
         "--compare",
         "--clear-cache",
@@ -219,7 +241,7 @@ fn test_config_snapshot_help() {
         code, 0,
         "config snapshot --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--network", "--out", "--json", "--retain"] {
+    for flag in ["--network", "--out", "--json", "--retain", "prune"] {
         assert!(
             stdout.contains(flag),
             "snapshot help should mention {flag}; got: {stdout}"
@@ -234,7 +256,14 @@ fn test_config_diff_help() {
         code, 0,
         "config diff --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--network", "--against", "--against-previous", "--summary"] {
+    for flag in [
+        "--network",
+        "--against",
+        "--against-previous",
+        "--summary",
+        "--ignore-pricing-exit",
+        "--fail-on-any-change",
+    ] {
         assert!(
             stdout.contains(flag),
             "diff help should mention {flag}; got: {stdout}"
@@ -308,6 +337,118 @@ fn test_cache_verify_empty_cache_succeeds() {
     assert!(
         stdout.contains("empty") || stdout.contains("nothing to verify"),
         "should report an empty cache: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_export_help() {
+    let (stdout, stderr, code) = run_cli(&["cache", "export", "--help"]);
+    assert_eq!(
+        code, 0,
+        "cache export --help should exit 0; stderr: {stderr}"
+    );
+    for flag in ["--out", "--network"] {
+        assert!(
+            stdout.contains(flag),
+            "export help should mention {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_cache_export_to_file_with_network_filter() {
+    let home = temp_home("cache-export-file");
+    // Distinct functions: the cache key is (wasm_hash, function, args_hash),
+    // so identical keys would upsert instead of producing two rows.
+    seed_cache_entry_for(&home, "testnet", "f_testnet", 42, "2026-01-01T00:00:00Z");
+    seed_cache_entry_for(&home, "mainnet", "f_mainnet", 43, "2026-01-02T00:00:00Z");
+    let out = home.join("backup.json");
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "cache",
+            "export",
+            "--network",
+            "testnet",
+            "--out",
+            out.to_str().unwrap(),
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "export should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("Exported 1 cache entry to"),
+        "confirmation should name the count and path; got: {stdout}"
+    );
+    assert!(
+        stdout.contains(out.to_str().unwrap()),
+        "confirmation should name the output file; got: {stdout}"
+    );
+
+    let raw = std::fs::read_to_string(&out).expect("read export file");
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON export");
+    assert_eq!(
+        parsed["schema_version"], 1,
+        "envelope should stamp the schema version"
+    );
+    assert!(
+        parsed["exported_at"].is_string(),
+        "envelope should carry an export timestamp; got: {parsed}"
+    );
+    assert_eq!(parsed["network"], "testnet");
+    let estimates = parsed["estimates"].as_array().expect("estimates array");
+    assert_eq!(estimates.len(), 1, "only the testnet entry should export");
+    assert_eq!(estimates[0]["network"], "testnet");
+}
+
+#[test]
+fn test_cache_export_all_networks_to_stdout() {
+    let home = temp_home("cache-export-stdout");
+    // Distinct functions: the cache key is (wasm_hash, function, args_hash),
+    // so identical keys would upsert instead of producing two rows.
+    seed_cache_entry_for(&home, "testnet", "f_testnet", 42, "2026-01-01T00:00:00Z");
+    seed_cache_entry_for(&home, "mainnet", "f_mainnet", 43, "2026-01-02T00:00:00Z");
+
+    // tracing's `info!` lines go to stdout in this binary, so silence them
+    // with RUST_LOG=error (via run_cli_quiet) to get pure JSON on stdout.
+    let (stdout, stderr, code) = run_cli_quiet(&["cache", "export"], Some(&home));
+    assert_eq!(code, 0, "export should exit 0; stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout should be the JSON envelope");
+    assert_eq!(parsed["schema_version"], 1);
+    assert!(parsed.get("network").is_none() || parsed["network"].is_null());
+    assert_eq!(
+        parsed["estimates"]
+            .as_array()
+            .expect("estimates array")
+            .len(),
+        2,
+        "unfiltered export should carry both networks"
+    );
+}
+
+#[test]
+fn test_cache_export_unwritable_destination_errors() {
+    let home = temp_home("cache-export-unwritable");
+    seed_cache_entry_for(
+        &home,
+        "testnet",
+        "(wasm upload)",
+        42,
+        "2026-01-01T00:00:00Z",
+    );
+    // A directory is never a writable file destination.
+    let dir = home.join("a-directory");
+    std::fs::create_dir_all(&dir).expect("create dir");
+
+    let (_, stderr, code) = run_cli_in_home(
+        &["cache", "export", "--out", dir.to_str().unwrap()],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "an unwritable destination should exit 1");
+    assert!(
+        stderr.contains(dir.to_str().unwrap()),
+        "the error should name the destination; got: {stderr}"
     );
 }
 
@@ -813,6 +954,53 @@ fn test_estimate_fn_without_id_errors() {
 }
 
 #[test]
+fn test_estimate_interactive_eof_cancels_cleanly() {
+    // `run_cli` leaves stdin closed, so the first prompt reads EOF. The
+    // command must abort with a clear error — no hang, no panic.
+    let (stdout, stderr, code) = run_cli(&[
+        "estimate",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--interactive",
+    ]);
+    assert_eq!(code, 1, "EOF on stdin should exit 1");
+    assert!(
+        stdout.contains("Available functions:"),
+        "the function list should print before the read; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("increment"),
+        "the fixture's increment function should be listed; got: {stdout}"
+    );
+    assert!(
+        stderr.contains("cancelled"),
+        "the error should say the input was cancelled; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "cancelling the prompt must not panic; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_interactive_short_flag_accepted() {
+    // `-i` is the short form of `--interactive`; like above, stdin is
+    // closed, so it must reach the prompt (then cancel) rather than fail
+    // on argument parsing.
+    let (stdout, stderr, code) =
+        run_cli(&["estimate", "--wasm", "tests/fixtures/contract.wasm", "-i"]);
+    assert_eq!(code, 1, "EOF on stdin should exit 1");
+    assert!(
+        stdout.contains("Available functions:"),
+        "the -i flag should enable the prompt; got: {stdout}; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("cancelled"),
+        "the error should say the input was cancelled; got: {stderr}"
+    );
+}
+
+#[test]
 fn test_estimate_invalid_contract_id_errors() {
     let (_, stderr, code) = run_cli(&[
         "estimate",
@@ -1116,22 +1304,243 @@ fn test_config_snapshot_retain_flag_accepted() {
     );
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// `config snapshot` retention
+// ─────────────────────────────────────────────────────────────────────────
+
 #[test]
-fn test_config_snapshot_retain_zero_rejected() {
-    // `--retain 0` would delete every snapshot, so clap must reject it before
-    // anything runs.
+fn test_config_snapshot_retain_flag_is_accepted() {
+    // `--retain` must parse; the failure should come from the unresolvable
+    // network, not from clap rejecting the flag.
+    let home = temp_home("snapshot-retain-flag");
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "snapshot",
+            "--retain",
+            "3",
+            "--network",
+            "not-a-network",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "the unknown network should exit 1");
+    assert!(
+        stderr.contains("failed to locate RPC endpoint"),
+        "the failure should come from the network, not the flag; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--retain must not be rejected by the parser; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_prune_help() {
+    let (stdout, stderr, code) = run_cli(&["config", "snapshot", "prune", "--help"]);
+    assert_eq!(code, 0, "prune --help should exit 0; stderr: {stderr}");
+    for flag in ["--network", "--older-than", "--json"] {
+        assert!(
+            stdout.contains(flag),
+            "prune help should mention {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_config_snapshot_prune_requires_older_than() {
+    let (_, stderr, code) = run_cli(&["config", "snapshot", "prune"]);
+    assert_ne!(code, 0, "prune without --older-than must be rejected");
+    assert!(
+        stderr.contains("--older-than"),
+        "the error should name the missing flag; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_prune_rejects_fetch_flags() {
+    // Pruning never fetches a snapshot, so combining it with the fetching
+    // flags would silently ignore them. It must be an explicit error instead.
     let (_, stderr, code) = run_cli(&[
         "config",
         "snapshot",
-        "--network",
-        "not-a-network",
         "--retain",
-        "0",
+        "3",
+        "prune",
+        "--older-than",
+        "1",
     ]);
-    assert_ne!(code, 0, "--retain 0 should be rejected");
+    assert_ne!(code, 0, "--retain with prune should be rejected");
     assert!(
-        stderr.contains("is not in"),
-        "clap should explain the valid range; stderr: {stderr}"
+        stderr.contains("--retain") && stderr.contains("prune"),
+        "the error should name both the flag and the subcommand; got: {stderr}"
+    );
+
+    let (_, stderr, code) = run_cli(&[
+        "config",
+        "snapshot",
+        "--out",
+        "/tmp/x.json",
+        "prune",
+        "--older-than",
+        "1",
+    ]);
+    assert_ne!(code, 0, "--out with prune should be rejected");
+    assert!(
+        stderr.contains("--out") && stderr.contains("prune"),
+        "the error should name both the flag and the subcommand; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_prune_deletes_only_stale_snapshots() {
+    let home = temp_home("prune-stale");
+    write_snapshot(&home, "testnet", &days_ago(40), 1);
+    write_snapshot(&home, "testnet", &days_ago(10), 2);
+    write_snapshot(&home, "testnet", &days_ago(1), 3);
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "snapshot",
+            "prune",
+            "--network",
+            "testnet",
+            "--older-than",
+            "30",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 0, "pruning should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("Pruned 1 snapshot(s)"),
+        "the count of pruned snapshots must be logged; got: {stdout}"
+    );
+    assert_eq!(
+        snapshot_files(&home, "testnet").len(),
+        2,
+        "only the 40-day-old snapshot should be gone; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_prune_keeps_latest_however_old_it_is() {
+    // Every snapshot is older than the threshold, but the newest one is the
+    // only thing left to diff against, so it has to survive.
+    let home = temp_home("prune-latest");
+    write_snapshot(&home, "testnet", &days_ago(300), 1);
+    write_snapshot(&home, "testnet", &days_ago(200), 2);
+    write_snapshot(&home, "testnet", &days_ago(100), 3);
+    let newest = snapshot_files(&home, "testnet")
+        .pop()
+        .expect("three snapshots were written");
+
+    let (stdout, _, code) = run_cli_in_home(
+        &[
+            "config",
+            "snapshot",
+            "prune",
+            "--network",
+            "testnet",
+            "--older-than",
+            "0",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 0, "pruning should exit 0");
+    assert!(
+        stdout.contains("Pruned 2 snapshot(s)"),
+        "only the two older snapshots should go; got: {stdout}"
+    );
+    assert_eq!(
+        snapshot_files(&home, "testnet"),
+        vec![newest],
+        "the newest snapshot must survive any age threshold"
+    );
+}
+
+#[test]
+fn test_config_snapshot_prune_without_snapshots_is_a_noop() {
+    let home = temp_home("prune-empty");
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "snapshot",
+            "prune",
+            "--network",
+            "testnet",
+            "--older-than",
+            "1",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 0,
+        "an empty snapshots dir is not an error; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Pruned 0 snapshot(s)"),
+        "a no-op run should still report its count; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_prune_json_reports_the_run() {
+    let home = temp_home("prune-json");
+    write_snapshot(&home, "testnet", &days_ago(90), 1);
+    write_snapshot(&home, "testnet", &days_ago(30), 2);
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "config",
+            "snapshot",
+            "prune",
+            "--network",
+            "testnet",
+            "--older-than",
+            "60",
+            "--json",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 0, "prune --json should exit 0; stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("valid JSON; {e}: {stdout}"));
+    assert_eq!(parsed["network"], "testnet");
+    assert_eq!(parsed["retain_days"], 60);
+    assert_eq!(parsed["pruned_count"], 1);
+    assert_eq!(parsed["remaining"], 1);
+    assert_eq!(parsed["pruned"].as_array().map(Vec::len), Some(1));
+}
+
+#[test]
+fn test_config_snapshot_prune_leaves_other_networks_alone() {
+    let home = temp_home("prune-network");
+    write_snapshot(&home, "testnet", &days_ago(90), 1);
+    write_snapshot(&home, "testnet", &days_ago(1), 2);
+    write_snapshot(&home, "mainnet", &days_ago(90), 9);
+
+    let (_, _, code) = run_cli_in_home(
+        &[
+            "config",
+            "snapshot",
+            "prune",
+            "--network",
+            "testnet",
+            "--older-than",
+            "30",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 0);
+    assert_eq!(
+        snapshot_files(&home, "mainnet").len(),
+        1,
+        "another network's snapshots must be untouched"
     );
 }
 
@@ -1291,6 +1700,45 @@ fn test_config_diff_summary_flag_accepted() {
         ),
         "the failure should come from the network, not the flag; got: {stderr}"
     );
+}
+
+#[test]
+fn test_config_diff_exit_code_flags_accepted() {
+    // `--ignore-pricing-exit` and `--fail-on-any-change` must be recognized
+    // flags (the run still fails, but on the unknown network, not on the
+    // arguments themselves).
+    for (label, flag) in [
+        ("ignore", "--ignore-pricing-exit"),
+        ("fail", "--fail-on-any-change"),
+    ] {
+        let home = temp_home(&format!("diff-exit-flag-{label}"));
+        let path = home.join("snapshot.json");
+        std::fs::write(&path, snapshot_json("not-a-network", 1000)).expect("write fixture");
+
+        let (_, stderr, code) = run_cli_in_home(
+            &[
+                "config",
+                "diff",
+                "--network",
+                "not-a-network",
+                "--against",
+                path.to_str().unwrap(),
+                flag,
+            ],
+            Some(&home),
+        );
+        assert_eq!(code, 1, "the unknown network should exit 1");
+        assert!(
+            !stderr.contains("unexpected argument"),
+            "{flag} should be a recognized argument; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains(
+                "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+            ),
+            "the failure should come from the network, not the flag; got: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -2490,6 +2938,38 @@ fn test_estimate_wasm_new_requires_diff() {
 }
 
 #[test]
+fn test_estimate_diff_requires_function_signature_in_both_wasms() {
+    for (old_wasm, new_wasm, missing_flag) in [
+        (
+            "tests/fixtures/minimal.wasm",
+            "tests/fixtures/contract.wasm",
+            "--wasm",
+        ),
+        (
+            "tests/fixtures/contract.wasm",
+            "tests/fixtures/minimal.wasm",
+            "--wasm-new",
+        ),
+    ] {
+        let (_, stderr, code) = run_cli(&[
+            "estimate",
+            "--wasm",
+            old_wasm,
+            "--wasm-new",
+            new_wasm,
+            "--diff",
+            "--fn",
+            "increment",
+        ]);
+        assert_ne!(code, 0, "missing signature from {missing_flag} must fail");
+        assert!(
+            stderr.contains(&format!("missing from {missing_flag} WASM")),
+            "error should identify missing signature in {missing_flag}; got: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn test_estimate_diff_table_end_to_end() {
     let (rpc_url, _stop) = start_mock_rpc_server("", "1000", 100);
     let home = temp_home("estimate-diff-table");
@@ -2578,10 +3058,15 @@ fn test_estimate_diff_json_structure() {
 
     let parsed: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
-    assert_eq!(parsed["identity"]["function"], "(wasm upload)");
-    assert_eq!(parsed["identity"]["network"], "testnet");
+    assert_eq!(parsed["wasm_a"]["function"], "(wasm upload)");
+    assert_eq!(parsed["wasm_b"]["function"], "(wasm upload)");
+    assert_eq!(parsed["wasm_a"]["network"], "testnet");
+    assert_eq!(parsed["wasm_b"]["network"], "testnet");
+    assert!(parsed["wasm_a"]["fee"]["total_stroops"].is_number());
+    assert!(parsed["wasm_b"]["fee"]["total_stroops"].is_number());
 
-    let rows = parsed["rows"].as_array().expect("rows array");
+    assert_eq!(parsed["diff"]["identity"]["network"], "testnet");
+    let rows = parsed["diff"]["rows"].as_array().expect("diff rows array");
     assert_eq!(rows.len(), 8, "one row per compared resource");
     assert_eq!(rows[0]["resource"], "WASM Size");
     // The two fixtures differ in size, so the WASM row must carry a delta.
@@ -2738,6 +3223,10 @@ fn test_completions_help() {
         stdout.contains("powershell"),
         "completions help should list powershell option"
     );
+    assert!(
+        stdout.contains("elvish"),
+        "completions help should list elvish option"
+    );
 }
 
 #[test]
@@ -2753,6 +3242,12 @@ fn test_completions_bash() {
         stdout.contains("estimate"),
         "bash completion script should contain subcommand names"
     );
+    for network in ["testnet", "mainnet", "futurenet", "local"] {
+        assert!(
+            stdout.contains(network),
+            "bash completion script should include {network}"
+        );
+    }
 }
 
 #[test]
@@ -2800,6 +3295,24 @@ fn test_completions_powershell() {
     assert!(
         stdout.contains("estimate"),
         "powershell completion script should contain subcommand names"
+    );
+}
+
+#[test]
+fn test_completions_elvish() {
+    let (stdout, stderr, code) = run_cli(&["completions", "elvish"]);
+    assert_eq!(
+        code, 0,
+        "completions elvish should exit 0; stderr: {stderr}"
+    );
+    assert!(!stdout.is_empty(), "completion script should not be empty");
+    assert!(
+        stdout.contains("soroban-cost-estimator"),
+        "elvish completion script should contain binary name"
+    );
+    assert!(
+        stdout.contains("estimate"),
+        "elvish completion script should contain subcommand names"
     );
 }
 
