@@ -83,6 +83,9 @@ impl TableFormatter {
             crate::report::cost_report::format_ledger_sequence(report.ledger)
         ));
         output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
+        if report.wasm_size > 0 {
+            output.push_str(&format!("WASM size: {} bytes\n", report.wasm_size));
+        }
         output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
 
         // Contract metadata from the WASM `contractmeta` section: always
@@ -214,6 +217,9 @@ impl ReportFormatter for JsonFormatter {
             serde_json::to_value(report.suggest_optimizations()).unwrap_or(serde_json::Value::Null);
         if let serde_json::Value::Object(ref mut map) = value {
             map.insert("suggestions".to_string(), suggestions);
+            if !report.wasm_sections.is_empty() {
+                map.insert("section_sizes".to_string(), section_size_map(report));
+            }
         }
         serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
     }
@@ -221,6 +227,28 @@ impl ReportFormatter for JsonFormatter {
     fn name(&self) -> &'static str {
         "json"
     }
+}
+
+/// Name-to-bytes map of the report's WASM section breakdown.
+///
+/// The values sum to the report's `wasm_size`, and repeated section names
+/// (two `name` custom sections, for instance) are suffixed with `#2`, `#3`, …
+/// so no bytes are lost.
+#[must_use]
+pub fn section_size_map(report: &CostReport) -> serde_json::Value {
+    let mut seen: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let mut map = serde_json::Map::new();
+    for entry in &report.wasm_sections {
+        let count = seen.entry(entry.name.as_str()).or_insert(0);
+        *count += 1;
+        let key = if *count > 1 {
+            format!("{}#{count}", entry.name)
+        } else {
+            entry.name.clone()
+        };
+        map.insert(key, serde_json::json!(entry.total_size));
+    }
+    serde_json::Value::Object(map)
 }
 
 impl fmt::Display for JsonFormatter {

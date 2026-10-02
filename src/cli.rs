@@ -317,8 +317,22 @@ pub enum Command {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum WasmAction {
+    /// Print size, SHA-256, exported signatures, embedded metadata, and the
+    /// section size summary for a WASM file. Fully offline: no RPC calls.
+    Info {
+        /// Path to the compiled Soroban contract `.wasm` file.
+        wasm: PathBuf,
+
+        /// Output the full parsed spec/metadata as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum CacheAction {
-    /// Export cached estimates as a versioned JSON document (schema
+@    /// Export cached estimates as a versioned JSON document (schema
     /// version, export timestamp, and estimate records) for backup or
     /// sharing across workstations.
     Export {
