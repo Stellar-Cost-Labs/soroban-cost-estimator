@@ -2530,7 +2530,6 @@ async fn fetch_config_snapshot(
     connect_timeout: u64,
     max_retries: usize,
     extra_headers: &[String],
-    quiet: bool,
     verbose: bool,
 ) -> error::AppResult<config_snapshot::model::ConfigSnapshot> {
     use tracing::Instrument;
@@ -2703,7 +2702,6 @@ async fn cmd_config_snapshot(
             connect_timeout,
             max_retries,
             extra_headers,
-            quiet,
             verbose,
         )
         .await?;
@@ -2886,7 +2884,6 @@ async fn cmd_config_diff(
             connect_timeout,
             max_retries,
             extra_headers,
-            quiet,
             verbose,
         )
         .await?;
@@ -2911,18 +2908,16 @@ async fn cmd_config_diff(
             if !quiet {
                 println!("{}", config_snapshot::diff::format_diff_summary(&diff));
             }
-        } else {
-            if !quiet {
-                println!(
-                    "{}",
-                    config_snapshot::diff::format_diff(
-                        &diff,
-                        cli::should_colorize(),
-                        pricing_only,
-                        threshold_percent
-                    )
-                );
-            }
+        } else if !quiet {
+            println!(
+                "{}",
+                config_snapshot::diff::format_diff(
+                    &diff,
+                    cli::should_colorize(),
+                    pricing_only,
+                    threshold_percent
+                )
+            );
         }
 
         if upgrade_detected(&diff) {
@@ -3005,19 +3000,17 @@ fn cmd_config_diff_against_previous(
         println!("{}", serde_json::to_string_pretty(&json_output)?);
     } else if summary {
         println!("{}", config_snapshot::diff::format_diff_summary(&diff));
-    } else {
-        if !quiet {
-            println!(
-                "{}",
-                config_snapshot::diff::format_diff(
-                    &diff,
-                    cli::should_colorize(),
-                    pricing_only,
-                    threshold_percent,
-                )
-            );
-            print_stale_estimates(network, new_snapshot.ledger, quiet);
-        }
+    } else if !quiet {
+        println!(
+            "{}",
+            config_snapshot::diff::format_diff(
+                &diff,
+                cli::should_colorize(),
+                pricing_only,
+                threshold_percent,
+            )
+        );
+        print_stale_estimates(network, new_snapshot.ledger, quiet);
     }
 
     let exit_code = config_snapshot::diff::resolve_exit_code(
@@ -3208,7 +3201,6 @@ async fn auto_snapshot_if_changed(
         connect_timeout,
         max_retries,
         extra_headers,
-        quiet,
         verbose,
     )
     .await?;
@@ -3292,7 +3284,6 @@ async fn watch_poll_once(
         connect_timeout,
         max_retries,
         extra_headers,
-        quiet,
         verbose,
     )
     .await;
