@@ -112,6 +112,11 @@ pub struct Cli {
     #[arg(long, short, global = true)]
     pub verbose: bool,
 
+    /// Suppress progress spinners, info banners, and non-error notices.
+    /// Outputs only the final result or error.
+    #[arg(long, short, global = true)]
+    pub quiet: bool,
+
     /// Custom HTTP header to send with every RPC request, e.g.
     /// `--header "X-API-Key: secret"`. Repeatable for multiple headers.
     #[arg(long = "header", value_name = "KEY: VALUE", global = true)]
@@ -146,10 +151,6 @@ pub struct Cli {
     /// limit. 0 disables the entry quota.
     #[arg(long, global = true, value_name = "N", default_value_t = 10_000)]
     pub max_cache_entries: usize,
-
-    /// Suppress non-essential output, including the fee-distribution chart.
-    #[arg(long, short, global = true)]
-    pub quiet: bool,
 
     /// Number of decimal places shown for XLM fee values (0..=7, default 7).
     ///
