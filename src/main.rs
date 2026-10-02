@@ -299,7 +299,6 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 max_retries,
                 precision,
                 &headers,
-                quiet,
                 watch,
                 args.wasm_info,
                 quiet,
@@ -432,9 +431,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                         summary,
                         diff_format == cli::OutputFormat::Json,
                         ignore_pricing_exit,
-                        quiet,
                         fail_on_any_change,
-                        quiet,
                     )
                 } else {
                     cmd_config_diff(
@@ -994,7 +991,6 @@ async fn cmd_estimate(
         format,
         precision,
         extra_headers,
-        quiet,
         rps,
         timeout,
         connect_timeout,
@@ -1511,7 +1507,6 @@ async fn emit_watch_estimate(
         format,
         precision,
         extra_headers,
-        quiet,
         rps,
         timeout,
         connect_timeout,
