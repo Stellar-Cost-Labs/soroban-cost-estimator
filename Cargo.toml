@@ -45,6 +45,8 @@ single_match_else = { level = "allow", priority = 1 }
 map_unwrap_or = { level = "allow", priority = 1 }
 useless_format = { level = "allow", priority = 1 }
 too_many_arguments = { level = "allow", priority = 1 }
+# New in Rust 1.99; noise for boolean emptiness assertions in tests.
+assert_is_empty = { level = "allow", priority = 1 }
 
 [dependencies]
 # CLI
@@ -104,6 +106,7 @@ insta = "1.40.0"
 proptest = "1.11.0"
 criterion = "0.5"
 rusqlite = { version = "0.37", features = ["bundled"] }
+wiremock = "0.6.0"
 
 [profile.release]
 lto = true
