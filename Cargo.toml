@@ -106,6 +106,7 @@ insta = "1.40.0"
 proptest = "1.11.0"
 criterion = "0.5"
 rusqlite = { version = "0.37", features = ["bundled"] }
+wiremock = "0.6.0"
 
 [profile.release]
 lto = true
