@@ -193,7 +193,8 @@ soroban-cost-estimator config snapshot --network testnet [--out /custom/path.jso
 ```
 
 Saved to `~/.soroban-cost-estimator/snapshots/<network>-<timestamp>.json`.
-`--json` also prints the snapshot as JSON (and still saves it).
+`--json` also prints the snapshot as JSON (and still saves it). Each snapshot
+also records the network protocol version from `getLatestLedger`.
 `--retain N` is a retention policy: snapshots for the network whose files are
 older than N days are deleted after saving, so the snapshots directory doesn't
 grow without bound.
@@ -209,6 +210,24 @@ soroban-cost-estimator config snapshot prune --network testnet --older-than 30
 `prune` makes no RPC call and never deletes the newest snapshot, however old it
 is — so there is always a pair left for `config diff --against-previous`. Both
 retention paths log how many snapshots they pruned.
+
+### `config snapshot list`
+
+List saved snapshots as a table: Filename, Network, Timestamp, Ledger
+Sequence, Protocol Version.
+
+```bash
+soroban-cost-estimator config snapshot list                    # default network (testnet)
+soroban-cost-estimator config snapshot list --network mainnet  # one network
+soroban-cost-estimator config snapshot list --all              # every network
+soroban-cost-estimator config snapshot list --all --json       # JSON array
+```
+
+Networks are matched on the `network` stored in each file, not the filename.
+Snapshots saved before protocol versions were recorded show `-` (`null` in
+JSON). With no matching snapshots, the table mode prints a message and
+`--json` prints `[]`. A malformed snapshot file fails the listing and names
+the file.
 
 ### `config diff`
 
