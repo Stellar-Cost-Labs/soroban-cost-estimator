@@ -184,6 +184,15 @@ pub enum Command {
         id: Option<String>,
         #[arg(long = "arg", value_name = "KEY=VAL")]
         args: Vec<String>,
+
+        /// Prompt interactively for the function and its arguments, using
+        /// the contract spec for names and types. Explicit `--fn`/`--arg`
+        /// values take precedence; the prompt only fills in the gaps.
+        #[arg(long, short = 'i')]
+        interactive: bool,
+
+        /// Skip re-simulation when a cached estimate is still fresh
+        /// (e.g. "30m", "1h", "7d"; bare value = seconds).
         #[arg(long, value_name = "DURATION")]
         cache_ttl: Option<String>,
 
@@ -309,11 +318,18 @@ pub enum Command {
 
 #[derive(Subcommand, Debug)]
 pub enum CacheAction {
-    /// Export every cached estimate as a JSON array.
+    /// Export cached estimates as a versioned JSON document (schema
+    /// version, export timestamp, and estimate records) for backup or
+    /// sharing across workstations.
     Export {
-        /// Write the JSON array to a file instead of standard output.
+        /// Write the JSON export to a file instead of standard output.
         #[arg(long, short)]
         out: Option<String>,
+
+        /// Only export estimates recorded for this network (default: all
+        /// networks).
+        #[arg(long)]
+        network: Option<String>,
     },
 
     /// List every cached estimate for a network (newest first).
@@ -454,6 +470,18 @@ pub enum ConfigAction {
         /// Output as JSON instead of a human-readable diff.
         #[arg(long)]
         json: bool,
+
+        /// Force exit code 0 even when pricing changes are detected.
+        /// Useful for informative CI reports that must not fail the build.
+        /// Takes precedence over `--fail-on-any-change`.
+        #[arg(long)]
+        ignore_pricing_exit: bool,
+
+        /// Exit with code 1 when any config setting changed, even
+        /// non-pricing settings (caps, limits, window sizes). By default
+        /// only pricing changes trigger a non-zero exit.
+        #[arg(long)]
+        fail_on_any_change: bool,
     },
     History {
         #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
