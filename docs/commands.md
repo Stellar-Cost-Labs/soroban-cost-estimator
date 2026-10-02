@@ -49,6 +49,7 @@ soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
 | `--id <ID>` | | | — | Deployed contract ID (64 hex chars). Required when `--fn` is used |
 | `--arg <KEY=VAL>` | | | — | Function arguments as `key=value` pairs (value is type-inferred; repeatable) |
 | `--cache-ttl <DURATION>` | | | — | Skip re-simulation when a cached estimate is still fresh (e.g. `30m`, `1h`, `7d`) |
+| `--compare` | | | `false` | Show the cost delta against the previous cached estimate for the same function and arguments |
 | `--clear-cache` | | | `false` | Wipe every cached estimate for `--network` before running the simulation |
 | `--diff` | | | `false` | Compare two WASM builds side by side. Requires `--wasm-new` |
 | `--wasm-new <PATH>` | | | — | The "new" WASM build to compare against when `--diff` is set |
@@ -100,6 +101,12 @@ soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
   other flag — including `--cache-ttl`, which then starts from an empty
   cache. Useful after upgrading the tool, after a network upgrade, or after
   debugging a bad estimate.
+- **`--no-cache`** bypasses the cache on both sides: the `--cache-ttl` lookup
+  never short-circuits the run (a live RPC simulation always executes) and the
+  fresh result is **not** written back to disk, so the run leaves no trace in
+  the cache. Unlike `--clear-cache`, it deletes nothing — use it to benchmark
+  network changes or debug transient state differences without disturbing the
+  entries you already have.
 - **Exit codes**: 0 on success, 1 on any error (simulation failure, missing
   WASM file, network error, etc.).
 
@@ -225,6 +232,7 @@ soroban-cost-estimator estimate-all [OPTIONS] --wasm <WASM>
 | `--wasm <WASM>` | `-w` | ✅ | — | Path to the compiled Soroban contract `.wasm` file |
 | `--network <NETWORK>` | | | `testnet` | Network to simulate against |
 | `--id <ID>` | | | — | Deployed contract ID (64 hex chars) to invoke each function against |
+| `--no-cache` | | | `false` | Bypass the cache entirely: never read cached estimates, never write fresh results |
 | `--json` | | | `false` | Output as JSON instead of a human-readable list |
 | `--help` | `-h` | | | Print help |
 
@@ -324,6 +332,7 @@ soroban-cost-estimator config snapshot [OPTIONS]
 |------|----------|---------|-------------|
 | `--network <NETWORK>` | | `testnet` | Network to fetch config from (`testnet`, `mainnet`, `futurenet`) |
 | `--out <OUT>` | | `~/.soroban-cost-estimator/snapshots/` | Explicit output path |
+| `--retain <N>` | | — | Automatically delete snapshots older than N days |
 | `--json` | | `false` | Print the snapshot as JSON (still saves it) |
 | `--help` | `-h` | | Print help |
 
@@ -338,6 +347,23 @@ soroban-cost-estimator config snapshot [OPTIONS]
   timestamp makes every snapshot a versioned artifact.
 - `--json` also prints the full snapshot as JSON to stdout.
 - `--out` writes to an explicit path instead of the default directory.
+- `--retain <N>` is a retention policy: after saving, any snapshot for this
+  network whose **file modification time** is older than N days is deleted.
+  Useful for long-running `watch`/cron setups where the snapshots directory
+  would otherwise grow without bound. `--retain 0` is rejected, since it
+  would delete every snapshot.
+
+**Examples**
+
+```bash
+soroban-cost-estimator config snapshot --network testnet
+```
+
+Delete testnet snapshots older than 30 days:
+
+```bash
+soroban-cost-estimator config snapshot --network testnet --retain 30
+```
 
 **What you get**
 
@@ -355,12 +381,6 @@ The snapshot JSON contains decoded values for all six settings:
 Take a fresh snapshot after every protocol vote and keep them around:
 [`config diff`](#config-diff) compares the current configuration against your
 most recent snapshot.
-
-**Examples**
-
-```bash
-soroban-cost-estimator config snapshot --network testnet
-```
 
 **Sample output**
 
@@ -396,6 +416,8 @@ soroban-cost-estimator config diff [OPTIONS]
 | `--against <AGAINST>` | | latest snapshot | Explicit snapshot path to compare against |
 | `--against-previous` | | `false` | Diff the two most recent on-disk snapshots against each other instead of the live network (conflicts with `--against`) |
 | `--summary` | | `false` | Print a single-line count summary instead of the full diff (for CI status lines) |
+| `--format <FORMAT>` | | `table` | Output format: `table`, `json`, `csv`, or `markdown` |
+| `--json` | | `false` | Legacy alias for `--format json` |
 | `--help` `-h` | | | Print help |
 
 **Behavior**
@@ -819,6 +841,7 @@ All commands accept:
 |------|-------------|
 | `--rps <N>` | Cap RPC requests at N per second (0 disables) |
 | `--timeout <SECS>` | HTTP request timeout for RPC calls in seconds (default `30`) |
+| `--format <FORMAT>` | Report format for commands that support it: `table`, `json`, `csv`, or `markdown` |
 | `--help` / `-h` | Print command-specific help |
 
 `--format` applies to report-producing commands. The legacy `--json` flag remains supported as an alias for `--format json` where it was previously available.
