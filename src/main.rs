@@ -763,6 +763,7 @@ struct SimulationRequest<'a> {
 /// `RpcClient`, which deduplicates identical requests â€” the same method with
 /// the same params â€” so identical fee-rate fetches transmit at most once.
 async fn simulate_report(
+    quiet: bool,
     req: &SimulationRequest<'_>,
 ) -> error::AppResult<report::cost_report::CostReport> {
     let endpoint = rpc::client::resolve_endpoint(req.network, req.rpc_url)?;
@@ -900,6 +901,7 @@ async fn cmd_estimate(
     extra_headers: &[String],
     watch: bool,
     wasm_info_flag: bool,
+    quiet: bool,
     verbose: bool,
     auto_snapshot: bool,
     diff: bool,
@@ -1119,6 +1121,7 @@ async fn estimate_once(
     max_retries: usize,
     print_wasm_hash: bool,
     wasm_info_flag: bool,
+    quiet: bool,
     verbose: bool,
     dry_run: bool,
 ) -> error::AppResult<EstimateRun> {
@@ -1220,7 +1223,7 @@ async fn estimate_once(
         if let Some(fresh) = fresh {
             let ttl_secs = ttl_secs.unwrap_or_default();
             info!(ttl_secs, function = %function_name, "cache hit â€” reusing fresh estimate");
-            print_cached_estimate(&fresh, ttl_secs, json_flag, precision);
+            print_cached_estimate(&fresh, ttl_secs, json_flag, precision, quiet);
             return Ok(EstimateRun::Cached);
         }
 
@@ -1765,6 +1768,7 @@ async fn cmd_estimate_diff(
     max_retries: usize,
     precision: u32,
     extra_headers: &[String],
+    quiet: bool,
     verbose: bool,
 ) -> error::AppResult<()> {
     use sha2::Digest;
@@ -2516,6 +2520,7 @@ async fn fetch_config_snapshot(
     connect_timeout: u64,
     max_retries: usize,
     extra_headers: &[String],
+    quiet: bool,
     verbose: bool,
 ) -> error::AppResult<config_snapshot::model::ConfigSnapshot> {
     use tracing::Instrument;
@@ -2897,19 +2902,18 @@ async fn cmd_config_diff(
             if !quiet {
                 println!("{}", config_snapshot::diff::format_diff_summary(&diff));
             }
-        } else if !quiet {
-            println!("{}", config_snapshot::diff::format_diff(&diff));
-            println!("{}", config_snapshot::diff::format_diff_summary(&diff));
         } else {
-            println!(
-                "{}",
-                config_snapshot::diff::format_diff(
-                    &diff,
-                    cli::should_colorize(),
-                    pricing_only,
-                    threshold_percent
-                )
-            );
+            if !quiet {
+                println!(
+                    "{}",
+                    config_snapshot::diff::format_diff(
+                        &diff,
+                        cli::should_colorize(),
+                        pricing_only,
+                        threshold_percent
+                    )
+                );
+            }
         }
 
         if upgrade_detected(&diff) {
@@ -2933,7 +2937,7 @@ async fn cmd_config_diff(
         }
 
         if !machine && !summary {
-            print_stale_estimates(network, new_snapshot.ledger);
+            print_stale_estimates(network, new_snapshot.ledger, quiet);
         }
 
         let exit_code = config_snapshot::diff::resolve_exit_code(
@@ -2972,6 +2976,7 @@ fn cmd_config_diff_against_previous(
     summary: bool,
     json_flag: bool,
     ignore_pricing_exit: bool,
+    quiet: bool,
     fail_on_any_change: bool,
 ) -> error::AppResult<()> {
     debug!(network, "diffing the two most recent snapshots");
@@ -2992,16 +2997,18 @@ fn cmd_config_diff_against_previous(
     } else if summary {
         println!("{}", config_snapshot::diff::format_diff_summary(&diff));
     } else {
-        println!(
-            "{}",
-            config_snapshot::diff::format_diff(
-                &diff,
-                cli::should_colorize(),
-                pricing_only,
-                threshold_percent,
-            )
-        );
-        print_stale_estimates(network, new_snapshot.ledger);
+        if !quiet {
+            println!(
+                "{}",
+                config_snapshot::diff::format_diff(
+                    &diff,
+                    cli::should_colorize(),
+                    pricing_only,
+                    threshold_percent,
+                )
+            );
+            print_stale_estimates(network, new_snapshot.ledger, quiet);
+        }
     }
 
     let exit_code = config_snapshot::diff::resolve_exit_code(
@@ -3176,6 +3183,7 @@ async fn auto_snapshot_if_changed(
     connect_timeout: u64,
     max_retries: usize,
     extra_headers: &[String],
+    quiet: bool,
     verbose: bool,
 ) -> error::AppResult<()> {
     use tracing::{debug, info};
@@ -3288,17 +3296,16 @@ async fn watch_poll_once(
                     if !diff.changes.is_empty() {
                         debug!(change_count = diff.changes.len(), "config changes detected");
                         if !quiet {
-                            println!("{}", config_snapshot::diff::format_diff(&diff));
+                            println!(
+                                "{}",
+                                config_snapshot::diff::format_diff(
+                                    &diff,
+                                    cli::should_colorize(),
+                                    false,
+                                    threshold_percent
+                                )
+                            );
                         }
-                        println!(
-                            "{}",
-                            config_snapshot::diff::format_diff(
-                                &diff,
-                                cli::should_colorize(),
-                                false,
-                                threshold_percent
-                            )
-                        );
                     }
 
                     print_stale_estimates(network, snapshot.ledger, quiet);
@@ -3643,6 +3650,7 @@ async fn handle_cache_action(
     connect_timeout: u64,
     max_retries: usize,
     headers: &[String],
+    quiet: bool,
     verbose: bool,
 ) -> error::AppResult<()> {
     match action {
@@ -3679,7 +3687,7 @@ async fn handle_cache_action(
             .await
         }
         cli::CacheAction::List { network, json } => cmd_cache_list(&network, json),
-        cli::CacheAction::Verify => cmd_cache_verify(),
+        cli::CacheAction::Verify => cmd_cache_verify(quiet),
         cli::CacheAction::Clear { network } => cmd_cache_clear(&network, quiet),
         cli::CacheAction::Prune => cmd_cache_prune(),
         cli::CacheAction::Query {
