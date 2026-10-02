@@ -39,12 +39,21 @@ impl Sandbox {
 
     /// Writes `$XDG_CONFIG_HOME/soroban-cost-estimator/config.toml`.
     fn write_xdg_config(&self, body: &str) -> PathBuf {
-        write(&self.xdg.join("soroban-cost-estimator/config.toml"), body)
+        write(
+            &self.xdg.join("soroban-cost-estimator").join("config.toml"),
+            body,
+        )
     }
 
     /// Writes `~/.soroban-cost-estimator/config.toml`.
     fn write_home_config(&self, body: &str) -> PathBuf {
-        write(&self.home.join(".soroban-cost-estimator/config.toml"), body)
+        write(
+            &self
+                .home
+                .join(".soroban-cost-estimator")
+                .join("config.toml"),
+            body,
+        )
     }
 
     /// Runs the CLI with `XDG_CONFIG_HOME` set to the sandbox XDG dir.
