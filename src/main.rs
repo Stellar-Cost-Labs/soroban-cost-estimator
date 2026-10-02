@@ -3422,15 +3422,13 @@ fn cmd_cache_stats(json: bool, quiet: bool) -> error::AppResult<()> {
     );
     print_cache_quota(limits);
 
-    if !quiet {
-        if !stats.per_network.is_empty() {
-            println!("\nPer-network breakdown:");
-            for (network, count) in &stats.per_network {
-                println!(
-                    "  {network}: {count} entr{}",
-                    if *count == 1 { "y" } else { "ies" }
-                );
-            }
+    if !quiet && !stats.per_network.is_empty() {
+        println!("\nPer-network breakdown:");
+        for (network, count) in &stats.per_network {
+            println!(
+                "  {network}: {count} entr{}",
+                if *count == 1 { "y" } else { "ies" }
+            );
         }
     }
 
@@ -3820,11 +3818,13 @@ fn cmd_cache_export(
             error::AppError::General(format!("failed to write cache export to {out_path}: {e}"))
         })?;
         let count = export.estimates.len();
-        println!(
-            "Exported {count} cache entr{} to {}.",
-            if count == 1 { "y" } else { "ies" },
-            out_path
-        );
+        if !quiet {
+            println!(
+                "Exported {count} cache entr{} to {}.",
+                if count == 1 { "y" } else { "ies" },
+                out_path
+            );
+        }
     } else {
         println!("{json}");
     }
