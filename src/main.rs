@@ -1,4 +1,4 @@
-﻿use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, Parser};
 use comfy_table::Cell;
 use comfy_table::Table;
 use soroban_cost_estimator::cache;
@@ -272,7 +272,6 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             dry_run,
             project,
         } => {
-            let format = format.unwrap_or_else(|| if json { "json" } else { "table" }.to_string());
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
             let format = match (args.format, json) {
@@ -453,9 +452,9 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     .await
                 }
             }
-            cli::ConfigAction::History { network } => cmd_config_history(&network),
-            cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network),
-            cli::ConfigAction::Validate { network } => cmd_config_validate(&network),
+            cli::ConfigAction::History { network } => cmd_config_history(&network, quiet),
+            cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network, quiet),
+            cli::ConfigAction::Validate { network } => cmd_config_validate(&network, quiet),
             cli::ConfigAction::Export { network, output } => {
                 cmd_config_export(network.as_deref(), &output)
             }
@@ -945,6 +944,7 @@ async fn cmd_estimate(
             max_retries,
             precision,
             extra_headers,
+            quiet,
             verbose,
         )
         .await;
@@ -1778,6 +1778,7 @@ async fn cmd_estimate_diff(
     max_retries: usize,
     precision: u32,
     extra_headers: &[String],
+    quiet: bool,
     verbose: bool,
 ) -> error::AppResult<()> {
     use sha2::Digest;
@@ -2906,9 +2907,6 @@ async fn cmd_config_diff(
                 println!("{}", config_snapshot::diff::format_diff_summary(&diff));
             }
         } else if !quiet {
-            println!("{}", config_snapshot::diff::format_diff(&diff));
-            println!("{}", config_snapshot::diff::format_diff_summary(&diff));
-        } else {
             println!(
                 "{}",
                 config_snapshot::diff::format_diff(
@@ -3295,17 +3293,16 @@ async fn watch_poll_once(
                     if !diff.changes.is_empty() {
                         debug!(change_count = diff.changes.len(), "config changes detected");
                         if !quiet {
-                            println!("{}", config_snapshot::diff::format_diff(&diff));
+                            println!(
+                                "{}",
+                                config_snapshot::diff::format_diff(
+                                    &diff,
+                                    cli::should_colorize(),
+                                    false,
+                                    threshold_percent
+                                )
+                            );
                         }
-                        println!(
-                            "{}",
-                            config_snapshot::diff::format_diff(
-                                &diff,
-                                cli::should_colorize(),
-                                false,
-                                threshold_percent
-                            )
-                        );
                     }
 
                     print_stale_estimates(network, snapshot.ledger, quiet);
