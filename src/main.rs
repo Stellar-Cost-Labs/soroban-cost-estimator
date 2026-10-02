@@ -5,6 +5,7 @@ use soroban_cost_estimator::cache;
 use soroban_cost_estimator::cli;
 use soroban_cost_estimator::config_snapshot;
 use soroban_cost_estimator::error;
+use soroban_cost_estimator::interactive;
 use soroban_cost_estimator::report;
 use soroban_cost_estimator::report::formatter::{
     ReportFormatter, TableFormatter, formatter_by_name,
@@ -254,6 +255,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             r#fn,
             id,
             args: contract_args,
+            interactive: interactive_flag,
             cache_ttl,
             compare,
             clear_cache,
@@ -282,6 +284,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 id.as_deref(),
                 r#fn.as_deref(),
                 &contract_args,
+                interactive_flag,
                 cache_ttl.as_deref(),
                 compare,
                 clear_cache,
@@ -386,6 +389,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 threshold_percent,
                 summary,
                 json,
+                ignore_pricing_exit,
+                fail_on_any_change,
             } => {
                 // `--format` wins when supplied; otherwise the legacy
                 // `--json` flag selects JSON on top of the config-file
@@ -402,6 +407,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                         threshold_percent,
                         summary,
                         diff_format == cli::OutputFormat::Json,
+                        ignore_pricing_exit,
+                        fail_on_any_change,
                     )
                 } else {
                     cmd_config_diff(
@@ -412,6 +419,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                         threshold_percent,
                         summary,
                         diff_format,
+                        ignore_pricing_exit,
+                        fail_on_any_change,
                         rps,
                         timeout,
                         connect_timeout,
@@ -857,6 +866,7 @@ async fn cmd_estimate(
     contract_id: Option<&str>,
     fn_name: Option<&str>,
     args: &[String],
+    interactive_flag: bool,
     cache_ttl: Option<&str>,
     compare: bool,
     clear_cache: bool,
@@ -943,6 +953,7 @@ async fn cmd_estimate(
         contract_id,
         fn_name,
         args,
+        interactive_flag,
         cache_ttl,
         compare,
         clear_cache,
@@ -1071,6 +1082,7 @@ async fn estimate_once(
     contract_id: Option<&str>,
     fn_name: Option<&str>,
     args: &[String],
+    interactive_flag: bool,
     cache_ttl: Option<&str>,
     compare: bool,
     clear_cache: bool,
@@ -1123,6 +1135,31 @@ async fn estimate_once(
             "WASM loaded"
         );
         emit_wasm_structure(&wasm_info, verbose, wasm_info_flag, json_flag);
+
+        // Interactive mode: resolve the function, arguments, and contract ID
+        // by prompting on stdin, using the contract spec for names and
+        // types. Explicit `--fn`/`--arg`/`--id` flags take precedence; the
+        // prompt only fills in the gaps. This runs before the cache lookup
+        // so prompted invocations still reuse fresh cached estimates.
+        let selection_holder: interactive::InteractiveSelection;
+        let (contract_id, fn_name, args): (Option<&str>, Option<&str>, &[String]) =
+            if interactive_flag {
+                selection_holder = interactive::prompt_for_invocation(
+                    &mut std::io::stdin().lock(),
+                    &mut std::io::stdout().lock(),
+                    &wasm_info.functions,
+                    fn_name,
+                    args,
+                    contract_id,
+                )?;
+                (
+                    selection_holder.contract_id.as_deref(),
+                    Some(selection_holder.function.as_str()),
+                    selection_holder.args.as_slice(),
+                )
+            } else {
+                (contract_id, fn_name, args)
+            };
 
         // Validate WASM memory and table constraints against network limits (defaults: 64KB max size, 2048 pages)
         wasm_info.validate_wasm_limits(65536, 2048)?;
@@ -1423,6 +1460,8 @@ async fn emit_watch_estimate(
         contract_id,
         fn_name,
         args,
+        // Watch mode never prompts; it re-simulates on every rebuild.
+        false,
         None,
         // `--compare` is a single-shot flag; watch mode reports its own
         // build-over-build delta in the per-build header instead.
@@ -1717,6 +1756,17 @@ async fn cmd_estimate_diff(
 
     let old_info = wasm::parser::load_wasm(std::path::Path::new(old_path))?;
     let new_info = wasm::parser::load_wasm(std::path::Path::new(new_path))?;
+
+    if let Some(function) = fn_name {
+        for (label, info) in [("--wasm", &old_info), ("--wasm-new", &new_info)] {
+            if !info.has_spec || !info.functions.iter().any(|item| item.name == function) {
+                return Err(error::AppError::TypeValidation(format!(
+                    "function signature for '{function}' is missing from {label} WASM"
+                )));
+            }
+        }
+    }
+
     let old_hash = hex::encode(sha2::Sha256::digest(&old_info.bytes));
     let new_hash = hex::encode(sha2::Sha256::digest(&new_info.bytes));
 
@@ -1772,7 +1822,12 @@ async fn cmd_estimate_diff(
 
     if format == "json" {
         let diff = report::diff::build_cost_report_diff(&old_report, &new_report);
-        println!("{}", serde_json::to_string_pretty(&diff)?);
+        let output = serde_json::json!({
+            "wasm_a": old_report,
+            "wasm_b": new_report,
+            "diff": diff,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         println!(
             "{}",
@@ -2637,6 +2692,12 @@ fn stale_estimates_for(network: &str, ledger: u32) -> Vec<cache::CachedEstimate>
 }
 
 /// `config diff` command: compare current config against a snapshot.
+/// `config diff` command: compare current config against a snapshot.
+///
+/// Exit-code semantics (for CI drift detection):
+/// - default: `0` when no pricing changes, `1` when pricing changes detected.
+/// - `--ignore-pricing-exit`: always `0`, even when pricing changed.
+/// - `--fail-on-any-change`: `1` when any setting changed, even non-pricing.
 #[allow(clippy::fn_params_excessive_bools)]
 async fn cmd_config_diff(
     network: &str,
@@ -2646,6 +2707,8 @@ async fn cmd_config_diff(
     threshold_percent: Option<f64>,
     summary: bool,
     format: cli::OutputFormat,
+    ignore_pricing_exit: bool,
+    fail_on_any_change: bool,
     rps: Option<u64>,
     timeout: u64,
     connect_timeout: u64,
@@ -2747,13 +2810,14 @@ async fn cmd_config_diff(
             print_stale_estimates(network, new_snapshot.ledger);
         }
 
-        let should_exit = match threshold_percent {
-            Some(t) => diff.has_significant_pricing_changes(t),
-            None => diff.has_pricing_changes,
-        };
-
-        if should_exit {
-            std::process::exit(1);
+        let exit_code = config_snapshot::diff::resolve_exit_code(
+            &diff,
+            ignore_pricing_exit,
+            fail_on_any_change,
+            threshold_percent,
+        );
+        if exit_code != 0 {
+            std::process::exit(exit_code);
         }
         Ok(())
     }
@@ -2774,12 +2838,15 @@ async fn cmd_config_diff(
 ///
 /// # Network calls
 /// None — pure file I/O.
+#[allow(clippy::fn_params_excessive_bools)]
 fn cmd_config_diff_against_previous(
     network: &str,
     pricing_only: bool,
     threshold_percent: Option<f64>,
     summary: bool,
     json_flag: bool,
+    ignore_pricing_exit: bool,
+    fail_on_any_change: bool,
 ) -> error::AppResult<()> {
     debug!(network, "diffing the two most recent snapshots");
     let (old_snapshot, new_snapshot) = config_snapshot::store::load_last_two_snapshots(network)?;
@@ -2811,13 +2878,14 @@ fn cmd_config_diff_against_previous(
         print_stale_estimates(network, new_snapshot.ledger);
     }
 
-    let should_exit = match threshold_percent {
-        Some(t) => diff.has_significant_pricing_changes(t),
-        None => diff.has_pricing_changes,
-    };
-
-    if should_exit {
-        std::process::exit(1);
+    let exit_code = config_snapshot::diff::resolve_exit_code(
+        &diff,
+        ignore_pricing_exit,
+        fail_on_any_change,
+        threshold_percent,
+    );
+    if exit_code != 0 {
+        std::process::exit(exit_code);
     }
     Ok(())
 }
@@ -3450,7 +3518,9 @@ async fn handle_cache_action(
     verbose: bool,
 ) -> error::AppResult<()> {
     match action {
-        cli::CacheAction::Export { out } => cmd_cache_export(out.as_deref()),
+        cli::CacheAction::Export { out, network } => {
+            cmd_cache_export(out.as_deref(), network.as_deref())
+        }
         cli::CacheAction::Warm {
             wasm,
             network,
@@ -3592,21 +3662,30 @@ fn cmd_cache_query(
     Ok(())
 }
 
-/// `cache export` command: print or save every cached estimate as a JSON array.
-fn cmd_cache_export(out_path: Option<&str>, quiet: bool) -> error::AppResult<()> {
-    let estimates = cache::export_cached_estimates()?;
-    let json = serde_json::to_string_pretty(&estimates)?;
+/// `cache export` command: print or save cached estimates as a versioned
+/// JSON export document (schema version, export timestamp, records).
+///
+/// Without `--out` the envelope is printed to standard output; otherwise it
+/// is written to the file and a confirmation names the entry count and the
+/// path. `--network` restricts the export to one network (default: all).
+/// An unwritable destination fails with an error naming the path.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+fn cmd_cache_export(out_path: Option<&str>, network: Option<&str>) -> error::AppResult<()> {
+    let export = cache::export_cache(network)?;
+    let json = serde_json::to_string_pretty(&export)?;
 
     if let Some(out_path) = out_path {
-        std::fs::write(out_path, json)?;
-        if !quiet {
-            println!(
-                "Exported {} cache entr{} to {}.",
-                estimates.len(),
-                if estimates.len() == 1 { "y" } else { "ies" },
-                out_path
-            );
-        }
+        std::fs::write(out_path, json).map_err(|e| {
+            error::AppError::General(format!("failed to write cache export to {out_path}: {e}"))
+        })?;
+        let count = export.estimates.len();
+        println!(
+            "Exported {count} cache entr{} to {}.",
+            if count == 1 { "y" } else { "ies" },
+            out_path
+        );
     } else {
         println!("{json}");
     }
