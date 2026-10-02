@@ -1706,6 +1706,17 @@ async fn cmd_estimate_diff(
 
     let old_info = wasm::parser::load_wasm(std::path::Path::new(old_path))?;
     let new_info = wasm::parser::load_wasm(std::path::Path::new(new_path))?;
+
+    if let Some(function) = fn_name {
+        for (label, info) in [("--wasm", &old_info), ("--wasm-new", &new_info)] {
+            if !info.has_spec || !info.functions.iter().any(|item| item.name == function) {
+                return Err(error::AppError::TypeValidation(format!(
+                    "function signature for '{function}' is missing from {label} WASM"
+                )));
+            }
+        }
+    }
+
     let old_hash = hex::encode(sha2::Sha256::digest(&old_info.bytes));
     let new_hash = hex::encode(sha2::Sha256::digest(&new_info.bytes));
 
@@ -1761,7 +1772,12 @@ async fn cmd_estimate_diff(
 
     if format == "json" {
         let diff = report::diff::build_cost_report_diff(&old_report, &new_report);
-        println!("{}", serde_json::to_string_pretty(&diff)?);
+        let output = serde_json::json!({
+            "wasm_a": old_report,
+            "wasm_b": new_report,
+            "diff": diff,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         println!(
             "{}",
