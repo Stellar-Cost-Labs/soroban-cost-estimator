@@ -908,7 +908,6 @@ async fn cmd_estimate(
     max_retries: usize,
     precision: u32,
     extra_headers: &[String],
-    quiet: bool,
     watch: bool,
     wasm_info_flag: bool,
     quiet: bool,
@@ -1127,7 +1126,6 @@ async fn estimate_once(
     format: &str,
     precision: u32,
     extra_headers: &[String],
-    quiet: bool,
     rps: Option<u64>,
     timeout: u64,
     connect_timeout: u64,
@@ -3043,7 +3041,6 @@ fn cmd_config_diff_against_previous(
     summary: bool,
     json_flag: bool,
     ignore_pricing_exit: bool,
-    quiet: bool,
     fail_on_any_change: bool,
     quiet: bool,
 ) -> error::AppResult<()> {
@@ -3288,10 +3285,12 @@ async fn auto_snapshot_if_changed(
     if has_changes {
         let path = config_snapshot::store::save_snapshot(&new_snapshot, None)?;
         info!(path = %path.display(), ledger = new_snapshot.ledger, "auto-snapshot saved");
-        println!(
-            "Network configuration updated: saved snapshot {}",
-            path.display()
-        );
+        if !quiet {
+            println!(
+                "Network configuration updated: saved snapshot {}",
+                path.display()
+            );
+        }
     }
 
     Ok(())
@@ -3461,7 +3460,7 @@ async fn cmd_watch(
 /// # Network calls
 /// None â€” pure SQLite I/O.
 #[allow(dead_code)] // wired once the `config cache stats` subcommand (#41) lands
-fn cmd_cache_stats(json: bool) -> error::AppResult<()> {
+fn cmd_cache_stats(json: bool, quiet: bool) -> error::AppResult<()> {
     let stats = cache::cache_stats()?;
     let limits = cache::cache_limits();
 
@@ -3875,7 +3874,11 @@ fn cmd_cache_query(
 ///
 /// # Network calls
 /// None â€” pure SQLite I/O.
-fn cmd_cache_export(out_path: Option<&str>, network: Option<&str>) -> error::AppResult<()> {
+fn cmd_cache_export(
+    out_path: Option<&str>,
+    network: Option<&str>,
+    quiet: bool,
+) -> error::AppResult<()> {
     let export = cache::export_cache(network)?;
     let json = serde_json::to_string_pretty(&export)?;
 
