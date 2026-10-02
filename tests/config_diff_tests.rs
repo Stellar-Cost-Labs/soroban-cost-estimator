@@ -8,6 +8,7 @@ fn empty_snapshot() -> ConfigSnapshot {
         network: "testnet".to_string(),
         timestamp: "2026-01-01T00:00:00Z".to_string(),
         ledger: 100,
+        protocol_version: None,
         contract_compute: None,
         contract_ledger_cost: None,
         contract_historical_data: None,
@@ -22,6 +23,7 @@ fn full_snapshot() -> ConfigSnapshot {
         network: "testnet".to_string(),
         timestamp: "2026-01-01T00:00:00Z".to_string(),
         ledger: 100,
+        protocol_version: None,
         contract_compute: Some(ContractComputeV0 {
             ledger_max_instructions: 1_000_000,
             tx_max_instructions: 100_000,
@@ -85,6 +87,7 @@ fn snapshot_with(
         network: "testnet".to_string(),
         timestamp: "2026-01-01T00:00:00Z".to_string(),
         ledger: 100,
+        protocol_version: None,
         contract_compute: if compute {
             Some(ContractComputeV0 {
                 ledger_max_instructions: 1_000_000,
@@ -166,6 +169,7 @@ fn make_snapshot(compute_fee: i64, bandwidth_fee: i64) -> ConfigSnapshot {
         network: "testnet".to_string(),
         timestamp: "2026-01-01T00:00:00Z".to_string(),
         ledger: 100,
+        protocol_version: None,
         contract_compute: Some(ContractComputeV0 {
             ledger_max_instructions: 1_000_000,
             tx_max_instructions: 100_000,
@@ -237,8 +241,10 @@ fn test_detects_multiple_changes() {
 #[test]
 fn test_format_diff_no_changes() {
     let snap = make_snapshot(100, 5);
+    let d = diff::diff_snapshots(&snap, &snap);
+    let _output = diff::format_diff(&d, true, false, None);
     let diff = diff::diff_snapshots(&snap, &snap);
-    let output = diff::format_diff(&diff, false, None);
+    let output = diff::format_diff(&diff, false, false, None);
     assert!(output.contains("No changes detected"));
 }
 
@@ -270,8 +276,10 @@ fn test_format_diff_summary_no_changes() {
 fn test_format_diff_with_changes() {
     let old = make_snapshot(100, 5);
     let new = make_snapshot(200, 5);
+    let d = diff::diff_snapshots(&old, &new);
+    let _output = diff::format_diff(&d, true, false, None);
     let diff = diff::diff_snapshots(&old, &new);
-    let output = diff::format_diff(&diff, false, None);
+    let output = diff::format_diff(&diff, false, false, None);
     // Should use human-readable setting and field names
     assert!(output.contains("Contract Compute V0"));
     assert!(output.contains("Fee Rate Per Instructions Increment"));
@@ -284,7 +292,7 @@ fn test_format_diff_shows_explanations() {
     let old = make_snapshot(100, 5);
     let new = make_snapshot(200, 5);
     let diff = diff::diff_snapshots(&old, &new);
-    let output = diff::format_diff(&diff, false, None);
+    let output = diff::format_diff(&diff, false, false, None);
     // fee_rate_per_instructions_increment has an explanation
     assert!(output.contains("Stroops charged per 10,000 CPU instructions"));
 }
@@ -1008,7 +1016,7 @@ fn test_diff_populates_snapshot_info_with_pricing_change() {
 fn test_format_diff_all_present_identical() {
     let snap = full_snapshot();
     let d = diff::diff_snapshots(&snap, &snap);
-    let output = diff::format_diff(&d, false, None);
+    let output = diff::format_diff(&d, false, false, None);
     assert!(output.contains("No changes detected"));
     assert!(output.contains("testnet"));
 }
@@ -1018,7 +1026,7 @@ fn test_format_diff_addition_contains_pricing_warning() {
     let old = snapshot_with(false, false, false, false, false, false);
     let new = snapshot_with(true, false, false, false, false, false);
     let d = diff::diff_snapshots(&old, &new);
-    let output = diff::format_diff(&d, false, None);
+    let output = diff::format_diff(&d, false, false, None);
     assert!(output.contains("Pricing changes detected"));
 }
 
@@ -1027,7 +1035,7 @@ fn test_format_diff_removal_contains_pricing_warning() {
     let old = snapshot_with(true, false, false, false, false, false);
     let new = snapshot_with(false, false, false, false, false, false);
     let d = diff::diff_snapshots(&old, &new);
-    let output = diff::format_diff(&d, false, None);
+    let output = diff::format_diff(&d, false, false, None);
     assert!(output.contains("Pricing changes detected"));
 }
 
@@ -1037,7 +1045,7 @@ fn test_format_diff_non_pricing_no_warning() {
     let mut new = full_snapshot();
     new.contract_compute.as_mut().unwrap().tx_max_instructions = 200_000;
     let d = diff::diff_snapshots(&old, &new);
-    let output = diff::format_diff(&d, false, None);
+    let output = diff::format_diff(&d, false, false, None);
     assert!(!output.contains("Pricing changes detected"));
     assert!(output.contains("Tx Max Instructions"));
 }
@@ -1052,7 +1060,7 @@ fn test_format_diff_shows_change_count() {
         .fee_rate_per_instructions_increment = 50;
     new.contract_bandwidth.as_mut().unwrap().fee_tx_size1_kb = 20;
     let d = diff::diff_snapshots(&old, &new);
-    let output = diff::format_diff(&d, false, None);
+    let output = diff::format_diff(&d, false, false, None);
     assert!(output.contains("2 field change(s)"));
 }
 
@@ -1061,7 +1069,7 @@ fn test_format_diff_shows_addition_and_removal_icons() {
     let old = snapshot_with(false, false, false, false, false, false);
     let new = snapshot_with(true, true, false, false, false, false);
     let d = diff::diff_snapshots(&old, &new);
-    let output = diff::format_diff(&d, false, None);
+    let output = diff::format_diff(&d, false, false, None);
     // Both additions are pricing changes, so they should show the pricing icon
     assert!(output.contains("Contract Compute V0"));
     assert!(output.contains("Contract Ledger Cost V0"));
@@ -1200,4 +1208,109 @@ fn test_symmetry_change_count() {
     let d_ab = diff::diff_snapshots(&a, &b);
     let d_ba = diff::diff_snapshots(&b, &a);
     assert_eq!(d_ab.changes.len(), d_ba.changes.len());
+}
+
+// ── CSV / Markdown diff rendering (#279) ──────────────────────────────────
+
+/// A one-change diff used to exercise the machine-readable renderers.
+fn single_change_diff() -> diff::ConfigDiff {
+    diff::ConfigDiff {
+        old_snapshot: diff::SnapshotInfo {
+            network: "testnet".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            ledger: 100,
+        },
+        new_snapshot: diff::SnapshotInfo {
+            network: "testnet".to_string(),
+            timestamp: "2026-01-02T00:00:00Z".to_string(),
+            ledger: 200,
+        },
+        changes: vec![diff::FieldDiff {
+            field_path: "contract_compute.fee_rate_per_instructions_increment".to_string(),
+            setting_id: Some(0),
+            setting_name: "Contract Compute V0".to_string(),
+            old_value: "10".to_string(),
+            new_value: "25".to_string(),
+            is_pricing_change: true,
+            explanation: None,
+        }],
+        has_pricing_changes: true,
+    }
+}
+
+#[test]
+fn test_format_diff_csv_has_header_and_row_per_change() {
+    let diff = diff::diff_snapshots(&empty_snapshot(), &full_snapshot());
+    let csv = diff::format_diff_csv(&diff);
+    let lines: Vec<&str> = csv.lines().collect();
+
+    assert_eq!(lines[0], "field,old_value,new_value,is_pricing_change");
+    assert_eq!(lines.len(), diff.changes.len() + 1);
+}
+
+#[test]
+fn test_format_diff_csv_row_contents() {
+    let csv = diff::format_diff_csv(&single_change_diff());
+    assert!(
+        csv.contains("contract_compute.fee_rate_per_instructions_increment,10,25,true"),
+        "unexpected CSV row: {csv}"
+    );
+}
+
+#[test]
+fn test_format_diff_csv_no_changes_is_header_only() {
+    let snap = full_snapshot();
+    let diff = diff::diff_snapshots(&snap, &snap);
+    assert_eq!(diff::format_diff_csv(&diff).lines().count(), 1);
+}
+
+#[test]
+fn test_format_diff_csv_escapes_special_characters() {
+    let mut diff = single_change_diff();
+    diff.changes[0].old_value = "a,b".to_string();
+    diff.changes[0].new_value = "say \"hi\"".to_string();
+
+    let csv = diff::format_diff_csv(&diff);
+    assert!(
+        csv.contains(",\"a,b\","),
+        "comma value should be quoted: {csv}"
+    );
+    assert!(
+        csv.contains("\"say \"\"hi\"\"\""),
+        "quotes should be doubled per RFC 4180: {csv}"
+    );
+}
+
+#[test]
+fn test_format_diff_markdown_has_table_and_row_per_change() {
+    let diff = diff::diff_snapshots(&empty_snapshot(), &full_snapshot());
+    let md = diff::format_diff_markdown(&diff);
+
+    assert!(md.starts_with("## Config diff:"));
+    assert!(md.contains("| Setting | Old | New | Pricing |"));
+    assert!(md.contains("| --- | --- | --- | --- |"));
+    let rows = md
+        .lines()
+        .filter(|l| l.starts_with("| ") && !l.contains("---") && !l.contains("Setting"))
+        .count();
+    assert_eq!(rows, diff.changes.len());
+}
+
+#[test]
+fn test_format_diff_markdown_marks_pricing_changes() {
+    let md = diff::format_diff_markdown(&single_change_diff());
+    assert!(md.contains("Fee Rate Per Instructions Increment"));
+    assert!(
+        md.contains("💰 yes"),
+        "pricing change should be marked: {md}"
+    );
+}
+
+#[test]
+fn test_format_diff_markdown_no_changes() {
+    let snap = full_snapshot();
+    let diff = diff::diff_snapshots(&snap, &snap);
+    let md = diff::format_diff_markdown(&diff);
+    assert!(md.contains("✅ No changes detected."));
+    assert!(!md.contains("| Setting |"));
 }

@@ -28,6 +28,11 @@ Options:
 - Without `--id`, simulations run against a zeroed contract ID and will
   almost certainly fail the "no cost data / no latest ledger" guard; the tool
   prints a note telling you to pass `--id` for real numbers.
+- Prints a **fee distribution box** after the per-function results summarising
+  the cost profile of the contract: min, max, mean, median, and standard
+  deviation of the fees (in stroops) and min, max, and mean CPU instruction
+  counts across every successfully estimated function. The same statistics are
+  emitted as the `fee_distribution` object in `--json` mode.
 
 ## Example
 
@@ -49,6 +54,27 @@ Enumerated 1 function(s) in WASM:
 Contract spec: present (typed params decoded from contractspecv0)
 [1/1] increment
 ── Estimating 'increment' ── Skipped: needs --fn/--arg (1 param(s))
+
+No functions estimated; no fee distribution to report.
+```
+
+When at least one function is estimated, the distribution box shows the
+contract's cost profile:
+
+```text
+Fee distribution across 2 function(s):
+
+  Fees (stroops):
+    min     : 5,000
+    max     : 500,000
+    mean    : 252,500 (0.0252500)
+    median  : 252,500
+    std dev : 247,500
+
+  CPU instructions:
+    min     : 100,000
+    max     : 5,000,000
+    mean    : 2,550,000
 ```
 
 To estimate that function, use the single-invocation
@@ -63,14 +89,28 @@ soroban-cost-estimator estimate-all \
   --network testnet --json
 ```
 
-Skipped and successful functions are reported as JSON records:
+Skipped and successful functions are reported as JSON records under the
+`functions` key, alongside the aggregate `fee_distribution` object:
 
 ```json
-[
-  {
-    "function": "increment",
-    "status": "skipped",
-    "reason": "needs --fn/--arg (1 param(s))"
+{
+  "functions": [
+    {
+      "function": "increment",
+      "status": "skipped",
+      "reason": "needs --fn/--arg (1 param(s))"
+    }
+  ],
+  "fee_distribution": {
+    "function_count": 0,
+    "min_fee_stroops": 0,
+    "max_fee_stroops": 0,
+    "mean_fee_stroops": 0,
+    "median_fee_stroops": 0,
+    "std_dev_fee_stroops": 0,
+    "min_cpu_instructions": 0,
+    "max_cpu_instructions": 0,
+    "mean_cpu_instructions": 0
   }
-]
+}
 ```
