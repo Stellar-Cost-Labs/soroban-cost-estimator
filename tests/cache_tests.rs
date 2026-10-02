@@ -1360,8 +1360,7 @@ fn test_load_fresh_estimate_expired_returns_none() {
 #[test]
 fn test_export_cache_envelope_shape() {
     with_temp_home(|_tmp| {
-        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true)
-            .expect("save");
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true).expect("save");
 
         let export = cache::export_cache(None).expect("export");
         assert_eq!(
@@ -1407,11 +1406,18 @@ fn test_export_cache_filters_by_network() {
 
         let all = cache::export_cache(None).expect("export all");
         assert!(all.network.is_none());
-        assert_eq!(all.estimates.len(), 2, "unfiltered export should carry both");
+        assert_eq!(
+            all.estimates.len(),
+            2,
+            "unfiltered export should carry both"
+        );
 
         let empty = cache::export_cache(Some("futurenet")).expect("export futurenet");
         assert_eq!(empty.network, Some("futurenet".to_string()));
-        assert!(empty.estimates.is_empty(), "unknown network exports nothing");
+        assert!(
+            empty.estimates.is_empty(),
+            "unknown network exports nothing"
+        );
     });
 }
 
@@ -1419,8 +1425,7 @@ fn test_export_cache_filters_by_network() {
 #[test]
 fn test_export_cache_json_round_trip() {
     with_temp_home(|_tmp| {
-        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true)
-            .expect("save");
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true).expect("save");
 
         let export = cache::export_cache(Some("testnet")).expect("export");
         let json = serde_json::to_string_pretty(&export).expect("serialize");

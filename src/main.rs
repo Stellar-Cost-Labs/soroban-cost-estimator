@@ -1125,7 +1125,7 @@ async fn estimate_once(
         );
         emit_wasm_structure(&wasm_info, verbose, wasm_info_flag, json_flag);
 
-// Interactive mode: resolve the function, arguments, and contract ID
+        // Interactive mode: resolve the function, arguments, and contract ID
         // by prompting on stdin, using the contract spec for names and
         // types. Explicit `--fn`/`--arg`/`--id` flags take precedence; the
         // prompt only fills in the gaps. This runs before the cache lookup

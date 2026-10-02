@@ -320,8 +320,14 @@ mod tests {
     ) -> (AppResult<InteractiveSelection>, String) {
         let mut reader = std::io::Cursor::new(input);
         let mut writer: Vec<u8> = Vec::new();
-        let result =
-            prompt_for_invocation(&mut reader, &mut writer, functions, fn_name, args, contract_id);
+        let result = prompt_for_invocation(
+            &mut reader,
+            &mut writer,
+            functions,
+            fn_name,
+            args,
+            contract_id,
+        );
         let output = String::from_utf8(writer).expect("prompt output is UTF-8");
         (result, output)
     }
@@ -346,7 +352,10 @@ mod tests {
         let (result, _) = run(input.as_bytes(), &functions, None, &[], None);
         let selection = result.expect("prompt should succeed");
         assert_eq!(selection.function, "add");
-        assert_eq!(selection.args, vec!["a=3".to_string(), "flag=true".to_string()]);
+        assert_eq!(
+            selection.args,
+            vec!["a=3".to_string(), "flag=true".to_string()]
+        );
     }
 
     #[test]
@@ -376,7 +385,10 @@ mod tests {
         let input = format!("1\n3\nmaybe\ntrue\n{}\n", valid_id());
         let (result, output) = run(input.as_bytes(), &functions, None, &[], None);
         let selection = result.expect("prompt should succeed after re-prompt");
-        assert_eq!(selection.args, vec!["a=3".to_string(), "flag=true".to_string()]);
+        assert_eq!(
+            selection.args,
+            vec!["a=3".to_string(), "flag=true".to_string()]
+        );
         assert!(output.contains("Invalid value:"));
     }
 
@@ -385,7 +397,10 @@ mod tests {
         let functions = vec![increment_function()];
         let (result, _) = run(b"", &functions, None, &[], None);
         let err = result.expect_err("EOF should abort the prompt");
-        assert!(err.to_string().contains("cancelled"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("cancelled"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -393,7 +408,10 @@ mod tests {
         let functions = vec![increment_function()];
         let (result, _) = run(b"1\n", &functions, None, &[], None);
         let err = result.expect_err("EOF mid-prompt should abort");
-        assert!(err.to_string().contains("cancelled"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("cancelled"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -401,8 +419,13 @@ mod tests {
         let functions = vec![two_param_function()];
         let args = vec!["a=3".to_string(), "flag=true".to_string()];
         // Empty stdin: any read attempt surfaces as EOF and fails the test.
-        let (result, output) =
-            run(b"", &functions, Some("add"), &args, Some(valid_id().as_str()));
+        let (result, output) = run(
+            b"",
+            &functions,
+            Some("add"),
+            &args,
+            Some(valid_id().as_str()),
+        );
         let selection = result.expect("no prompt should be needed");
         assert_eq!(selection.function, "add");
         assert_eq!(selection.args, args);
@@ -418,22 +441,37 @@ mod tests {
         let (result, _) = run(input.as_bytes(), &functions, Some("add"), &args, None);
         let selection = result.expect("prompt should succeed");
         // Parameters stay in declaration order regardless of flag order.
-        assert_eq!(selection.args, vec!["a=3".to_string(), "flag=true".to_string()]);
+        assert_eq!(
+            selection.args,
+            vec!["a=3".to_string(), "flag=true".to_string()]
+        );
     }
 
     #[test]
     fn test_unknown_function_flag_errors() {
         let functions = vec![increment_function()];
-        let (result, _) = run(b"", &functions, Some("nope"), &[], Some(valid_id().as_str()));
+        let (result, _) = run(
+            b"",
+            &functions,
+            Some("nope"),
+            &[],
+            Some(valid_id().as_str()),
+        );
         let err = result.expect_err("unknown function should fail");
-        assert!(err.to_string().contains("unknown function 'nope'"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("unknown function 'nope'"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
     fn test_no_functions_without_fn_errors() {
         let (result, _) = run(b"", &[], None, &[], None);
         let err = result.expect_err("empty function list should fail");
-        assert!(err.to_string().contains("at least one exported function"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("at least one exported function"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -451,8 +489,13 @@ mod tests {
     fn test_untyped_function_uses_existing_args_without_prompting() {
         let functions = vec![untyped_function()];
         let args = vec!["hello".to_string()];
-        let (result, output) =
-            run(b"", &functions, Some("raw"), &args, Some(valid_id().as_str()));
+        let (result, output) = run(
+            b"",
+            &functions,
+            Some("raw"),
+            &args,
+            Some(valid_id().as_str()),
+        );
         let selection = result.expect("existing args should skip prompts");
         assert_eq!(selection.args, args);
         assert!(output.is_empty(), "nothing should be printed: {output}");
@@ -461,8 +504,13 @@ mod tests {
     #[test]
     fn test_zero_arg_function_prompts_for_nothing() {
         let functions = vec![zero_arg_function()];
-        let (result, output) =
-            run(b"", &functions, Some("ping"), &[], Some(valid_id().as_str()));
+        let (result, output) = run(
+            b"",
+            &functions,
+            Some("ping"),
+            &[],
+            Some(valid_id().as_str()),
+        );
         let selection = result.expect("zero-arg function needs no prompts");
         assert_eq!(selection.function, "ping");
         assert!(selection.args.is_empty());
@@ -483,8 +531,13 @@ mod tests {
     fn test_leftover_args_are_preserved_for_arity_check() {
         let functions = vec![increment_function()];
         let args = vec!["step=5".to_string(), "extra=1".to_string()];
-        let (result, _) =
-            run(b"", &functions, Some("increment"), &args, Some(valid_id().as_str()));
+        let (result, _) = run(
+            b"",
+            &functions,
+            Some("increment"),
+            &args,
+            Some(valid_id().as_str()),
+        );
         let selection = result.expect("prompt should succeed");
         assert_eq!(selection.args, args);
     }

@@ -322,7 +322,10 @@ fn test_cache_verify_empty_cache_succeeds() {
 #[test]
 fn test_cache_export_help() {
     let (stdout, stderr, code) = run_cli(&["cache", "export", "--help"]);
-    assert_eq!(code, 0, "cache export --help should exit 0; stderr: {stderr}");
+    assert_eq!(
+        code, 0,
+        "cache export --help should exit 0; stderr: {stderr}"
+    );
     for flag in ["--out", "--network"] {
         assert!(
             stdout.contains(flag),
@@ -363,7 +366,10 @@ fn test_cache_export_to_file_with_network_filter() {
 
     let raw = std::fs::read_to_string(&out).expect("read export file");
     let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON export");
-    assert_eq!(parsed["schema_version"], 1, "envelope should stamp the schema version");
+    assert_eq!(
+        parsed["schema_version"], 1,
+        "envelope should stamp the schema version"
+    );
     assert!(
         parsed["exported_at"].is_string(),
         "envelope should carry an export timestamp; got: {parsed}"
@@ -391,7 +397,10 @@ fn test_cache_export_all_networks_to_stdout() {
     assert_eq!(parsed["schema_version"], 1);
     assert!(parsed.get("network").is_none() || parsed["network"].is_null());
     assert_eq!(
-        parsed["estimates"].as_array().expect("estimates array").len(),
+        parsed["estimates"]
+            .as_array()
+            .expect("estimates array")
+            .len(),
         2,
         "unfiltered export should carry both networks"
     );
@@ -400,7 +409,13 @@ fn test_cache_export_all_networks_to_stdout() {
 #[test]
 fn test_cache_export_unwritable_destination_errors() {
     let home = temp_home("cache-export-unwritable");
-    seed_cache_entry_for(&home, "testnet", "(wasm upload)", 42, "2026-01-01T00:00:00Z");
+    seed_cache_entry_for(
+        &home,
+        "testnet",
+        "(wasm upload)",
+        42,
+        "2026-01-01T00:00:00Z",
+    );
     // A directory is never a writable file destination.
     let dir = home.join("a-directory");
     std::fs::create_dir_all(&dir).expect("create dir");
@@ -951,12 +966,8 @@ fn test_estimate_interactive_short_flag_accepted() {
     // `-i` is the short form of `--interactive`; like above, stdin is
     // closed, so it must reach the prompt (then cancel) rather than fail
     // on argument parsing.
-    let (stdout, stderr, code) = run_cli(&[
-        "estimate",
-        "--wasm",
-        "tests/fixtures/contract.wasm",
-        "-i",
-    ]);
+    let (stdout, stderr, code) =
+        run_cli(&["estimate", "--wasm", "tests/fixtures/contract.wasm", "-i"]);
     assert_eq!(code, 1, "EOF on stdin should exit 1");
     assert!(
         stdout.contains("Available functions:"),
