@@ -1,4 +1,38 @@
+use clap::builder::{PossibleValue, TypedValueParser};
 use clap::{Parser, Subcommand, ValueEnum};
+
+/// Value parser for `--network` that advertises the supported network names to
+/// shell completion generators and `--help` output while still accepting any
+/// value at runtime, preserving the existing `AppError`-based handling of
+/// unknown networks (issue #270).
+#[derive(Clone)]
+struct NetworkValueParser;
+
+impl TypedValueParser for NetworkValueParser {
+    type Value = String;
+
+    fn parse_ref(
+        &self,
+        _cmd: &clap::Command,
+        _arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        value.to_str().map(str::to_owned).ok_or_else(|| {
+            clap::Error::raw(
+                clap::error::ErrorKind::InvalidUtf8,
+                "invalid UTF-8: network value must be valid UTF-8",
+            )
+        })
+    }
+
+    fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
+        Some(Box::new(
+            ["testnet", "mainnet", "futurenet", "local"]
+                .iter()
+                .map(|&name| PossibleValue::new(name)),
+        ))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 #[value(rename_all = "lower")]
@@ -140,7 +174,7 @@ pub enum Command {
     Estimate {
         #[arg(long, short)]
         wasm: String,
-        #[arg(long, default_value = "testnet")]
+        #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
         #[arg(long)]
         rpc_url: Option<String>,
@@ -150,6 +184,15 @@ pub enum Command {
         id: Option<String>,
         #[arg(long = "arg", value_name = "KEY=VAL")]
         args: Vec<String>,
+
+        /// Prompt interactively for the function and its arguments, using
+        /// the contract spec for names and types. Explicit `--fn`/`--arg`
+        /// values take precedence; the prompt only fills in the gaps.
+        #[arg(long, short = 'i')]
+        interactive: bool,
+
+        /// Skip re-simulation when a cached estimate is still fresh
+        /// (e.g. "30m", "1h", "7d"; bare value = seconds).
         #[arg(long, value_name = "DURATION")]
         cache_ttl: Option<String>,
 
@@ -212,7 +255,7 @@ pub enum Command {
     EstimateAll {
         #[arg(long, short)]
         wasm: String,
-        #[arg(long, default_value = "testnet")]
+        #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
 
         /// Explicit RPC URL (overrides network-based resolution).
@@ -256,7 +299,7 @@ pub enum Command {
         action: CacheAction,
     },
     Watch {
-        #[arg(long, default_value = "testnet")]
+        #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
         #[arg(long, default_value = "1h")]
         interval: String,
@@ -265,7 +308,7 @@ pub enum Command {
         threshold_percent: Option<f64>,
     },
 
-    /// Generate shell completion scripts for Bash, Zsh, Fish, and PowerShell.
+    /// Generate shell completion scripts for Bash, Zsh, Fish, PowerShell, and Elvish.
     Completions {
         /// Target shell for completion script generation.
         #[arg(value_enum)]
@@ -275,17 +318,24 @@ pub enum Command {
 
 #[derive(Subcommand, Debug)]
 pub enum CacheAction {
-    /// Export every cached estimate as a JSON array.
+    /// Export cached estimates as a versioned JSON document (schema
+    /// version, export timestamp, and estimate records) for backup or
+    /// sharing across workstations.
     Export {
-        /// Write the JSON array to a file instead of standard output.
+        /// Write the JSON export to a file instead of standard output.
         #[arg(long, short)]
         out: Option<String>,
+
+        /// Only export estimates recorded for this network (default: all
+        /// networks).
+        #[arg(long)]
+        network: Option<String>,
     },
 
     /// List every cached estimate for a network (newest first).
     List {
         /// Network whose cached estimates to list.
-        #[arg(long, default_value = "testnet")]
+        #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
 
         /// Output the full cached-estimate records as a JSON array.
@@ -299,7 +349,7 @@ pub enum CacheAction {
     /// Delete every cached estimate recorded for a network.
     Clear {
         /// Network whose cached estimates to delete.
-        #[arg(long, default_value = "testnet")]
+        #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
     },
 
@@ -307,7 +357,7 @@ pub enum CacheAction {
     Warm {
         #[arg(long, short)]
         wasm: String,
-        #[arg(long, default_value = "testnet")]
+        #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
 
         /// Explicit RPC URL (overrides network-based resolution).
@@ -390,13 +440,13 @@ pub enum ConfigAction {
     /// List all saved config snapshots with their timestamp and ledger.
     List {
         /// Network whose snapshots to list.
-        #[arg(long, default_value = "testnet")]
+        #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
     },
 
     /// Diff the current network config against the most recent snapshot.
     Diff {
-        #[arg(long, default_value = "testnet")]
+        #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
         #[arg(long)]
         against: Option<String>,
@@ -421,17 +471,29 @@ pub enum ConfigAction {
         /// Output as JSON instead of a human-readable diff.
         #[arg(long)]
         json: bool,
+
+        /// Force exit code 0 even when pricing changes are detected.
+        /// Useful for informative CI reports that must not fail the build.
+        /// Takes precedence over `--fail-on-any-change`.
+        #[arg(long)]
+        ignore_pricing_exit: bool,
+
+        /// Exit with code 1 when any config setting changed, even
+        /// non-pricing settings (caps, limits, window sizes). By default
+        /// only pricing changes trigger a non-zero exit.
+        #[arg(long)]
+        fail_on_any_change: bool,
     },
     History {
-        #[arg(long, default_value = "testnet")]
+        #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
     },
     LastChanged {
-        #[arg(long, default_value = "testnet")]
+        #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
     },
     Validate {
-        #[arg(long, default_value = "testnet")]
+        #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
     },
 
@@ -575,5 +637,32 @@ mod tests {
             chart_width_for(false, true, None),
             Some(DEFAULT_CHART_WIDTH)
         );
+    }
+
+    /// AC for #270: generating a completion script for every supported shell
+    /// must produce valid, non-empty output without panicking.
+    #[test]
+    fn test_completion_script_generation_all_shells() {
+        use clap::CommandFactory;
+
+        let mut cmd = Cli::command();
+        let bin_name = cmd.get_name().to_string();
+
+        for shell in [
+            clap_complete::Shell::Bash,
+            clap_complete::Shell::Zsh,
+            clap_complete::Shell::Fish,
+            clap_complete::Shell::PowerShell,
+            clap_complete::Shell::Elvish,
+        ] {
+            let mut buffer: Vec<u8> = Vec::new();
+            clap_complete::generate(shell, &mut cmd, &bin_name, &mut buffer);
+            let script = String::from_utf8(buffer).expect("completion script should be UTF-8");
+            assert!(!script.is_empty(), "empty completion script for {shell:?}");
+            assert!(
+                script.contains(&bin_name),
+                "completion script for {shell:?} should reference {bin_name}"
+            );
+        }
     }
 }
