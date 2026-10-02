@@ -66,6 +66,13 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "SECS", default_value_t = 30)]
     pub timeout: u64,
 
+    /// TCP connection establishment timeout for RPC calls, in seconds. Bounds
+    /// only the initial connect — a dead or unreachable host fails within
+    /// this window instead of hanging for the full --timeout. 0 disables it
+    /// (connect attempts then fall under --timeout alone).
+    #[arg(long, global = true, value_name = "SECS", default_value_t = 5)]
+    pub connect_timeout: u64,
+
     /// Enable debug-level logging, including full RPC request payloads and
     /// response summaries.
     #[arg(long, short, global = true)]
@@ -146,10 +153,21 @@ pub enum Command {
         #[arg(long, value_name = "DURATION")]
         cache_ttl: Option<String>,
 
+        /// Show the cost difference against the previous cached estimate for
+        /// the same function and arguments (CPU, memory, ledger I/O, and fee).
+        #[arg(long)]
+        compare: bool,
+
         /// Wipe this network's cached estimates before running the
         /// simulation (e.g. after upgrading the tool or a network upgrade).
         #[arg(long)]
         clear_cache: bool,
+
+        /// Bypass the estimate cache entirely: never read a cached estimate
+        /// (including under `--cache-ttl`) and never write the fresh result
+        /// back to disk.
+        #[arg(long)]
+        no_cache: bool,
 
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
@@ -204,6 +222,17 @@ pub enum Command {
         /// Deployed contract ID (64 hex chars) to invoke each function against.
         #[arg(long)]
         id: Option<String>,
+
+        /// Bypass the estimate cache entirely: never read cached estimates
+        /// and never write fresh results back to disk.
+        #[arg(long)]
+        no_cache: bool,
+
+        /// Restrict estimation to these function names (repeatable). When
+        /// omitted, every exported function is estimated.
+        #[arg(long = "fn", value_name = "NAME")]
+        fn_names: Vec<String>,
+
         #[arg(long)]
         json: bool,
 
@@ -351,6 +380,13 @@ pub enum ConfigAction {
         network: String,
         #[arg(long)]
         out: Option<String>,
+        /// Automatically delete snapshots older than N days.
+        #[arg(
+            long,
+            value_name = "N",
+            value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..)
+        )]
+        retain: Option<u64>,
         #[arg(long)]
         json: bool,
 
