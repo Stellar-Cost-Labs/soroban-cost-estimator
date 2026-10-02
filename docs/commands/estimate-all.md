@@ -12,6 +12,7 @@ Options:
       --network <NETWORK>  Network to simulate against [default: testnet]
       --id <ID>            Deployed contract ID (64 hex chars) to invoke each function against
       --json               Output as JSON instead of a human-readable list
+  -o, --output <PATH>      Write the rendered results to a file (creates parent directories)
   -h, --help               Print help
 ```
 
@@ -33,6 +34,10 @@ Options:
   deviation of the fees (in stroops) and min, max, and mean CPU instruction
   counts across every successfully estimated function. The same statistics are
   emitted as the `fee_distribution` object in `--json` mode.
+
+`--output <PATH>` / `-o` writes the rendered table, Markdown, CSV, or JSON
+results to a file instead of stdout. Missing parent directories are created,
+and progress text is kept out of the result file.
 
 ## Example
 

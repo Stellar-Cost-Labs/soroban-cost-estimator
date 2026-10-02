@@ -17,6 +17,7 @@ Options:
       --arg <KEY=VAL>      Function arguments as key=value pairs (value is type-inferred)
   -i, --interactive        Prompt for the function and its arguments using the contract spec
       --json               Output as JSON instead of a human-readable table
+  -o, --output <PATH>      Write the rendered result to a file (creates parent directories)
   -h, --help               Print help
 ```
 
@@ -48,6 +49,9 @@ Options:
 - A simulation that returns no cost data and no latest ledger fails loudly
   with an error naming `--id`, `--fn`, and the RPC endpoint — it is treated
   as a misconfigured request, not a free transaction.
+- **`--output <PATH>` / `-o`** writes the rendered report to a file instead
+  of stdout and creates missing parent directories. It supports table, JSON,
+  CSV, Markdown, and comparison output.
 
 ## Example — upload simulation
 

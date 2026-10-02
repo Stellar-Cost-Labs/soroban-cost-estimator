@@ -2841,6 +2841,190 @@ fn test_estimate_minimal_wasm_upload_zero_footprint() {
     assert_eq!(parsed["write_bytes"], 0);
 }
 
+#[test]
+fn test_estimate_output_writes_json_and_table_to_nested_paths() {
+    let (rpc_url, _stop) = start_mock_rpc_server("", "1000", 100);
+    let home = temp_home("estimate-output");
+    let json_path = home.join("nested/json/report.json");
+    let json_path_arg = json_path.to_string_lossy().into_owned();
+
+    let json_output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--rpc-url",
+            &rpc_url,
+            "--json",
+            "--output",
+            &json_path_arg,
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("run estimate with JSON output file");
+    assert_eq!(json_output.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&json_output.stdout)
+            .trim()
+            .is_empty()
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&json_path).expect("read JSON report"))
+            .expect("output file contains valid JSON");
+    assert_eq!(parsed["fee"]["total_stroops"], 1100);
+
+    let table_path = home.join("nested/table/report.txt");
+    let table_path_arg = table_path.to_string_lossy().into_owned();
+    let table_output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--rpc-url",
+            &rpc_url,
+            "-o",
+            &table_path_arg,
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("run estimate with table output file");
+    assert_eq!(table_output.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&table_output.stdout)
+            .trim()
+            .is_empty()
+    );
+    let table = std::fs::read_to_string(table_path).expect("read table report");
+    assert!(table.contains("1000"));
+    assert!(table.contains("Fee"));
+}
+
+#[test]
+fn test_estimate_output_reports_parent_directory_errors() {
+    let (rpc_url, _stop) = start_mock_rpc_server("", "1000", 100);
+    let home = temp_home("estimate-output-invalid-path");
+    let blocker = home.join("not-a-directory");
+    std::fs::write(&blocker, "file").expect("create blocking file");
+    let output_path = blocker.join("report.json").to_string_lossy().into_owned();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--rpc-url",
+            &rpc_url,
+            "--json",
+            "--output",
+            &output_path,
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("run estimate with invalid output path");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to create output directory"));
+    assert!(stderr.contains("not-a-directory"));
+}
+
+#[test]
+fn test_estimate_all_output_writes_json_and_table_files() {
+    let (rpc_url, _stop) = start_mock_rpc_server("", "1000", 100);
+    let home = temp_home("estimate-all-output");
+    let json_path = home.join("nested/json/all.json");
+    let json_path_arg = json_path.to_string_lossy().into_owned();
+    let (stdout, stderr, code) = run_cli_json_in_home(
+        &[
+            "estimate-all",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--rpc-url",
+            &rpc_url,
+            "--json",
+            "--output",
+            &json_path_arg,
+        ],
+        &home,
+    );
+    assert_eq!(code, 0, "estimate-all JSON output failed: {stderr}");
+    assert!(
+        stdout.is_empty(),
+        "result should be written to file: {stdout}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(json_path).expect("read estimate-all JSON"))
+            .expect("estimate-all output is valid JSON");
+    assert!(parsed["functions"].as_array().is_some_and(|functions| {
+        functions
+            .iter()
+            .any(|function| function["function"] == "increment")
+    }));
+
+    let table_path = home.join("nested/table/all.txt");
+    let table_path_arg = table_path.to_string_lossy().into_owned();
+    let (stdout, stderr, code) = run_cli_json_in_home(
+        &[
+            "estimate-all",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--rpc-url",
+            &rpc_url,
+            "--format",
+            "table",
+            "-o",
+            &table_path_arg,
+        ],
+        &home,
+    );
+    assert_eq!(code, 0, "estimate-all table output failed: {stderr}");
+    assert!(
+        stdout.is_empty(),
+        "result should be written to file: {stdout}"
+    );
+    let table = std::fs::read_to_string(table_path).expect("read estimate-all table");
+    assert!(table.contains("Function"));
+    assert!(table.contains("increment"));
+    assert!(table.contains("skipped"));
+}
+
+#[test]
+fn test_config_diff_output_writes_json_and_creates_parent_directories() {
+    let home = temp_home("config-diff-output");
+    write_snapshot(&home, "testnet", "2026-01-01T00:00:00+00:00", 10);
+    write_snapshot(&home, "testnet", "2026-01-02T00:00:00+00:00", 11);
+    let output_path = home.join("nested/diff/report.json");
+    let output_path_arg = output_path.to_string_lossy().into_owned();
+
+    let (stdout, stderr, code) = run_cli_json_in_home(
+        &[
+            "config",
+            "diff",
+            "--network",
+            "testnet",
+            "--against-previous",
+            "--json",
+            "--output",
+            &output_path_arg,
+        ],
+        &home,
+    );
+    assert_eq!(code, 0, "config diff output failed: {stderr}");
+    assert!(
+        stdout.is_empty(),
+        "result should be written to file: {stdout}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output_path).expect("read config diff JSON"))
+            .expect("config diff output is valid JSON");
+    assert!(parsed["diff"].is_object());
+}
+
 /// Regression: the mock server must read the *entire* request body before
 /// answering. HTTP clients serialize header names in lowercase
 /// (`content-length`), and a large body — such as a WASM upload envelope —
@@ -3023,6 +3207,44 @@ fn test_estimate_diff_table_end_to_end() {
         stdout.contains("Old WASM SHA-256") && stdout.contains("New WASM SHA-256"),
         "diff should name both artifacts; got: {stdout}"
     );
+}
+
+#[test]
+fn test_estimate_diff_output_writes_table_to_file() {
+    let (rpc_url, _stop) = start_mock_rpc_server("", "1000", 100);
+    let home = temp_home("estimate-diff-output");
+    let output_path = home.join("nested/diff/report.txt");
+    let output_path_arg = output_path.to_string_lossy().into_owned();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--wasm-new",
+            "tests/fixtures/contract.wasm",
+            "--diff",
+            "--rpc-url",
+            &rpc_url,
+            "--output",
+            &output_path_arg,
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("run estimate --diff with output file");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        stdout.trim().is_empty(),
+        "diff result should go to file: {stdout}"
+    );
+    let diff = std::fs::read_to_string(output_path).expect("read estimate diff table");
+    assert!(diff.contains("Old WASM SHA-256"));
+    assert!(diff.contains("Change (+/- %)"));
 }
 
 #[test]
