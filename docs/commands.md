@@ -92,9 +92,14 @@ soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
   WASM Size, CPU Instructions, RAM Bytes, Read Entry/Write Entries, Read/Write
   Bytes, and Total Fee. Increases are red, decreases green. The cache is not
   read or written in diff mode, and `--wasm-new` without `--diff` is an error.
-  With `--json`, the comparison is emitted as `{ identity, rows }` where each
-  row carries `resource`, `old`, `new`, `delta`, `change_percent`, and
-  `direction` (`increase` / `decrease` / `unchanged`).
+  When `--fn` is given, its signature must exist in both WASM files; a
+  missing signature fails before any RPC call, naming the offending
+  `--wasm`/`--wasm-new` file.
+  With `--json`, the output carries three structures — `wasm_a` (the full
+  baseline report), `wasm_b` (the full comparison report), and `diff` — where
+  `diff` holds `identity`, plus `rows` whose entries carry `resource`, `old`,
+  `new`, `delta`, `change_percent`, and `direction` (`increase` / `decrease` /
+  `unchanged`).
 - **`--clear-cache`** wipes every cached estimate for `--network` (default
   `testnet`) *before* the simulation runs, printing
   `Cleared N cached estimate(s) for <network>.` It can be combined with any
