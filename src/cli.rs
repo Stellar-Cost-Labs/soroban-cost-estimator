@@ -152,10 +152,6 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "N", default_value_t = 10_000)]
     pub max_cache_entries: usize,
 
-    /// Suppress non-essential output, including the fee-distribution chart.
-    #[arg(long, short, global = true)]
-    pub quiet: bool,
-
     /// Number of decimal places shown for XLM fee values (0..=7, default 7).
     ///
     /// Stellar amounts are denominated in stroops (1 XLM = 10,000,000
