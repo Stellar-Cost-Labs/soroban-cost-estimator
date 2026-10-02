@@ -839,7 +839,7 @@ async fn simulate_report(
         memory_bytes, latest_ledger, total_fee_stroops, "simulation complete"
     );
 
-    let fee_rates = fetch_fee_rates(&client, quiet).await;
+    let fee_rates = fetch_fee_rates(&client, req.quiet).await;
 
     let fee = report::fee_calc::compute_fee_breakdown(
         total_fee_stroops,
@@ -1481,6 +1481,7 @@ async fn emit_watch_estimate(
     precision: u32,
     extra_headers: &[String],
     human: bool,
+    quiet: bool,
     verbose: bool,
 ) {
     match estimate_once(
@@ -1576,6 +1577,7 @@ async fn estimate_watch_poll_once(
     precision: u32,
     extra_headers: &[String],
     human: bool,
+    quiet: bool,
     verbose: bool,
 ) -> error::AppResult<()> {
     let path = std::path::Path::new(wasm_path);
@@ -1619,6 +1621,7 @@ async fn estimate_watch_poll_once(
         precision,
         extra_headers,
         human,
+        quiet,
         verbose,
     )
     .await;
@@ -1699,6 +1702,7 @@ async fn cmd_estimate_watch(
                 precision,
                 extra_headers,
                 human,
+                quiet,
                 verbose,
             )
             .await;
@@ -1742,6 +1746,7 @@ async fn cmd_estimate_watch(
                     precision,
                     extra_headers,
                     human,
+                    quiet,
                     verbose,
                 ).await;
                 tokio::time::sleep(WATCH_POLL_DURATION).await;
