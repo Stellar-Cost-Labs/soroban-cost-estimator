@@ -1,4 +1,4 @@
-use soroban_cost_estimator::config_snapshot::diff;
+use soroban_cost_estimator::config_snapshot::diff::{self, FieldDiff};
 use soroban_cost_estimator::config_snapshot::model::*;
 
 // ── Builders ───────────────────────────────────────────────────────────────
@@ -192,7 +192,7 @@ fn make_snapshot(compute_fee: i64, bandwidth_fee: i64) -> ConfigSnapshot {
 fn test_no_changes() {
     let snap = make_snapshot(100, 5);
     let d = diff::diff_snapshots(&snap, &snap);
-    assert!(d.changes.is_empty());
+    assert_eq!(d.changes, [] as [FieldDiff; 0]);
     assert!(!d.has_pricing_changes);
 }
 
@@ -313,7 +313,7 @@ fn test_diff_change_has_explanation() {
 fn test_all_present_identical_no_changes() {
     let snap = full_snapshot();
     let d = diff::diff_snapshots(&snap, &snap);
-    assert!(d.changes.is_empty());
+    assert_eq!(d.changes, [] as [FieldDiff; 0]);
     assert!(!d.has_pricing_changes);
 }
 
@@ -321,7 +321,7 @@ fn test_all_present_identical_no_changes() {
 fn test_all_absent_identical_no_changes() {
     let snap = empty_snapshot();
     let d = diff::diff_snapshots(&snap, &snap);
-    assert!(d.changes.is_empty());
+    assert_eq!(d.changes, [] as [FieldDiff; 0]);
     assert!(!d.has_pricing_changes);
 }
 
@@ -528,28 +528,28 @@ fn test_one_added_one_removed_others_unchanged() {
 fn test_compute_present_bandwidth_present_no_changes() {
     let snap = snapshot_with(true, false, false, false, true, false);
     let d = diff::diff_snapshots(&snap, &snap);
-    assert!(d.changes.is_empty());
+    assert_eq!(d.changes, [] as [FieldDiff; 0]);
 }
 
 #[test]
 fn test_compute_present_bandwidth_absent_no_changes() {
     let snap = snapshot_with(true, false, false, false, false, false);
     let d = diff::diff_snapshots(&snap, &snap);
-    assert!(d.changes.is_empty());
+    assert_eq!(d.changes, [] as [FieldDiff; 0]);
 }
 
 #[test]
 fn test_compute_absent_bandwidth_present_no_changes() {
     let snap = snapshot_with(false, false, false, false, true, false);
     let d = diff::diff_snapshots(&snap, &snap);
-    assert!(d.changes.is_empty());
+    assert_eq!(d.changes, [] as [FieldDiff; 0]);
 }
 
 #[test]
 fn test_compute_absent_bandwidth_absent_no_changes() {
     let snap = snapshot_with(false, false, false, false, false, false);
     let d = diff::diff_snapshots(&snap, &snap);
-    assert!(d.changes.is_empty());
+    assert_eq!(d.changes, [] as [FieldDiff; 0]);
 }
 
 // ── Non-pricing field changes (should NOT set has_pricing_changes) ────────
@@ -877,56 +877,56 @@ fn test_mixed_pricing_and_non_pricing_changes() {
 fn test_all_none_no_changes() {
     let snap = snapshot_with(false, false, false, false, false, false);
     let d = diff::diff_snapshots(&snap, &snap);
-    assert!(d.changes.is_empty());
+    assert_eq!(d.changes, [] as [FieldDiff; 0]);
 }
 
 #[test]
 fn test_all_some_no_changes() {
     let snap = snapshot_with(true, true, true, true, true, true);
     let d = diff::diff_snapshots(&snap, &snap);
-    assert!(d.changes.is_empty());
+    assert_eq!(d.changes, [] as [FieldDiff; 0]);
 }
 
 #[test]
 fn test_only_compute_present_no_changes() {
     let snap = snapshot_with(true, false, false, false, false, false);
     let d = diff::diff_snapshots(&snap, &snap);
-    assert!(d.changes.is_empty());
+    assert_eq!(d.changes, [] as [FieldDiff; 0]);
 }
 
 #[test]
 fn test_only_ledger_cost_present_no_changes() {
     let snap = snapshot_with(false, true, false, false, false, false);
     let d = diff::diff_snapshots(&snap, &snap);
-    assert!(d.changes.is_empty());
+    assert_eq!(d.changes, [] as [FieldDiff; 0]);
 }
 
 #[test]
 fn test_only_historical_present_no_changes() {
     let snap = snapshot_with(false, false, true, false, false, false);
     let d = diff::diff_snapshots(&snap, &snap);
-    assert!(d.changes.is_empty());
+    assert_eq!(d.changes, [] as [FieldDiff; 0]);
 }
 
 #[test]
 fn test_only_events_present_no_changes() {
     let snap = snapshot_with(false, false, false, true, false, false);
     let d = diff::diff_snapshots(&snap, &snap);
-    assert!(d.changes.is_empty());
+    assert_eq!(d.changes, [] as [FieldDiff; 0]);
 }
 
 #[test]
 fn test_only_bandwidth_present_no_changes() {
     let snap = snapshot_with(false, false, false, false, true, false);
     let d = diff::diff_snapshots(&snap, &snap);
-    assert!(d.changes.is_empty());
+    assert_eq!(d.changes, [] as [FieldDiff; 0]);
 }
 
 #[test]
 fn test_only_archival_present_no_changes() {
     let snap = snapshot_with(false, false, false, false, false, true);
     let d = diff::diff_snapshots(&snap, &snap);
-    assert!(d.changes.is_empty());
+    assert_eq!(d.changes, [] as [FieldDiff; 0]);
 }
 
 // ── Combinations: compute absent in old, others vary ──────────────────────
@@ -969,7 +969,7 @@ fn test_compute_absent_others_varying() {
     ] {
         let snap = snapshot_with(false, lc, h, e, b, a);
         let d = diff::diff_snapshots(&snap, &snap);
-        assert!(d.changes.is_empty());
+        assert_eq!(d.changes, [] as [FieldDiff; 0]);
     }
 }
 

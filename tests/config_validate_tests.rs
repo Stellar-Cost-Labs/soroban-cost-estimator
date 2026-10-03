@@ -17,7 +17,7 @@ fn test_validate_all_snapshots_returns_empty_list() {
     let results = result.unwrap();
     // Each result has path, filename, valid, error fields
     for status in &results {
-        assert!(!status.filename.is_empty());
+        assert_ne!(status.filename, "");
         assert!(!status.path.as_os_str().is_empty());
         // Either valid or has an error message
         assert!(status.valid || status.error.is_some());

@@ -1,5 +1,5 @@
 use soroban_cost_estimator::config_snapshot::history::{
-    build_change_log_from_snapshots, last_changed_from_log,
+    FieldHistoryEntry, build_change_log_from_snapshots, last_changed_from_log,
 };
 use soroban_cost_estimator::config_snapshot::model::*;
 
@@ -35,8 +35,14 @@ fn make_snapshot(
 #[test]
 fn test_empty_with_fewer_than_two_snapshots() {
     let snap = make_snapshot("2026-01-01T00:00:00Z", 100, 100, 5);
-    assert!(build_change_log_from_snapshots(&[]).is_empty());
-    assert!(build_change_log_from_snapshots(&[snap]).is_empty());
+    assert_eq!(
+        build_change_log_from_snapshots(&[]),
+        [] as [FieldHistoryEntry; 0]
+    );
+    assert_eq!(
+        build_change_log_from_snapshots(&[snap]),
+        [] as [FieldHistoryEntry; 0]
+    );
 }
 
 #[test]
@@ -44,7 +50,7 @@ fn test_no_changes_across_identical_snapshots() {
     let a = make_snapshot("2026-01-01T00:00:00Z", 100, 100, 5);
     let b = make_snapshot("2026-01-02T00:00:00Z", 200, 100, 5);
     let log = build_change_log_from_snapshots(&[a, b]);
-    assert!(log.is_empty());
+    assert_eq!(log, [] as [FieldHistoryEntry; 0]);
 }
 
 #[test]
