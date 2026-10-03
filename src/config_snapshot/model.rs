@@ -48,6 +48,12 @@ pub struct ConfigSnapshot {
     pub network: String,
     pub timestamp: String,
     pub ledger: u32,
+    /// Network protocol version reported by `getLatestLedger` when the
+    /// snapshot was taken. `None` for snapshots saved before it was recorded
+    /// or when the RPC call failed; omitted from JSON in that case so older
+    /// files and outputs are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<u32>,
     pub contract_compute: Option<ContractComputeV0>,
     pub contract_ledger_cost: Option<ContractLedgerCostV0>,
     pub contract_historical_data: Option<ContractHistoricalDataV0>,
@@ -137,5 +143,38 @@ pub fn setting_unit_description(field_path: &str) -> Option<&'static str> {
         "state_archival.persistent_rent_rate_denominator"
         | "state_archival.temp_rent_rate_denominator" => Some("fractional fee scaling"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConfigSnapshot;
+
+    const LEGACY: &str = r#"{"network":"testnet","timestamp":"t","ledger":7,
+        "contract_compute":null,"contract_ledger_cost":null,
+        "contract_historical_data":null,"contract_events":null,
+        "contract_bandwidth":null,"state_archival":null}"#;
+
+    #[test]
+    fn snapshot_without_protocol_version_still_loads() {
+        let snap: ConfigSnapshot = serde_json::from_str(LEGACY).unwrap();
+        assert_eq!(snap.protocol_version, None);
+        assert_eq!(snap.ledger, 7);
+    }
+
+    #[test]
+    fn missing_protocol_version_is_not_written() {
+        let snap: ConfigSnapshot = serde_json::from_str(LEGACY).unwrap();
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(!json.contains("protocol_version"), "{json}");
+    }
+
+    #[test]
+    fn protocol_version_round_trips() {
+        let mut snap: ConfigSnapshot = serde_json::from_str(LEGACY).unwrap();
+        snap.protocol_version = Some(23);
+        let back: ConfigSnapshot =
+            serde_json::from_str(&serde_json::to_string(&snap).unwrap()).unwrap();
+        assert_eq!(back.protocol_version, Some(23));
     }
 }
