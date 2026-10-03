@@ -674,3 +674,89 @@ pub fn import_snapshots(bundle_path: &str) -> AppResult<usize> {
     }
     Ok(imported)
 }
+
+/// Summary of one saved snapshot, read from the snapshot file itself.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SnapshotMetadata {
+    pub filename: String,
+    pub network: String,
+    pub timestamp: String,
+    pub ledger_sequence: u32,
+    /// `None` for snapshots saved before the protocol version was recorded.
+    pub protocol_version: Option<u32>,
+}
+
+/// The header fields of a snapshot file. The config sections are not
+/// materialised; serde skips them.
+#[derive(serde::Deserialize)]
+struct SnapshotHeader {
+    network: String,
+    timestamp: String,
+    ledger: u32,
+    #[serde(default)]
+    protocol_version: Option<u32>,
+}
+
+/// Lists metadata for saved snapshots in the snapshots directory.
+///
+/// `network = None` lists every network. Filtering uses the `network` field
+/// stored inside each file, not the filename. Results are sorted by network,
+/// then timestamp (oldest first), then filename.
+///
+/// A missing snapshots directory means no snapshots. As with `config list`,
+/// an unreadable or malformed `.json` file fails the listing and names the
+/// file; `config validate` reports every bad file at once.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn list_snapshots_metadata(network: Option<&str>) -> AppResult<Vec<SnapshotMetadata>> {
+    let dir = data_dir()?.join("snapshots");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(AppError::General(format!(
+                "cannot read snapshot directory {}: {e}",
+                dir.display()
+            )));
+        }
+    };
+
+    let mut out = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|e| {
+                AppError::General(format!(
+                    "cannot read snapshot directory {}: {e}",
+                    dir.display()
+                ))
+            })?
+            .path();
+        if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| AppError::SnapshotParse(format!("cannot read {}: {e}", path.display())))?;
+        let header: SnapshotHeader = serde_json::from_str(&text)
+            .map_err(|e| AppError::SnapshotParse(format!("{}: {e}", path.display())))?;
+        if network.is_some_and(|n| n != header.network) {
+            continue;
+        }
+        let filename = path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        out.push(SnapshotMetadata {
+            filename,
+            network: header.network,
+            timestamp: header.timestamp,
+            ledger_sequence: header.ledger,
+            protocol_version: header.protocol_version,
+        });
+    }
+    out.sort_by(|a, b| {
+        (&a.network, &a.timestamp, &a.filename).cmp(&(&b.network, &b.timestamp, &b.filename))
+    });
+    trace!(count = out.len(), ?network, "snapshot metadata listed");
+    Ok(out)
+}
