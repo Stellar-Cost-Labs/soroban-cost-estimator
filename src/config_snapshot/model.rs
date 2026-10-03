@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::rpc::config::ConfigSettingId;
@@ -47,6 +49,13 @@ pub fn config_setting_id_for_prefix(prefix: &str) -> Option<ConfigSettingId> {
 pub struct ConfigSnapshot {
     pub network: String,
     pub timestamp: String,
+    /// The network's **current** ledger when the snapshot was taken, as
+    /// reported by the node's `latestLedger`.
+    ///
+    /// This is deliberately *not* the newest `last_modified_ledger` across the
+    /// config settings. Those settings only change on protocol-governance
+    /// events, so that value is frozen between upgrades and would leave every
+    /// snapshot reporting the same long-stale ledger.
     pub ledger: u32,
     /// Network protocol version reported by `getLatestLedger` when the
     /// snapshot was taken. `None` for snapshots saved before it was recorded
