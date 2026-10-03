@@ -102,6 +102,23 @@ fn default_schema_version() -> u32 {
     INITIAL_SCHEMA_VERSION
 }
 
+/// Ledger I/O footprint of a simulated invocation.
+///
+/// Recorded alongside an estimate so a later run can diff I/O against it.
+/// Only runs that captured the footprint store this (older entries leave it
+/// absent), which is why it lives behind [`CachedEstimate::io`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct IoFootprint {
+    /// Ledger entries read.
+    pub read_entries: u32,
+    /// Ledger entries written.
+    pub write_entries: u32,
+    /// Bytes read from the ledger.
+    pub read_bytes: u32,
+    /// Bytes written to the ledger.
+    pub write_bytes: u32,
+}
+
 /// A cached estimate result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedEstimate {
@@ -141,6 +158,9 @@ pub struct CachedEstimate {
     /// Whether the simulation succeeded.
     #[serde(default = "default_true")]
     pub success: bool,
+    /// Ledger I/O footprint recorded with this estimate, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io: Option<IoFootprint>,
 }
 
 /// Filter criteria for querying cached simulation estimates.
@@ -438,11 +458,15 @@ pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
             duration_ms      INTEGER,
             success          INTEGER NOT NULL DEFAULT 1,
             last_accessed    TEXT NOT NULL DEFAULT '',
+            io_json          TEXT,
             PRIMARY KEY (wasm_hash, function, args_hash)
         );",
     )?;
     // Migrate a pre-v3 table (created before LRU access tracking) in place.
     ensure_column(conn, "last_accessed", "TEXT NOT NULL DEFAULT ''")?;
+    // The ledger I/O footprint is additive and nullable, so adding it in
+    // place keeps older databases readable without a schema-version bump.
+    ensure_column(conn, "io_json", "TEXT")?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_estimates_lookup
              ON estimates (wasm_hash, function);
@@ -678,6 +702,9 @@ fn import_legacy_json_file(conn: &Connection, path: &Path) -> AppResult<bool> {
         timestamp: parsed.timestamp.clone(),
         duration_ms: parsed.duration_ms,
         success: parsed.success,
+        // A legacy JSON entry predates the I/O footprint, so there is none
+        // to carry over.
+        io: None,
     };
     let Ok(migrated) = migrate_to_latest(migrated) else {
         warn!(path = %path.display(), "legacy cache entry needs a newer tool; keeping file");
@@ -754,6 +781,9 @@ where
 /// * `duration_ms` - Wall-clock duration of the simulation in milliseconds.
 /// * `success` - Whether the simulation succeeded.
 ///
+/// The ledger I/O footprint is not recorded here — use
+/// [`save_estimate_with_io`] when it is available.
+///
 /// # Network calls
 /// None — local SQLite I/O.
 pub fn save_estimate(
@@ -777,6 +807,45 @@ pub fn save_estimate(
         total_stroops,
         cpu_instructions,
         memory_bytes,
+        None,
+        duration_ms,
+        success,
+        cache_limits(),
+    )
+}
+
+/// Save an estimate together with its ledger I/O footprint.
+///
+/// `save_estimate` records only the metrics the cache has always stored; this
+/// variant additionally persists the read/write entry and byte counts, so a
+/// later run can diff I/O against it (`estimate --compare`).
+///
+/// # Network calls
+/// None — local SQLite I/O.
+#[allow(clippy::too_many_arguments)]
+pub fn save_estimate_with_io(
+    wasm_hash: &str,
+    function: &str,
+    args: &[String],
+    network: &str,
+    ledger: u32,
+    total_stroops: i64,
+    cpu_instructions: u64,
+    memory_bytes: u64,
+    io: IoFootprint,
+    duration_ms: Option<u64>,
+    success: bool,
+) -> AppResult<()> {
+    save_estimate_with_limits(
+        wasm_hash,
+        function,
+        args,
+        network,
+        ledger,
+        total_stroops,
+        cpu_instructions,
+        memory_bytes,
+        Some(io),
         duration_ms,
         success,
         cache_limits(),
@@ -801,11 +870,16 @@ pub fn save_estimate_with_limits(
     total_stroops: i64,
     cpu_instructions: u64,
     memory_bytes: u64,
+    io: Option<IoFootprint>,
     duration_ms: Option<u64>,
     success: bool,
     limits: CacheLimits,
 ) -> AppResult<()> {
     let args_hash = hash_args(args);
+    let io_json = match io {
+        Some(io) => Some(serde_json::to_string(&io)?),
+        None => None,
+    };
 
     let _guard = WRITE_LOCK
         .lock()
@@ -816,8 +890,8 @@ pub fn save_estimate_with_limits(
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute(
         "INSERT INTO estimates \
-         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, duration_ms, success, last_accessed) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, duration_ms, success, last_accessed, io_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
          ON CONFLICT(wasm_hash, function, args_hash) DO UPDATE SET \
             version = excluded.version, \
             network = excluded.network, \
@@ -828,7 +902,8 @@ pub fn save_estimate_with_limits(
             timestamp = excluded.timestamp, \
             duration_ms = excluded.duration_ms, \
             success = excluded.success, \
-            last_accessed = excluded.last_accessed",
+            last_accessed = excluded.last_accessed, \
+            io_json = excluded.io_json",
         rusqlite::params![
             CACHE_SCHEMA_VERSION as i64,
             wasm_hash,
@@ -843,6 +918,7 @@ pub fn save_estimate_with_limits(
             duration_ms.map(|v| v as i64),
             success as i64,
             now,
+            io_json,
         ],
     )?;
 
@@ -1014,6 +1090,11 @@ fn estimate_from_row(row: &rusqlite::Row<'_>) -> Result<CachedEstimate, rusqlite
         timestamp: row.get(9)?,
         duration_ms: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
         success: row.get::<_, i64>(11)? != 0,
+        // A footprint that cannot be decoded is treated as absent: better to
+        // omit I/O from a comparison than to fail the whole read.
+        io: row
+            .get::<_, Option<String>>(12)?
+            .and_then(|raw| serde_json::from_str(&raw).ok()),
     })
 }
 
@@ -1113,7 +1194,7 @@ pub fn load_estimate(
     let cached = {
         let mut stmt = conn.prepare(
             "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-             cpu_instructions, memory_bytes, timestamp, duration_ms, success \
+             cpu_instructions, memory_bytes, timestamp, duration_ms, success, io_json \
              FROM estimates WHERE wasm_hash = ?1 AND function = ?2 AND args_hash = ?3",
         )?;
         let mut rows = stmt.query(rusqlite::params![wasm_hash, function, args_hash.as_str()])?;
@@ -1189,7 +1270,7 @@ pub fn list_cached_estimates(network: &str) -> AppResult<Vec<CachedEstimate>> {
     let conn = open_db()?;
     let mut stmt = conn.prepare(
         "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-         cpu_instructions, memory_bytes, timestamp, duration_ms, success \
+         cpu_instructions, memory_bytes, timestamp, duration_ms, success, io_json \
          FROM estimates WHERE network = ?1 ORDER BY timestamp DESC",
     )?;
 
@@ -1275,7 +1356,7 @@ pub fn list_all_cached_estimates() -> AppResult<Vec<CachedEstimate>> {
     let conn = open_db()?;
     let mut stmt = conn.prepare(
         "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-         cpu_instructions, memory_bytes, timestamp, duration_ms, success \
+         cpu_instructions, memory_bytes, timestamp, duration_ms, success, io_json \
          FROM estimates ORDER BY timestamp DESC",
     )?;
 
@@ -1344,7 +1425,7 @@ pub fn export_cached_estimates() -> AppResult<Vec<CachedEstimate>> {
     let conn = open_db()?;
     let mut stmt = conn.prepare(
         "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-         cpu_instructions, memory_bytes, timestamp \
+         cpu_instructions, memory_bytes, timestamp, duration_ms, success, io_json \
          FROM estimates ORDER BY wasm_hash, function, args_hash",
     )?;
 
@@ -1358,6 +1439,63 @@ pub fn export_cached_estimates() -> AppResult<Vec<CachedEstimate>> {
 
     debug!(count = estimates.len(), "exported cached estimates");
     Ok(estimates)
+}
+
+/// Schema version of the `cache export` file format.
+///
+/// Independent from [`CACHE_SCHEMA_VERSION`] (which versions individual
+/// cache *entries*): this versions the *export envelope* so backups stay
+/// readable as the envelope gains fields.
+pub const CACHE_EXPORT_SCHEMA_VERSION: u32 = 1;
+
+/// A portable, self-describing dump of cached estimates.
+///
+/// Written by `cache export` for backup, sharing across workstations, and
+/// archiving. The envelope carries everything needed to interpret the
+/// records without the exporting tool's help.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheExport {
+    /// Version of the export envelope format ([`CACHE_EXPORT_SCHEMA_VERSION`]).
+    pub schema_version: u32,
+    /// RFC-3339 timestamp of when the export was created.
+    pub exported_at: String,
+    /// Network the export was filtered to, or `None` for all networks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    /// The exported estimates in deterministic
+    /// `(wasm_hash, function, args_hash)` order.
+    pub estimates: Vec<CachedEstimate>,
+}
+
+/// Build a versioned [`CacheExport`] of cached estimates.
+///
+/// * `network` - Only include estimates recorded for this network, or `None`
+///   for every network. Unknown networks simply yield an empty list.
+///
+/// Like [`export_cached_estimates`], a malformed or unsupported entry
+/// returns an error rather than producing an incomplete backup.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+pub fn export_cache(network: Option<&str>) -> AppResult<CacheExport> {
+    let estimates: Vec<CachedEstimate> = export_cached_estimates()?
+        .into_iter()
+        .filter(|e| match network {
+            Some(n) => e.network == n,
+            None => true,
+        })
+        .collect();
+
+    debug!(
+        count = estimates.len(),
+        network, "built cache export envelope"
+    );
+    Ok(CacheExport {
+        schema_version: CACHE_EXPORT_SCHEMA_VERSION,
+        exported_at: chrono::Utc::now().to_rfc3339(),
+        network: network.map(str::to_string),
+        estimates,
+    })
 }
 
 /// Integrity status of a single cache entry file.
@@ -1417,6 +1555,7 @@ pub fn verify_cache() -> AppResult<Vec<CacheEntryStatus>> {
             timestamp: String::new(),
             duration_ms: None,
             success: true,
+            io: None,
         };
         let valid = migrate_to_latest(cached).is_ok();
 

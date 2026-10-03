@@ -1059,6 +1059,7 @@ fn test_migrate_to_latest_current_version_is_identity() {
             timestamp: "t".to_string(),
             duration_ms: Some(42),
             success: true,
+            io: None,
         };
         let migrated = cache::migrate_to_latest(entry.clone()).expect("migrate");
         assert_eq!(migrated.version, current_schema_version());
@@ -1084,6 +1085,7 @@ fn test_migrate_to_latest_rejects_future_version() {
             timestamp: "t".to_string(),
             duration_ms: None,
             success: true,
+            io: None,
         };
         let err = cache::migrate_to_latest(entry).expect_err("future version must be rejected");
         assert!(err.to_string().contains("newer"), "unhelpful error: {err}");
@@ -1353,6 +1355,88 @@ fn test_load_fresh_estimate_expired_returns_none() {
     });
 }
 
+/// The export envelope carries a schema version, an export timestamp, and
+/// the estimate records — everything a backup needs to be self-describing.
+#[test]
+fn test_export_cache_envelope_shape() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true).expect("save");
+
+        let export = cache::export_cache(None).expect("export");
+        assert_eq!(
+            export.schema_version,
+            cache::CACHE_EXPORT_SCHEMA_VERSION,
+            "envelope should stamp the export schema version"
+        );
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&export.exported_at).is_ok(),
+            "exported_at should be RFC-3339: {}",
+            export.exported_at
+        );
+        assert!(export.network.is_none(), "unfiltered export has no network");
+        assert_eq!(export.estimates.len(), 1, "should export the seeded entry");
+        assert_eq!(export.estimates[0].function, "f1");
+    });
+}
+
+/// A network filter restricts the export to that network's estimates.
+#[test]
+fn test_export_cache_filters_by_network() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h1", "f_testnet", &[], "testnet", 1, 100, 10, 5, None, true)
+            .expect("testnet save");
+        cache::save_estimate(
+            "h1",
+            "f_mainnet",
+            &[],
+            "mainnet",
+            2,
+            200,
+            20,
+            10,
+            None,
+            true,
+        )
+        .expect("mainnet save");
+
+        let testnet = cache::export_cache(Some("testnet")).expect("export testnet");
+        assert_eq!(testnet.network, Some("testnet".to_string()));
+        assert_eq!(testnet.estimates.len(), 1, "should export only testnet");
+        assert_eq!(testnet.estimates[0].function, "f_testnet");
+
+        let all = cache::export_cache(None).expect("export all");
+        assert!(all.network.is_none());
+        assert_eq!(
+            all.estimates.len(),
+            2,
+            "unfiltered export should carry both"
+        );
+
+        let empty = cache::export_cache(Some("futurenet")).expect("export futurenet");
+        assert_eq!(empty.network, Some("futurenet".to_string()));
+        assert!(
+            empty.estimates.is_empty(),
+            "unknown network exports nothing"
+        );
+    });
+}
+
+/// The envelope round-trips through JSON — the shape backups are stored in.
+#[test]
+fn test_export_cache_json_round_trip() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true).expect("save");
+
+        let export = cache::export_cache(Some("testnet")).expect("export");
+        let json = serde_json::to_string_pretty(&export).expect("serialize");
+        let parsed: cache::CacheExport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.schema_version, cache::CACHE_EXPORT_SCHEMA_VERSION);
+        assert_eq!(parsed.network, Some("testnet".to_string()));
+        assert_eq!(parsed.estimates.len(), 1);
+        assert_eq!(parsed.estimates[0].total_stroops, 100);
+    });
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────
 // SQLite storage backend: indexes & legacy JSON migration (#334)
@@ -1583,6 +1667,7 @@ fn test_v2_entry_migrates_to_v3_preserving_fields() {
         timestamp: "2026-01-01T00:00:00Z".to_string(),
         duration_ms: Some(1_234),
         success: false,
+        io: None,
     };
     let migrated = cache::migrate_to_latest(entry).expect("migrate v2 to v3");
     assert_eq!(migrated.version, cache::CACHE_SCHEMA_VERSION);
@@ -1608,6 +1693,7 @@ fn test_schema_version_serialization_key() {
         timestamp: "2026-01-01T00:00:00Z".to_string(),
         duration_ms: None,
         success: true,
+        io: None,
     };
     let json = serde_json::to_string(&entry).expect("serialize");
     assert!(
@@ -1659,6 +1745,7 @@ fn test_future_schema_error_names_version_and_remedy() {
         timestamp: "2026-01-01T00:00:00Z".to_string(),
         duration_ms: None,
         success: true,
+        io: None,
     };
     let err = cache::migrate_to_latest(entry).expect_err("future version must be rejected");
     let message = err.to_string();
@@ -1698,6 +1785,7 @@ fn save_with(
         1_000,
         100,
         50,
+        None,
         None,
         true,
         limits,
@@ -2510,5 +2598,137 @@ fn test_query_cache_read_only() {
         .expect("load")
         .expect("exists");
         assert_eq!(entry.timestamp, "2026-01-01T00:00:00Z");
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Ledger I/O footprint (#278)
+// ─────────────────────────────────────────────────────────────────────────
+
+fn sample_io() -> cache::IoFootprint {
+    cache::IoFootprint {
+        read_entries: 3,
+        write_entries: 2,
+        read_bytes: 40,
+        write_bytes: 136,
+    }
+}
+
+#[test]
+fn test_save_estimate_with_io_roundtrip() {
+    with_temp_home(|_tmp| {
+        let io = sample_io();
+        cache::save_estimate_with_io("h", "f", &[], "testnet", 7, 500, 20, 10, io, Some(12), true)
+            .expect("save with io");
+
+        let loaded = cache::load_estimate("h", "f", &[])
+            .expect("load")
+            .expect("entry should exist");
+        assert_eq!(loaded.io, Some(io));
+        assert_eq!(loaded.duration_ms, Some(12));
+    });
+}
+
+#[test]
+fn test_save_estimate_without_io_leaves_footprint_absent() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h", "f", &[], "testnet", 1, 100, 10, 5, None, true).expect("save");
+
+        let loaded = cache::load_estimate("h", "f", &[])
+            .expect("load")
+            .expect("entry should exist");
+        assert!(
+            loaded.io.is_none(),
+            "save_estimate must not invent an I/O footprint"
+        );
+    });
+}
+
+/// Re-running the same key replaces the stored footprint along with the other
+/// metrics.
+#[test]
+fn test_save_estimate_with_io_updates_existing_entry() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h", "f", &[], "testnet", 1, 100, 10, 5, None, true).expect("first");
+
+        let io = sample_io();
+        cache::save_estimate_with_io("h", "f", &[], "testnet", 2, 200, 20, 10, io, None, true)
+            .expect("second");
+
+        let loaded = cache::load_estimate("h", "f", &[])
+            .expect("load")
+            .expect("entry should exist");
+        assert_eq!(loaded.ledger, 2);
+        assert_eq!(loaded.io, Some(io));
+    });
+}
+
+/// `export_cached_estimates` reads every column the row mapping needs,
+/// including the ones added after the initial schema.
+#[test]
+fn test_export_cached_estimates_includes_footprint() {
+    with_temp_home(|_tmp| {
+        let io = sample_io();
+        cache::save_estimate_with_io("h", "f", &[], "testnet", 3, 42, 7, 9, io, Some(5), true)
+            .expect("save");
+
+        let exported = cache::export_cached_estimates().expect("export");
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].io, Some(io));
+        assert_eq!(exported[0].duration_ms, Some(5));
+        assert!(exported[0].success);
+    });
+}
+
+/// A database written by a build that predates the `io_json` column is
+/// upgraded in place when the library opens it, and its rows still load.
+#[test]
+fn test_legacy_database_without_io_column_still_loads() {
+    with_temp_home(|home| {
+        let dir = home.join(".soroban-cost-estimator");
+        std::fs::create_dir_all(&dir).expect("create data dir");
+        let db = dir.join("cache.db");
+
+        // The schema exactly as it existed before `io_json` was added.
+        {
+            let conn = rusqlite::Connection::open(&db).expect("open cache db");
+            conn.execute_batch(
+                "CREATE TABLE estimates (
+                    version          INTEGER NOT NULL,
+                    wasm_hash        TEXT NOT NULL,
+                    function         TEXT NOT NULL,
+                    args_hash        TEXT NOT NULL,
+                    network          TEXT NOT NULL,
+                    ledger           INTEGER NOT NULL,
+                    total_stroops    INTEGER NOT NULL,
+                    cpu_instructions INTEGER NOT NULL,
+                    memory_bytes     INTEGER NOT NULL,
+                    timestamp        TEXT NOT NULL,
+                    duration_ms      INTEGER,
+                    success          INTEGER NOT NULL DEFAULT 1,
+                    PRIMARY KEY (wasm_hash, function, args_hash)
+                );",
+            )
+            .expect("create legacy schema");
+            conn.execute(
+                "INSERT INTO estimates \
+                 (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, success) \
+                 VALUES (?1, 'old', 'legacy_fn', ?2, 'testnet', 3, 100, 10, 5, '2026-01-01T00:00:00Z', 1)",
+                rusqlite::params![
+                    cache::CACHE_SCHEMA_VERSION as i64,
+                    args_hash_of(&["a"]),
+                ],
+            )
+            .expect("insert legacy row");
+        }
+
+        let loaded = cache::load_estimate("old", "legacy_fn", &["a".to_string()])
+            .expect("load legacy entry")
+            .expect("legacy entry should exist");
+        assert_eq!(loaded.total_stroops, 100);
+        assert!(
+            loaded.io.is_none(),
+            "a pre-io_json row has no footprint to report"
+        );
     });
 }
