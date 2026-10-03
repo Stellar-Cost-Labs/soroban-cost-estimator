@@ -467,7 +467,9 @@ pub enum ConfigAction {
     /// command's own flags.
     #[command(args_conflicts_with_subcommands = true)]
     Snapshot {
-        #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
+        #[command(subcommand)]
+        action: Option<SnapshotAction>,
+        #[arg(long, default_value = "testnet")]
         network: String,
         #[arg(long)]
         out: Option<String>,
@@ -482,7 +484,6 @@ pub enum ConfigAction {
         #[command(subcommand)]
         action: Option<SnapshotAction>,
     },
-
     /// List all saved config snapshots with their timestamp and ledger.
     List {
         /// Network whose snapshots to list.

@@ -358,6 +358,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
         }
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot {
+                action,
                 network,
                 out,
                 json,
@@ -3173,6 +3174,48 @@ fn print_cached_estimate(
             fresh.ledger,
         );
     }
+}
+
+fn cmd_config_snapshot_validate(path: Option<&std::path::Path>, all: bool) -> error::AppResult<()> {
+    let statuses = if all {
+        config_snapshot::store::validate_all_snapshot_files()?
+    } else if let Some(path) = path {
+        vec![config_snapshot::store::validate_snapshot_file(path)]
+    } else {
+        return Err(error::AppError::Config(
+            "provide a snapshot path or use --all".to_string(),
+        ));
+    };
+
+    if statuses.is_empty() {
+        println!("No snapshot files found.");
+        return Ok(());
+    }
+
+    let mut invalid = 0;
+    for status in &statuses {
+        if status.valid {
+            println!("Valid: {}", status.path.display());
+        } else {
+            invalid += 1;
+            println!(
+                "Invalid: {}: {}",
+                status.path.display(),
+                status
+                    .error
+                    .as_deref()
+                    .unwrap_or("unknown validation error")
+            );
+        }
+    }
+
+    if invalid > 0 {
+        return Err(error::AppError::SnapshotParse(format!(
+            "{invalid} of {} snapshot file(s) failed validation",
+            statuses.len()
+        )));
+    }
+    Ok(())
 }
 
 /// `config validate` command: check all stored snapshots for integrity.
