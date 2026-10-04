@@ -26,6 +26,19 @@ pub enum AppError {
     #[error("failed to send HTTP request: {0}")]
     Http(#[from] reqwest::Error),
 
+    /// A non-success HTTP status returned by the RPC endpoint.
+    ///
+    /// Transient statuses (429/5xx) are retried by the RPC client; this error
+    /// surfaces only once the retry budget is exhausted. `retry_after` carries
+    /// the endpoint's `Retry-After` hint (HTTP 429) when present, so the retry
+    /// loop can honor it instead of its computed backoff.
+    #[error("RPC HTTP error: status {status} - {message}")]
+    HttpStatus {
+        status: u16,
+        retry_after: Option<std::time::Duration>,
+        message: String,
+    },
+
     /// The TCP connection could not be established within the configured
     /// connect timeout (distinct from a whole-request timeout). Wraps the
     /// underlying reqwest error so the original context is preserved.
