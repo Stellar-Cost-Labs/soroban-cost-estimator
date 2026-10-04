@@ -430,8 +430,8 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
                         summary,
                         diff_format == cli::OutputFormat::Json,
                         ignore_pricing_exit,
-                        quiet,
                         fail_on_any_change,
+                        quiet,
                     )
                 } else {
                     cmd_config_diff(
@@ -3038,8 +3038,8 @@ fn cmd_config_diff_against_previous(
     summary: bool,
     json_flag: bool,
     ignore_pricing_exit: bool,
-    quiet: bool,
     fail_on_any_change: bool,
+    quiet: bool,
 ) -> error::AppResult<()> {
     debug!(network, "diffing the two most recent snapshots");
     let (old_snapshot, new_snapshot) = config_snapshot::store::load_last_two_snapshots(network)?;
@@ -3457,7 +3457,7 @@ async fn cmd_watch(
 /// # Network calls
 /// None â€” pure SQLite I/O.
 #[allow(dead_code)] // wired once the `config cache stats` subcommand (#41) lands
-fn cmd_cache_stats(json: bool) -> error::AppResult<()> {
+fn cmd_cache_stats(json: bool, quiet: bool) -> error::AppResult<()> {
     let stats = cache::cache_stats()?;
     let limits = cache::cache_limits();
 
@@ -3487,7 +3487,7 @@ fn cmd_cache_stats(json: bool) -> error::AppResult<()> {
     );
     print_cache_quota(limits);
 
-    if !stats.per_network.is_empty() {
+    if !quiet && !stats.per_network.is_empty() {
         println!("\nPer-network breakdown:");
         for (network, count) in &stats.per_network {
             println!(
@@ -3717,7 +3717,7 @@ async fn handle_cache_action(
 ) -> error::AppResult<()> {
     match action {
         cli::CacheAction::Export { out, network } => {
-            cmd_cache_export(out.as_deref(), network.as_deref())
+            cmd_cache_export(out.as_deref(), network.as_deref(), quiet)
         }
         cli::CacheAction::Warm {
             wasm,
@@ -3772,7 +3772,7 @@ async fn handle_cache_action(
             json,
             quiet,
         ),
-        cli::CacheAction::Stats { json } => cmd_cache_stats(json),
+        cli::CacheAction::Stats { json } => cmd_cache_stats(json, quiet),
     }
 }
 
@@ -3872,7 +3872,11 @@ fn cmd_cache_query(
 ///
 /// # Network calls
 /// None â€” pure SQLite I/O.
-fn cmd_cache_export(out_path: Option<&str>, network: Option<&str>) -> error::AppResult<()> {
+fn cmd_cache_export(
+    out_path: Option<&str>,
+    network: Option<&str>,
+    quiet: bool,
+) -> error::AppResult<()> {
     let export = cache::export_cache(network)?;
     let json = serde_json::to_string_pretty(&export)?;
 
@@ -3881,11 +3885,13 @@ fn cmd_cache_export(out_path: Option<&str>, network: Option<&str>) -> error::App
             error::AppError::General(format!("failed to write cache export to {out_path}: {e}"))
         })?;
         let count = export.estimates.len();
-        println!(
-            "Exported {count} cache entr{} to {}.",
-            if count == 1 { "y" } else { "ies" },
-            out_path
-        );
+        if !quiet {
+            println!(
+                "Exported {count} cache entr{} to {}.",
+                if count == 1 { "y" } else { "ies" },
+                out_path
+            );
+        }
     } else {
         println!("{json}");
     }
