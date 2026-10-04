@@ -26,6 +26,29 @@ pub enum AppError {
     #[error("failed to send HTTP request: {0}")]
     Http(#[from] reqwest::Error),
 
+    /// A non-success HTTP status returned by the RPC endpoint.
+    ///
+    /// Transient statuses (429/5xx) are retried by the RPC client; this error
+    /// surfaces only once the retry budget is exhausted. `retry_after` carries
+    /// the endpoint's `Retry-After` hint (HTTP 429) when present, so the retry
+    /// loop can honor it instead of its computed backoff.
+    #[error("RPC HTTP error: status {status} - {message}")]
+    HttpStatus {
+        status: u16,
+        retry_after: Option<std::time::Duration>,
+        message: String,
+    },
+
+    /// The TCP connection could not be established within the configured
+    /// connect timeout (distinct from a whole-request timeout). Wraps the
+    /// underlying reqwest error so the original context is preserved.
+    #[error("Failed to establish connection to RPC host within {seconds} seconds")]
+    ConnectTimeout {
+        seconds: u64,
+        #[source]
+        source: reqwest::Error,
+    },
+
     // ── WebSocket ────────────────────────────────────────────────
     #[error("WebSocket connection failed: {0}")]
     WsConnect(String),
@@ -65,6 +88,12 @@ pub enum AppError {
 
     #[error("failed to load snapshots: none available for network {0}")]
     NoSnapshots(String),
+
+    #[error(
+        "failed to load snapshots: need at least 2 for network {network}, found {found} \
+         (run `config snapshot --network {network}` to capture another)"
+    )]
+    NotEnoughSnapshots { network: String, found: usize },
 
     // ── Simulation ──────────────────────────────────────────────────
     #[error("failed to simulate transaction: {0}")]
