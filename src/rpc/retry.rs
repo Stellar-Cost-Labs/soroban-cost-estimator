@@ -73,8 +73,7 @@ fn is_retryable(error: &AppError) -> bool {
     match error {
         AppError::Http(e) => e.is_connect() || e.is_timeout() || e.is_request(),
         AppError::HttpStatus { status, .. } => TRANSIENT_STATUSES.contains(status),
-        AppError::RpcUnavailable { .. } => true,
-        AppError::ConnectTimeout { .. } => true,
+        AppError::RpcUnavailable { .. } | AppError::ConnectTimeout { .. } => true,
         _ => false,
     }
 }

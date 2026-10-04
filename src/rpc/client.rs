@@ -615,8 +615,7 @@ impl RpcClient {
                 // are the cases where a fallback endpoint might succeed.
                 e.is_connect() || e.is_timeout() || e.is_request()
             }
-            AppError::ConnectTimeout { .. } => true,
-            AppError::RpcUnavailable { .. } => true,
+            AppError::ConnectTimeout { .. } | AppError::RpcUnavailable { .. } => true,
             // Transient gateway statuses surfaced as HttpStatus (502/503/504)
             // are also failover triggers; other HttpStatus values (429/500 or
             // deterministic 4xx) are not — 429/500 are retried but not failed
@@ -900,8 +899,7 @@ mod tests {
                 };
                 let counter = Arc::clone(&server_counter);
                 tokio::spawn(async move {
-                    let _ =
-                        handle_conn(stream, counter, fail_times, 200, result_body, delay).await;
+                    let _ = handle_conn(stream, counter, fail_times, 200, result_body, delay).await;
                 });
             }
         });

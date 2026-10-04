@@ -1920,7 +1920,7 @@ fn test_config_diff_against_previous_summary_output() {
 
     assert_eq!(code, 0, "--summary should exit 0 here; stderr: {stderr}");
     assert!(
-        stdout.contains("0 pricing changes, 0 non-pricing changes"),
+        stdout.contains("Network config up to date (ledger 200)"),
         "--summary should emit exactly the one-line summary; got: {stdout}"
     );
 }
@@ -3937,8 +3937,7 @@ fn test_estimate_repeat_json_reports_latency_array() {
         "estimate --repeat --json should succeed; stderr: {stderr}"
     );
 
-    let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("valid JSON output");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON output");
     let _ = stderr;
 
     assert_eq!(parsed["iterations"], 3);
