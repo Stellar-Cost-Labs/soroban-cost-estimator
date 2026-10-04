@@ -18,6 +18,10 @@ use crate::rpc::retry::{DEFAULT_MAX_RETRIES, with_retry};
 /// CLI's `--timeout` default (30 seconds).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default TCP connection establishment timeout applied to every RPC call.
+/// Matches the CLI's `--connect-timeout` default (5 seconds).
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Resolves a network name to its well-known Soroban RPC endpoint.
 ///
 /// # Network calls
@@ -182,6 +186,12 @@ pub struct RpcClient {
     /// Maximum number of retries on transient (HTTP) failures, with
     /// exponential backoff.
     max_retries: usize,
+    /// TCP connection establishment timeout. Distinct from the total request
+    /// timeout: it bounds only the initial connect (TCP/TLS handshake), so a
+    /// dead or unreachable host fails fast instead of hanging for the full
+    /// request timeout.
+    #[cfg_attr(not(test), allow(dead_code))]
+    connect_timeout: Duration,
     /// Custom HTTP headers attached to every outbound request.
     pub headers: HeaderMap,
     /// Whether to print verbose RPC request/response diagnostics to stderr.
@@ -232,6 +242,35 @@ impl RpcClient {
         Self::with_fallback(url, None, rps, timeout, max_retries, verbose)
     }
 
+    /// Create a new RPC client pointing at the given URL, optionally capping
+    /// outbound requests to `rps` requests per second, bounding each HTTP
+    /// request with `timeout`, bounding the TCP connection establishment with
+    /// `connect_timeout`, and retrying transient failures up to `max_retries`
+    /// times with exponential backoff.
+    ///
+    /// Rate limiting, retry behavior, and `timeout` behave exactly as in
+    /// [`Self::with_options`]. `connect_timeout` bounds only the initial
+    /// connect — a zero duration disables it (the total request timeout then
+    /// applies to the connect phase too).
+    pub fn with_connect_timeout(
+        url: &str,
+        rps: Option<u64>,
+        timeout: Duration,
+        connect_timeout: Duration,
+        max_retries: usize,
+    ) -> Self {
+        Self::with_fallback_headers_connect_timeout(
+            url,
+            None,
+            rps,
+            timeout,
+            connect_timeout,
+            max_retries,
+            &[],
+            false,
+        )
+    }
+
     /// Create a new RPC client pointing at the given URL, with an optional
     /// secondary URL used for failover, optionally capping outbound requests
     /// to `rps` requests per second, bounding each HTTP request with
@@ -261,14 +300,16 @@ impl RpcClient {
 
     /// Create a new RPC client that attaches custom HTTP headers (each a
     /// `"Key: Value"` string) to every request, without rate limiting, with
-    /// the default request timeout and the default retry policy. Entries
-    /// that cannot be parsed (or that carry an empty value) are skipped.
+    /// the default request timeout, the default connect timeout, and the default
+    /// retry policy. Entries that cannot be parsed (or that carry an empty
+    /// value) are skipped.
     pub fn with_headers(url: &str, headers: &[String], verbose: bool) -> Self {
-        Self::with_fallback_headers(
+        Self::with_fallback_headers_connect_timeout(
             url,
             None,
             None,
             DEFAULT_TIMEOUT,
+            DEFAULT_CONNECT_TIMEOUT,
             DEFAULT_MAX_RETRIES,
             headers,
             verbose,
@@ -279,9 +320,10 @@ impl RpcClient {
     /// limit, request timeout, retry policy, and custom HTTP headers attached
     /// to every request.
     ///
-    /// Behaves exactly like [`Self::with_fallback`] and additionally attaches
-    /// the parsed `"Key: Value"` headers (skipping any entry that cannot be
-    /// parsed or that has an empty value) to every outbound request.
+    /// Behaves exactly like [`Self::with_fallback_headers_connect_timeout`] and
+    /// additionally attaches the parsed `"Key: Value"` headers (skipping any
+    /// entry that cannot be parsed or that has an empty value) to every
+    /// outbound request. Uses the [`DEFAULT_CONNECT_TIMEOUT`] default.
     pub fn with_fallback_headers(
         url: &str,
         fallback_url: Option<&str>,
@@ -291,11 +333,42 @@ impl RpcClient {
         headers: &[String],
         verbose: bool,
     ) -> Self {
+        Self::with_fallback_headers_connect_timeout(
+            url,
+            fallback_url,
+            rps,
+            timeout,
+            DEFAULT_CONNECT_TIMEOUT,
+            max_retries,
+            headers,
+            verbose,
+        )
+    }
+
+    /// Create a new RPC client with an optional fallback URL, optional rate
+    /// limit, request timeout, TCP connect timeout, retry policy, and custom
+    /// HTTP headers attached to every request.
+    ///
+    /// Behaves exactly like [`Self::with_fallback_headers`], additionally
+    /// bounding the TCP connection establishment with `connect_timeout`.
+    /// A zero `connect_timeout` disables the connect timeout (the total
+    /// request timeout then applies to the connect phase too).
+    pub fn with_fallback_headers_connect_timeout(
+        url: &str,
+        fallback_url: Option<&str>,
+        rps: Option<u64>,
+        timeout: Duration,
+        connect_timeout: Duration,
+        max_retries: usize,
+        headers: &[String],
+        verbose: bool,
+    ) -> Self {
         debug!(
             url,
             ?fallback_url,
             rps,
             ?timeout,
+            ?connect_timeout,
             max_retries,
             "creating RPC client"
         );
@@ -308,6 +381,7 @@ impl RpcClient {
             // construction infallible.
             client: reqwest::Client::builder()
                 .timeout(timeout)
+                .connect_timeout(connect_timeout)
                 .tcp_keepalive(Duration::from_secs(30))
                 .pool_idle_timeout(Duration::from_secs(90))
                 .default_headers(headers.clone())
@@ -316,6 +390,7 @@ impl RpcClient {
             dedup: Arc::new(Mutex::new(DedupState::default())),
             limiter: rps.and_then(build_rate_limiter),
             max_retries,
+            connect_timeout,
             headers,
             verbose,
         }
@@ -498,7 +573,10 @@ impl RpcClient {
             header_count = self.headers.len(),
             "sending RPC request"
         );
-        match self.post_and_parse(method, &body, &self.url).await {
+        match self
+            .post_and_parse(method, &body, &self.url, self.connect_timeout)
+            .await
+        {
             Ok(result) => Ok(result),
             Err(e) if Self::is_failover_trigger(&e) => {
                 if let Some(ref fallback) = self.fallback_url {
@@ -512,7 +590,8 @@ impl RpcClient {
                         error = %e,
                         "primary RPC endpoint failed — failing over to fallback"
                     );
-                    self.post_and_parse(method, &body, fallback).await
+                    self.post_and_parse(method, &body, fallback, self.connect_timeout)
+                        .await
                 } else {
                     Err(e)
                 }
@@ -536,14 +615,26 @@ impl RpcClient {
                 // are the cases where a fallback endpoint might succeed.
                 e.is_connect() || e.is_timeout() || e.is_request()
             }
+            AppError::ConnectTimeout { .. } => true,
             AppError::RpcUnavailable { .. } => true,
+            // Transient gateway statuses surfaced as HttpStatus (502/503/504)
+            // are also failover triggers; other HttpStatus values (429/500 or
+            // deterministic 4xx) are not — 429/500 are retried but not failed
+            // over, matching the gateway-only failover contract.
+            AppError::HttpStatus { status, .. } => matches!(status, 502..=504),
             _ => false,
         }
     }
 
     /// POST `body` to `url` (with retries), parse the JSON-RPC response, and
     /// extract the raw `result` value.
-    async fn post_and_parse(&self, method: &str, body: &Value, url: &str) -> AppResult<Value> {
+    async fn post_and_parse(
+        &self,
+        method: &str,
+        body: &Value,
+        url: &str,
+        connect_timeout: Duration,
+    ) -> AppResult<Value> {
         let client = self.client.clone();
         let url = url.to_string();
         let request_body = body.clone();
@@ -575,7 +666,7 @@ impl RpcClient {
                     .json(&request_body)
                     .send()
                     .await
-                    .map_err(AppError::from)?;
+                    .map_err(|e| connect_timeout_error(e, connect_timeout))?;
 
                 // Transient statuses (429/5xx) must be turned into errors so
                 // `with_retry` can back off and retry them. Non-transient
@@ -646,6 +737,26 @@ impl RpcClient {
         );
         trace!(method, "RPC call succeeded");
         Ok(result.clone())
+    }
+}
+
+/// Rewrap a reqwest error whose connect phase timed out into an
+/// [`AppError::ConnectTimeout`], so an unreachable host produces a distinct,
+/// actionable message instead of a generic request timeout.
+///
+/// In reqwest, an expired `connect_timeout` surfaces as a timeout-flagged
+/// error whose source chain also carries a connect error (a `TimedOut` marker
+/// inside a hyper connect error), so `is_timeout() && is_connect()` separates
+/// it from a whole-request timeout (`is_timeout()` without `is_connect()`).
+/// Every other error maps to [`AppError::Http`] as before.
+fn connect_timeout_error(error: reqwest::Error, connect_timeout: Duration) -> AppError {
+    if !connect_timeout.is_zero() && error.is_timeout() && error.is_connect() {
+        AppError::ConnectTimeout {
+            seconds: connect_timeout.as_secs(),
+            source: error,
+        }
+    } else {
+        AppError::from(error)
     }
 }
 
@@ -789,7 +900,46 @@ mod tests {
                 };
                 let counter = Arc::clone(&server_counter);
                 tokio::spawn(async move {
-                    let _ = handle_conn(stream, counter, fail_times, result_body, delay).await;
+                    let _ =
+                        handle_conn(stream, counter, fail_times, 200, result_body, delay).await;
+                });
+            }
+        });
+
+        (format!("http://{addr}"), counter)
+    }
+
+    /// Spawns a stub server whose first `fail_times` responses carry HTTP
+    /// `fail_status` (e.g. 503) and whose later responses are 200 JSON-RPC
+    /// successes. Exercises the transient-status retry path.
+    async fn spawn_stub(
+        fail_times: u32,
+        fail_status: u16,
+        result_body: &'static str,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind stub server");
+        let addr = listener.local_addr().expect("no local address");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let server_counter = Arc::clone(&counter);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let counter = Arc::clone(&server_counter);
+                tokio::spawn(async move {
+                    let _ = handle_conn(
+                        stream,
+                        counter,
+                        fail_times,
+                        fail_status,
+                        result_body,
+                        Duration::ZERO,
+                    )
+                    .await;
                 });
             }
         });
@@ -856,9 +1006,20 @@ mod tests {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let body = if (call_no as u32) < fail_times {
-            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure"}}"#
-                .to_string()
+        let (status, body) = if (call_no as u32) < fail_times {
+            if fail_status == 200 {
+                (
+                    200u16,
+                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure"}}"#
+                        .to_string(),
+                )
+            } else {
+                (
+                    fail_status,
+                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure"}}"#
+                        .to_string(),
+                )
+            }
         } else {
             (
                 200u16,
@@ -1222,6 +1383,100 @@ mod tests {
             "a hanging server must eventually produce a timeout error"
         );
     }
+    /// The `connect_timeout` supplied to `with_connect_timeout` must be
+    /// stored verbatim on the client (asserts the configuration is actually
+    /// wired through, per the issue's acceptance criteria).
+    #[test]
+    fn test_connect_timeout_config_is_stored() {
+        let client = RpcClient::with_connect_timeout(
+            "http://localhost",
+            None,
+            Duration::from_secs(30),
+            Duration::from_secs(7),
+            3,
+        );
+        assert_eq!(client.connect_timeout, Duration::from_secs(7));
+    }
+
+    /// Constructors without an explicit connect timeout must fall back to
+    /// [`super::DEFAULT_CONNECT_TIMEOUT`], which matches the CLI's
+    /// `--connect-timeout` default of 5 seconds.
+    #[test]
+    fn test_default_connect_timeout_is_five_seconds() {
+        let client =
+            RpcClient::with_options("http://localhost", None, Duration::from_secs(30), 3, false);
+        assert_eq!(client.connect_timeout, Duration::from_secs(5));
+
+        let client = RpcClient::with_fallback_headers(
+            "http://localhost",
+            None,
+            None,
+            Duration::from_secs(30),
+            3,
+            &[],
+            false,
+        );
+        assert_eq!(client.connect_timeout, Duration::from_secs(5));
+    }
+
+    /// A zero connect timeout is the documented "disabled" sentinel: it must
+    /// be preserved as-is so callers can observe the disable convention.
+    #[test]
+    fn test_zero_connect_timeout_is_preserved_as_disabled() {
+        let client = RpcClient::with_connect_timeout(
+            "http://localhost",
+            None,
+            Duration::from_secs(30),
+            Duration::ZERO,
+            3,
+        );
+        assert_eq!(client.connect_timeout, Duration::ZERO);
+    }
+
+    /// A connect timeout failure must surface the distinct, actionable
+    /// message (acceptance criterion), separate from the generic request
+    /// timeout error.
+    #[tokio::test]
+    async fn test_connect_timeout_error_message_is_distinct() {
+        let source = reqwest::get("http://127.0.0.1:1")
+            .await
+            .expect_err("port 1 must refuse");
+        let error = AppError::ConnectTimeout { seconds: 5, source };
+        let message = error.to_string();
+        assert_eq!(
+            message,
+            "Failed to establish connection to RPC host within 5 seconds"
+        );
+    }
+
+    /// Only a genuine "connect phase timed out" error (timeout-flagged AND
+    /// connect-flagged) may be rewrapped as [`AppError::ConnectTimeout`]. A
+    /// connection-refused error is connect-flagged but not timeout-flagged,
+    /// so it must stay a plain [`AppError::Http`].
+    #[tokio::test]
+    async fn test_connect_timeout_error_does_not_absorb_refused_connections() {
+        let refused = reqwest::get("http://127.0.0.1:1")
+            .await
+            .expect_err("port 1 must refuse");
+
+        let mapped = super::connect_timeout_error(refused, Duration::from_secs(5));
+        assert!(
+            matches!(mapped, AppError::Http(_)),
+            "connection refused must not be rewrapped as a connect timeout: {mapped}"
+        );
+    }
+
+    /// With the connect timeout disabled (zero), even a timeout-flagged,
+    /// connect-flagged error must stay a plain [`AppError::Http`].
+    #[tokio::test]
+    async fn test_disabled_connect_timeout_skips_rewrapping() {
+        let refused = reqwest::get("http://127.0.0.1:1")
+            .await
+            .expect_err("port 1 must refuse");
+
+        let mapped = super::connect_timeout_error(refused, Duration::ZERO);
+        assert!(matches!(mapped, AppError::Http(_)));
+    }
 
     /// Reserves a port and immediately closes it, so connecting to it yields
     /// a network-level connection-refused error (rather than a timeout).
@@ -1408,7 +1663,7 @@ mod tests {
     #[tokio::test]
     async fn test_transient_status_is_retried_then_succeeds() {
         let (url, counter) = spawn_stub(1, 503, r#"{"pong":true}"#).await;
-        let client = RpcClient::with_options(&url, None, Duration::from_secs(5), 3);
+        let client = RpcClient::with_options(&url, None, Duration::from_secs(5), 3, false);
 
         let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
 
@@ -1424,7 +1679,7 @@ mod tests {
     #[tokio::test]
     async fn test_transient_status_exhausts_retries() {
         let (url, counter) = spawn_stub(100, 503, r#"{"pong":true}"#).await;
-        let client = RpcClient::with_options(&url, None, Duration::from_secs(5), 2);
+        let client = RpcClient::with_options(&url, None, Duration::from_secs(5), 2, false);
 
         let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
 
@@ -1439,7 +1694,7 @@ mod tests {
     #[tokio::test]
     async fn test_client_error_status_is_not_retried() {
         let (url, counter) = spawn_stub(100, 400, r#"{"pong":true}"#).await;
-        let client = RpcClient::with_options(&url, None, Duration::from_secs(5), 3);
+        let client = RpcClient::with_options(&url, None, Duration::from_secs(5), 3, false);
 
         let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
 
@@ -1523,6 +1778,20 @@ mod header_tests {
     }
 
     #[test]
+    fn test_parse_headers_empty() {
+        assert!(parseheaders(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_parse_headers_stores_parsed() {
+        let headers = parseheaders(&[
+            "X-API-Key: secret".to_string(),
+            "Authorization: Bearer tok".to_string(),
+        ]);
+        assert_eq!(headers.len(), 2);
+    }
+
+    #[test]
     fn test_with_headers_empty() {
         let client = RpcClient::with_headers("http://localhost", &[], false);
         assert!(client.custom_headers().is_empty());
@@ -1559,6 +1828,18 @@ mod header_tests {
                 .unwrap(),
             "Bearer tok"
         );
+    }
+
+    #[test]
+    fn test_parse_headers_skips_malformed() {
+        let headers = parseheaders(&[
+            "Good: ok".to_string(),
+            "NoColonHere".to_string(),
+            "Also-Bad:".to_string(),
+        ]);
+        // Only the valid header should be kept.
+        assert_eq!(headers.len(), 1);
+        assert!(headers.contains_key("good"));
     }
 
     #[test]
