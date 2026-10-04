@@ -271,6 +271,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             watch,
             dry_run,
             project,
+            repeat,
         } => {
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
@@ -298,6 +299,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 connect_timeout,
                 max_retries,
                 precision,
+                repeat,
                 &headers,
                 watch,
                 args.wasm_info,
@@ -905,6 +907,7 @@ async fn cmd_estimate(
     connect_timeout: u64,
     max_retries: usize,
     precision: u32,
+    repeat: u32,
     extra_headers: &[String],
     watch: bool,
     wasm_info_flag: bool,
@@ -972,6 +975,38 @@ async fn cmd_estimate(
             extra_headers,
             quiet,
             verbose,
+        )
+        .await;
+    }
+
+    // Benchmark mode: run the simulation N times and report latency
+    // statistics plus CPU/fee determinism instead of a single cost report.
+    if repeat > 1 {
+        return cmd_estimate_repeat(
+            wasm_path,
+            network,
+            rpc_url,
+            rpc_fallback_url,
+            contract_id,
+            fn_name,
+            args,
+            interactive_flag,
+            cache_ttl,
+            clear_cache,
+            no_cache,
+            format,
+            rps,
+            timeout,
+            connect_timeout,
+            max_retries,
+            precision,
+            repeat,
+            extra_headers,
+            wasm_info_flag,
+            quiet,
+            verbose,
+            auto_snapshot,
+            dry_run,
         )
         .await;
     }
@@ -1091,6 +1126,362 @@ async fn cmd_estimate(
         }
     }
     Ok(())
+}
+
+/// `estimate --repeat` benchmarking: run the simulation N times and report
+/// latency statistics plus CPU/fee determinism.
+///
+/// Each run bypasses the client's request deduplication so every iteration
+/// performs a real network round-trip; otherwise runs 2..N would be served
+/// from cache and never measured. Fee rates are fetched once (network config,
+/// not per-run state) and the first run's breakdown is cached like a
+/// single-run estimate. `--repeat 1` never reaches here — the caller keeps
+/// the existing single-run cost report in every output format.
+///
+/// Cache (`--cache-ttl`/`--no-cache`/`--clear-cache`), interactive prompts,
+/// `--dry-run`, and `--quiet`/`--verbose` behave exactly as in
+/// [`estimate_once`]; `--compare` and `--project` are ignored in benchmark
+/// mode, which reports its own cross-run determinism instead.
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::fn_params_excessive_bools)]
+async fn cmd_estimate_repeat(
+    wasm_path: &str,
+    network: &str,
+    rpc_url: Option<&str>,
+    rpc_fallback_url: Option<&str>,
+    contract_id: Option<&str>,
+    fn_name: Option<&str>,
+    args: &[String],
+    interactive_flag: bool,
+    cache_ttl: Option<&str>,
+    clear_cache: bool,
+    no_cache: bool,
+    format: &str,
+    rps: Option<u64>,
+    timeout: u64,
+    connect_timeout: u64,
+    max_retries: usize,
+    precision: u32,
+    repeat: u32,
+    extra_headers: &[String],
+    wasm_info_flag: bool,
+    quiet: bool,
+    verbose: bool,
+    auto_snapshot: bool,
+    dry_run: bool,
+) -> error::AppResult<()> {
+    use tracing::{Instrument, info_span};
+
+    let json_flag = format == "json";
+    let table_mode = format == "table";
+    let span = info_span!("cmd_estimate_repeat", wasm_path, network, repeat);
+    async {
+        if clear_cache {
+            let cleared = cache::clear_cache(network)?;
+            let message = format!("Cleared {cleared} cached estimate(s) for {network}.");
+            if table_mode && !quiet {
+                println!("{message}");
+            } else if !table_mode && !quiet {
+                eprintln!("{message}");
+            }
+        }
+
+        info!("loading WASM");
+        let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
+        debug!(
+            functions = wasm_info.functions.len(),
+            has_spec = wasm_info.has_spec,
+            "WASM loaded"
+        );
+        emit_wasm_structure(&wasm_info, verbose, wasm_info_flag, json_flag);
+
+        let selection_holder: interactive::InteractiveSelection;
+        let (contract_id, fn_name, args): (Option<&str>, Option<&str>, &[String]) =
+            if interactive_flag {
+                selection_holder = interactive::prompt_for_invocation(
+                    &mut std::io::stdin().lock(),
+                    &mut std::io::stdout().lock(),
+                    &wasm_info.functions,
+                    fn_name,
+                    args,
+                    contract_id,
+                )?;
+                (
+                    selection_holder.contract_id.as_deref(),
+                    Some(selection_holder.function.as_str()),
+                    selection_holder.args.as_slice(),
+                )
+            } else {
+                (contract_id, fn_name, args)
+            };
+
+        wasm_info.validate_wasm_limits(65536, 2048)?;
+
+        let wasm_hash = wasm::parser::wasm_sha256_hex(&wasm_info.bytes);
+        let wasm_size = wasm_info.bytes.len() as u64;
+        let function_name = fn_name.unwrap_or("(wasm upload)");
+
+        if table_mode {
+            println!("WASM SHA-256: {wasm_hash}");
+        }
+
+        let ttl_secs = cache_ttl.map(parse_interval_secs);
+        let fresh = if no_cache {
+            None
+        } else {
+            fresh_cached_estimate(&wasm_hash, function_name, args, ttl_secs)?
+        };
+        if let Some(fresh) = fresh {
+            let ttl_secs = ttl_secs.unwrap_or_default();
+            info!(ttl_secs, function = %function_name, "cache hit — reusing fresh estimate");
+            print_cached_estimate(&fresh, ttl_secs, json_flag, precision, quiet);
+            return Ok(());
+        }
+
+        if dry_run {
+            let sc_vals: Vec<stellar_xdr::ScVal> = args
+                .iter()
+                .map(|a| xdr_helper::parse_arg_scval(a))
+                .collect();
+            let tx_xdr = xdr_helper::build_simulation_tx_envelope(
+                &wasm_info.bytes,
+                contract_id,
+                fn_name,
+                &sc_vals,
+            )?;
+            xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
+            let tx_b64 =
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
+            let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
+            println!("Dry run — planned simulation payload (no network calls):");
+            println!();
+            println!("  Resolved RPC endpoint: {endpoint}");
+            println!(
+                "  Contract ID:           {}",
+                contract_id.unwrap_or("(wasm upload)")
+            );
+            println!(
+                "  Function name:         {}",
+                fn_name.unwrap_or("(wasm upload)")
+            );
+            println!("  Network:               {network}");
+            println!();
+            println!("  WASM SHA-256:          {wasm_hash}");
+            println!("  WASM size:             {} bytes", wasm_info.bytes.len());
+            println!(
+                "  Contract spec:         {}",
+                if wasm_info.has_spec {
+                    "present"
+                } else {
+                    "absent"
+                }
+            );
+            println!();
+            println!("  Arguments ({}):", args.len());
+            for (i, (arg, sc_val)) in args.iter().zip(&sc_vals).enumerate() {
+                println!("    [{i}] {arg} → {sc_val:?}");
+            }
+            println!();
+            println!("  Transaction envelope:");
+            println!("    XDR size:   {} bytes", tx_xdr.len());
+            println!("    Base64 size: {} bytes", tx_b64.len());
+            println!("    Base64 data: {tx_b64}");
+            return Ok(());
+        }
+
+        let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
+        let client = rpc::client::RpcClient::with_fallback_headers_connect_timeout(
+            &endpoint,
+            rpc_fallback_url,
+            rps,
+            std::time::Duration::from_secs(timeout),
+            std::time::Duration::from_secs(connect_timeout),
+            max_retries,
+            extra_headers,
+            verbose,
+        );
+
+        let sc_vals: Vec<stellar_xdr::ScVal> = args
+            .iter()
+            .map(|a| xdr_helper::parse_arg_scval(a))
+            .collect();
+        let tx_xdr = xdr_helper::build_simulation_tx_envelope(
+            &wasm_info.bytes,
+            contract_id,
+            fn_name,
+            &sc_vals,
+        )?;
+        xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
+        let tx_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
+
+        client.health_check().await?;
+
+        let mut latencies_ms: Vec<u64> = Vec::with_capacity(repeat as usize);
+        let mut first_cpu: Option<u64> = None;
+        let mut first_fee: Option<i64> = None;
+        let mut cpu_identical = true;
+        let mut fee_identical = true;
+        let mut first_cpu_val: u64 = 0;
+        let mut first_fee_val: i64 = 0;
+        let mut first_report: Option<report::cost_report::CostReport> = None;
+
+        for iteration in 1..=repeat {
+            let rpc_start = std::time::Instant::now();
+            let response =
+                rpc::simulate::simulate_transaction_uncached(&client, &tx_b64).await?;
+            let rpc_latency_ms = rpc_start.elapsed().as_millis() as u64;
+
+            if missing_simulation_data(&response) {
+                return Err(error::AppError::SimulationFailed(
+                    "simulation returned no cost data and no latest ledger — check --id, --fn, and the RPC endpoint".to_string(),
+                ));
+            }
+
+            let (
+                cpu_instructions,
+                memory_bytes,
+                read_entries,
+                write_entries,
+                read_bytes,
+                write_bytes,
+            ) = response_resources(&response)?;
+
+            let latest_ledger = response.ledger_sequence();
+
+            let total_fee_stroops = rpc::simulate::parse_resource_fee(&response.min_resource_fee)
+                .unwrap_or(None)
+                .or(rpc::simulate::parse_transaction_data_resource_fee(
+                    &response.transaction_data,
+                )?)
+                .unwrap_or(0);
+
+            latencies_ms.push(rpc_latency_ms);
+
+            match first_cpu {
+                Some(prev) if prev != cpu_instructions => cpu_identical = false,
+                None => {
+                    first_cpu = Some(cpu_instructions);
+                    first_cpu_val = cpu_instructions;
+                }
+                _ => {}
+            }
+            match first_fee {
+                Some(prev) if prev != total_fee_stroops => fee_identical = false,
+                None => {
+                    first_fee = Some(total_fee_stroops);
+                    first_fee_val = total_fee_stroops;
+                }
+                _ => {}
+            }
+
+            debug!(
+                iteration,
+                cpu_instructions,
+                total_fee_stroops,
+                rpc_latency_ms,
+                "simulation iteration complete"
+            );
+
+            if iteration == 1 {
+                let fee_rates = fetch_fee_rates(&client, quiet).await;
+                let fee = report::fee_calc::compute_fee_breakdown(
+                    total_fee_stroops,
+                    cpu_instructions,
+                    read_entries,
+                    write_entries,
+                    read_bytes,
+                    tx_xdr.len() as u32,
+                    fee_rates,
+                    precision,
+                );
+
+                if !no_cache {
+                    let _ = cache::save_estimate(
+                        &wasm_hash,
+                        function_name,
+                        args,
+                        network,
+                        latest_ledger,
+                        fee.total_stroops,
+                        cpu_instructions,
+                        memory_bytes,
+                        Some(rpc_latency_ms),
+                        true,
+                    );
+                }
+                info!(total_stroops = fee.total_stroops, total_xlm = %fee.total_xlm, "estimate complete");
+
+                first_report = Some(report::cost_report::CostReport {
+                    function: function_name.to_string(),
+                    wasm_hash: wasm_hash.clone(),
+                    wasm_size,
+                    cpu_instructions,
+                    memory_bytes,
+                    tx_size: tx_xdr.len() as u32,
+                    read_entries,
+                    write_entries,
+                    read_bytes,
+                    write_bytes,
+                    fee,
+                    ledger: latest_ledger,
+                    network: network.to_string(),
+                    rpc_latency_ms,
+                    rates: Some(fee_rates),
+                    projections: None,
+                    contract_meta: wasm_info.contract_meta.clone(),
+                });
+            }
+        }
+
+        let stats = rpc::simulate::summarize_latencies(&latencies_ms).ok_or_else(|| {
+            error::AppError::General("no simulation samples were collected".to_string())
+        })?;
+
+        // Keep the first report alive for potential future use; the benchmark
+        // summary is the user-visible output in repeat mode.
+        let _ = first_report;
+
+        print_repeat_summary(
+            repeat,
+            &latencies_ms,
+            &stats,
+            first_cpu_val,
+            cpu_identical,
+            first_fee_val,
+            fee_identical,
+            json_flag,
+        )?;
+        if !cpu_identical || !fee_identical {
+            eprintln!(
+                "Warning: fee or resource estimates varied across {repeat} runs — simulation may be non-deterministic"
+            );
+        }
+
+        if auto_snapshot {
+            if let Err(e) = auto_snapshot_if_changed(
+                network,
+                rpc_fallback_url,
+                rps,
+                timeout,
+                connect_timeout,
+                max_retries,
+                extra_headers,
+                quiet,
+                verbose,
+            )
+            .await
+            {
+                warn!(error = %e, "auto-snapshot failed");
+                eprintln!("Warning: auto-snapshot failed: {e}");
+            }
+        }
+
+        Ok(())
+    }
+    .instrument(span)
+    .await
 }
 
 /// Run a single estimation for `estimate` (and each `estimate --watch` build).
@@ -1346,6 +1737,77 @@ async fn estimate_once(
     }
     .instrument(span)
     .await
+}
+
+/// Prints the `estimate --repeat` benchmarking summary.
+///
+/// With `json_flag` set this emits an object containing every per-run latency
+/// plus the aggregate statistics (min/max/mean/stddev) and the determinism
+/// flags. Otherwise it renders a compact human-readable table with the same
+/// information.
+fn print_repeat_summary(
+    iterations: u32,
+    latencies_ms: &[u64],
+    stats: &rpc::simulate::LatencyStats,
+    cpu_instructions: u64,
+    cpu_identical: bool,
+    total_fee_stroops: i64,
+    fee_identical: bool,
+    json_flag: bool,
+) -> error::AppResult<()> {
+    if json_flag {
+        let output = serde_json::json!({
+            "iterations": iterations,
+            "latencies_ms": latencies_ms,
+            "min_latency_ms": stats.min_ms,
+            "max_latency_ms": stats.max_ms,
+            "mean_latency_ms": stats.mean_ms,
+            "stddev_latency_ms": stats.stddev_ms,
+            "cpu_instructions": cpu_instructions,
+            "cpu_identical": cpu_identical,
+            "total_fee_stroops": total_fee_stroops,
+            "fee_identical": fee_identical,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+
+    let identical = |ok: bool| if ok { "identical" } else { "VARIES" };
+    let mut table = Table::new();
+    table.set_header(vec!["Metric", "Value"]);
+    table.add_row(vec![
+        Cell::new("Iteration count"),
+        Cell::new(iterations.to_string()),
+    ]);
+    table.add_row(vec![
+        Cell::new("Min latency (ms)"),
+        Cell::new(stats.min_ms.to_string()),
+    ]);
+    table.add_row(vec![
+        Cell::new("Max latency (ms)"),
+        Cell::new(stats.max_ms.to_string()),
+    ]);
+    table.add_row(vec![
+        Cell::new("Mean latency (ms)"),
+        Cell::new(stats.mean_ms.to_string()),
+    ]);
+    table.add_row(vec![
+        Cell::new("Stddev latency (ms)"),
+        Cell::new(format!("{:.2}", stats.stddev_ms)),
+    ]);
+    table.add_row(vec![
+        Cell::new("CPU Instructions"),
+        Cell::new(format!("{cpu_instructions} ({})", identical(cpu_identical))),
+    ]);
+    table.add_row(vec![
+        Cell::new("Total Fee (stroops)"),
+        Cell::new(format!(
+            "{total_fee_stroops} ({})",
+            identical(fee_identical)
+        )),
+    ]);
+    println!("{table}");
+    Ok(())
 }
 
 /// Poll interval for `estimate --watch`.

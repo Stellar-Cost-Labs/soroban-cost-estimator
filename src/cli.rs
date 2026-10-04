@@ -256,6 +256,12 @@ pub enum Command {
             default_missing_value = "100,1000,10000"
         )]
         project: Option<String>,
+
+        /// Number of times to repeat the simulation (1..=100, default 1).
+        /// Collects latency statistics (min, max, mean, stddev) and checks
+        /// fee/CPU consistency across runs.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=100))]
+        repeat: u32,
     },
     EstimateAll {
         #[arg(long, short)]
