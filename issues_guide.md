@@ -272,3 +272,5 @@ Before you hit "Create issue," verify:
 ---
 
 *Create issues like your community's time matters. Because it does.* 🌊
+
+...
