@@ -1,4 +1,4 @@
-use comfy_table::{Cell, CellAlignment, Table};
+use comfy_table::{Cell, CellAlignment, Color, Table};
 
 use crate::report::fee_calc::{FeeBreakdown, FeeRates};
 use crate::wasm::parser::{ContractMeta, format_contract_meta};
@@ -524,6 +524,16 @@ pub struct CostReport {
     /// serialized output; `None` when the rates were unavailable.
     #[serde(skip)]
     pub rates: Option<FeeRates>,
+    /// Resource-limit warnings for this run (#322). Always serialized so JSON
+    /// consumers see a stable `warnings` array (empty when nothing is near a
+    /// limit).
+    #[serde(default)]
+    pub warnings: Vec<ResourceWarning>,
+    /// Historical trend entries (#321). `None` unless the caller requested
+    /// history (via `--history`); when requested it is always an array in JSON
+    /// output, possibly empty when there are no previous runs to compare.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<Vec<HistoryEntry>>,
     /// Optional batch invocation cost projections.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub projections: Option<Vec<CostProjection>>,
@@ -905,6 +915,7 @@ pub fn format_distribution_box(distribution: &FeeDistribution, precision: u32) -
 }
 
 /// Formats a cost report as a human-readable table.
+#[allow(clippy::too_many_lines)]
 pub fn format_report_table(report: &CostReport) -> String {
     let mut output = String::new();
 
@@ -1012,6 +1023,14 @@ pub fn format_report_table(report: &CostReport) -> String {
 
     // ASCII bar chart for visual cost breakdown
     output.push_str(&render_fee_bar_chart(&report.fee, DEFAULT_CHART_WIDTH));
+
+    // Resource-limit warnings (#322) — only when something nears a ceiling.
+    output.push_str(&format_resource_warnings(&report.warnings));
+
+    // Historical trend table (#321) — only populated with `--history`.
+    if let Some(history) = &report.history {
+        output.push_str(&format_cost_history(history));
+    }
 
     if let Some(ref projections) = report.projections {
         output.push_str(&format_projections_table(projections));
@@ -1357,6 +1376,8 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
             rates: Some(rates),
+            warnings: Vec::new(),
+            history: None,
             projections: None,
             contract_meta: ContractMeta::default(),
         }
@@ -1475,6 +1496,8 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 0,
             rates: None,
+            warnings: Vec::new(),
+            history: None,
             projections: None,
             contract_meta: ContractMeta::default(),
         };

@@ -219,6 +219,12 @@ pub enum Command {
         #[arg(long)]
         no_cache: bool,
 
+        /// Compare against up to 5 previous cached runs of the same function
+        /// and render a cost-trend table (red = regression, green = improvement).
+        /// Adds a `history` array to `--json` output when requested.
+        #[arg(long)]
+        history: bool,
+
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
         json: bool,

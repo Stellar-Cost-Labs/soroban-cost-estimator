@@ -4183,7 +4183,7 @@ fn test_config_snapshot_diff_pricing_change_exits_one() {
     let a = write_snapshot_file(&home, "a.json", &snapshot_json_fee("testnet", 100, 100));
     let b = write_snapshot_file(&home, "b.json", &snapshot_json_fee("testnet", 101, 200));
 
-    let (stdout, stderr, code) = run_cli_in_home(
+    let (stdout, _stderr, code) = run_cli_in_home(
         &[
             "config",
             "snapshot",

@@ -462,6 +462,25 @@ pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
             PRIMARY KEY (wasm_hash, function, args_hash)
         );",
     )?;
+    // Append-only log of every estimate ever saved, used by `estimate
+    // --history` to show how a function's cost evolved across runs (#321).
+    // The `estimates` table upserts on its primary key, so it cannot answer
+    // "what did this function cost last build?" on its own.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS estimate_history (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            wasm_hash        TEXT NOT NULL,
+            function         TEXT NOT NULL,
+            network          TEXT NOT NULL,
+            ledger           INTEGER NOT NULL,
+            total_stroops    INTEGER NOT NULL,
+            cpu_instructions INTEGER NOT NULL,
+            memory_bytes     INTEGER NOT NULL,
+            timestamp        TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_estimate_history_lookup
+            ON estimate_history (wasm_hash, function, timestamp DESC);",
+    )?;
     // Migrate a pre-v3 table (created before LRU access tracking) in place.
     ensure_column(conn, "last_accessed", "TEXT NOT NULL DEFAULT ''")?;
     // The ledger I/O footprint is additive and nullable, so adding it in
@@ -922,6 +941,25 @@ pub fn save_estimate_with_limits(
         ],
     )?;
 
+    // Append to the unbounded history log so `estimate --history` can show
+    // how this function's cost evolved across runs (#321). Unlike the
+    // `estimates` upsert above, every call adds a row here.
+    tx.execute(
+        "INSERT INTO estimate_history \
+         (wasm_hash, function, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            wasm_hash,
+            function,
+            network,
+            ledger as i64,
+            total_stroops,
+            cpu_instructions as i64,
+            memory_bytes as i64,
+            now,
+        ],
+    )?;
+
     let evicted = enforce_limits_in_tx(&tx, limits)?;
     tx.commit()?;
 
@@ -931,6 +969,76 @@ pub fn save_estimate_with_limits(
 
     debug!(function, network, ledger, "estimate cached (sqlite)");
     Ok(())
+}
+
+/// Default number of previous runs returned by [`load_estimate_history`].
+pub const DEFAULT_HISTORY_LIMIT: usize = 5;
+
+/// One entry in the append-only estimate history log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EstimateHistoryEntry {
+    /// SHA-256 hash of the WASM bytes (hex).
+    pub wasm_hash: String,
+    /// Contract function name.
+    pub function: String,
+    /// Network the simulation ran against.
+    pub network: String,
+    /// Ledger sequence at simulation time.
+    pub ledger: u32,
+    /// Total fee in stroops.
+    pub total_stroops: i64,
+    /// CPU instructions consumed.
+    pub cpu_instructions: u64,
+    /// Memory bytes consumed.
+    pub memory_bytes: u64,
+    /// ISO-8601 timestamp of when the estimate was made.
+    pub timestamp: String,
+}
+
+/// Load up to `limit` previous estimates for the same `(wasm_hash,
+/// function)`, newest first.
+///
+/// Reads the append-only history log written by [`save_estimate`]. Returns an
+/// empty vector when the function has never been estimated before. A `limit`
+/// of 0 yields no rows.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+pub fn load_estimate_history(
+    wasm_hash: &str,
+    function: &str,
+    limit: usize,
+) -> AppResult<Vec<EstimateHistoryEntry>> {
+    let conn = open_db()?;
+    let mut stmt = conn.prepare(
+        "SELECT wasm_hash, function, network, ledger, total_stroops, \
+         cpu_instructions, memory_bytes, timestamp \
+         FROM estimate_history WHERE wasm_hash = ?1 AND function = ?2 \
+         ORDER BY timestamp DESC, id DESC LIMIT ?3",
+    )?;
+
+    let rows = stmt.query_map(
+        rusqlite::params![wasm_hash, function, limit as i64],
+        |row| {
+            Ok(EstimateHistoryEntry {
+                wasm_hash: row.get(0)?,
+                function: row.get(1)?,
+                network: row.get(2)?,
+                ledger: row.get::<_, i64>(3)? as u32,
+                total_stroops: row.get(4)?,
+                cpu_instructions: row.get::<_, i64>(5)? as u64,
+                memory_bytes: row.get::<_, i64>(6)? as u64,
+                timestamp: row.get(7)?,
+            })
+        },
+    )?;
+
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(row?);
+    }
+    trace!(function, count = entries.len(), "loaded estimate history");
+    Ok(entries)
 }
 
 /// Log an eviction pass at info level so users notice disk pressure.
@@ -969,6 +1077,10 @@ fn enforce_limits_in_tx(tx: &Transaction<'_>, limits: CacheLimits) -> AppResult<
     for _ in 0..MAX_EVICTION_ROUNDS {
         let entries: usize =
             tx.query_row("SELECT COUNT(*) FROM estimates", [], |row| row.get(0))?;
+        let history_rows: usize =
+            tx.query_row("SELECT COUNT(*) FROM estimate_history", [], |row| {
+                row.get(0)
+            })?;
         let bytes = live_db_bytes(tx)?;
 
         let over_entries = limits.max_entries > 0 && entries > limits.max_entries;
@@ -977,28 +1089,42 @@ fn enforce_limits_in_tx(tx: &Transaction<'_>, limits: CacheLimits) -> AppResult<
             break;
         }
 
-        // A byte quota below SQLite's structural floor (page 1 plus one root
-        // page per table/index) can never be met, and evicting the last
-        // entry cannot free any space either — stop rather than wipe the
-        // cache chasing an impossible target.
-        if over_bytes && !over_entries && entries <= 1 {
-            break;
+        let mut removed_any = false;
+
+        // Delete a batch of the oldest estimate rows each round: enough to
+        // make progress toward the quota, small enough to avoid over-evicting
+        // a large cache. The newest entry is never the only casualty of a
+        // byte-driven pass.
+        if entries > 1 {
+            let batch = eviction_batch(entries, bytes, limits, target_entries);
+            let removed = tx.execute(
+                "DELETE FROM estimates WHERE rowid IN (\
+                     SELECT rowid FROM estimates \
+                     ORDER BY last_accessed ASC, timestamp ASC \
+                     LIMIT ?1\
+                 )",
+                [batch as i64],
+            )?;
+            evicted += removed;
+            removed_any |= removed > 0;
         }
 
-        // Delete a batch of the oldest rows each round: enough to make
-        // progress toward the quota, small enough to avoid over-evicting a
-        // large cache.
-        let batch = eviction_batch(entries, bytes, limits, target_entries);
-        let removed = tx.execute(
-            "DELETE FROM estimates WHERE rowid IN (\
-                 SELECT rowid FROM estimates \
-                 ORDER BY last_accessed ASC, timestamp ASC \
-                 LIMIT ?1\
-             )",
-            [batch as i64],
-        )?;
-        evicted += removed;
-        if removed == 0 {
+        // The append-only history log lives in the same database file, so a
+        // byte quota has to reclaim it as well: otherwise history rows alone
+        // can keep the cache permanently over budget no matter how many
+        // estimates are evicted. Oldest entries go first.
+        if over_bytes && history_rows > 0 {
+            let batch = history_eviction_batch(history_rows, bytes, limits);
+            let removed = tx.execute(
+                "DELETE FROM estimate_history WHERE id IN (\
+                     SELECT id FROM estimate_history ORDER BY id ASC LIMIT ?1\
+                 )",
+                [batch as i64],
+            )?;
+            removed_any |= removed > 0;
+        }
+
+        if !removed_any {
             // Nothing left to delete; the quota cannot be satisfied further
             // (e.g. a single entry larger than the byte quota).
             break;
@@ -1012,6 +1138,22 @@ fn enforce_limits_in_tx(tx: &Transaction<'_>, limits: CacheLimits) -> AppResult<
     }
 
     Ok(evicted)
+}
+
+/// How many history rows to delete in one byte-driven eviction round.
+///
+/// Sized like [`eviction_batch`]: it targets roughly the number of rows whose
+/// average size covers the byte excess, bounded by the rows available so the
+/// log is never emptied by an impossible quota.
+fn history_eviction_batch(history_rows: usize, bytes: u64, limits: CacheLimits) -> usize {
+    if limits.max_bytes == 0 || bytes <= limits.max_bytes {
+        return 0;
+    }
+    let excess = bytes - limits.max_bytes;
+    let per_row = (bytes / history_rows.max(1) as u64).max(1);
+    usize::try_from(excess / per_row)
+        .unwrap_or(1)
+        .clamp(1, history_rows)
 }
 
 /// How many rows to evict in one round.
