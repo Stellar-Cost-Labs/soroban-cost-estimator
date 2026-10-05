@@ -3,6 +3,7 @@ source: tests/report_snapshots.rs
 expression: JsonFormatter.format(&empty)
 ---
 {
+  "contract_meta": {},
   "cpu_instructions": 0,
   "fee": {
     "bandwidth_fee_stroops": 0,
@@ -16,7 +17,7 @@ expression: JsonFormatter.format(&empty)
     "total_xlm": "0.0000000"
   },
   "function": "(wasm upload)",
-  "ledger": 0,
+  "ledger_sequence": 0,
   "memory_bytes": 0,
   "network": "mainnet",
   "read_bytes": 0,
@@ -26,6 +27,7 @@ expression: JsonFormatter.format(&empty)
   "tx_size": 0,
   "warnings": [],
   "wasm_hash": "0000000000000000",
+  "wasm_size": 0,
   "write_bytes": 0,
   "write_entries": 0
 }
