@@ -275,10 +275,9 @@ pub fn load_snapshot_by_timestamp(network: &str, timestamp: &str) -> AppResult<C
     let path = dir.join(&filename);
 
     if !path.exists() {
-        return Err(AppError::General(format!(
-            "No snapshot found for network '{}' at timestamp '{}'",
-            network, timestamp
-        )));
+        return Err(AppError::SnapshotNotFound(
+            path.to_string_lossy().into_owned(),
+        ));
     }
 
     let content = std::fs::read_to_string(&path)?;
@@ -653,7 +652,7 @@ pub fn export_snapshots(network: Option<&str>, output_path: &str) -> AppResult<(
 
     let bundle = SnapshotBundle { snapshots };
     let json = serde_json::to_string_pretty(&bundle)
-        .map_err(|e| AppError::General(format!("Failed to serialize bundle: {}", e)))?;
+        .map_err(|e| AppError::General(format!("failed to serialize bundle: {e}")))?;
     std::fs::write(output_path, json)?;
     Ok(())
 }
@@ -662,7 +661,7 @@ pub fn export_snapshots(network: Option<&str>, output_path: &str) -> AppResult<(
 pub fn import_snapshots(bundle_path: &str) -> AppResult<usize> {
     let content = std::fs::read_to_string(bundle_path)?;
     let bundle: SnapshotBundle = serde_json::from_str(&content)
-        .map_err(|e| AppError::SnapshotParse(format!("Invalid bundle: {}", e)))?;
+        .map_err(|e| AppError::SnapshotParse(format!("invalid bundle: {e}")))?;
 
     let mut imported = 0;
     for snapshot in bundle.snapshots {
@@ -671,7 +670,7 @@ pub fn import_snapshots(bundle_path: &str) -> AppResult<usize> {
         let path = snapshots_dir()?.join(&filename);
         if !path.exists() {
             let json = serde_json::to_string_pretty(&snapshot)
-                .map_err(|e| AppError::General(format!("Failed to serialize snapshot: {}", e)))?;
+                .map_err(|e| AppError::General(format!("failed to serialize snapshot: {e}")))?;
             std::fs::write(&path, json)?;
             imported += 1;
             println!("  Imported snapshot: {}", filename);

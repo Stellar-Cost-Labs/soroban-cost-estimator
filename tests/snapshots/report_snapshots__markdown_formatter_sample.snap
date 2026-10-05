@@ -7,6 +7,7 @@ expression: MarkdownFormatter.format(&report)
 - **Network:** testnet (ledger 3894195)
 - **Simulated at ledger sequence:** `3,894,195`
 - **WASM hash:** `abc123def456`
+- **WASM size:** 14432 bytes
 - **RPC round-trip:** 87 ms
 
 ### Resources
@@ -31,6 +32,10 @@ expression: MarkdownFormatter.format(&report)
 | Base Fee | 100 |  |
 | Rent Fee | 10931 |  |
 | **Total** | **15427** (0.0015427) | **100.0%** |
+
+### Optimization Tips
+
+- Tip: 70% of the total fee is refundable, which comes from ledger rent bumps and contract events. Consider reducing state growth and the number or size of emitted events.
 
 ### Optimization Suggestions
 

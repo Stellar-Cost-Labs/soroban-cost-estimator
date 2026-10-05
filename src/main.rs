@@ -10,7 +10,7 @@ use soroban_cost_estimator::error;
 use soroban_cost_estimator::interactive;
 use soroban_cost_estimator::report;
 use soroban_cost_estimator::report::formatter::{
-    ReportFormatter, TableFormatter, formatter_by_name,
+    ReportFormatter, ReportOptions, TableFormatter, formatter_by_name,
 };
 use soroban_cost_estimator::rpc;
 use soroban_cost_estimator::wasm;
@@ -806,7 +806,7 @@ async fn simulate_report(
         req.max_retries,
         req.extra_headers,
         req.verbose,
-    );
+    )?;
 
     let sc_vals: Vec<stellar_xdr::ScVal> = req
         .args
@@ -1094,7 +1094,14 @@ async fn cmd_estimate(
                 Some(width) => {
                     println!(
                         "{}",
-                        TableFormatter.format_with_options(report, true, width)
+                        TableFormatter.format_with_options(
+                            report,
+                            true,
+                            width,
+                            ReportOptions {
+                                quiet: cli::is_quiet()
+                            },
+                        )
                     );
                 }
                 None => {
@@ -1104,6 +1111,9 @@ async fn cmd_estimate(
                             report,
                             false,
                             report::cost_report::DEFAULT_CHART_WIDTH,
+                            ReportOptions {
+                                quiet: cli::is_quiet()
+                            },
                         )
                     );
                 }
@@ -1118,6 +1128,9 @@ async fn cmd_estimate(
                             report,
                             false,
                             report::cost_report::DEFAULT_CHART_WIDTH,
+                            ReportOptions {
+                                quiet: cli::is_quiet()
+                            },
                         )
                     );
                 }
@@ -1321,7 +1334,7 @@ async fn cmd_estimate_repeat(
             max_retries,
             extra_headers,
             verbose,
-        );
+        )?;
 
         let sc_vals: Vec<stellar_xdr::ScVal> = args
             .iter()
@@ -2618,7 +2631,7 @@ async fn cmd_estimate_all(
             max_retries,
             extra_headers,
             verbose,
-        );
+        )?;
 
         // Validate the RPC endpoint is reachable before running a full batch
         // of simulations (#55): fail fast up front rather than after each
@@ -3064,7 +3077,7 @@ async fn fetch_config_snapshot(
             max_retries,
             extra_headers,
             verbose,
-        );
+        )?;
         debug!("fetching all config settings");
         let raw_entries = rpc::config::fetch_all_config_settings(&client).await?;
         debug!(entries = raw_entries.len(), "received config entries");
