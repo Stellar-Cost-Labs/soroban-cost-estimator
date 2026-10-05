@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::builder::{PossibleValue, TypedValueParser};
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -124,8 +126,12 @@ pub struct Cli {
     pub quiet: bool,
 
     /// Custom HTTP header to send with every RPC request, e.g.
-    /// `--header "X-API-Key: secret"`. Repeatable for multiple headers.
-    #[arg(long = "header", value_name = "KEY: VALUE", global = true)]
+    /// `--header "Authorization=Bearer <token>"`. Repeatable for multiple
+    /// headers. The `KEY: VALUE` spelling is also accepted.
+    ///
+    /// Sensitive headers (`Authorization`, `x-api-key`, `api-key`, …) are
+    /// redacted in verbose logs.
+    #[arg(long = "header", short = 'H', value_name = "KEY=VALUE", global = true)]
     pub headers: Vec<String>,
 
     /// Fallback RPC URL used when the primary endpoint is unreachable or
@@ -219,6 +225,12 @@ pub enum Command {
         #[arg(long)]
         no_cache: bool,
 
+        /// Compare against up to 5 previous cached runs of the same function
+        /// and render a cost-trend table (red = regression, green = improvement).
+        /// Adds a `history` array to `--json` output when requested.
+        #[arg(long)]
+        history: bool,
+
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
         json: bool,
@@ -258,6 +270,12 @@ pub enum Command {
             default_missing_value = "100,1000,10000"
         )]
         project: Option<String>,
+
+        /// Number of times to repeat the simulation (1..=100, default 1).
+        /// Collects latency statistics (min, max, mean, stddev) and checks
+        /// fee/CPU consistency across runs.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=100))]
+        repeat: u32,
     },
     EstimateAll {
         #[arg(long, short)]
@@ -462,6 +480,55 @@ pub enum SnapshotAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Delete a saved snapshot file, or purge every snapshot older than N days.
+    Delete {
+        /// Snapshot filename (or path) to delete.
+        #[arg(value_name = "FILENAME")]
+        filename: Option<String>,
+
+        /// Delete snapshots older than this many days.
+        #[arg(long, value_name = "DAYS")]
+        older_than: Option<u64>,
+
+        /// Show which files would be removed without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip the confirmation prompt (required in non-interactive sessions).
+        #[arg(long, short = 'y')]
+        yes: bool,
+
+        /// Restrict `--older-than` to a single network's snapshots.
+        #[arg(long, value_name = "NETWORK")]
+        network: Option<String>,
+    },
+
+    /// Compare two saved snapshot files offline, without any network calls.
+    Diff {
+        /// First (older) snapshot file to compare.
+        #[arg(value_name = "SNAPSHOT_A")]
+        file_a: PathBuf,
+
+        /// Second (newer) snapshot file to compare.
+        #[arg(value_name = "SNAPSHOT_B")]
+        file_b: PathBuf,
+
+        /// Output as JSON instead of a human-readable diff.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Validate a snapshot file or every stored snapshot.
+    Validate {
+        /// Explicit snapshot file to validate.
+        #[arg(value_name = "PATH", required_unless_present = "all")]
+        path: Option<PathBuf>,
+
+        /// Validate every JSON snapshot in the snapshots directory.
+        #[arg(long, conflicts_with = "path")]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -473,7 +540,9 @@ pub enum ConfigAction {
     /// command's own flags.
     #[command(args_conflicts_with_subcommands = true)]
     Snapshot {
-        #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
+        #[command(subcommand)]
+        action: Option<SnapshotAction>,
+        #[arg(long, default_value = "testnet")]
         network: String,
         #[arg(long)]
         out: Option<String>,
@@ -484,11 +553,7 @@ pub enum ConfigAction {
         /// older ones once the new snapshot is safely on disk.
         #[arg(long, value_name = "COUNT")]
         retain: Option<usize>,
-
-        #[command(subcommand)]
-        action: Option<SnapshotAction>,
     },
-
     /// List all saved config snapshots with their timestamp and ledger.
     List {
         /// Network whose snapshots to list.
