@@ -11,7 +11,7 @@ management**.
   - [`estimate`](#estimate) — simulate a single invocation
   - [`estimate-all`](#estimate-all) — enumerate and estimate every function
 - [Network Config](#network-config)
-  - [`config snapshot`](#config-snapshot) — fetch and save config settings
+  - [`config snapshot`](#config-snapshot) — fetch, save, and validate config settings
   - [`config diff`](#config-diff) — compare config against a snapshot
   - [`config history`](#config-history) — chronological change log
   - [`config last-changed`](#config-last-changed) — last-change timestamps
