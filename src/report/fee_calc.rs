@@ -273,9 +273,9 @@ pub fn xlm_to_stroops(xlm: &str) -> AppResult<i64> {
             let whole: i64 = parts[0]
                 .parse()
                 .map_err(|_| AppError::FeeCalc(format!("invalid XLM value: {xlm}")))?;
-            whole
-                .checked_mul(10_000_000)
-                .ok_or_else(|| AppError::FeeCalc("XLM value overflow".to_string()))
+            whole.checked_mul(10_000_000).ok_or_else(|| {
+                AppError::FeeCalc("XLM value is out of range for stroops".to_string())
+            })
         }
         2 => {
             let whole: i64 = parts[0]
@@ -288,7 +288,9 @@ pub fn xlm_to_stroops(xlm: &str) -> AppResult<i64> {
             whole
                 .checked_mul(10_000_000)
                 .and_then(|w| w.checked_add(fraction))
-                .ok_or_else(|| AppError::FeeCalc("XLM value overflow".to_string()))
+                .ok_or_else(|| {
+                    AppError::FeeCalc("XLM value is out of range for stroops".to_string())
+                })
         }
         _ => Err(AppError::FeeCalc(format!("invalid XLM value: {xlm}"))),
     }
