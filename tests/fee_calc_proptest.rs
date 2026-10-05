@@ -87,6 +87,31 @@ fn realistic_quantities() -> impl Strategy<Value = (u64, u32, u32, u32, u32)> {
     )
 }
 
+#[test]
+fn maximum_resource_values_do_not_panic_or_overflow() {
+    let breakdown = compute_fee_breakdown(
+        i64::MAX,
+        u64::MAX,
+        u32::MAX,
+        u32::MAX,
+        u32::MAX,
+        u32::MAX,
+        FeeRates {
+            fee_per_10k_insns: i64::MAX,
+            fee_per_read_entry: i64::MAX,
+            fee_per_write_entry: i64::MAX,
+            fee_per_read_1kb: i64::MAX,
+            fee_per_1kb: i64::MAX,
+        },
+        DEFAULT_PRECISION,
+    );
+
+    assert_eq!(breakdown.non_refundable_stroops, i64::MAX);
+    assert!(breakdown.refundable_stroops >= 0);
+    assert_eq!(breakdown.total_stroops, i64::MAX);
+    assert!(!breakdown.total_xlm.is_empty());
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(1024))]
 
@@ -119,8 +144,10 @@ proptest! {
             breakdown.refundable_stroops
         );
         // The authoritative total is always reported verbatim.
-        prop_assert_eq!(breakdown.total_stroops, total_resource_fee);
-        prop_assert_eq!(breakdown.total_xlm, stroops_to_xlm(total_resource_fee, DEFAULT_PRECISION));
+        let expected_base_fee = if total_resource_fee > 0 { 100 } else { 0 };
+        let expected_total_stroops = total_resource_fee.saturating_add(expected_base_fee);
+        prop_assert_eq!(breakdown.total_stroops, expected_total_stroops);
+        prop_assert_eq!(breakdown.total_xlm, stroops_to_xlm(expected_total_stroops, DEFAULT_PRECISION));
     }
 
     /// The reported totals are internally consistent for any realistic
@@ -161,13 +188,67 @@ proptest! {
             non_refundable + breakdown.refundable_stroops,
             total_resource_fee.max(non_refundable)
         );
-        prop_assert_eq!(breakdown.total_stroops, total_resource_fee);
-        prop_assert_eq!(&breakdown.total_xlm, &stroops_to_xlm(total_resource_fee, DEFAULT_PRECISION));
+        if total_resource_fee >= non_refundable {
+            let expected_base_fee = if total_resource_fee > 0 { 100 } else { 0 };
+            prop_assert_eq!(
+                breakdown.total_stroops,
+                non_refundable + breakdown.refundable_stroops + expected_base_fee
+            );
+        }
+        let expected_base_fee = if total_resource_fee > 0 { 100 } else { 0 };
+        let expected_total_stroops = total_resource_fee.saturating_add(expected_base_fee);
+        prop_assert_eq!(breakdown.total_stroops, expected_total_stroops);
+        prop_assert_eq!(&breakdown.total_xlm, &stroops_to_xlm(expected_total_stroops, DEFAULT_PRECISION));
         // The XLM string representation round-trips back to the exact
         // stroop count.
         prop_assert_eq!(
             xlm_to_stroops(&breakdown.total_xlm).unwrap(),
-            total_resource_fee
+            expected_total_stroops
+        );
+    }
+
+    /// For valid simulations, the authoritative resource fee covers the
+    /// rate-derived non-refundable portion. Adding the refundable remainder
+    /// and base inclusion fee must reconcile with the total without overflow.
+    #[test]
+    fn valid_total_fee_covers_its_parts(
+        quantities in realistic_quantities(),
+        rates in realistic_rates(),
+        extra_resource_fee in 0..1_000_000i64,
+    ) {
+        let (cpu_insns, read_entries, write_entries, read_bytes, tx_size) = quantities;
+        let preliminary = compute_fee_breakdown(
+            0,
+            cpu_insns,
+            read_entries,
+            write_entries,
+            read_bytes,
+            tx_size,
+            rates,
+            DEFAULT_PRECISION,
+        );
+        let total_resource_fee = preliminary
+            .non_refundable_stroops
+            .saturating_add(extra_resource_fee);
+        let breakdown = compute_fee_breakdown(
+            total_resource_fee,
+            cpu_insns,
+            read_entries,
+            write_entries,
+            read_bytes,
+            tx_size,
+            rates,
+            DEFAULT_PRECISION,
+        );
+        let resource_parts = breakdown
+            .non_refundable_stroops
+            .saturating_add(breakdown.refundable_stroops);
+
+        prop_assert!(breakdown.refundable_stroops >= 0);
+        prop_assert!(breakdown.total_stroops >= resource_parts);
+        prop_assert_eq!(
+            breakdown.total_stroops,
+            resource_parts.saturating_add(breakdown.base_fee_stroops)
         );
     }
 

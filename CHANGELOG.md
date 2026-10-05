@@ -9,8 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `config diff --against-previous` — diff the two most recent on-disk
+  snapshots against each other without contacting the live network. Works
+  offline, honors `--summary` and `--json`, and errors with the snapshot count
+  when fewer than two exist for the network.
+- `config snapshot --retain <N>` — keep only the N most recent snapshots for a
+  network, pruning older ones after the new snapshot is safely on disk.
+- `config snapshot prune --older-than <DAYS>` — delete snapshots recorded more
+  than D days ago. Pure file I/O, so it is safe offline and in a cron job.
+
+### Fixed
+
+- Snapshot retention never deletes the newest snapshot for a network, however
+  old it is or however small `--retain` is, so a `config diff` always has a
+  pair left to compare.
+
+### Added
+
 - `--timeout` global flag — configurable HTTP request timeout for RPC calls
   in seconds (default 30).
+- `--max-retries` global flag — configurable maximum number of retry attempts
+  for transient RPC failures (default 3). 0 disables retries, so CI runs can
+  opt into aggressive retries while interactive use can fail fast.
 - `config diff --summary` — print a single-line summary
   (`X pricing changes, Y non-pricing changes`) instead of the full diff, for CI
   status lines. Exit code and auto-save side effects are unchanged.
@@ -21,6 +41,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   command, its flags, and its offline error paths.
 - CI build matrix running fmt, clippy, build, and tests on Linux, macOS, and
   Windows for cross-platform compatibility.
+- `estimate-all` prints a fee/CPU **distribution box** (min/max/mean/median/
+  standard deviation of fees and min/max/mean CPU instructions) and exposes the
+  same statistics as a `fee_distribution` object in `--json` output.
+- Report headers show `Simulated at ledger sequence: <n>` and JSON reports
+  serialize the ledger as `ledger_sequence`.
+
+### Changed
+
+- `estimate-all --json` now emits an object (`{ "functions": [...],
+  "fee_distribution": { ... } }`) instead of a bare array; the per-function
+  records moved under the `functions` key.
 
 ### Fixed
 
