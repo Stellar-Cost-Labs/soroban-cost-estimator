@@ -522,6 +522,24 @@ impl RpcClient {
         }
     }
 
+    /// Send a JSON-RPC request, bypassing request deduplication.
+    ///
+    /// Every call reaches the network. This is what benchmarking paths (e.g.
+    /// `estimate --repeat`) use: otherwise an identical request would be
+    /// served from the dedup cache and only the first run would be measured.
+    ///
+    /// # Network calls
+    /// One HTTP POST (plus any transient-failure retries).
+    pub async fn call_uncached<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> AppResult<T> {
+        self.perform_call(method, params)
+            .await
+            .and_then(deserialize_result::<T>)
+    }
+
     /// Returns the cached result for `key`, if a prior identical request
     /// completed successfully.
     async fn cached_result(&self, key: &RequestKey) -> Option<Value> {
@@ -550,7 +568,11 @@ impl RpcClient {
             "params": params,
         });
 
-        trace!(method, "sending RPC request");
+        trace!(
+            method,
+            header_count = self.headers.len(),
+            "sending RPC request"
+        );
         match self
             .post_and_parse(method, &body, &self.url, self.connect_timeout)
             .await
@@ -593,7 +615,12 @@ impl RpcClient {
                 // are the cases where a fallback endpoint might succeed.
                 e.is_connect() || e.is_timeout() || e.is_request()
             }
-            AppError::RpcUnavailable { .. } => true,
+            AppError::ConnectTimeout { .. } | AppError::RpcUnavailable { .. } => true,
+            // Transient gateway statuses surfaced as HttpStatus (502/503/504)
+            // are also failover triggers; other HttpStatus values (429/500 or
+            // deterministic 4xx) are not — 429/500 are retried but not failed
+            // over, matching the gateway-only failover contract.
+            AppError::HttpStatus { status, .. } => matches!(status, 502..=504),
             _ => false,
         }
     }
@@ -633,12 +660,25 @@ impl RpcClient {
                 if let Some(limiter) = &limiter {
                     limiter.until_ready().await;
                 }
-                client
+                let response = client
                     .post(&url)
                     .json(&request_body)
                     .send()
                     .await
-                    .map_err(|e| connect_timeout_error(e, connect_timeout))
+                    .map_err(|e| connect_timeout_error(e, connect_timeout))?;
+
+                // Transient statuses (429/5xx) must be turned into errors so
+                // `with_retry` can back off and retry them. Non-transient
+                // statuses fall through and are parsed as JSON-RPC below.
+                let status = response.status();
+                if is_transient_status(status) {
+                    return Err(AppError::HttpStatus {
+                        status: status.as_u16(),
+                        retry_after: parse_retry_after(response.headers()),
+                        message: format!("RPC endpoint returned transient HTTP status {status}"),
+                    });
+                }
+                Ok::<reqwest::Response, AppError>(response)
             }
         })
         .await?;
@@ -733,6 +773,26 @@ fn build_rate_limiter(rps: u64) -> Option<Arc<governor::DefaultDirectRateLimiter
     let period = std::time::Duration::from_secs_f64(1.0 / f64::from(rps.get()));
     let quota = Quota::with_period(period)?.allow_burst(NonZeroU32::new(1)?);
     Some(Arc::new(RateLimiter::direct(quota)))
+}
+
+/// Returns `true` when `status` is a transient HTTP failure worth retrying.
+///
+/// Rate limiting (429) and server-side errors (500/502/503/504) are
+/// transient; everything else — including deterministic 4xx client errors —
+/// is returned to the caller as-is.
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
+}
+
+/// Parses a `Retry-After` response header into a delay, if present.
+///
+/// Only the delta-seconds form (e.g. `Retry-After: 5`) is supported; the
+/// HTTP-date form and unparseable values yield `None`, falling back to the
+/// retry loop's computed backoff.
+fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let seconds: u64 = value.trim().parse().ok()?;
+    Some(Duration::from_secs(seconds))
 }
 
 /// Deserializes a raw JSON-RPC `result` value into the caller's type.
@@ -839,7 +899,7 @@ mod tests {
                 };
                 let counter = Arc::clone(&server_counter);
                 tokio::spawn(async move {
-                    let _ = handle_conn(stream, counter, fail_times, result_body, delay).await;
+                    let _ = handle_conn(stream, counter, fail_times, 200, result_body, delay).await;
                 });
             }
         });
@@ -847,10 +907,61 @@ mod tests {
         (format!("http://{addr}"), counter)
     }
 
+    /// Spawns a stub server whose first `fail_times` responses carry HTTP
+    /// `fail_status` (e.g. 503) and whose later responses are 200 JSON-RPC
+    /// successes. Exercises the transient-status retry path.
+    async fn spawn_stub(
+        fail_times: u32,
+        fail_status: u16,
+        result_body: &'static str,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind stub server");
+        let addr = listener.local_addr().expect("no local address");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let server_counter = Arc::clone(&counter);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let counter = Arc::clone(&server_counter);
+                tokio::spawn(async move {
+                    let _ = handle_conn(
+                        stream,
+                        counter,
+                        fail_times,
+                        fail_status,
+                        result_body,
+                        Duration::ZERO,
+                    )
+                    .await;
+                });
+            }
+        });
+
+        (format!("http://{addr}"), counter)
+    }
+
+    /// HTTP reason phrase for the stubbed failure status.
+    fn status_reason(status: u16) -> &'static str {
+        match status {
+            429 => "Too Many Requests",
+            500 => "Internal Server Error",
+            502 => "Bad Gateway",
+            503 => "Service Unavailable",
+            504 => "Gateway Timeout",
+            _ => "OK",
+        }
+    }
+
     async fn handle_conn(
         mut stream: TcpStream,
         counter: Arc<AtomicUsize>,
         fail_times: u32,
+        fail_status: u16,
         result_body: &'static str,
         delay: Duration,
     ) -> std::io::Result<()> {
@@ -893,14 +1004,29 @@ mod tests {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let body = if (call_no as u32) < fail_times {
-            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure"}}"#
-                .to_string()
+        let (status, body) = if (call_no as u32) < fail_times {
+            if fail_status == 200 {
+                (
+                    200u16,
+                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure"}}"#
+                        .to_string(),
+                )
+            } else {
+                (
+                    fail_status,
+                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure"}}"#
+                        .to_string(),
+                )
+            }
         } else {
-            format!(r#"{{"jsonrpc":"2.0","id":1,"result":{result_body}}}"#)
+            (
+                200u16,
+                format!(r#"{{"jsonrpc":"2.0","id":1,"result":{result_body}}}"#),
+            )
         };
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            status_reason(status),
             body.len()
         );
         stream.write_all(response.as_bytes()).await?;
@@ -963,6 +1089,30 @@ mod tests {
             counter.load(Ordering::SeqCst),
             1,
             "identical requests must hit the network once"
+        );
+    }
+
+    /// `call_uncached` must bypass dedup: identical requests both reach the
+    /// network, which is what makes `estimate --repeat` benchmark N real runs.
+    #[tokio::test]
+    async fn test_call_uncached_bypasses_dedup() {
+        let (url, counter) = spawn_json_rpc_stub(0).await;
+        let client = RpcClient::new(&url);
+        let params = serde_json::json!({"k": "v"});
+
+        let _: Value = client
+            .call_uncached("test.method", params.clone())
+            .await
+            .expect("first uncached call");
+        let _: Value = client
+            .call_uncached("test.method", params)
+            .await
+            .expect("second uncached call");
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "identical uncached requests must both hit the network"
         );
     }
 
@@ -1504,6 +1654,50 @@ mod tests {
             message.contains("unable to reach RPC endpoint") && message.contains("--rpc-url"),
             "unexpected error: {message}"
         );
+    }
+
+    /// A transient HTTP status (503) must be retried; once the stub starts
+    /// answering 200 the call succeeds.
+    #[tokio::test]
+    async fn test_transient_status_is_retried_then_succeeds() {
+        let (url, counter) = spawn_stub(1, 503, r#"{"pong":true}"#).await;
+        let client = RpcClient::with_options(&url, None, Duration::from_secs(5), 3, false);
+
+        let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
+
+        assert!(
+            result.is_ok(),
+            "503 should be retried then succeed: {result:?}"
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    /// Persistent transient statuses consume every retry, and the final error
+    /// preserves the HTTP status.
+    #[tokio::test]
+    async fn test_transient_status_exhausts_retries() {
+        let (url, counter) = spawn_stub(100, 503, r#"{"pong":true}"#).await;
+        let client = RpcClient::with_options(&url, None, Duration::from_secs(5), 2, false);
+
+        let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
+
+        match result {
+            Err(AppError::HttpStatus { status, .. }) => assert_eq!(status, 503),
+            other => panic!("expected HttpStatus(503), got {other:?}"),
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+
+    /// A deterministic 4xx client error must not be retried.
+    #[tokio::test]
+    async fn test_client_error_status_is_not_retried() {
+        let (url, counter) = spawn_stub(100, 400, r#"{"pong":true}"#).await;
+        let client = RpcClient::with_options(&url, None, Duration::from_secs(5), 3, false);
+
+        let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
+
+        assert!(result.is_err(), "400 must surface as an error");
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "400 must not be retried");
     }
 
     #[test]
