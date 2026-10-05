@@ -457,7 +457,7 @@ The CLI prints errors to stderr and exits with code 1 on failure.
 | Unit tests | In-module `#[cfg(test)]` blocks for pure functions | Most `src/` files |
 | Integration tests | Separate `tests/` directory, exercises CLI end-to-end | `cli_tests.rs`, `parser_tests.rs`, `fee_calc_tests.rs`, `cache_tests.rs` |
 | Snapshot tests | `insta` crate for deterministic formatter output | `report_snapshots.rs`, `tests/snapshots/` |
-| Property tests | `proptest` for fee calculation edge cases | `fee_calc_tests.rs` |
+| Property tests | `proptest` for fee calculation edge cases | `fee_calc_proptest.rs` |
 | Benchmarks | `criterion` for WASM parsing throughput | `benches/wasm_parse.rs` |
 
 CI runs `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
