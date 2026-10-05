@@ -1,8 +1,7 @@
+use std::path::PathBuf;
+
 use clap::builder::{PossibleValue, TypedValueParser};
 use clap::{Parser, Subcommand, ValueEnum};
-use soroban_spec_types::{ScVal, ScSpecTypeDef};
-
-use crate::error::{AppError, AppResult};
 
 /// Value parser for `--network` that advertises the supported network names to
 /// shell completion generators and `--help` output while still accepting any
@@ -69,10 +68,14 @@ impl std::fmt::Display for OutputFormat {
 fn build_version() -> &'static str {
     concat!(
         env!("CARGO_PKG_VERSION"),
-        " (",
+        " (commit: ",
         env!("GIT_HASH"),
-        " ",
+        " built: ",
         env!("BUILD_DATE"),
+        " target: ",
+        env!("TARGET"),
+        " rustc: ",
+        env!("RUSTC_VERSION"),
         ")"
     )
 }
@@ -115,9 +118,18 @@ pub struct Cli {
     #[arg(long, short, global = true)]
     pub verbose: bool,
 
+    /// Suppress progress spinners, info banners, and non-error notices.
+    /// Outputs only the final result or error.
+    #[arg(long, short, global = true)]
+    pub quiet: bool,
+
     /// Custom HTTP header to send with every RPC request, e.g.
-    /// `--header "X-API-Key: secret"`. Repeatable for multiple headers.
-    #[arg(long = "header", value_name = "KEY: VALUE", global = true)]
+    /// `--header "Authorization=Bearer <token>"`. Repeatable for multiple
+    /// headers. The `KEY: VALUE` spelling is also accepted.
+    ///
+    /// Sensitive headers (`Authorization`, `x-api-key`, `api-key`, …) are
+    /// redacted in verbose logs.
+    #[arg(long = "header", short = 'H', value_name = "KEY=VALUE", global = true)]
     pub headers: Vec<String>,
 
     /// Fallback RPC URL used when the primary endpoint is unreachable or
@@ -150,10 +162,6 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "N", default_value_t = 10_000)]
     pub max_cache_entries: usize,
 
-    /// Suppress non-essential output, including the fee-distribution chart.
-    #[arg(long, short, global = true)]
-    pub quiet: bool,
-
     /// Number of decimal places shown for XLM fee values (0..=7, default 7).
     ///
     /// Stellar amounts are denominated in stroops (1 XLM = 10,000,000
@@ -185,7 +193,6 @@ pub enum Command {
         r#fn: Option<String>,
         #[arg(long)]
         id: Option<String>,
-/// Function arguments as key=value pairs (value is coerced to the contract-spec type when available).
         #[arg(long = "arg", value_name = "KEY=VAL")]
         args: Vec<String>,
 
@@ -215,6 +222,12 @@ pub enum Command {
         /// back to disk.
         #[arg(long)]
         no_cache: bool,
+
+        /// Compare against up to 5 previous cached runs of the same function
+        /// and render a cost-trend table (red = regression, green = improvement).
+        /// Adds a `history` array to `--json` output when requested.
+        #[arg(long)]
+        history: bool,
 
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
@@ -255,6 +268,12 @@ pub enum Command {
             default_missing_value = "100,1000,10000"
         )]
         project: Option<String>,
+
+        /// Number of times to repeat the simulation (1..=100, default 1).
+        /// Collects latency statistics (min, max, mean, stddev) and checks
+        /// fee/CPU consistency across runs.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=100))]
+        repeat: u32,
     },
     EstimateAll {
         #[arg(long, short)]
@@ -262,7 +281,6 @@ pub enum Command {
         #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
 
-        /// Deployed contract ID (TE8 hex chars) to invoke each function against.
         /// Explicit RPC URL (overrides network-based resolution).
         #[arg(long)]
         rpc_url: Option<String>,
@@ -319,71 +337,6 @@ pub enum Command {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
-}
-
-impl Command {
-    /// Validate and coerce `--arg` values against the contract spec.
-    ///
-    /// This should be called if `--fn` is specified. It loads the deployed
-    /// contract's spec from the `.wasm` file and coerces each argument to the
-    /// declared input type. If a function or input is not found, or a value
-    /// does not match its expected type, an `AppError::TypeValidation` is
-    /// returned.
-    pub fn parse_typed_args(&self) -> AppResult<Vec<ScVal>> {
-        match self {
-            Command::Estimate { wasm, r#fn, args, .. } => {
-                let Some(func_name) = r#fn.as_deref() else {
-                    return Ok(Vec::new());
-                };
-
-                let spec = crate::wasm::parser::get_function_spec(wasm, func_name)?
-                    .ok_or_else(|| {
-                        AppError::General(format!(
-                            "function '{}' not found in contract spec",
-                            func_name
-                        ))
-                    })?;
-
-                let mut vals = Vec::with_capacity(args.len());
-                for arg in args {
-                    let (key, value) = arg.split_once('=').ok_or_else(|| {
-                        AppError::TypeValidation(format!(
-                            "invalid argument '{}', expected KEY=VAL",
-                            arg
-                        ))
-                    })?;
-
-                    let input = spec
-                        .inputs()
-                        .iter()
-                        .find(|input| input.name() == key)
-                        .ok_or_else(|| {
-                            AppError::TypeValidation(format!(
-                                "unknown argument '{}' for function '{}'",
-                                key, func_name
-                            ))
-                        })?;
-
-                    let expected = match input.type_def() {
-                        ScSpecTypeDef::Bool => "bool",
-                        ScSpecTypeDef::I64 => "i64",
-                        ScSpecTypeDef::U64 => "u64",
-                        ScSpecTypeDef::String => "string",
-                        ScSpecTypeDef::Symbol => "symbol",
-                        _ => return Err(AppError::TypeValidation(format!(
-                            "unsupported parameter type for '{}': {:?}",
-                            key,
-                            input.type_def()
-                        ))),
-                    };
-
-                    vals.push(coerce_arg_value(value, expected, key)?);
-                }
-                Ok(vals)
-            }
-            _ => Ok(Vec::new()),
-        }
-    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -488,17 +441,94 @@ pub enum CacheAction {
     },
 }
 
+/// Sub-actions under `config snapshot` that operate on snapshots already on
+/// disk rather than fetching a new one. Each carries its own `--network`
+/// rather than inheriting the parent command's.
+#[derive(Subcommand, Debug)]
+pub enum SnapshotAction {
+    /// List saved snapshots: filename, network, timestamp, ledger sequence
+    /// and protocol version.
+    List {
+        /// Only list snapshots for this network (default: testnet).
+        #[arg(long, default_value = "testnet", conflicts_with = "all")]
+        network: String,
+
+        /// List snapshots for every network.
+        #[arg(long)]
+        all: bool,
+
+        /// Output a JSON array instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Delete stored snapshots older than a number of days.
+    ///
+    /// The newest snapshot is always kept, however old it is.
+    Prune {
+        /// Network whose snapshots should be pruned.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+
+        /// Delete snapshots recorded more than this many days ago.
+        #[arg(long, value_name = "DAYS")]
+        older_than: u32,
+
+        /// Output as JSON instead of a human-readable summary.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Delete a saved snapshot file, or purge every snapshot older than N days.
+    Delete {
+        /// Snapshot filename (or path) to delete.
+        #[arg(value_name = "FILENAME")]
+        filename: Option<String>,
+
+        /// Delete snapshots older than this many days.
+        #[arg(long, value_name = "DAYS")]
+        older_than: Option<u64>,
+
+        /// Show which files would be removed without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip the confirmation prompt (required in non-interactive sessions).
+        #[arg(long, short = 'y')]
+        yes: bool,
+
+        /// Restrict `--older-than` to a single network's snapshots.
+        #[arg(long, value_name = "NETWORK")]
+        network: Option<String>,
+    },
+
+    /// Compare two saved snapshot files offline, without any network calls.
+    Diff {
+        /// First (older) snapshot file to compare.
+        #[arg(value_name = "SNAPSHOT_A")]
+        file_a: PathBuf,
+
+        /// Second (newer) snapshot file to compare.
+        #[arg(value_name = "SNAPSHOT_B")]
+        file_b: PathBuf,
+
+        /// Output as JSON instead of a human-readable diff.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 pub enum ConfigAction {
     /// Fetch all ConfigSetting entries and save a timestamped snapshot.
     ///
-    /// Subcommands manage snapshots already on disk instead of fetching a new
-    /// one, so they are mutually exclusive with this command's own flags.
+    /// Subcommands (`list`, `prune`) manage snapshots already on disk instead
+    /// of fetching a new one, so they are mutually exclusive with this
+    /// command's own flags.
     #[command(args_conflicts_with_subcommands = true)]
     Snapshot {
         #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
-/// Explicit output path (defaults to ~/.soroban-cost-estimator/.snapshots/).
         #[arg(long)]
         out: Option<String>,
         #[arg(long)]
@@ -565,7 +595,6 @@ pub enum ConfigAction {
         network: String,
     },
     LastChanged {
-/// Network whose snapshots to inspect.
         #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
     },
@@ -598,30 +627,6 @@ pub enum ConfigAction {
     },
 }
 
-/// Retention sub-actions under `config snapshot`.
-///
-/// These operate purely on snapshots already on disk and never fetch a new
-/// one, which is why they carry their own `--network` rather than inheriting
-/// the parent command's.
-#[derive(Subcommand, Debug)]
-pub enum SnapshotAction {
-    /// Delete stored snapshots older than a number of days.
-    ///
-    /// The newest snapshot is always kept, however old it is.
-    Prune {
-        /// Network whose snapshots should be pruned.
-        #[arg(long, default_value = "testnet")]
-        network: String,
-
-        /// Delete snapshots recorded more than this many days ago.
-        #[arg(long, value_name = "DAYS")]
-        older_than: u32,
-
-        /// Output as JSON instead of a human-readable summary.
-        #[arg(long)]
-        json: bool,
-    },
-}
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 pub static COLOR_CHOICE: AtomicU8 = AtomicU8::new(0);
@@ -747,94 +752,5 @@ mod tests {
                 "completion script for {shell:?} should reference {bin_name}"
             );
         }
-    }
-}
-
-/// Coerce a raw CLI argument value into an `ScVal` of the given type.
-fn coerce_arg_value(raw: &str, expected: &str, param_name: &str) -> AppResult<ScVal> {
-    match expected {
-        "bool" => raw
-            .parse::<bool>()
-            .map(ScVal::Bool)
-            .map_err(|_| {
-                AppError::TypeValidation(format!(
-                    "argument '{}' expected bool, got '{}'",
-                    param_name, raw
-                ))
-            }),
-        "i64" => raw
-            .parse::<i64>()
-            .map(ScVal::I64)
-            .map_err(|_| {
-                AppError::TypeValidation(format!(
-                    "argument '{}' expected i64, got '{}'",
-                    param_name, raw
-                ))
-            }),
-        "u64" => raw
-            .parse::<u64>()
-            .map(ScVal::U64)
-            .map_err(|_| {
-                AppError::TypeValidation(format!(
-                    "argument '{}' expected u64, got '{}'",
-                    param_name, raw
-                ))
-            }),
-        "string" => Ok(ScVal::String(raw.to_string())),
-        "symbol" => Ok(ScVal::Symbol(raw.to_string())),
-        other => Err(AppError::TypeValidation(format!(
-            "unsupported expected type '{}' for argument '{}'",
-            other, param_name
-        ))),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn coerce_bool() {
-        assert_eq!(
-            coerce_arg_value("true", "bool", "flag").unwrap(),
-            ScVal::Bool(true)
-        );
-        assert!(coerce_arg_value("notabool", "bool", "flag").is_err());
-    }
-
-    #[test]
-    fn coerce_i64() {
-        assert_eq!(coerce_arg_value("42", "i64", "n").unwrap(), ScVal::I64(42));
-        assert!(coerce_arg_value("abc", "i64", "n").is_err());
-    }
-
-    #[test]
-    fn coerce_u64() {
-        assert_eq!(coerce_arg_value("42", "u64", "n").unwrap(), ScVal::U64(42));
-        assert!(coerce_arg_value("-1", "u64", "n").is_err());
-    }
-
-    #[test]
-    fn coerce_string() {
-        assert_eq!(
-            coerce_arg_value("hello", "string", "s").unwrap(),
-            ScVal::String("hello".to_string())
-        );
-    }
-
-    #[test]
-    fn coerce_symbol() {
-        assert_eq!(
-            coerce_arg_value("hello", "symbol", "s").unwrap(),
-            ScVal::Symbol("hello".to_string())
-        );
-    }
-
-    #[test]
-    fn invalid_value_mentions_param_and_expected_type() {
-        let err = coerce_arg_value("abc", "i64", "step").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("step"));
-        assert!(msg.contains("i64"));
     }
 }

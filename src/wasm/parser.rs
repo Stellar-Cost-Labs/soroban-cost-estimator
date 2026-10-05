@@ -1,7 +1,8 @@
 use std::io::Cursor;
 use std::path::Path;
 
-use stellar_xdr::{ReadXdr, ScVal};
+use sha2::Digest;
+use stellar_xdr::ReadXdr;
 use tracing::{debug, trace, warn};
 
 use crate::error::{AppError, AppResult};
@@ -27,6 +28,20 @@ pub const WASM_PAGE_SIZE_BYTES: u64 = 65_536;
 
 /// Import module used by Soroban contracts for host functions (`env._` imports).
 pub const HOST_IMPORT_MODULE: &str = "env";
+
+/// Computes the lowercase-hex SHA-256 of a contract's raw WASM bytes.
+///
+/// This is the hash the Stellar network uses to identify a build, and the
+/// key this tool's estimate cache is keyed on, so it is computed once per
+/// run over the whole binary. It lives here rather than being inlined at
+/// each CLI call site so the `wasm_benchmark` Criterion target measures this
+/// exact code path rather than re-implementing it.
+///
+/// Pure CPU work — no I/O, no allocation beyond the 64-char hex string.
+#[must_use]
+pub fn wasm_sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(sha2::Sha256::digest(bytes))
+}
 
 /// Loads a compiled Soroban contract `.wasm` file from disk.
 ///
@@ -70,6 +85,11 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
         }
     }
 
+    // Soroban identifies a contract on-chain by the SHA-256 hash of its WASM
+    // bytes (the executable hash). Compute it once, here, so every command
+    // reports the same identity for the same file without re-hashing.
+    let wasm_hash = wasm_sha256_hex(&bytes);
+
     trace!(functions = functions.len(), has_spec, "WASM parsed");
     let initial_pages = match metadata.memories.first() {
         Some(m) => m.initial_pages,
@@ -89,7 +109,10 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
         tables_count: metadata.tables_count,
     };
     Ok(WasmInfo {
+        wasm_hash,
         bytes,
+        has_debug_symbols: metadata.has_debug_symbols,
+        debug_symbol_bytes: metadata.debug_symbol_bytes,
         functions,
         has_spec,
         contract_meta,
@@ -200,6 +223,11 @@ pub struct ModuleMetadata {
     pub exports: Vec<ExportInfo>,
     /// Number of tables declared by the module.
     pub tables_count: usize,
+    /// Whether the module carries a `name` or `.debug*` custom section —
+    /// the signature of an unoptimized/debug build.
+    pub has_debug_symbols: bool,
+    /// Combined byte size of the `name` and `.debug*` custom sections.
+    pub debug_symbol_bytes: usize,
 }
 
 /// Enumerates exported functions and captures module entry-point metadata:
@@ -221,6 +249,8 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
     let mut imports = Vec::new();
     let mut exports = Vec::new();
     let mut tables_count = 0;
+    let mut has_debug_symbols = false;
+    let mut debug_symbol_bytes = 0usize;
 
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
         let payload = payload.map_err(|e| AppError::WasmParse(e.to_string()))?;
@@ -274,6 +304,15 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
                         maximum_pages: memory.maximum,
                         memory64: memory.memory64,
                     });
+                }
+            }
+            wasmparser::Payload::CustomSection(section) => {
+                // `name` carries the function/local symbol table; `.debug*`
+                // sections carry DWARF info. Both are stripped by
+                // `soroban contract optimize` / `wasm-opt -g`.
+                if is_debug_custom_section(section.name()) {
+                    has_debug_symbols = true;
+                    debug_symbol_bytes += section.data().len();
                 }
             }
             wasmparser::Payload::StartSection { func, .. } => start_function = Some(func),
@@ -331,6 +370,8 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
         imports,
         exports,
         tables_count,
+        has_debug_symbols,
+        debug_symbol_bytes,
     })
 }
 
@@ -389,7 +430,7 @@ pub fn parse_contract_spec(bytes: &[u8]) -> AppResult<(SpecFunctions, bool)> {
             let mut cursor = Cursor::new(data);
             while (cursor.position() as usize) < data.len() {
                 let mut limited =
-                    stellar_xdr::Limited::new(&mut cursor, stellar_xdr::Limits::unlimited());
+                    stellar_xdr::Limited::new(&mut cursor, stellar_xdr::Limits::none());
                 // Break (not `?`) on a decode error: a trailing byte or a
                 // truncated final entry should not discard the entries already
                 // decoded. If nothing decoded, the caller's `unwrap_or_default`
@@ -677,88 +718,6 @@ pub fn validate_arg_value(type_def: &stellar_xdr::ScSpecTypeDef, arg: &str) -> A
     Ok(())
 }
 
-/// Coerces a single `--arg` `key=value` pair to an `ScVal` using a
-/// contract-spec type.
-///
-/// The spec type is authoritative when it has a text form that maps directly
-/// onto an `ScVal` (bool, common fixed-width integers, string, symbol). For
-/// those types a value that cannot represent the spec type is rejected early
-/// with the parameter's `key=value` text and the expected type name. Spec
-/// types that require a bespoke parser (vec, map, udt, ...) return `Ok(None)`
-/// so callers can fall back to the legacy type-inference path.
-pub fn coerce_arg_scval(
-    type_def: &stellar_xdr::ScSpecTypeDef,
-    arg: &str,
-) -> AppResult<Option<stellar_xdr::ScVal>> {
-    let value = arg.split_once('=').map(|(_, v)| v).unwrap_or(arg);
-    let expected = spec_type_name(type_def);
-    let invalid = || {
-        AppError::TypeValidation(format!(
-            "arg '{arg}' cannot be used as '{expected}'"
-        ))
-    };
-
-    let coerced = match type_def {
-        stellar_xdr::ScSpecTypeDef::Bool => {
-            if value == "true" {
-                Some(ScVal::Bool(true))
-            } else if value == "false" {
-                Some(ScVal::Bool(false))
-            } else {
-                return Err(invalid());
-            }
-        }
-        stellar_xdr::ScSpecTypeDef::U32 => Some(ScVal::U32(
-            value.parse::<u32>().map_err(|_| invalid())?,
-        )),
-        stellar_xdr::ScSpecTypeDef::I32 => Some(ScVal::I32(
-            value.parse::<i32>().map_err(|_| invalid())?,
-        )),
-        stellar_xdr::ScSpecTypeDef::U64 => Some(ScVal::U64(
-            value.parse::<u64>().map_err(|_| invalid())?,
-        )),
-        stellar_xdr::ScSpecTypeDef::I64 => Some(ScVal::I64(
-            value.parse::<i64>().map_err(|_| invalid())?,
-        )),
-        stellar_xdr::ScSpecTypeDef::Timepoint => Some(ScVal::Timepoint(
-            value.parse::<u64>().map_err(|_| invalid())?,
-        )),
-        stellar_xdr::ScSpecTypeDef::Duration => Some(ScVal::Duration(
-            value.parse::<u64>().map_err(|_| invalid())?,
-        )),
-        stellar_xdr::ScSpecTypeDef::U128 => {
-            let n = value.parse::<u128>().map_err(|_| invalid())?;
-            Some(ScVal::U128(stellar_xdr::UInt128Parts {
-                hi: (n >> 64) as u64,
-                lo: n as u64,
-            }))
-        }
-        stellar_xdr::ScSpecTypeDef::I128 => {
-            let n = value.parse::<i128>().map_err(|_| invalid())?;
-            Some(ScVal::I128(stellar_xdr::Int128Parts {
-                hi: (n >> 64) as i64,
-                lo: n as u64,
-            }))
-        }
-        stellar_xdr::ScSpecTypeDef::Symbol => {
-            if !is_valid_symbol(value) {
-                return Err(invalid());
-            }
-            Some(ScVal::Symbol(stellar_xdr::ScSymbol(
-                value.as_bytes().to_vec(),
-            )))
-        }
-        stellar_xdr::ScSpecTypeDef::String => Some(ScVal::String(stellar_xdr::ScString(
-            value.as_bytes().to_vec(),
-        ))),
-        // Types with no trivial text->ScVal mapping are left to the caller's
-        // inference fallback.
-        _ => None,
-    };
-
-    Ok(coerced)
-}
-
 /// True when `value` is a plausible u256/i256 integer: optional `0x` hex or a
 /// plain decimal without sign-ambiguity issues. A full 256-bit parse is out of
 /// scope, so this is a conservative syntax check.
@@ -879,8 +838,16 @@ pub struct WasmStructureSummary {
 /// Information extracted from a WASM file.
 #[derive(Debug, Clone)]
 pub struct WasmInfo {
+    /// SHA-256 hash of the raw WASM bytes (lowercase hex). Soroban uses this
+    /// 32-byte digest as the on-chain executable hash of the contract.
+    pub wasm_hash: String,
     /// Raw WASM bytes.
     pub bytes: Vec<u8>,
+    /// True when the binary carries a `name` or `.debug*` custom section,
+    /// which marks it as an unoptimized/debug build.
+    pub has_debug_symbols: bool,
+    /// Combined byte size of the `name` and `.debug*` custom sections.
+    pub debug_symbol_bytes: usize,
     /// Names and signatures of exported (public) functions.
     pub functions: Vec<FunctionInfo>,
     /// Whether the WASM carries a Soroban contract spec (`contractspecv0`).
@@ -898,6 +865,53 @@ pub struct WasmInfo {
     pub exports: Vec<ExportInfo>,
     /// WASM structure summary.
     pub summary: WasmStructureSummary,
+}
+
+impl WasmInfo {
+    /// Estimated percentage of the binary that can be reclaimed by stripping
+    /// its `name` / `.debug*` custom sections, rounded to whole percent.
+    ///
+    /// Returns `0` when the binary carries no debug sections. Real-world
+    /// `soroban contract optimize` runs typically shrink a debug build by
+    /// 40–70%; the value here is derived from the actual section sizes rather
+    /// than hard-coded.
+    #[must_use]
+    pub fn estimated_size_reduction_percent(&self) -> u32 {
+        if self.debug_symbol_bytes == 0 || self.bytes.is_empty() {
+            return 0;
+        }
+        let bytes = self.bytes.len() as u64;
+        let debug = self.debug_symbol_bytes as u64;
+        // Round to nearest percent, then floor at 1 so a detected debug
+        // section never reports "~0%".
+        let rounded = (debug * 100 + bytes / 2) / bytes;
+        u32::try_from(rounded.max(1)).unwrap_or(1)
+    }
+}
+
+/// True when a WASM custom section is a debug/optimization artifact: the
+/// `name` symbol section or any DWARF `.debug*` section.
+#[must_use]
+pub fn is_debug_custom_section(name: &str) -> bool {
+    name == "name" || name.starts_with(".debug")
+}
+
+/// Builds the "unoptimized WASM" tip for an unoptimized build, or `None` when
+/// the binary carries no debug symbols.
+///
+/// The returned string is meant for stderr so it never contaminates
+/// machine-readable stdout; callers are responsible for suppressing it in
+/// quiet/JSON modes.
+#[must_use]
+pub fn format_optimization_tip(info: &WasmInfo) -> Option<String> {
+    if !info.has_debug_symbols {
+        return None;
+    }
+    Some(format!(
+        "💡 Tip: Unoptimized WASM detected (contains debug symbols). \
+         Run `soroban contract optimize` or `wasm-opt` to reduce upload cost by ~{}%",
+        info.estimated_size_reduction_percent()
+    ))
 }
 
 /// Formats a human-readable diagnostic summary of a loaded module: the start
@@ -1006,52 +1020,41 @@ fn push_entries_generic<T>(
         lines.push(format!("  - ... and {} more", entries.len() - max_listed));
     }
 }
-#[cfg(test)]
-    mod tests {
-        use super::*;
-        use stellar_xdr::{ScSpecTypeDef, ScVal};
 
-        fn coerce(type_def: ScSpecTypeDef, arg: &str) -> Option<ScVal> {
-            coerce_arg_scval(&type_def, arg).expect("coercion should be valid")
+impl WasmInfo {
+    /// Validates WASM memory and table constraints against network limits before simulation.
+    pub fn validate_wasm_limits(
+        &self,
+        max_size: u32,
+        max_pages: u32,
+    ) -> Result<(), crate::error::AppError> {
+        let size = self.bytes.len() as u32;
+        if size > max_size {
+            return Err(crate::error::AppError::WasmValidation(format!(
+                "WASM file size {} exceeds maximum deployable size {}",
+                size, max_size
+            )));
         }
 
-        #[test]
-        fn coerces_i64_args() {
-            assert_eq!(coerce(ScSpecTypeDef::I64, "step=5"), Some(ScVal::I64(5)));
+        for memory in &self.memories {
+            if memory.initial_pages > max_pages as u64 {
+                return Err(crate::error::AppError::WasmValidation(format!(
+                    "WASM memory initial pages {} exceeds limit {}",
+                    memory.initial_pages, max_pages
+                )));
+            }
+            if let Some(maximum_pages) = memory.maximum_pages {
+                if maximum_pages > max_pages as u64 {
+                    return Err(crate::error::AppError::WasmValidation(format!(
+                        "WASM memory maximum pages {} exceeds limit {}",
+                        maximum_pages, max_pages
+                    )));
+                }
+            } else {
+                // For test fixtures or old contracts that omit the max limit, we only enforce
+                // the limit on initial pages. The runtime will cap it anyway.
+            }
         }
-
-        #[test]
-        fn coerces_u64_args() {
-            assert_eq!(
-                coerce(ScSpecTypeDef::U64, "amount=10"),
-                Some(ScVal::U64(10))
-            );
-        }
-
-        #[test]
-        fn coerces_bool_args() {
-            assert_eq!(
-                coerce(ScSpecTypeDef::Bool, "flag=true"),
-                Some(ScVal::Bool(true))
-            );
-        }
-
-        #[test]
-        fn coerces_string_args() {
-            assert_eq!(
-                coerce(ScSpecTypeDef::String, "name=hello"),
-                Some(ScVal::String(stellar_xdr::ScString(b"hello".to_vec())))
-            );
-        }
-
-        #[test]
-        fn coerces_symbol_args() {
-            assert_eq!(
-                coerce(ScSpecTypeDef::Symbol, "symbol=hello_world"),
-                Some(ScVal::Symbol(stellar_xdr::ScSymbol(
-                    b"hello_world".to_vec()
-                )))
-            );
-        }
+        Ok(())
     }
 }
