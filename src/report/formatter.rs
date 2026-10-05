@@ -999,6 +999,19 @@ mod tests {
         }
     }
 
+    // ── Resource warnings & history rendering (#321, #322) ───────────
+
+    fn sample_warning() -> crate::report::cost_report::ResourceWarning {
+        crate::report::cost_report::ResourceWarning {
+            resource: "cpu_instructions".to_string(),
+            label: "CPU instructions".to_string(),
+            used: 900,
+            limit: 1_000,
+            percent: 90,
+            message: "CPU instructions at 90% of the network limit (900 of 1000)".to_string(),
+        }
+    }
+
     // ── Optimization tips (#323) ──────────────────────────────────────
 
     /// A report whose fee is dominated by ledger writes must surface the
@@ -1098,6 +1111,107 @@ mod tests {
                 formatter.name()
             );
         }
+    }
+
+    #[test]
+    fn test_json_formatter_always_includes_warnings_array() {
+        let formatter = JsonFormatter;
+        let output = formatter.format(&sample_report());
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(parsed["warnings"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_json_formatter_serializes_warnings_and_history() {
+        let mut report = sample_report();
+        report.warnings = vec![sample_warning()];
+        report.history = Some(vec![crate::report::cost_report::HistoryEntry {
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            ledger: 10,
+            cpu_instructions: 100,
+            total_stroops: 20_000,
+            total_xlm: "0.0020000".to_string(),
+            delta_stroops: 5_000,
+            trend: crate::report::cost_report::CostTrend::Regression,
+        }]);
+
+        let output = JsonFormatter.format(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(parsed["warnings"][0]["resource"], "cpu_instructions");
+        assert_eq!(parsed["warnings"][0]["percent"], 90);
+        assert_eq!(parsed["history"][0]["trend"], "regression");
+        assert_eq!(parsed["history"][0]["delta_stroops"], 5_000);
+    }
+
+    #[test]
+    fn test_json_formatter_omits_history_when_not_requested() {
+        let output = JsonFormatter.format(&sample_report());
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert!(parsed.get("history").is_none());
+    }
+
+    #[test]
+    fn test_json_formatter_includes_empty_history_when_requested() {
+        let mut report = sample_report();
+        report.history = Some(Vec::new());
+        let output = JsonFormatter.format(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(parsed["history"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_table_formatter_renders_resource_warnings() {
+        let mut report = sample_report();
+        report.warnings = vec![sample_warning()];
+        let output = TableFormatter.format(&report);
+        assert!(output.contains("Resource limit warnings:"));
+        assert!(output.contains("CPU instructions at 90%"));
+    }
+
+    #[test]
+    fn test_table_formatter_omits_warnings_when_clean() {
+        let output = TableFormatter.format(&sample_report());
+        assert!(!output.contains("Resource limit warnings:"));
+    }
+
+    #[test]
+    fn test_table_formatter_renders_history() {
+        let mut report = sample_report();
+        const PREVIOUS_TOTAL_STROOPS: i64 = 20_000;
+        report.history = Some(crate::report::cost_report::build_history_entries(
+            report.fee.total_stroops,
+            7,
+            &[crate::report::cost_report::HistoricalRun {
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                ledger: 100,
+                cpu_instructions: 1_000,
+                total_stroops: PREVIOUS_TOTAL_STROOPS,
+            }],
+        ));
+        let output = TableFormatter.format(&report);
+        assert!(output.contains("Cost history (previous runs, newest first):"));
+        // The previous run cost more than the current one, so it renders as a
+        // regression with an explicit `+` prefix. Derive the expected value
+        // from the fixture so changing `sample_report`'s fee does not break it.
+        let delta = PREVIOUS_TOTAL_STROOPS - report.fee.total_stroops;
+        assert!(delta > 0, "fixture must be a regression");
+        assert!(output.contains(&format!("+{delta}")));
+    }
+
+    #[test]
+    fn test_markdown_formatter_has_collapsible_details() {
+        let output = MarkdownFormatter.format(&sample_report());
+        assert!(output.contains("<details>"));
+        assert!(output.contains("</details>"));
+    }
+
+    #[test]
+    fn test_markdown_formatter_renders_resource_warnings() {
+        let mut report = sample_report();
+        report.warnings = vec![sample_warning()];
+        let output = MarkdownFormatter.format(&report);
+        assert!(output.contains("### Resource Limit Warnings"));
+        assert!(output.contains("> **Warning:** CPU instructions at 90%"));
     }
 
     #[test]
