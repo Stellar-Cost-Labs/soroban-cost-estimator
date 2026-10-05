@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::builder::{PossibleValue, TypedValueParser};
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -122,8 +124,12 @@ pub struct Cli {
     pub quiet: bool,
 
     /// Custom HTTP header to send with every RPC request, e.g.
-    /// `--header "X-API-Key: secret"`. Repeatable for multiple headers.
-    #[arg(long = "header", value_name = "KEY: VALUE", global = true)]
+    /// `--header "Authorization=Bearer <token>"`. Repeatable for multiple
+    /// headers. The `KEY: VALUE` spelling is also accepted.
+    ///
+    /// Sensitive headers (`Authorization`, `x-api-key`, `api-key`, …) are
+    /// redacted in verbose logs.
+    #[arg(long = "header", short = 'H', value_name = "KEY=VALUE", global = true)]
     pub headers: Vec<String>,
 
     /// Fallback RPC URL used when the primary endpoint is unreachable or
@@ -216,6 +222,12 @@ pub enum Command {
         /// back to disk.
         #[arg(long)]
         no_cache: bool,
+
+        /// Compare against up to 5 previous cached runs of the same function
+        /// and render a cost-trend table (red = regression, green = improvement).
+        /// Adds a `history` array to `--json` output when requested.
+        #[arg(long)]
+        history: bool,
 
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
@@ -463,6 +475,44 @@ pub enum SnapshotAction {
         older_than: u32,
 
         /// Output as JSON instead of a human-readable summary.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Delete a saved snapshot file, or purge every snapshot older than N days.
+    Delete {
+        /// Snapshot filename (or path) to delete.
+        #[arg(value_name = "FILENAME")]
+        filename: Option<String>,
+
+        /// Delete snapshots older than this many days.
+        #[arg(long, value_name = "DAYS")]
+        older_than: Option<u64>,
+
+        /// Show which files would be removed without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip the confirmation prompt (required in non-interactive sessions).
+        #[arg(long, short = 'y')]
+        yes: bool,
+
+        /// Restrict `--older-than` to a single network's snapshots.
+        #[arg(long, value_name = "NETWORK")]
+        network: Option<String>,
+    },
+
+    /// Compare two saved snapshot files offline, without any network calls.
+    Diff {
+        /// First (older) snapshot file to compare.
+        #[arg(value_name = "SNAPSHOT_A")]
+        file_a: PathBuf,
+
+        /// Second (newer) snapshot file to compare.
+        #[arg(value_name = "SNAPSHOT_B")]
+        file_b: PathBuf,
+
+        /// Output as JSON instead of a human-readable diff.
         #[arg(long)]
         json: bool,
     },
