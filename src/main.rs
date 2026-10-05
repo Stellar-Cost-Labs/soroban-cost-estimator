@@ -367,7 +367,6 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 out,
                 json,
                 retain,
-                action,
             } => match action {
                 // A subcommand manages snapshots already on disk, so it cannot
                 // be combined with this command's fetching flags (enforced by
@@ -403,6 +402,9 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     file_b,
                     json,
                 }) => cmd_config_snapshot_diff(&file_a, &file_b, json),
+                Some(cli::SnapshotAction::Validate { path, all }) => {
+                    cmd_config_snapshot_validate(path.as_deref(), all)
+                }
                 None => {
                     let format = match (args.format, json) {
                         (Some(fmt), _) => fmt,
@@ -3867,14 +3869,11 @@ fn cmd_config_snapshot_validate(path: Option<&std::path::Path>, all: bool) -> er
             println!("Valid: {}", status.path.display());
         } else {
             invalid += 1;
-            println!(
-                "Invalid: {}: {}",
-                status.path.display(),
-                status
-                    .error
-                    .as_deref()
-                    .unwrap_or("unknown validation error")
-            );
+            let validation_error = status
+                .error
+                .as_deref()
+                .map_or("unknown validation error", |message| message);
+            println!("Invalid: {}: {}", status.path.display(), validation_error);
         }
     }
 

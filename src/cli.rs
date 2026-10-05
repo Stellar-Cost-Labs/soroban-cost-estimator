@@ -510,6 +510,17 @@ pub enum SnapshotAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Validate a snapshot file or every stored snapshot.
+    Validate {
+        /// Explicit snapshot file to validate.
+        #[arg(value_name = "PATH", required_unless_present = "all")]
+        path: Option<PathBuf>,
+
+        /// Validate every JSON snapshot in the snapshots directory.
+        #[arg(long, conflicts_with = "path")]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -534,9 +545,6 @@ pub enum ConfigAction {
         /// older ones once the new snapshot is safely on disk.
         #[arg(long, value_name = "COUNT")]
         retain: Option<usize>,
-
-        #[command(subcommand)]
-        action: Option<SnapshotAction>,
     },
     /// List all saved config snapshots with their timestamp and ledger.
     List {

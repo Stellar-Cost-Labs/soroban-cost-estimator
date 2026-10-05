@@ -63,10 +63,9 @@ pub fn load_latest_snapshot(network: &str) -> AppResult<ConfigSnapshot> {
     let mut entries: Vec<_> = std::fs::read_dir(&dir)?
         .filter_map(|e| e.ok())
         .filter(|e| {
-            e.file_name()
-                .to_str()
-                .map(|n| n.starts_with(&format!("{}-", network)) && n.ends_with(".json"))
-                .unwrap_or(false)
+            e.file_name().to_str().is_some_and(|name| {
+                name.starts_with(&format!("{}-", network)) && name.ends_with(".json")
+            })
         })
         .collect();
 
@@ -330,28 +329,31 @@ pub fn validate_all_snapshot_files() -> AppResult<Vec<SnapshotValidation>> {
 /// Validates a snapshot at an explicit path without requiring it to be stored
 /// in the snapshots directory.
 pub fn validate_snapshot_file(path: &std::path::Path) -> SnapshotValidation {
-    validate_snapshot_paths(vec![path.to_path_buf()])
+    match validate_snapshot_paths(vec![path.to_path_buf()])
         .into_iter()
         .next()
-        .unwrap_or_else(|| SnapshotValidation {
+    {
+        Some(validation) => validation,
+        None => SnapshotValidation {
             path: path.to_path_buf(),
-            filename: path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            filename: match path.file_name() {
+                Some(name) => name.to_string_lossy().into_owned(),
+                None => String::new(),
+            },
             valid: false,
             error: Some("snapshot validation produced no result".to_string()),
-        })
+        },
+    }
 }
 
 fn validate_snapshot_paths(paths: Vec<PathBuf>) -> Vec<SnapshotValidation> {
     paths
         .into_iter()
         .map(|path| {
-            let filename = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            let filename = match path.file_name() {
+                Some(name) => name.to_string_lossy().into_owned(),
+                None => String::new(),
+            };
             match validate_single_snapshot(&path) {
                 Ok(()) => SnapshotValidation {
                     path,
