@@ -14,13 +14,51 @@ use std::fmt;
 
 use crate::report::cost_report::CostReport;
 
+/// Rendering options that are not part of the report data itself.
+///
+/// Currently one switch: [`quiet`](Self::quiet), set by the CLI's global
+/// `--quiet` flag, which drops every *advisory* section (optimization tips and
+/// the quantified savings breakdown) while leaving the measured cost data
+/// untouched. Machine consumers that already read the JSON keys are
+/// unaffected — see [`JsonFormatter`] — so a caller can always ask for the
+/// structured data explicitly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReportOptions {
+    /// Suppress advisory output (optimization tips and savings breakdown).
+    pub quiet: bool,
+}
+
+impl ReportOptions {
+    /// Options with advisory output enabled — the default.
+    #[must_use]
+    pub fn verbose_advisory() -> Self {
+        Self { quiet: false }
+    }
+
+    /// Options with advisory output suppressed, as `--quiet` requests.
+    #[must_use]
+    pub fn quiet() -> Self {
+        Self { quiet: true }
+    }
+}
+
 /// Formats a [`CostReport`] into a specific output representation.
 ///
 /// All implementations are deterministic and produce stable output for the
 /// same input, making them safe for snapshot testing and piping into scripts.
 pub trait ReportFormatter {
     /// Format the report into the target representation.
-    fn format(&self, report: &CostReport) -> String;
+    ///
+    /// Equivalent to calling [`Self::format_with`] with the default
+    /// [`ReportOptions`]; it exists so callers that do not care about
+    /// `--quiet` keep a one-argument entry point.
+    fn format(&self, report: &CostReport) -> String {
+        self.format_with(report, ReportOptions::default())
+    }
+
+    /// Format the report into the target representation, honouring
+    /// `options`.
+    fn format_with(&self, report: &CostReport, options: ReportOptions) -> String;
 
     /// Human-readable name of this format (e.g. `"table"`, `"json"`).
     fn name(&self) -> &'static str;
@@ -135,6 +173,7 @@ impl TableFormatter {
         report: &CostReport,
         show_chart: bool,
         chart_width: usize,
+        options: ReportOptions,
     ) -> String {
         let mut output = String::new();
 
@@ -148,7 +187,9 @@ impl TableFormatter {
             crate::report::cost_report::format_ledger_sequence(report.ledger)
         ));
         output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
-        output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
+        output.push_str(&format!("WASM hash: {}\n", report.wasm_hash));
+        output.push_str(&format!("WASM size: {} bytes\n", report.wasm_size));
+        output.push('\n');
 
         // Contract metadata from the WASM `contractmeta` section: always
         // rendered (present or absent) so the report states whether the
@@ -193,21 +234,31 @@ impl TableFormatter {
             ));
         }
 
-        output.push('\n');
-        output.push_str(&crate::report::cost_report::format_suggestions(
-            &report.suggest_optimizations(),
-        ));
+        // Advisory sections (contextual tips and the structured savings
+        // breakdown) are omitted entirely under `--quiet`.
+        if !options.quiet {
+            let tips = crate::report::cost_report::generate_optimization_tips(report);
+            if !tips.is_empty() {
+                output.push('\n');
+                output.push_str(&crate::report::cost_report::format_tips(&tips));
+            }
+            output.push('\n');
+            output.push_str(&crate::report::cost_report::format_suggestions(
+                &report.suggest_optimizations(),
+            ));
+        }
 
         output
     }
 }
 
 impl ReportFormatter for TableFormatter {
-    fn format(&self, report: &CostReport) -> String {
+    fn format_with(&self, report: &CostReport, options: ReportOptions) -> String {
         self.format_with_options(
             report,
             true,
             crate::report::cost_report::DEFAULT_CHART_WIDTH,
+            options,
         )
     }
 
@@ -226,12 +277,34 @@ impl fmt::Display for TableFormatter {
 pub struct JsonFormatter;
 
 impl ReportFormatter for JsonFormatter {
-    fn format(&self, report: &CostReport) -> String {
+    /// Emits the report plus two derived keys:
+    ///
+    /// * `suggestions` — contextual, human-readable tips from
+    ///   [`crate::report::cost_report::generate_optimization_tips`]
+    ///   (issue #323).
+    /// * `optimization_suggestions` — the structured per-resource savings
+    ///   records from [`CostReport::suggest_optimizations`], each with a
+    ///   quantified `potential_savings_stroops`.
+    ///
+    /// `suggestions` is the documented key for the tip list; the structured
+    /// records live under `optimization_suggestions` so the two are never
+    /// confused for one another.
+    ///
+    /// `--quiet` omits both keys (issue #323) so a machine consumer that
+    /// wants the data simply leaves the flag off.
+    fn format_with(&self, report: &CostReport, options: ReportOptions) -> String {
         let mut value = serde_json::to_value(report).unwrap_or(serde_json::Value::Null);
-        let suggestions =
-            serde_json::to_value(report.suggest_optimizations()).unwrap_or(serde_json::Value::Null);
         if let serde_json::Value::Object(ref mut map) = value {
-            map.insert("suggestions".to_string(), suggestions);
+            if !options.quiet {
+                let tips = serde_json::to_value(
+                    crate::report::cost_report::generate_optimization_tips(report),
+                )
+                .unwrap_or(serde_json::Value::Null);
+                let structured = serde_json::to_value(report.suggest_optimizations())
+                    .unwrap_or(serde_json::Value::Null);
+                map.insert("suggestions".to_string(), tips);
+                map.insert("optimization_suggestions".to_string(), structured);
+            }
         }
         serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
     }
@@ -255,9 +328,9 @@ impl fmt::Display for JsonFormatter {
 pub struct CsvFormatter;
 
 impl ReportFormatter for CsvFormatter {
-    fn format(&self, report: &CostReport) -> String {
+    fn format_with(&self, report: &CostReport, _options: ReportOptions) -> String {
         let mut output = String::from(
-            "function,network,ledger,wasm_hash,cpu_instructions,memory_bytes,\
+            "function,network,ledger,wasm_hash,wasm_size,cpu_instructions,memory_bytes,\
              read_entries,write_entries,read_bytes,write_bytes,tx_size,\
              non_refundable_stroops,refundable_stroops,total_stroops,total_xlm,\
              rpc_latency_ms\n",
@@ -268,6 +341,7 @@ impl ReportFormatter for CsvFormatter {
             &report.network,
             &report.ledger.to_string(),
             &report.wasm_hash,
+            &report.wasm_size.to_string(),
             &report.cpu_instructions.to_string(),
             &report.memory_bytes.to_string(),
             &report.read_entries.to_string(),
@@ -306,7 +380,7 @@ pub struct MarkdownFormatter;
 
 impl ReportFormatter for MarkdownFormatter {
     #[allow(clippy::too_many_lines)]
-    fn format(&self, report: &CostReport) -> String {
+    fn format_with(&self, report: &CostReport, options: ReportOptions) -> String {
         let mut output = String::new();
 
         output.push_str(&format!("## Cost Report: `{}`\n\n", report.function));
@@ -319,6 +393,7 @@ impl ReportFormatter for MarkdownFormatter {
             crate::report::cost_report::format_ledger_sequence(report.ledger)
         ));
         output.push_str(&format!("- **WASM hash:** `{}`\n", report.wasm_hash));
+        output.push_str(&format!("- **WASM size:** {} bytes\n", report.wasm_size));
         output.push_str(&format!(
             "- **RPC round-trip:** {} ms\n\n",
             report.rpc_latency_ms
@@ -409,19 +484,29 @@ impl ReportFormatter for MarkdownFormatter {
             }
         }
 
-        // Optimization suggestions
-        output.push_str("\n### Optimization Suggestions\n\n");
-        let suggestions = report.suggest_optimizations();
-        if suggestions.is_empty() {
-            output.push_str(
-                "No cost optimizations identified (fee rates unavailable or no reducible resources).\n",
-            );
-        } else {
-            for s in &suggestions {
-                output.push_str(&format!(
-                    "- **{}**: {} (potential saving: {} stroops)\n",
-                    s.title, s.detail, s.potential_savings_stroops
-                ));
+        // Advisory sections — omitted entirely under `--quiet`.
+        if !options.quiet {
+            let tips = crate::report::cost_report::generate_optimization_tips(report);
+            if !tips.is_empty() {
+                output.push_str("\n### Optimization Tips\n\n");
+                for tip in &tips {
+                    output.push_str(&format!("- {tip}\n"));
+                }
+            }
+
+            output.push_str("\n### Optimization Suggestions\n\n");
+            let suggestions = report.suggest_optimizations();
+            if suggestions.is_empty() {
+                output.push_str(
+                    "No cost optimizations identified (fee rates unavailable or no reducible resources).\n",
+                );
+            } else {
+                for s in &suggestions {
+                    output.push_str(&format!(
+                        "- **{}**: {} (potential saving: {} stroops)\n",
+                        s.title, s.detail, s.potential_savings_stroops
+                    ));
+                }
             }
         }
         output.push_str("\n</details>\n");
@@ -485,7 +570,7 @@ mod tests {
         CostReport {
             function: "increment".to_string(),
             wasm_hash: "abc123def456".to_string(),
-            wasm_size: 4_096,
+            wasm_size: 14_432,
             cpu_instructions: 532_502,
             memory_bytes: 0,
             tx_size: 156,
@@ -500,8 +585,8 @@ mod tests {
                 storage_fee_stroops: 4_063,
                 bandwidth_fee_stroops: 61,
                 base_fee_stroops: 100,
-                total_stroops: 15_527,
-                total_xlm: "0.0015527".to_string(),
+                total_stroops: 15_427,
+                total_xlm: "0.0015427".to_string(),
                 fee_percentages: std::collections::BTreeMap::new(),
             },
             ledger: 3_894_195,
@@ -590,7 +675,7 @@ mod tests {
         assert!(output.contains("CPU Instructions"));
         assert!(output.contains("Rent Fee"));
         assert!(output.contains("Total"));
-        assert!(output.contains("15527 stroops (0.0015527)"));
+        assert!(output.contains("15427 stroops (0.0015427)"));
     }
 
     #[test]
@@ -654,7 +739,8 @@ mod tests {
     #[test]
     fn test_table_formatter_can_disable_chart() {
         let formatter = TableFormatter;
-        let output = formatter.format_with_options(&sample_report(), false, 80);
+        let output =
+            formatter.format_with_options(&sample_report(), false, 80, ReportOptions::default());
         assert!(!output.contains("Fee Distribution:"));
         // Everything else in the report is still rendered.
         assert!(output.contains("Fee Breakdown:"));
@@ -719,8 +805,8 @@ mod tests {
         assert_eq!(parsed["ledger_sequence"], 3_894_195);
         assert_eq!(parsed["network"], "testnet");
         assert_eq!(parsed["rpc_latency_ms"], 87);
-        assert_eq!(parsed["fee"]["total_stroops"], 15_527);
-        assert_eq!(parsed["fee"]["total_xlm"], "0.0015527");
+        assert_eq!(parsed["fee"]["total_stroops"], 15_427);
+        assert_eq!(parsed["fee"]["total_xlm"], "0.0015427");
     }
 
     #[test]
@@ -754,7 +840,7 @@ mod tests {
         let first_line = output.lines().next().unwrap();
         assert!(first_line.starts_with("function,"));
         let field_count = first_line.split(',').count();
-        assert_eq!(field_count, 16);
+        assert_eq!(field_count, 17);
     }
 
     #[test]
@@ -767,7 +853,7 @@ mod tests {
         assert!(data.contains("increment"));
         assert!(data.contains("testnet"));
         assert!(data.contains("532502"));
-        assert!(data.contains("15527"));
+        assert!(data.contains("15427"));
     }
 
     #[test]
@@ -842,7 +928,7 @@ mod tests {
         assert!(output.contains("### Fee Breakdown"));
         assert!(output.contains("| CPU Instructions | 372 |"));
         assert!(output.contains("| Rent Fee | 10931 |"));
-        assert!(output.contains("| **Total** | **15527** (0.0015527) |"));
+        assert!(output.contains("| **Total** | **15427** (0.0015427) |"));
     }
 
     #[test]
@@ -913,118 +999,135 @@ mod tests {
         }
     }
 
-    // ── Resource warnings & history rendering (#321, #322) ───────────
+    // ── Optimization tips (#323) ──────────────────────────────────────
 
-    fn sample_warning() -> crate::report::cost_report::ResourceWarning {
-        crate::report::cost_report::ResourceWarning {
-            resource: "cpu_instructions".to_string(),
-            label: "CPU instructions".to_string(),
-            used: 900,
-            limit: 1_000,
-            percent: 90,
-            message: "CPU instructions at 90% of the network limit (900 of 1000)".to_string(),
+    /// A report whose fee is dominated by ledger writes must surface the
+    /// contextual tip in the table output (issue #323).
+    fn dominant_write_report() -> CostReport {
+        let mut report = sample_report();
+        report.write_entries = 3;
+        report.fee.storage_fee_stroops = 11_110;
+        report.fee.refundable_stroops = 0;
+        report
+    }
+
+    #[test]
+    fn test_table_formatter_shows_optimization_tips() {
+        let output = TableFormatter.format(&dominant_write_report());
+        assert!(output.contains("Optimization Tips:"));
+        assert!(output.contains("writing 3 ledger entries"));
+    }
+
+    /// `--quiet` must drop the advisory sections but keep every measured value.
+    #[test]
+    fn test_table_formatter_quiet_omits_advisory_sections() {
+        let report = dominant_write_report();
+        let output = TableFormatter.format_with(&report, ReportOptions::quiet());
+
+        assert!(!output.contains("Optimization Tips:"), "{output}");
+        assert!(!output.contains("Optimization Suggestions:"), "{output}");
+        assert!(!output.contains("writing 3 ledger entries"), "{output}");
+        // The cost data is untouched.
+        assert!(output.contains("15427 stroops (0.0015427)"));
+        assert!(output.contains("Write Entries"));
+    }
+
+    #[test]
+    fn test_markdown_formatter_shows_and_omits_tips() {
+        let report = dominant_write_report();
+
+        let output = MarkdownFormatter.format(&report);
+        assert!(output.contains("### Optimization Tips"));
+        assert!(output.contains("writing 3 ledger entries"));
+
+        let quiet = MarkdownFormatter.format_with(&report, ReportOptions::quiet());
+        assert!(!quiet.contains("### Optimization Tips"), "{quiet}");
+        assert!(!quiet.contains("### Optimization Suggestions"), "{quiet}");
+        assert!(quiet.contains("| **Total** | **15427** (0.0015427) |"));
+    }
+
+    /// `suggestions` carries the tip strings; the structured per-resource
+    /// savings live under `optimization_suggestions` (issue #323).
+    #[test]
+    fn test_json_formatter_exposes_suggestions_key() {
+        let output = JsonFormatter.format(&dominant_write_report());
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+
+        let suggestions = parsed["suggestions"]
+            .as_array()
+            .expect("`suggestions` must be an array of tip strings");
+        assert!(
+            suggestions.iter().any(|s| s
+                .as_str()
+                .is_some_and(|s| s.contains("writing 3 ledger entries"))),
+            "got: {suggestions:?}"
+        );
+        assert!(parsed["optimization_suggestions"].is_array());
+    }
+
+    /// `--quiet` omits both advisory keys from the JSON report.
+    #[test]
+    fn test_json_formatter_quiet_omits_suggestions() {
+        let report = dominant_write_report();
+        let output = JsonFormatter.format_with(&report, ReportOptions::quiet());
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+
+        assert!(parsed.get("suggestions").is_none(), "{output}");
+        assert!(parsed.get("optimization_suggestions").is_none(), "{output}");
+        // The measured data is still there.
+        assert_eq!(parsed["fee"]["total_stroops"], 15_427);
+        assert_eq!(parsed["write_entries"], 3);
+    }
+
+    /// `format` must be exactly `format_with` under the default options, so the
+    /// two entry points can never drift.
+    #[test]
+    fn test_format_matches_format_with_default_options() {
+        let report = sample_report();
+        let formatters: Vec<Box<dyn ReportFormatter>> = vec![
+            Box::new(TableFormatter),
+            Box::new(JsonFormatter),
+            Box::new(CsvFormatter),
+            Box::new(MarkdownFormatter),
+        ];
+        for formatter in &formatters {
+            assert_eq!(
+                formatter.format(&report),
+                formatter.format_with(&report, ReportOptions::verbose_advisory()),
+                "{} formatter disagreed with the default options",
+                formatter.name()
+            );
         }
     }
 
     #[test]
-    fn test_json_formatter_always_includes_warnings_array() {
-        let formatter = JsonFormatter;
-        let output = formatter.format(&sample_report());
-        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
-        assert_eq!(parsed["warnings"], serde_json::json!([]));
+    fn test_report_options_defaults() {
+        assert!(!ReportOptions::default().quiet);
+        assert!(!ReportOptions::verbose_advisory().quiet);
+        assert!(ReportOptions::quiet().quiet);
     }
 
+    /// `wasm_size` is now a report field, so every format must carry it.
     #[test]
-    fn test_json_formatter_serializes_warnings_and_history() {
-        let mut report = sample_report();
-        report.warnings = vec![sample_warning()];
-        report.history = Some(vec![crate::report::cost_report::HistoryEntry {
-            timestamp: "2026-01-01T00:00:00Z".to_string(),
-            ledger: 10,
-            cpu_instructions: 100,
-            total_stroops: 20_000,
-            total_xlm: "0.0020000".to_string(),
-            delta_stroops: 5_000,
-            trend: crate::report::cost_report::CostTrend::Regression,
-        }]);
+    fn test_all_formatters_report_wasm_size() {
+        let report = sample_report();
+        let table = TableFormatter.format(&report);
+        assert!(table.contains("WASM size: 14432 bytes"), "{table}");
 
-        let output = JsonFormatter.format(&report);
-        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
-        assert_eq!(parsed["warnings"][0]["resource"], "cpu_instructions");
-        assert_eq!(parsed["warnings"][0]["percent"], 90);
-        assert_eq!(parsed["history"][0]["trend"], "regression");
-        assert_eq!(parsed["history"][0]["delta_stroops"], 5_000);
-    }
+        let markdown = MarkdownFormatter.format(&report);
+        assert!(
+            markdown.contains("**WASM size:** 14432 bytes"),
+            "{markdown}"
+        );
 
-    #[test]
-    fn test_json_formatter_omits_history_when_not_requested() {
-        let output = JsonFormatter.format(&sample_report());
-        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
-        assert!(parsed.get("history").is_none());
-    }
+        let csv = CsvFormatter.format(&report);
+        let header = csv.lines().next().unwrap_or_default();
+        assert!(header.contains("wasm_size"), "{header}");
+        assert!(csv.contains("14432"), "{csv}");
 
-    #[test]
-    fn test_json_formatter_includes_empty_history_when_requested() {
-        let mut report = sample_report();
-        report.history = Some(Vec::new());
-        let output = JsonFormatter.format(&report);
-        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
-        assert_eq!(parsed["history"], serde_json::json!([]));
-    }
-
-    #[test]
-    fn test_table_formatter_renders_resource_warnings() {
-        let mut report = sample_report();
-        report.warnings = vec![sample_warning()];
-        let output = TableFormatter.format(&report);
-        assert!(output.contains("Resource limit warnings:"));
-        assert!(output.contains("CPU instructions at 90%"));
-    }
-
-    #[test]
-    fn test_table_formatter_omits_warnings_when_clean() {
-        let output = TableFormatter.format(&sample_report());
-        assert!(!output.contains("Resource limit warnings:"));
-    }
-
-    #[test]
-    fn test_table_formatter_renders_history() {
-        let mut report = sample_report();
-        const PREVIOUS_TOTAL_STROOPS: i64 = 20_000;
-        report.history = Some(crate::report::cost_report::build_history_entries(
-            report.fee.total_stroops,
-            7,
-            &[crate::report::cost_report::HistoricalRun {
-                timestamp: "2026-01-01T00:00:00Z".to_string(),
-                ledger: 100,
-                cpu_instructions: 1_000,
-                total_stroops: PREVIOUS_TOTAL_STROOPS,
-            }],
-        ));
-        let output = TableFormatter.format(&report);
-        assert!(output.contains("Cost history (previous runs, newest first):"));
-        // The previous run cost more than the current one, so it renders as a
-        // regression with an explicit `+` prefix. Derive the expected value
-        // from the fixture so changing `sample_report`'s fee does not break it.
-        let delta = PREVIOUS_TOTAL_STROOPS - report.fee.total_stroops;
-        assert!(delta > 0, "fixture must be a regression");
-        assert!(output.contains(&format!("+{delta}")));
-    }
-
-    #[test]
-    fn test_markdown_formatter_has_collapsible_details() {
-        let output = MarkdownFormatter.format(&sample_report());
-        assert!(output.contains("<details>"));
-        assert!(output.contains("</details>"));
-    }
-
-    #[test]
-    fn test_markdown_formatter_renders_resource_warnings() {
-        let mut report = sample_report();
-        report.warnings = vec![sample_warning()];
-        let output = MarkdownFormatter.format(&report);
-        assert!(output.contains("### Resource Limit Warnings"));
-        assert!(output.contains("> **Warning:** CPU instructions at 90%"));
+        let json = JsonFormatter.format(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(parsed["wasm_size"], 14_432);
     }
 
     #[test]

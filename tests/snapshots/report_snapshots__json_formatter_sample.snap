@@ -20,14 +20,17 @@ expression: JsonFormatter.format(&report)
   "ledger_sequence": 3894195,
   "memory_bytes": 0,
   "network": "testnet",
+  "optimization_suggestions": [],
   "read_bytes": 0,
   "read_entries": 1,
   "rpc_latency_ms": 87,
-  "suggestions": [],
+  "suggestions": [
+    "Tip: 70% of the total fee is refundable, which comes from ledger rent bumps and contract events. Consider reducing state growth and the number or size of emitted events."
+  ],
   "tx_size": 156,
   "warnings": [],
   "wasm_hash": "abc123def456",
-  "wasm_size": 4096,
+  "wasm_size": 14432,
   "write_bytes": 136,
   "write_entries": 1
 }
