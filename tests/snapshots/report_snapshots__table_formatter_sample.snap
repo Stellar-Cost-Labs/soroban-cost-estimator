@@ -7,6 +7,7 @@ Network: testnet (ledger 3894195)
 Simulated at ledger sequence: 3,894,195
 RPC round-trip: 87 ms
 WASM hash: abc123def456
+WASM size: 14432 bytes
 
 Contract meta: absent
 
@@ -52,6 +53,9 @@ Fee Distribution:
   Storage I/O | ██████████████▒                                         |  26.3%
   Bandwidth   | ░                                                       |   0.4%
   Rent        | ███████████████████████████████████████                 |  70.9%
+
+Optimization Tips:
+  Tip: 70% of the total fee is refundable, which comes from ledger rent bumps and contract events. Consider reducing state growth and the number or size of emitted events.
 
 Optimization Suggestions:
   No cost optimizations identified (fee rates unavailable or no reducible resources).
