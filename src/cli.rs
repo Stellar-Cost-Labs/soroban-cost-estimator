@@ -124,8 +124,12 @@ pub struct Cli {
     pub quiet: bool,
 
     /// Custom HTTP header to send with every RPC request, e.g.
-    /// `--header "X-API-Key: secret"`. Repeatable for multiple headers.
-    #[arg(long = "header", value_name = "KEY: VALUE", global = true)]
+    /// `--header "Authorization=Bearer <token>"`. Repeatable for multiple
+    /// headers. The `KEY: VALUE` spelling is also accepted.
+    ///
+    /// Sensitive headers (`Authorization`, `x-api-key`, `api-key`, …) are
+    /// redacted in verbose logs.
+    #[arg(long = "header", short = 'H', value_name = "KEY=VALUE", global = true)]
     pub headers: Vec<String>,
 
     /// Fallback RPC URL used when the primary endpoint is unreachable or
