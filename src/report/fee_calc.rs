@@ -94,25 +94,16 @@ pub fn compute_fee_breakdown(
     precision: u32,
 ) -> FeeBreakdown {
     // CPU fee: stroops per 10K instructions → (cpu_insns * rate) / 10000
-    let cpu_fee = ((cpu_insns as i64)
-        .checked_mul(rates.fee_per_10k_insns)
-        .unwrap_or(i64::MAX))
-        / 10_000;
+    let cpu_fee = scaled_fee(cpu_insns, rates.fee_per_10k_insns, 10_000);
 
     // Storage I/O fees (non-refundable): per-entry read/write fees and a
     // per-KB fee on disk bytes read.
-    let read_entry_fee = (read_entries as i64).saturating_mul(rates.fee_per_read_entry);
-    let write_entry_fee = (write_entries as i64).saturating_mul(rates.fee_per_write_entry);
-    let read_bytes_fee = ((read_bytes as i64)
-        .checked_mul(rates.fee_per_read_1kb)
-        .unwrap_or(i64::MAX))
-        / 1024;
+    let read_entry_fee = scaled_fee(u64::from(read_entries), rates.fee_per_read_entry, 1);
+    let write_entry_fee = scaled_fee(u64::from(write_entries), rates.fee_per_write_entry, 1);
+    let read_bytes_fee = scaled_fee(u64::from(read_bytes), rates.fee_per_read_1kb, 1024);
 
     // Bandwidth fee: stroops per 1KB → (tx_size * rate) / 1024
-    let bandwidth_fee = ((tx_size as i64)
-        .checked_mul(rates.fee_per_1kb)
-        .unwrap_or(i64::MAX))
-        / 1024;
+    let bandwidth_fee = scaled_fee(u64::from(tx_size), rates.fee_per_1kb, 1024);
 
     // Non-refundable: CPU + storage I/O + bandwidth fees, computed
     // independently from the config-sourced rates. This is NOT clamped to
@@ -220,6 +211,18 @@ pub fn compute_fee_breakdown(
         total_stroops,
         total_xlm,
         fee_percentages,
+    }
+}
+
+/// Calculate `units * rate / divisor` without narrowing the unit count or
+/// overflowing intermediate arithmetic. The final fee is clamped to the
+/// representable stroop range.
+fn scaled_fee(units: u64, rate: i64, divisor: i128) -> i64 {
+    let fee = i128::from(units).saturating_mul(i128::from(rate)) / divisor;
+    match i64::try_from(fee) {
+        Ok(value) => value,
+        Err(_) if fee < 0 => i64::MIN,
+        Err(_) => i64::MAX,
     }
 }
 
@@ -357,6 +360,26 @@ mod tests {
             fee_per_read_1kb: 0,
             fee_per_1kb: 10,
         }
+    }
+
+    /// Issue #354: `scaled_fee` keeps the intermediate multiplication in
+    /// `i128`, so extreme unit counts and rates saturate at the stroop
+    /// boundary instead of wrapping (or panicking) in `i64`.
+    #[test]
+    fn test_scaled_fee_saturates_at_i64_bounds() {
+        // Ordinary `(units * rate) / divisor` scaling, floor-divided.
+        assert_eq!(scaled_fee(100_000, 1024, 10_000), 10_240);
+        assert_eq!(scaled_fee(9_999, 1, 10_000), 0);
+        // Negative rates stay negative (division truncates toward zero).
+        assert_eq!(scaled_fee(1, -10_000, 10_000), -1);
+        // `u64::MAX * i64::MAX` overflows `i64` but not `i128`, so the fee is
+        // clamped to the representable maximum rather than wrapping.
+        assert_eq!(scaled_fee(u64::MAX, i64::MAX, 1), i64::MAX);
+        // Negative products clamp to the representable minimum.
+        assert_eq!(scaled_fee(u64::MAX, i64::MIN, 1), i64::MIN);
+        // Zero units always cost zero, whatever the rate.
+        assert_eq!(scaled_fee(0, i64::MAX, 10_000), 0);
+        assert_eq!(scaled_fee(0, i64::MIN, 1024), 0);
     }
 
     #[test]

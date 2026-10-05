@@ -5,12 +5,13 @@ use soroban_cost_estimator::report::fee_calc::{DEFAULT_PRECISION, FeeBreakdown};
 use soroban_cost_estimator::report::formatter::{
     CsvFormatter, JsonFormatter, MarkdownFormatter, ReportFormatter, TableFormatter,
 };
+use soroban_cost_estimator::wasm::parser::ContractMeta;
 
 fn sample_report() -> CostReport {
     CostReport {
         function: "increment".to_string(),
         wasm_hash: "abc123def456".to_string(),
-        wasm_size_bytes: 14_432,
+        wasm_size: 14_432,
         cpu_instructions: 532_502,
         memory_bytes: 0,
         tx_size: 156,
@@ -33,6 +34,8 @@ fn sample_report() -> CostReport {
         network: "testnet".to_string(),
         rpc_latency_ms: 87,
         rates: None,
+        projections: None,
+        contract_meta: ContractMeta::default(),
     }
 }
 
@@ -40,7 +43,7 @@ fn empty_report() -> CostReport {
     CostReport {
         function: "(wasm upload)".to_string(),
         wasm_hash: "0000000000000000".to_string(),
-        wasm_size_bytes: 0,
+        wasm_size: 0,
         cpu_instructions: 0,
         memory_bytes: 0,
         tx_size: 0,
@@ -63,6 +66,8 @@ fn empty_report() -> CostReport {
         network: "mainnet".to_string(),
         rpc_latency_ms: 0,
         rates: None,
+        projections: None,
+        contract_meta: ContractMeta::default(),
     }
 }
 
@@ -110,7 +115,7 @@ fn batch_report(function: &str, cpu: u64, fee_stroops: i64, writes: u32) -> Cost
     CostReport {
         function: function.to_string(),
         wasm_hash: "abc123def456".to_string(),
-        wasm_size_bytes: 14_432,
+        wasm_size: 14_432,
         cpu_instructions: cpu,
         memory_bytes: 0,
         tx_size: 156,
@@ -124,16 +129,20 @@ fn batch_report(function: &str, cpu: u64, fee_stroops: i64, writes: u32) -> Cost
             cpu_fee_stroops: 372,
             storage_fee_stroops: 4_063,
             bandwidth_fee_stroops: 61,
+            base_fee_stroops: 100,
             total_stroops: fee_stroops,
             total_xlm: soroban_cost_estimator::report::fee_calc::stroops_to_xlm(
                 fee_stroops,
                 DEFAULT_PRECISION,
             ),
+            fee_percentages: std::collections::BTreeMap::new(),
         },
         ledger: 3_894_195,
         network: "testnet".to_string(),
         rpc_latency_ms: 87,
         rates: None,
+        projections: None,
+        contract_meta: ContractMeta::default(),
     }
 }
 

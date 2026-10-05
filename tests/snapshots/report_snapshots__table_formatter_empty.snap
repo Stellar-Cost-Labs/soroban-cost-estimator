@@ -4,9 +4,12 @@ expression: TableFormatter.format(&empty)
 ---
 Function: (wasm upload)
 Network: mainnet (ledger 0)
+Simulated at ledger sequence: 0
 RPC round-trip: 0 ms
 WASM hash: 0000000000000000
 WASM size: 0 bytes
+
+Contract meta: absent
 
 +------------------+----------+---------------+
 | Resource         | Consumed | Fee (stroops) |

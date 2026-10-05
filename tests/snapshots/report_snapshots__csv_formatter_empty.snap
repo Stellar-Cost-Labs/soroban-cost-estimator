@@ -1,7 +1,6 @@
 ---
 source: tests/report_snapshots.rs
-assertion_line: 89
 expression: CsvFormatter.format(&empty)
 ---
-function,network,ledger,wasm_hash,wasm_size_bytes,cpu_instructions,memory_bytes,read_entries,write_entries,read_bytes,write_bytes,tx_size,non_refundable_stroops,refundable_stroops,total_stroops,total_xlm,rpc_latency_ms
+function,network,ledger,wasm_hash,wasm_size,cpu_instructions,memory_bytes,read_entries,write_entries,read_bytes,write_bytes,tx_size,non_refundable_stroops,refundable_stroops,total_stroops,total_xlm,rpc_latency_ms
 (wasm upload),mainnet,0,0000000000000000,0,0,0,0,0,0,0,0,0,0,0,0.0000000,0
