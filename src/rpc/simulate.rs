@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use stellar_xdr::ReadXdr;
 use tracing::{debug, trace};
 
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::rpc::client::RpcClient;
 
 /// Parameters for the `simulateTransaction` RPC call.

@@ -1,5 +1,6 @@
 //! Helpers for encoding/decoding Soroban XDR types using `stellar_xdr`.
 
+use anyhow::{anyhow, Context};
 use stellar_xdr::ReadXdr;
 use stellar_xdr::WriteXdr;
 
@@ -41,10 +42,10 @@ pub fn decode_config_entry_xdr(
 
     match entry_data {
         stellar_xdr::LedgerEntryData::ConfigSetting(config_entry) => Ok(config_entry),
-        other => Err(AppError::XdrDecode(format!(
-            "expected ConfigSetting entry, got {}",
+        other => Err(anyhow!(
+            "XDR decode error: expected ConfigSetting entry, got {}",
             other.name()
-        ))),
+        )),
     }
 }
 
@@ -164,9 +165,7 @@ pub fn build_simulation_tx_envelope(
     let host_function = match function_name {
         Some(fn_name) => {
             let id_hex = contract_id.ok_or_else(|| {
-                AppError::TxConstruction(
-                    "contract id required for function invocation (pass --id <64-hex>)".to_string(),
-                )
+                anyhow!("Transaction construction error: contract id required for function invocation (pass --id <64-hex>)")
             })?;
             let id_bytes = parse_contract_id(id_hex)?;
 
@@ -304,9 +303,7 @@ pub fn parse_contract_id(id: &str) -> AppResult<[u8; 32]> {
     // Fall back to a strkey contract ID (`C…`, SEP-23) — the format the
     // Stellar CLI prints after `contract deploy`.
     let contract_id = id.parse::<stellar_xdr::ContractId>().map_err(|e| {
-        AppError::TxConstruction(format!(
-            "invalid contract id (expected 64 hex chars or a C… strkey): {e}"
-        ))
+        anyhow!("invalid contract id (expected 64 hex chars or a C… strkey): {e}")
     })?;
     Ok(contract_id.0.0)
 }

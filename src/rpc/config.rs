@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tracing::{debug, trace};
 
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::rpc::client::RpcClient;
 
 /// Well-known `ConfigSettingID` values used by Soroban.
@@ -137,7 +137,7 @@ pub async fn fetch_config_setting(
         .entries
         .into_iter()
         .next()
-        .ok_or_else(|| AppError::ConfigSettingNotFound(setting_id.human_name().to_string()))?;
+        .ok_or_else(|| anyhow!("Config setting not found: {}", setting_id.human_name()))?;
 
     trace!(
         setting = setting_id.human_name(),
@@ -206,7 +206,7 @@ pub async fn fetch_all_config_settings(
             raw.id = *id;
             results.push(raw);
         } else {
-            return Err(AppError::ConfigSettingNotFound(id.human_name().to_string()));
+            return Err(anyhow!("Config setting not found: {}", id.human_name()));
         }
     }
 

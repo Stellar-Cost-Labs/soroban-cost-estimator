@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::error::{AppError, AppResult};
+use anyhow::anyhow;
+
+use crate::error::AppResult;
 
 /// Default number of decimal places shown for XLM fee values.
 pub const DEFAULT_PRECISION: u32 = 7;
@@ -280,11 +282,11 @@ pub fn xlm_to_stroops(xlm: &str) -> AppResult<i64> {
         2 => {
             let whole: i64 = parts[0]
                 .parse()
-                .map_err(|_| AppError::FeeCalc(format!("invalid XLM value: {xlm}")))?;
+                .map_err(|_| anyhow!("Fee calculation error: invalid XLM value: {xlm}"))?;
             let fraction_str = format!("{:0<7}", parts[1]);
             let fraction: i64 = fraction_str[..7.min(fraction_str.len())]
                 .parse()
-                .map_err(|_| AppError::FeeCalc(format!("invalid XLM value: {xlm}")))?;
+                .map_err(|_| anyhow!("Fee calculation error: invalid XLM value: {xlm}"))?;
             whole
                 .checked_mul(10_000_000)
                 .and_then(|w| w.checked_add(fraction))
@@ -292,7 +294,7 @@ pub fn xlm_to_stroops(xlm: &str) -> AppResult<i64> {
                     AppError::FeeCalc("XLM value is out of range for stroops".to_string())
                 })
         }
-        _ => Err(AppError::FeeCalc(format!("invalid XLM value: {xlm}"))),
+        _ => Err(anyhow!("Fee calculation error: invalid XLM value: {xlm}")),
     }
 }
 
