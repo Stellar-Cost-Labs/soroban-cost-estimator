@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Commands
+
+- Cache warm-up command and WASM-change invalidation (#168).
+- `--cache-ttl` flag to reuse fresh cached estimates without re-simulating
+  (#189).
 - `estimate --history` — compare the current run against up to 5 previous
   cached runs of the same contract function, rendered as a trend table
   (regressions in red, improvements in green) with a `history` array in
@@ -47,27 +52,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `config diff --summary` — print a single-line summary
   (`X pricing changes, Y non-pricing changes`) instead of the full diff, for CI
   status lines. Exit code and auto-save side effects are unchanged.
-- `CHANGELOG.md` following the Keep a Changelog format.
-- `docs/migration.md` — migration guide for users coming from
-  `stellar contract invoke --cost`.
-- End-to-end integration tests in `tests/cli_tests.rs` covering every CLI
-  command, its flags, and its offline error paths.
-- CI build matrix running fmt, clippy, build, and tests on Linux, macOS, and
-  Windows for cross-platform compatibility.
+- `--timeout` global flag — configurable HTTP request timeout for RPC calls
+  in seconds (default 30).
+
+#### Core
+
+- Cache schema-version field and automatic migration path for cache entries
+  (#185).
+- Cache integrity verification to detect corrupted or tampered entries (#144).
+- Config setting change history tracking (#181).
+- Automatic snapshot on network upgrade detection (#143).
+- Snapshot history with timestamp-based navigation (#146, #150, #153).
+- Formatter trait implementations for pluggable report output formats (#180).
+- Structured tracing across all modules for improved diagnostics.
+- `#[must_use]` annotations on pure value-returning functions (#145).
+- Enhanced error handling for file-not-found scenarios.
+- Extracted `fetch_config_snapshot` and `print_stale_estimates` helpers for
+  better main-loop readability (#151).
 - `estimate-all` prints a fee/CPU **distribution box** (min/max/mean/median/
   standard deviation of fees and min/max/mean CPU instructions) and exposes the
   same statistics as a `fee_distribution` object in `--json` output.
 - Report headers show `Simulated at ledger sequence: <n>` and JSON reports
   serialize the ledger as `ledger_sequence`.
 
+#### Project
+
+- Performance benchmarks for WASM parsing (#184).
+- Snapshot testing for cost report formatters using `insta` (#183).
+- Concurrency tests for cache save/load access (#182).
+- Property-based tests for fee calculator (#152).
+- Edge-case coverage for `xlm_to_stroops` (#149).
+- Expanded `parse_interval_secs` edge-case coverage (#147).
+- Code-coverage reporting with `cargo-tarpaulin` (#177).
+- Dependency audit and vulnerability scanning CI job (#172).
+- Comprehensive command reference documentation page (#162).
+- Architecture overview document (#160).
+- Troubleshooting guide (#158).
+- `docs/migration.md` — migration guide for users coming from
+  `stellar contract invoke --cost`.
+- End-to-end integration tests in `tests/cli_tests.rs` covering every CLI
+  command, its flags, and its offline error paths.
+- CI build matrix running fmt, clippy, build, and tests on Linux, macOS, and
+  Windows for cross-platform compatibility.
+- `CHANGELOG.md` following the Keep a Changelog format.
+
 ### Changed
 
+- Refactored main CLI loop to extract config snapshot fetching and stale-
+  estimate printing into dedicated helpers (#151).
 - `estimate-all --json` now emits an object (`{ "functions": [...],
   "fee_distribution": { ... } }`) instead of a bare array; the per-function
   records moved under the `functions` key.
 
 ### Fixed
 
+- Corrected error messages and handling for missing files.
 - Restore the WebSocket RPC client (`rpc::ws`) after the merge of `main`
   dropped its `AppError` variants and `resolve_ws_endpoint`, which broke
   compilation and red-flagged every CI job.

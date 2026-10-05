@@ -1791,7 +1791,10 @@ mod tests {
     fn test_suggest_optimizations_without_rates_is_empty() {
         let mut report = report_with_rates(sample_rates());
         report.rates = None;
-        assert!(report.suggest_optimizations().is_empty());
+        assert_eq!(
+            report.suggest_optimizations(),
+            [] as [OptimizationSuggestion; 0]
+        );
     }
 
     #[test]
@@ -1804,7 +1807,10 @@ mod tests {
             fee_per_1kb: 0,
         });
         // No reducible resource with a positive rate, so no suggestions.
-        assert!(report.suggest_optimizations().is_empty());
+        assert_eq!(
+            report.suggest_optimizations(),
+            [] as [OptimizationSuggestion; 0]
+        );
     }
 
     #[test]

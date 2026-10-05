@@ -383,7 +383,7 @@ mod tests {
         assert!(snap.contract_events.is_none());
         assert!(snap.contract_bandwidth.is_none());
         assert!(snap.state_archival.is_none());
-        assert!(!snap.timestamp.is_empty());
+        assert_ne!(snap.timestamp, "");
     }
 
     #[test]
