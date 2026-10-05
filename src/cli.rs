@@ -312,6 +312,10 @@ pub enum Command {
     Watch {
         #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
+        /// RPC endpoint to watch (e.g. a `ws://` URL). Defaults to the
+        /// network's public endpoint.
+        #[arg(long)]
+        rpc_url: Option<String>,
         #[arg(long, default_value = "1h")]
         interval: String,
         /// Percentage threshold for flagging significant changes (e.g. 10 for 10%).
