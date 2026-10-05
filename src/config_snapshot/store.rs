@@ -63,10 +63,9 @@ pub fn load_latest_snapshot(network: &str) -> AppResult<ConfigSnapshot> {
     let mut entries: Vec<_> = std::fs::read_dir(&dir)?
         .filter_map(|e| e.ok())
         .filter(|e| {
-            e.file_name()
-                .to_str()
-                .map(|n| n.starts_with(&format!("{}-", network)) && n.ends_with(".json"))
-                .unwrap_or(false)
+            e.file_name().to_str().is_some_and(|name| {
+                name.starts_with(&format!("{}-", network)) && name.ends_with(".json")
+            })
         })
         .collect();
 
@@ -309,55 +308,102 @@ pub struct SnapshotValidation {
 /// None — pure file I/O.
 pub fn validate_all_snapshots(network: &str) -> AppResult<Vec<SnapshotValidation>> {
     let paths = list_snapshots(network)?;
-    let mut results = Vec::with_capacity(paths.len());
+    Ok(validate_snapshot_paths(paths))
+}
 
-    for path in paths {
-        let filename = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+/// Validates every JSON snapshot in the snapshots directory, across networks.
+pub fn validate_all_snapshot_files() -> AppResult<Vec<SnapshotValidation>> {
+    let dir = snapshots_dir()?;
+    let paths = std::fs::read_dir(dir)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect();
+    Ok(validate_snapshot_paths(paths))
+}
 
-        match validate_single_snapshot(&path) {
-            Ok(()) => {
-                results.push(SnapshotValidation {
+/// Validates a snapshot at an explicit path without requiring it to be stored
+/// in the snapshots directory.
+pub fn validate_snapshot_file(path: &std::path::Path) -> SnapshotValidation {
+    match validate_snapshot_paths(vec![path.to_path_buf()])
+        .into_iter()
+        .next()
+    {
+        Some(validation) => validation,
+        None => SnapshotValidation {
+            path: path.to_path_buf(),
+            filename: match path.file_name() {
+                Some(name) => name.to_string_lossy().into_owned(),
+                None => String::new(),
+            },
+            valid: false,
+            error: Some("snapshot validation produced no result".to_string()),
+        },
+    }
+}
+
+fn validate_snapshot_paths(paths: Vec<PathBuf>) -> Vec<SnapshotValidation> {
+    paths
+        .into_iter()
+        .map(|path| {
+            let filename = match path.file_name() {
+                Some(name) => name.to_string_lossy().into_owned(),
+                None => String::new(),
+            };
+            match validate_single_snapshot(&path) {
+                Ok(()) => SnapshotValidation {
                     path,
                     filename,
                     valid: true,
                     error: None,
-                });
-            }
-            Err(e) => {
-                results.push(SnapshotValidation {
+                },
+                Err(error) => SnapshotValidation {
                     path,
                     filename,
                     valid: false,
-                    error: Some(e.to_string()),
-                });
+                    error: Some(error.to_string()),
+                },
             }
-        }
-    }
-
-    Ok(results)
+        })
+        .collect()
 }
 
 /// Validates a single snapshot file.
 fn validate_single_snapshot(path: &std::path::Path) -> AppResult<()> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| AppError::General(format!("cannot read file: {e}")))?;
+    let content = std::fs::read_to_string(path).map_err(|error| {
+        AppError::SnapshotParse(format!("{}: cannot read file: {error}", path.display()))
+    })?;
 
     if content.trim().is_empty() {
-        return Err(AppError::General("file is empty".to_string()));
+        return Err(AppError::SnapshotParse(format!(
+            "{}: file is empty",
+            path.display()
+        )));
     }
 
-    let snapshot: ConfigSnapshot = serde_json::from_str(&content)
-        .map_err(|e| AppError::General(format!("invalid JSON: {e}")))?;
+    let snapshot: ConfigSnapshot = serde_json::from_str(&content).map_err(|error| {
+        AppError::SnapshotParse(format!(
+            "{}: invalid snapshot JSON: {error}",
+            path.display()
+        ))
+    })?;
 
     if snapshot.network.is_empty() {
-        return Err(AppError::General("network field is empty".to_string()));
+        return Err(AppError::SnapshotParse(format!(
+            "{}: network field is empty",
+            path.display()
+        )));
     }
 
     if snapshot.ledger == 0 {
-        return Err(AppError::General("ledger is zero".to_string()));
+        return Err(AppError::SnapshotParse(format!(
+            "{}: ledger is zero",
+            path.display()
+        )));
     }
 
     Ok(())
