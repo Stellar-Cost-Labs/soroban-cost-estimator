@@ -157,7 +157,9 @@ pub struct CostReport {
     pub wasm_hash: String,
     /// Size of the compiled WASM artifact in bytes. Reported in the
     /// side-by-side diff so a build-size regression is visible next to the
-    /// fee delta. `0` when the caller did not supply it.
+    /// fee delta, and used by [`generate_optimization_tips`] to flag an
+    /// oversized binary. `0` when the caller did not supply it; `#[serde(default)]`
+    /// so reports serialized before this field existed still deserialize.
     #[serde(default)]
     pub wasm_size: u64,
     /// CPU instructions consumed.
@@ -324,6 +326,382 @@ pub fn format_suggestions(suggestions: &[OptimizationSuggestion]) -> String {
             ));
         }
     }
+    out
+}
+
+/// Contract WASM size, in bytes, above which a size-optimization tip is
+/// emitted (30 KB).
+///
+/// Uploads are charged bandwidth per byte on every deploy, and a contract
+/// above this size is usually carrying debug symbols or unoptimized
+/// dependencies rather than logic.
+pub const WASM_SIZE_TIP_THRESHOLD_BYTES: u32 = 30 * 1024;
+
+/// Share of the total fee, in percent, at which a cost component is treated
+/// as the *dominant* factor and earns a targeted tip.
+pub const DOMINANT_COST_PCT: u64 = 40;
+
+/// Ledger-entry count from which batching/merging state becomes worth
+/// suggesting. One or two entries is normal for a contract instance; three or
+/// more usually means the footprint can be collapsed.
+pub const MULTI_ENTRY_THRESHOLD: u32 = 3;
+
+/// Transaction-envelope size, in bytes, above which a large-payload tip is
+/// eligible (1 KB).
+pub const LARGE_TX_BYTES: u32 = 1024;
+
+/// `part` as a whole percentage of `total`, using integer-only arithmetic.
+///
+/// Fee math in this crate stays in `stroops`/`i64` — no floats near a value
+/// that gets added up and compared. Returns `0` when `total` is not positive,
+/// and clamps negative `part` to `0` so a defensive negative component can
+/// never produce a nonsensical share.
+#[must_use]
+pub fn share_pct(part: i64, total: i64) -> u64 {
+    if total <= 0 || part <= 0 {
+        return 0;
+    }
+    let pct = i128::from(part) * 100 / i128::from(total);
+    u64::try_from(pct).unwrap_or(u64::MAX)
+}
+
+/// Generate contextual, actionable cost-optimization tips for a report.
+///
+/// Where [`CostReport::suggest_optimizations`] quantifies *per-unit* savings
+/// from the network's fee rates, this function answers the question a
+/// newcomer actually has: **which single factor dominates this fee, and what
+/// should I change?** Each tip names the dominant factor, quantifies its share
+/// of the total fee, and proposes a concrete change.
+///
+/// A factor earns a tip when it both has a meaningful footprint and accounts
+/// for at least [`DOMINANT_COST_PCT`]% of the total fee:
+///
+/// * **WASM size** — reported whenever the binary exceeds
+///   [`WASM_SIZE_TIP_THRESHOLD_BYTES`], independent of the fee split (the
+///   upload cost lands on the bandwidth component).
+/// * **Ledger writes** — [`MULTI_ENTRY_THRESHOLD`] or more write entries while
+///   storage dominates; suggests merging related state into one entry.
+/// * **Ledger reads** — same threshold, suggests caching/batching.
+/// * **CPU** — the instruction fee dominates.
+/// * **Argument payload** — a large transaction envelope whose bandwidth fee
+///   dominates; suggests trimming the payload.
+/// * **Refundable fee** — rent bumps and events dominate; suggests reducing
+///   state growth and emitted events.
+///
+/// Tips are returned in a fixed order (WASM, writes, reads, CPU, payload,
+/// refundable) so output is deterministic and snapshot-testable. An empty
+/// vector means no factor is dominant — callers should render nothing rather
+/// than a "nothing to say" block.
+///
+/// # Network calls
+/// None — pure computation over the report.
+#[must_use]
+pub fn generate_optimization_tips(report: &CostReport) -> Vec<String> {
+    let total = report.fee.total_stroops;
+    let mut tips: Vec<String> = Vec::new();
+
+    if report.wasm_size > u64::from(WASM_SIZE_TIP_THRESHOLD_BYTES) {
+        tips.push(format!(
+            "Tip: the contract WASM is {} bytes, over the {} KB threshold. Uploads are charged bandwidth on every byte, so consider a release build with LTO and `strip = true` to shrink the binary.",
+            report.wasm_size,
+            WASM_SIZE_TIP_THRESHOLD_BYTES / 1024
+        ));
+    }
+
+    let storage_share = share_pct(report.fee.storage_fee_stroops, total);
+    if report.write_entries >= MULTI_ENTRY_THRESHOLD && storage_share >= DOMINANT_COST_PCT {
+        tips.push(format!(
+            "Tip: writing {} ledger entries accounts for {}% of the total fee. Consider combining related state into a single entry.",
+            report.write_entries, storage_share
+        ));
+    }
+    if report.read_entries >= MULTI_ENTRY_THRESHOLD && storage_share >= DOMINANT_COST_PCT {
+        tips.push(format!(
+            "Tip: reading {} ledger entries accounts for {}% of the total fee. Consider caching hot state or batching the reads into one call.",
+            report.read_entries, storage_share
+        ));
+    }
+
+    let cpu_share = share_pct(report.fee.cpu_fee_stroops, total);
+    if report.cpu_instructions > 0 && cpu_share >= DOMINANT_COST_PCT {
+        tips.push(format!(
+            "Tip: CPU instructions account for {}% of the total fee ({} instructions consumed). Consider profiling the hot path and moving work off-chain.",
+            cpu_share, report.cpu_instructions
+        ));
+    }
+
+    let bandwidth_share = share_pct(report.fee.bandwidth_fee_stroops, total);
+    if report.tx_size >= LARGE_TX_BYTES && bandwidth_share >= DOMINANT_COST_PCT {
+        tips.push(format!(
+            "Tip: the transaction envelope is {} bytes and its bandwidth fee accounts for {}% of the total fee. Consider trimming large argument payloads or passing a reference instead of the full value.",
+            report.tx_size, bandwidth_share
+        ));
+    }
+
+    let refundable_share = share_pct(report.fee.refundable_stroops, total);
+    if report.fee.refundable_stroops > 0 && refundable_share >= DOMINANT_COST_PCT {
+        tips.push(format!(
+            "Tip: {}% of the total fee is refundable, which comes from ledger rent bumps and contract events. Consider reducing state growth and the number or size of emitted events.",
+            refundable_share
+        ));
+    }
+
+    tips
+}
+
+/// Render cost-optimization tips as a human-readable block.
+///
+/// Returns an empty string when there is nothing to say, so callers can
+/// append the result unconditionally and stay quiet for a report with no
+/// dominant cost factor.
+#[must_use]
+pub fn format_tips(tips: &[String]) -> String {
+    if tips.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("Optimization Tips:\n");
+    for tip in tips {
+        out.push_str(&format!("  {tip}\n"));
+    }
+    out
+}
+
+/// Aggregated metrics for a whole `estimate-all` batch.
+///
+/// Every value is a whole-unit aggregate over the successfully estimated
+/// functions; `functions_evaluated` is the number of reports the aggregates
+/// were computed from, so a caller can tell an empty batch from a single
+/// cheap function. All fee values are stroops; the XLM strings are rendered
+/// with the caller's chosen precision.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EstimateAllSummary {
+    /// Number of functions included in the aggregates.
+    pub functions_evaluated: usize,
+    /// Lowest per-function total fee, in stroops.
+    pub min_fee_stroops: i64,
+    /// Highest per-function total fee, in stroops.
+    pub max_fee_stroops: i64,
+    /// Mean per-function total fee, in stroops (integer division).
+    pub avg_fee_stroops: i64,
+    /// Sum of every per-function total fee, in stroops.
+    pub total_fee_stroops: i64,
+    /// Lowest per-function CPU instruction count.
+    pub min_cpu_instructions: u64,
+    /// Highest per-function CPU instruction count.
+    pub max_cpu_instructions: u64,
+    /// Sum of every per-function CPU instruction count.
+    pub total_cpu_instructions: u64,
+    /// Sum of every per-function ledger write entry count.
+    pub total_write_entries: u64,
+    /// Sum of every per-function ledger read entry count.
+    pub total_read_entries: u64,
+    /// Lowest XLM total across the batch.
+    pub min_total_xlm: String,
+    /// Highest XLM total across the batch.
+    pub max_total_xlm: String,
+    /// Mean XLM total across the batch.
+    pub avg_total_xlm: String,
+}
+
+/// Aggregate a batch of per-function reports into an [`EstimateAllSummary`].
+///
+/// Returns `None` for an empty batch — a summary over zero functions is
+/// undefined (there is no min, max, or average), so callers can render a
+/// "nothing was estimated" state instead of a row full of zeros.
+///
+/// The fee sum accumulates in `i128` so a large batch cannot overflow before
+/// being cast back to `i64`; the cast is lossless because the result is a sum
+/// of `i64` fees. The average uses integer division, matching
+/// [`crate::report::fee_calc::fee_range`] and keeping fee math float-free.
+#[must_use]
+pub fn summarize_estimate_all(
+    reports: &[CostReport],
+    precision: u32,
+) -> Option<EstimateAllSummary> {
+    let first = reports.first()?;
+    let mut min_fee = first.fee.total_stroops;
+    let mut max_fee = first.fee.total_stroops;
+    let mut min_cpu = first.cpu_instructions;
+    let mut max_cpu = first.cpu_instructions;
+    let mut total_fee: i128 = 0;
+    let mut total_cpu: u128 = 0;
+    let mut total_writes: u64 = 0;
+    let mut total_reads: u64 = 0;
+
+    for report in reports {
+        min_fee = min_fee.min(report.fee.total_stroops);
+        max_fee = max_fee.max(report.fee.total_stroops);
+        min_cpu = min_cpu.min(report.cpu_instructions);
+        max_cpu = max_cpu.max(report.cpu_instructions);
+        total_fee += i128::from(report.fee.total_stroops);
+        total_cpu += u128::from(report.cpu_instructions);
+        total_writes += u64::from(report.write_entries);
+        total_reads += u64::from(report.read_entries);
+    }
+
+    let count = reports.len();
+    let avg_fee = (total_fee / i128::try_from(count).unwrap_or(1)) as i64;
+
+    Some(EstimateAllSummary {
+        functions_evaluated: count,
+        min_fee_stroops: min_fee,
+        max_fee_stroops: max_fee,
+        avg_fee_stroops: avg_fee,
+        total_fee_stroops: total_fee as i64,
+        min_cpu_instructions: min_cpu,
+        max_cpu_instructions: max_cpu,
+        total_cpu_instructions: total_cpu as u64,
+        total_write_entries: total_writes,
+        total_read_entries: total_reads,
+        min_total_xlm: crate::report::fee_calc::stroops_to_xlm(min_fee, precision),
+        max_total_xlm: crate::report::fee_calc::stroops_to_xlm(max_fee, precision),
+        avg_total_xlm: crate::report::fee_calc::stroops_to_xlm(avg_fee, precision),
+    })
+}
+
+/// Narrowest column width comfy-table is given, so a column of short cells
+/// still renders a readable box.
+const MIN_COLUMN_WIDTH: u16 = 6;
+
+/// Builds the `estimate-all` table: one row per estimated function plus a
+/// visually separated summary footer row.
+///
+/// The footer is separated with real border styling, not a blank line: the
+/// table draws a `├───┼───┤` rule above every row (comfy-table's internal
+/// horizontal line), so the summary sits in its own band at the bottom of the
+/// box. The whole table is rendered in one pass by one `comfy_table::Table`,
+/// which sizes every column to its widest cell (footer included) — so nothing
+/// is truncated and the rows can never drift out of alignment.
+///
+/// Returns an empty string for an empty batch, so an empty `estimate-all` run
+/// adds nothing to the output.
+///
+/// # Arguments
+/// * `reports` — the successfully estimated functions, in run order.
+/// * `summary` — pre-computed aggregates via [`summarize_estimate_all`];
+///   `None` omits the footer row (e.g. when `--quiet` suppressed it).
+pub fn format_estimate_all_table(
+    reports: &[CostReport],
+    summary: Option<&EstimateAllSummary>,
+) -> String {
+    if reports.is_empty() && summary.is_none() {
+        return String::new();
+    }
+
+    let header = vec![
+        "Function".to_string(),
+        "CPU insns".to_string(),
+        "Fee (stroops)".to_string(),
+        "Fee (XLM)".to_string(),
+        "Ledger".to_string(),
+        "Write entries".to_string(),
+    ];
+    let mut rows: Vec<Vec<String>> = reports
+        .iter()
+        .map(|r| {
+            vec![
+                r.function.clone(),
+                r.cpu_instructions.to_string(),
+                r.fee.total_stroops.to_string(),
+                r.fee.total_xlm.clone(),
+                r.ledger.to_string(),
+                r.write_entries.to_string(),
+            ]
+        })
+        .collect();
+
+    if let Some(s) = summary {
+        // The footer is the last row, so comfy-table draws the separator rule
+        // immediately above it.
+        rows.push(vec![
+            format!("Summary: {} function(s)", s.functions_evaluated),
+            format!("{} - {}", s.min_cpu_instructions, s.max_cpu_instructions),
+            format!(
+                "min {} / max {} / avg {}",
+                s.min_fee_stroops, s.max_fee_stroops, s.avg_fee_stroops
+            ),
+            format!("{} - {}", s.min_total_xlm, s.max_total_xlm),
+            String::new(),
+            s.total_write_entries.to_string(),
+        ]);
+    }
+
+    let mut table = comfy_table::Table::new();
+    table.load_preset(comfy_table::presets::UTF8_BORDERS_ONLY);
+    // Turn on comfy-table's internal horizontal rule so the last row (the
+    // summary footer) is visually separated from the per-function rows, and
+    // close the header divider with proper intersections.
+    table.set_style(comfy_table::TableComponent::HorizontalLines, '─');
+    table.set_style(comfy_table::TableComponent::MiddleIntersections, '┼');
+    table.set_style(comfy_table::TableComponent::LeftBorderIntersections, '├');
+    table.set_style(comfy_table::TableComponent::RightBorderIntersections, '┤');
+    table.set_style(comfy_table::TableComponent::BottomBorderIntersections, '┴');
+    table.set_style(comfy_table::TableComponent::MiddleHeaderIntersections, '╪');
+
+    table.set_header(header);
+    for row in &rows {
+        table.add_row(row.clone());
+    }
+    // Keep very narrow columns (e.g. a single-digit write-entry count) from
+    // collapsing to an unreadable box.
+    let widths: Vec<u16> = table
+        .column_max_content_widths()
+        .into_iter()
+        .map(|width| width.max(MIN_COLUMN_WIDTH))
+        .collect();
+    for (index, width) in widths.iter().enumerate() {
+        if let Some(column) = table.column_mut(index) {
+            // `ColumnConstraint::Boundaries` pins both ends of the column to
+            // the same width, so comfy-table neither grows the column beyond
+            // its widest cell nor truncates one.
+            column.set_constraint(comfy_table::ColumnConstraint::Boundaries {
+                lower: comfy_table::Width::Fixed(*width),
+                upper: comfy_table::Width::Fixed(*width),
+            });
+        }
+    }
+
+    table.to_string()
+}
+
+/// Renders the batch [`EstimateAllSummary`] as a GitHub-flavored Markdown
+/// table, for `estimate-all --format markdown`.
+///
+/// Complements [`format_estimate_all_table`]: the same aggregate in the same
+/// shape, but expressed in Markdown so it renders in a PR comment or a
+/// GitBook page. Returns an empty string when there is no summary.
+#[must_use]
+pub fn format_estimate_all_summary_markdown(summary: &EstimateAllSummary) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "### Summary — {} function(s) evaluated\n\n",
+        summary.functions_evaluated
+    ));
+    out.push_str("| Metric | Value |\n| --- | --- |\n");
+    out.push_str(&format!(
+        "| Min fee | {} stroops ({}) |\n",
+        summary.min_fee_stroops, summary.min_total_xlm
+    ));
+    out.push_str(&format!(
+        "| Max fee | {} stroops ({}) |\n",
+        summary.max_fee_stroops, summary.max_total_xlm
+    ));
+    out.push_str(&format!(
+        "| Average fee | {} stroops ({}) |\n",
+        summary.avg_fee_stroops, summary.avg_total_xlm
+    ));
+    out.push_str(&format!(
+        "| Total fee | {} stroops |\n",
+        summary.total_fee_stroops
+    ));
+    out.push_str(&format!(
+        "| CPU instructions | {} - {} (total {}) |\n",
+        summary.min_cpu_instructions, summary.max_cpu_instructions, summary.total_cpu_instructions
+    ));
+    out.push_str(&format!(
+        "| Ledger entries | {} read / {} written |\n",
+        summary.total_read_entries, summary.total_write_entries
+    ));
     out
 }
 
@@ -693,6 +1071,170 @@ pub fn format_report_json(report: &CostReport) -> String {
     serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// Signed change of a single metric between two estimate runs.
+///
+/// Fee arithmetic stays in integer stroops (`previous`, `current`,
+/// `absolute`); `percent` is derived for display only and is `None` when the
+/// baseline is zero, because a percentage change from zero is undefined.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct MetricDelta {
+    /// Baseline value from the previous estimate.
+    pub previous: i64,
+    /// Value from the current estimate.
+    pub current: i64,
+    /// `current - previous`, saturating rather than wrapping.
+    pub absolute: i64,
+    /// Percentage change, or `None` when `previous == 0`.
+    pub percent: Option<f64>,
+}
+
+impl MetricDelta {
+    /// Compute the delta between two values.
+    #[must_use]
+    pub fn new(previous: i64, current: i64) -> Self {
+        let absolute = current.saturating_sub(previous);
+        let percent = if previous == 0 {
+            None
+        } else {
+            Some(absolute as f64 / previous as f64 * 100.0)
+        };
+        Self {
+            previous,
+            current,
+            absolute,
+            percent,
+        }
+    }
+
+    /// Renders the signed change, e.g. `+12400 (+5.2%)`, `-100 (-1.0%)`,
+    /// `0 (0.0%)`, or just `+5` when the percentage is undefined.
+    #[must_use]
+    pub fn format_signed(&self) -> String {
+        let sign = if self.absolute > 0 { "+" } else { "" };
+        match self.percent {
+            Some(pct) => format!("{sign}{} ({sign}{pct:.1}%)", self.absolute),
+            None => format!("{sign}{}", self.absolute),
+        }
+    }
+}
+
+/// Cost deltas between a previous estimate and the current report.
+///
+/// CPU, memory, and fee are always present because every cached entry stores
+/// them. The ledger entry-count deltas are `None` when the previous estimate
+/// predates I/O recording.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct CostDelta {
+    /// CPU instruction delta.
+    pub cpu_instructions: MetricDelta,
+    /// Memory byte delta.
+    pub memory_bytes: MetricDelta,
+    /// Total fee delta, in stroops.
+    pub fee_stroops: MetricDelta,
+    /// Ledger read-entry delta, when the previous estimate recorded I/O.
+    pub read_entries: Option<MetricDelta>,
+    /// Ledger write-entry delta, when the previous estimate recorded I/O.
+    pub write_entries: Option<MetricDelta>,
+}
+
+impl CostDelta {
+    /// Computes the delta of `current` against a previous estimate's metrics.
+    ///
+    /// `previous_io` is `(read_entries, write_entries)` when the previous
+    /// estimate recorded its ledger I/O footprint.
+    #[must_use]
+    pub fn compute(
+        previous_cpu: u64,
+        previous_memory: u64,
+        previous_fee_stroops: i64,
+        previous_io: Option<(u32, u32)>,
+        current: &CostReport,
+    ) -> Self {
+        Self {
+            cpu_instructions: MetricDelta::new(
+                previous_cpu as i64,
+                current.cpu_instructions as i64,
+            ),
+            memory_bytes: MetricDelta::new(previous_memory as i64, current.memory_bytes as i64),
+            fee_stroops: MetricDelta::new(previous_fee_stroops, current.fee.total_stroops),
+            read_entries: previous_io.map(|(read, _)| {
+                MetricDelta::new(i64::from(read), i64::from(current.read_entries))
+            }),
+            write_entries: previous_io.map(|(_, write)| {
+                MetricDelta::new(i64::from(write), i64::from(current.write_entries))
+            }),
+        }
+    }
+
+    /// `(label, delta)` rows for every metric with a baseline to compare to.
+    fn rows(&self) -> Vec<(&'static str, MetricDelta)> {
+        let mut rows = vec![
+            ("CPU Instructions", self.cpu_instructions),
+            ("Memory Bytes", self.memory_bytes),
+        ];
+        if let Some(delta) = self.read_entries {
+            rows.push(("Read Entries", delta));
+        }
+        if let Some(delta) = self.write_entries {
+            rows.push(("Write Entries", delta));
+        }
+        rows.push(("Fee (stroops)", self.fee_stroops));
+        rows
+    }
+
+    /// Renders the comparison as a terminal table.
+    #[must_use]
+    pub fn format_text(&self) -> String {
+        let mut output = String::from("\nCost delta vs previous estimate:\n");
+        let mut table = Table::new();
+        table.set_header(vec!["Metric", "Previous", "Current", "Change"]);
+        for (label, delta) in self.rows() {
+            table.add_row(vec![
+                label.to_string(),
+                delta.previous.to_string(),
+                delta.current.to_string(),
+                delta.format_signed(),
+            ]);
+        }
+        output.push_str(&table.to_string());
+        output.push('\n');
+        output
+    }
+
+    /// Renders the comparison as a GitHub-flavored markdown table.
+    #[must_use]
+    pub fn format_markdown(&self) -> String {
+        let mut output = String::from("\n### Cost delta vs previous estimate\n\n");
+        output.push_str("| Metric | Previous | Current | Change |\n");
+        output.push_str("| --- | --- | --- | --- |\n");
+        for (label, delta) in self.rows() {
+            output.push_str(&format!(
+                "| {label} | {} | {} | {} |\n",
+                delta.previous,
+                delta.current,
+                delta.format_signed(),
+            ));
+        }
+        output
+    }
+
+    /// Renders the comparison as RFC 4180 CSV records.
+    ///
+    /// The percent column is empty when there is no baseline to divide by.
+    #[must_use]
+    pub fn format_csv(&self) -> String {
+        let mut output = String::from("metric,previous,current,absolute,percent\n");
+        for (label, delta) in self.rows() {
+            let percent = delta.percent.map(|p| format!("{p:.1}")).unwrap_or_default();
+            output.push_str(&format!(
+                "{label},{},{},{},{percent}\n",
+                delta.previous, delta.current, delta.absolute
+            ));
+        }
+        output
+    }
+}
+
 /// Parse a comma-separated list of invocation counts for cost projections.
 ///
 /// Ensures each count is non-zero, unique, fits within `i64::MAX` so it can be
@@ -838,7 +1380,7 @@ mod tests {
         CostReport {
             function: "increment".to_string(),
             wasm_hash: "abc".to_string(),
-            wasm_size: 4_096,
+            wasm_size: 14_432,
             cpu_instructions: 532_502,
             memory_bytes: 0,
             tx_size: 156,
@@ -1226,5 +1768,106 @@ mod tests {
         assert_eq!(parsed["projections"][0]["total_stroops"], 1_552_700);
         assert_eq!(parsed["projections"][0]["total_xlm"], "0.1552700");
         assert!(parsed["projections"][0].get("usd").is_none());
+    }
+
+    // ── Cost delta math (#278) ──────────────────────────────────────────
+
+    #[test]
+    fn test_metric_delta_positive() {
+        let delta = MetricDelta::new(100, 200);
+        assert_eq!(delta.absolute, 100);
+        assert_eq!(delta.percent, Some(100.0));
+        assert_eq!(delta.format_signed(), "+100 (+100.0%)");
+    }
+
+    #[test]
+    fn test_metric_delta_negative() {
+        let delta = MetricDelta::new(200, 100);
+        assert_eq!(delta.absolute, -100);
+        assert_eq!(delta.percent, Some(-50.0));
+        assert_eq!(delta.format_signed(), "-100 (-50.0%)");
+    }
+
+    #[test]
+    fn test_metric_delta_zero() {
+        let delta = MetricDelta::new(200, 200);
+        assert_eq!(delta.absolute, 0);
+        assert_eq!(delta.percent, Some(0.0));
+        assert_eq!(delta.format_signed(), "0 (0.0%)");
+    }
+
+    #[test]
+    fn test_metric_delta_zero_baseline_has_no_percentage() {
+        let delta = MetricDelta::new(0, 500);
+        assert_eq!(delta.absolute, 500);
+        assert_eq!(delta.percent, None);
+        assert_eq!(delta.format_signed(), "+500");
+    }
+
+    #[test]
+    fn test_metric_delta_saturates_instead_of_wrapping() {
+        assert_eq!(MetricDelta::new(i64::MIN, i64::MAX).absolute, i64::MAX);
+    }
+
+    #[test]
+    fn test_cost_delta_without_previous_io_omits_entry_deltas() {
+        let report = report_with_rates(sample_rates());
+        let delta = CostDelta::compute(500_000, 10, 10_000, None, &report);
+
+        assert_eq!(delta.cpu_instructions.absolute, 32_502);
+        assert_eq!(delta.memory_bytes.absolute, -10);
+        assert_eq!(delta.fee_stroops.absolute, 5_527);
+        assert!(delta.read_entries.is_none());
+        assert!(delta.write_entries.is_none());
+        assert!(!delta.format_markdown().contains("Read Entries"));
+    }
+
+    #[test]
+    fn test_cost_delta_with_previous_io_includes_entry_deltas() {
+        let report = report_with_rates(sample_rates());
+        let delta = CostDelta::compute(532_502, 0, 15_527, Some((3, 0)), &report);
+
+        assert_eq!(delta.read_entries.map(|d| d.absolute), Some(-2));
+        assert_eq!(delta.write_entries.map(|d| d.absolute), Some(1));
+        assert!(delta.format_text().contains("Read Entries"));
+        assert!(delta.format_markdown().contains("Write Entries"));
+    }
+
+    #[test]
+    fn test_cost_delta_is_json_serializable() {
+        let report = report_with_rates(sample_rates());
+        let delta = CostDelta::compute(1, 2, 3, Some((1, 1)), &report);
+        let value = serde_json::to_value(delta).expect("serialize");
+
+        assert_eq!(value["cpu_instructions"]["previous"], 1);
+        assert_eq!(value["cpu_instructions"]["current"], 532_502);
+        assert_eq!(value["memory_bytes"]["absolute"], -2);
+        assert_eq!(value["fee_stroops"]["absolute"], 15_524);
+    }
+
+    #[test]
+    fn test_cost_delta_csv_has_header_and_one_row_per_metric() {
+        let report = report_with_rates(sample_rates());
+        let delta = CostDelta::compute(532_502, 0, 15_527, Some((1, 1)), &report);
+        let csv = delta.format_csv();
+        let lines: Vec<&str> = csv.lines().collect();
+
+        assert_eq!(lines[0], "metric,previous,current,absolute,percent");
+        // cpu, memory, read entries, write entries, fee
+        assert_eq!(lines.len(), 6);
+        assert!(lines[1].starts_with("CPU Instructions,532502,532502,0,0.0"));
+    }
+
+    #[test]
+    fn test_cost_delta_csv_leaves_percent_empty_without_baseline() {
+        let report = report_with_rates(sample_rates());
+        let delta = CostDelta::compute(0, 0, 0, None, &report);
+        let csv = delta.format_csv();
+        let cpu_row = csv.lines().nth(1).expect("cpu row");
+
+        assert!(
+            cpu_row.ends_with(','),
+            "percent column should be empty; got: {cpu_row}"
+        );
     }
 }

@@ -20,6 +20,7 @@ expression: JsonFormatter.format(&empty)
   "ledger_sequence": 0,
   "memory_bytes": 0,
   "network": "mainnet",
+  "optimization_suggestions": [],
   "read_bytes": 0,
   "read_entries": 0,
   "rpc_latency_ms": 0,
