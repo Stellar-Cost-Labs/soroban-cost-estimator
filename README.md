@@ -95,6 +95,7 @@ soroban-cost-estimator estimate \
     [--fn my_function --arg key=val] \
     [--rpc-url https://custom-rpc.example.com] \
     [--clear-cache] \
+    [--quiet] \
     [--diff --wasm-new contract-new.wasm] \
     [--json]
 ```
@@ -163,6 +164,52 @@ footprint, not zero-filled placeholders. If a fee-rate source
 source and zeroes only the affected rate (so the non-refundable fee is visibly
 understated) rather than silently reporting a wrong fee.
 
+#### Cost-optimization tips
+
+Every report ends with two advisory sections, driven purely by the measured
+simulation data:
+
+- **Optimization Tips** — contextual advice about the *dominant* cost factor
+  (`>= 40%` of the total fee), e.g.
+  `Tip: writing 3 ledger entries accounts for 72% of the total fee. Consider
+  combining related state into a single entry.` A WASM-size tip is added
+  independently whenever the binary exceeds 30 KB.
+- **Optimization Suggestions** — per-resource savings quantified against the
+  network's live fee rates (`Removing one write entry saves ~2500 stroops`).
+
+```bash
+soroban-cost-estimator estimate --wasm contract.wasm --network testnet --quiet
+```
+
+Pass `--quiet` to drop both sections. The measured cost data is unaffected, so
+`--quiet` is safe for pipelines that only want numbers. In `--json` mode the
+same data is available as `suggestions` (the `Tip: …` strings) and
+`optimization_suggestions` (the structured savings records); `--quiet` omits
+both keys.
+
+### Authenticated RPC endpoints
+
+Commercial Soroban RPC providers (QuickNode, Blockdaemon, NowNodes, …) require
+an API key or bearer token. `--header` / `-H` attaches custom HTTP headers to
+**every** outgoing RPC request, on any command:
+
+```bash
+soroban-cost-estimator estimate \
+    --wasm contract.wasm \
+    --network testnet \
+    -H "Authorization=Bearer $RPC_TOKEN" \
+    -H "X-API-Key=$PROVIDER_KEY"
+```
+
+- `KEY=VALUE` is the documented spelling; `KEY: VALUE` is accepted too.
+- Repeat `-H` to send several headers. A repeated name keeps the last value.
+- A malformed header (no separator, empty name, empty value, or characters the
+  HTTP grammar forbids) **fails the command** before any network traffic,
+  rather than being silently dropped and leaving the request unauthenticated.
+- Credential headers (`Authorization`, `Proxy-Authorization`, `X-API-Key`,
+  `API-Key`, `Cookie`) are replaced with `<redacted>` in verbose logs, so a
+  token never reaches a terminal, log file, or CI transcript.
+
 ### `estimate-all`
 
 Enumerate every public contract function (including typed params decoded from
@@ -173,6 +220,7 @@ soroban-cost-estimator estimate-all \
     --wasm contract.wasm \
     --id <contract-id-hex> \
     --network testnet \
+    [--quiet] \
     [--json]
 ```
 
@@ -181,6 +229,43 @@ Functions requiring arguments are reported as `"Skipped — needs --fn/--arg"`
 
 A `[i/N] <function>` progress line is printed before each simulation, so you
 can watch progress on contracts with many functions.
+
+The run finishes with a **summary footer row** in the table, separated from the
+per-function rows by a border rule, so a 15-function contract does not have to
+be totalled by hand:
+
+```
+┌────────────────────────┬───────────┬────────────────────────────────┬───────────────────────┬─────────┬───────────────┐
+│ Function               │ CPU insns │ Fee (stroops)                 │ Fee (XLM)             │ Ledger  │ Write entries │
+╞════════════════════════╪═══════════╪════════════════════════════════╪═══════════════════════╪═════════╪═══════════════╡
+│ increment              │ 532502    │ 15427                          │ 0.0015427             │ 3894195 │ 1             │
+├────────────────────────┼───────────┼────────────────────────────────┼───────────────────────┼─────────┼───────────────┤
+│ Summary: 2 function(s) │ 100 - 900 │ min 900 / max 3000 / avg 1633  │ 0.0000900 - 0.0030000 │         │ 6             │
+└────────────────────────┴───────────┴────────────────────────────────┴───────────────────────┴─────────┴───────────────┘
+```
+
+With `--json` the same aggregate is available as a `summary` object next to the
+per-function `functions` array:
+
+```json
+{
+  "functions": [ { "function": "increment", "status": "ok", "...": "..." } ],
+  "summary": {
+    "functions_evaluated": 2,
+    "min_fee_stroops": 900, "max_fee_stroops": 3000, "avg_fee_stroops": 1633,
+    "total_fee_stroops": 3900,
+    "min_cpu_instructions": 100, "max_cpu_instructions": 900,
+    "total_cpu_instructions": 1000,
+    "total_read_entries": 2, "total_write_entries": 6,
+    "min_total_xlm": "0.0000900", "max_total_xlm": "0.0030000", "avg_total_xlm": "0.0016333"
+  }
+}
+```
+
+All aggregates are computed with integer arithmetic in stroops. Only functions
+that were actually simulated contribute; skipped and errored ones are counted
+and reported separately under the footer. `--quiet` suppresses the footer in
+the table, but the `summary` object always stays in `--json` output.
 
 ### `config snapshot`
 
@@ -405,6 +490,21 @@ soroban-cost-estimator config cache query --fn transfer --since 2026-01-01 --jso
 - Combines multiple filters using logical AND semantics
 - Supports `--wasm-hash`, `--fn`, `--network`, `--min-fee`, `--max-fee`, `--since`, and `--json`
 
+## Global flags
+
+Accepted by every command, before or after the subcommand:
+
+| Flag | Purpose |
+| --- | --- |
+| `--rps N` | Cap outbound RPC requests at N/second (0 disables) |
+| `--timeout SECS` | Per-request HTTP timeout (default `30`) |
+| `--max-retries N` | Retry transient RPC failures N times with backoff (default `3`, `0` disables) |
+| `--rpc-fallback-url URL` | Secondary endpoint used when the primary is unreachable |
+| `--header/-H KEY=VALUE` | Custom HTTP header sent with every RPC request (repeatable) |
+| `--quiet` | Drop advisory output (optimization tips/suggestions) while keeping the measured cost data |
+| `--verbose/-v` | Debug-level logging, including RPC payloads |
+| `--wasm-info` | Print the WASM structure summary (memory, imports, exports) |
+
 ## Installation
 
 ### Prerequisites
@@ -471,6 +571,30 @@ cargo install soroban-cost-estimator
    and stores them as versioned JSON snapshots.
 5. **Config drift detection**: Compares two snapshots field-by-field and reports
    which pricing parameters changed, flagging cached estimates that are now stale.
+6. **Advisory analysis**: Derives cost-optimization tips from the measured
+   footprint and fee breakdown, and aggregates a batch summary for
+   `estimate-all` — all with the same integer-only stroops math, so no advice
+   is ever derived from a float.
+
+## Error messages
+
+Every error in the crate follows one house style, so CLI output reads as a
+single system (see the `# Message style` docs on `AppError`):
+
+- lower-case the first word, unless it is an acronym or proper noun
+  (`WASM`, `RPC`, `XDR`, `XLM`, `JSON`, `HTTP`, `WebSocket`)
+- lead with **what failed**, then the underlying cause after a colon
+- no trailing period
+- never restate the prefix inside the payload
+
+```
+failed to parse HTTP header: 'X-Api-Key' is not a KEY=VALUE pair (or KEY: VALUE)
+failed to validate argument type: arg 'abc' cannot be used as 'i64'
+failed to decode XDR: invalid base64
+```
+
+A test enumerates every `AppError` variant and asserts the rendered message
+obeys the style, so a new variant cannot silently drift from the guidelines.
 
 ## Storage
 

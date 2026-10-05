@@ -124,8 +124,12 @@ pub struct Cli {
     pub quiet: bool,
 
     /// Custom HTTP header to send with every RPC request, e.g.
-    /// `--header "X-API-Key: secret"`. Repeatable for multiple headers.
-    #[arg(long = "header", value_name = "KEY: VALUE", global = true)]
+    /// `--header "Authorization=Bearer <token>"`. Repeatable for multiple
+    /// headers. The `KEY: VALUE` spelling is also accepted.
+    ///
+    /// Sensitive headers (`Authorization`, `x-api-key`, `api-key`, …) are
+    /// redacted in verbose logs.
+    #[arg(long = "header", short = 'H', value_name = "KEY=VALUE", global = true)]
     pub headers: Vec<String>,
 
     /// Fallback RPC URL used when the primary endpoint is unreachable or
@@ -230,6 +234,12 @@ pub enum Command {
         /// back to disk.
         #[arg(long)]
         no_cache: bool,
+
+        /// Compare against up to 5 previous cached runs of the same function
+        /// and render a cost-trend table (red = regression, green = improvement).
+        /// Adds a `history` array to `--json` output when requested.
+        #[arg(long)]
+        history: bool,
 
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
@@ -531,6 +541,17 @@ pub enum SnapshotAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Validate a snapshot file or every stored snapshot.
+    Validate {
+        /// Explicit snapshot file to validate.
+        #[arg(value_name = "PATH", required_unless_present = "all")]
+        path: Option<PathBuf>,
+
+        /// Validate every JSON snapshot in the snapshots directory.
+        #[arg(long, conflicts_with = "path")]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -542,7 +563,9 @@ pub enum ConfigAction {
     /// command's own flags.
     #[command(args_conflicts_with_subcommands = true)]
     Snapshot {
-        #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
+        #[command(subcommand)]
+        action: Option<SnapshotAction>,
+        #[arg(long, default_value = "testnet")]
         network: String,
         #[arg(long)]
         out: Option<String>,
@@ -553,11 +576,7 @@ pub enum ConfigAction {
         /// older ones once the new snapshot is safely on disk.
         #[arg(long, value_name = "COUNT")]
         retain: Option<usize>,
-
-        #[command(subcommand)]
-        action: Option<SnapshotAction>,
     },
-
     /// List all saved config snapshots with their timestamp and ledger.
     List {
         /// Network whose snapshots to list.

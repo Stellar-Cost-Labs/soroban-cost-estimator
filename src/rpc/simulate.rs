@@ -197,13 +197,11 @@ pub fn parse_transaction_data_resource_fee(
         Some(data_b64) => {
             let bytes =
                 base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data_b64)
-                    .map_err(|e| AppError::XdrDecode(format!("transaction_data base64: {e}")))?;
+                    .map_err(|e| AppError::XdrDecode(format!("invalid base64: {e}")))?;
 
             let data =
                 stellar_xdr::SorobanTransactionData::from_xdr(&bytes, stellar_xdr::Limits::none())
-                    .map_err(|e| {
-                        AppError::XdrDecode(format!("SorobanTransactionData from_xdr: {e}"))
-                    })?;
+                    .map_err(|e| AppError::XdrDecode(format!("SorobanTransactionData: {e}")))?;
 
             Ok(Some(data.resource_fee))
         }
@@ -244,13 +242,11 @@ pub fn parse_transaction_data_resources(
         Some(data_b64) => {
             let bytes =
                 base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data_b64)
-                    .map_err(|e| AppError::XdrDecode(format!("transaction_data base64: {e}")))?;
+                    .map_err(|e| AppError::XdrDecode(format!("invalid base64: {e}")))?;
 
             let data =
                 stellar_xdr::SorobanTransactionData::from_xdr(&bytes, stellar_xdr::Limits::none())
-                    .map_err(|e| {
-                        AppError::XdrDecode(format!("SorobanTransactionData from_xdr: {e}"))
-                    })?;
+                    .map_err(|e| AppError::XdrDecode(format!("SorobanTransactionData: {e}")))?;
 
             Ok(Some(SimulationResources {
                 cpu_insns: data.resources.instructions as u64,
@@ -279,13 +275,11 @@ pub fn parse_resource_fee(min_resource_fee: &Option<String>) -> AppResult<Option
 
             // Legacy form: base64-encoded XDR int64 (big-endian, 8 bytes).
             let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, fee_str)
-                .map_err(|e| {
-                    AppError::General(format!("failed to decode resource fee base64: {e}"))
-                })?;
+                .map_err(|e| AppError::General(format!("resource fee: invalid base64: {e}")))?;
 
             let fee_bytes: [u8; 8] = bytes[..8].try_into().map_err(|_| {
                 AppError::General(format!(
-                    "resource fee XDR invalid length: {} bytes",
+                    "resource fee: invalid XDR length: {} bytes",
                     bytes.len()
                 ))
             })?;
