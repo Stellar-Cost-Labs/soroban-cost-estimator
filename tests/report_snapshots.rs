@@ -3,11 +3,13 @@ use soroban_cost_estimator::report::fee_calc::FeeBreakdown;
 use soroban_cost_estimator::report::formatter::{
     CsvFormatter, JsonFormatter, MarkdownFormatter, ReportFormatter, TableFormatter,
 };
+use soroban_cost_estimator::wasm::parser::ContractMeta;
 
 fn sample_report() -> CostReport {
     CostReport {
         function: "increment".to_string(),
         wasm_hash: "abc123def456".to_string(),
+        wasm_size: 4_096,
         cpu_instructions: 532_502,
         memory_bytes: 0,
         tx_size: 156,
@@ -21,13 +23,17 @@ fn sample_report() -> CostReport {
             cpu_fee_stroops: 372,
             storage_fee_stroops: 4_063,
             bandwidth_fee_stroops: 61,
+            base_fee_stroops: 100,
             total_stroops: 15_427,
             total_xlm: "0.0015427".to_string(),
+            fee_percentages: std::collections::BTreeMap::new(),
         },
         ledger: 3_894_195,
         network: "testnet".to_string(),
         rpc_latency_ms: 87,
         rates: None,
+        projections: None,
+        contract_meta: ContractMeta::default(),
     }
 }
 
@@ -35,6 +41,7 @@ fn empty_report() -> CostReport {
     CostReport {
         function: "(wasm upload)".to_string(),
         wasm_hash: "0000000000000000".to_string(),
+        wasm_size: 0,
         cpu_instructions: 0,
         memory_bytes: 0,
         tx_size: 0,
@@ -48,13 +55,17 @@ fn empty_report() -> CostReport {
             cpu_fee_stroops: 0,
             storage_fee_stroops: 0,
             bandwidth_fee_stroops: 0,
+            base_fee_stroops: 0,
             total_stroops: 0,
             total_xlm: "0.0000000".to_string(),
+            fee_percentages: std::collections::BTreeMap::new(),
         },
         ledger: 0,
         network: "mainnet".to_string(),
         rpc_latency_ms: 0,
         rates: None,
+        projections: None,
+        contract_meta: ContractMeta::default(),
     }
 }
 
