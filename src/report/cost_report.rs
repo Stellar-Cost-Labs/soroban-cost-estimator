@@ -2044,7 +2044,10 @@ mod tests {
             }],
         );
         let json = format_batch_report_json(&report);
-        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        let parsed: serde_json::Value = match serde_json::from_str(&json) {
+            Ok(value) => value,
+            Err(err) => panic!("batch report JSON must parse: {err}"),
+        };
         assert_eq!(parsed["total_contracts"], 1);
         assert_eq!(parsed["contracts"][0]["function_count"], 2);
     }
