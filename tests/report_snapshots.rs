@@ -189,3 +189,151 @@ fn test_estimate_all_table_snapshot_quiet_has_no_footer() {
         format_estimate_all_table(&reports, None)
     );
 }
+
+// ── Config-drift snapshots (`config diff`, `config snapshot`) ─────────────
+//
+// The formatters above lock down `estimate`, `estimate --json` and
+// `estimate-all`. The remaining report surfaces that issue #357 calls out are
+// the config-drift ones: `config diff` (human table, `--summary`, `--format
+// csv`, `--format markdown`), the `estimate --diff` side-by-side table, and
+// the `config snapshot --json` render. They are pure functions over a
+// `ConfigDiff` / `ConfigSnapshot`, so they snapshot deterministically offline.
+
+use soroban_cost_estimator::config_snapshot::diff::{
+    ConfigDiff, FieldDiff, SnapshotInfo, format_diff, format_diff_csv, format_diff_markdown,
+    format_diff_summary,
+};
+use soroban_cost_estimator::config_snapshot::model::{ConfigSnapshot, ContractComputeV0};
+use soroban_cost_estimator::report::diff::format_cost_report_diff_sized;
+
+/// Two testnet snapshots whose pricing and non-pricing settings both moved:
+/// one small pricing bump (within the default 10% band), one large repricing
+/// (>50%), and one non-pricing TTL change.
+fn sample_config_diff() -> ConfigDiff {
+    ConfigDiff {
+        old_snapshot: SnapshotInfo {
+            network: "testnet".to_string(),
+            timestamp: "2026-09-01T00:00:00+00:00".to_string(),
+            ledger: 3_800_000,
+        },
+        new_snapshot: SnapshotInfo {
+            network: "testnet".to_string(),
+            timestamp: "2026-09-15T00:00:00+00:00".to_string(),
+            ledger: 3_894_195,
+        },
+        changes: vec![
+            FieldDiff {
+                field_path: "contract_compute.tx_max_instructions".to_string(),
+                setting_id: Some(0),
+                setting_name: "Contract Compute V0".to_string(),
+                old_value: "1000000".to_string(),
+                new_value: "2750000".to_string(),
+                is_pricing_change: true,
+                explanation: None,
+            },
+            FieldDiff {
+                field_path: "contract_ledger_cost.fee_write_ledger_entry".to_string(),
+                setting_id: Some(1),
+                setting_name: "Contract Ledger Cost V0".to_string(),
+                old_value: "1000".to_string(),
+                new_value: "1040".to_string(),
+                is_pricing_change: true,
+                explanation: None,
+            },
+            FieldDiff {
+                field_path: "state_archival.max_entry_ttl".to_string(),
+                setting_id: Some(6),
+                setting_name: "State Archival".to_string(),
+                old_value: "3110400".to_string(),
+                new_value: "5184000".to_string(),
+                is_pricing_change: false,
+                explanation: None,
+            },
+        ],
+        has_pricing_changes: true,
+    }
+}
+
+/// `config diff` — the human-readable drift report, uncolored so the snapshot
+/// is stable regardless of whether stdout is a terminal.
+#[test]
+fn test_config_diff_table_snapshot() {
+    let diff = sample_config_diff();
+    insta::assert_snapshot!("config_diff_table", format_diff(&diff, false, false, None));
+}
+
+/// `config diff --pricing-only --threshold 25` — non-pricing changes are
+/// summarized away and the change over the threshold is marked.
+#[test]
+fn test_config_diff_table_pricing_only_snapshot() {
+    let diff = sample_config_diff();
+    insta::assert_snapshot!(
+        "config_diff_table_pricing_only",
+        format_diff(&diff, false, true, Some(25.0))
+    );
+}
+
+/// `config diff --summary` — the one-line CI/`--quiet` form.
+#[test]
+fn test_config_diff_summary_snapshot() {
+    let diff = sample_config_diff();
+    insta::assert_snapshot!("config_diff_summary", format_diff_summary(&diff));
+}
+
+/// `config diff --format csv` — the spreadsheet-friendly form.
+#[test]
+fn test_config_diff_csv_snapshot() {
+    let diff = sample_config_diff();
+    insta::assert_snapshot!("config_diff_csv", format_diff_csv(&diff));
+}
+
+/// `config diff --format markdown` — the paste-into-a-PR form.
+#[test]
+fn test_config_diff_markdown_snapshot() {
+    let diff = sample_config_diff();
+    insta::assert_snapshot!("config_diff_markdown", format_diff_markdown(&diff));
+}
+
+/// `estimate --diff` — the side-by-side cost table for two WASM builds. Uses
+/// the explicit-color entry point so the snapshot never depends on whether
+/// the test runner's stdout is a TTY.
+#[test]
+fn test_estimate_diff_table_snapshot() {
+    let old = sample_report();
+    let mut new = sample_report();
+    new.wasm_size = 12_288;
+    new.cpu_instructions = 480_000;
+    new.write_bytes = 96;
+    insta::assert_snapshot!(
+        "estimate_diff_table",
+        format_cost_report_diff_sized(&old, &new, None, false)
+    );
+}
+
+/// `config snapshot --json` — the machine-readable render of a saved
+/// snapshot, which is what tooling consumes when a snapshot is "shown"
+/// rather than diffed.
+#[test]
+fn test_config_snapshot_show_json_snapshot() {
+    let snapshot = ConfigSnapshot {
+        network: "testnet".to_string(),
+        timestamp: "2026-09-15T00:00:00+00:00".to_string(),
+        ledger: 3_894_195,
+        protocol_version: Some(23),
+        contract_compute: Some(ContractComputeV0 {
+            ledger_max_instructions: 2_750_000_000,
+            tx_max_instructions: 2_750_000_000,
+            fee_rate_per_instructions_increment: 25,
+            tx_memory_limit: 52_428_800,
+        }),
+        contract_ledger_cost: None,
+        contract_historical_data: None,
+        contract_events: None,
+        contract_bandwidth: None,
+        state_archival: None,
+    };
+    insta::assert_snapshot!(
+        "config_snapshot_show_json",
+        serde_json::to_string_pretty(&snapshot).unwrap()
+    );
+}

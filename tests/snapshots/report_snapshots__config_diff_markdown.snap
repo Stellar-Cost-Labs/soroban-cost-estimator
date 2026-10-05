@@ -1,0 +1,14 @@
+---
+source: tests/report_snapshots.rs
+expression: format_diff_markdown(&diff)
+---
+## Config diff: 2026-09-01T00:00:00+00:00 (ledger 3800000) → 2026-09-15T00:00:00+00:00 (ledger 3894195)
+
+- **Network:** testnet
+- **Pricing changes:** yes
+
+| Setting | Old | New | Pricing |
+| --- | --- | --- | --- |
+| Contract Compute V0 > Tx Max Instructions | `1000000` | `2750000` | 💰 yes |
+| Contract Ledger Cost V0 > Fee Write Ledger Entry | `1000` | `1040` | 💰 yes |
+| State Archival > Max Entry Ttl | `3110400` | `5184000` | no |

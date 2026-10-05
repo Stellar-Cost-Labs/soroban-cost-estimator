@@ -1,0 +1,21 @@
+---
+source: tests/report_snapshots.rs
+expression: "serde_json::to_string_pretty(&snapshot).unwrap()"
+---
+{
+  "network": "testnet",
+  "timestamp": "2026-09-15T00:00:00+00:00",
+  "ledger": 3894195,
+  "protocol_version": 23,
+  "contract_compute": {
+    "ledger_max_instructions": 2750000000,
+    "tx_max_instructions": 2750000000,
+    "fee_rate_per_instructions_increment": 25,
+    "tx_memory_limit": 52428800
+  },
+  "contract_ledger_cost": null,
+  "contract_historical_data": null,
+  "contract_events": null,
+  "contract_bandwidth": null,
+  "state_archival": null
+}
