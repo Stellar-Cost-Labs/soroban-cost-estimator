@@ -22,6 +22,9 @@ expression: MarkdownFormatter.format(&report)
 | Write Bytes | 136 |
 | Transaction Size | 156 |
 
+<details>
+<summary>Fee breakdown</summary>
+
 ### Fee Breakdown
 
 | Component | Stroops | % of Total |
@@ -40,3 +43,5 @@ expression: MarkdownFormatter.format(&report)
 ### Optimization Suggestions
 
 No cost optimizations identified (fee rates unavailable or no reducible resources).
+
+</details>
