@@ -1,167 +1,483 @@
-use comfy_table::Table;
+use comfy_table::{Cell, CellAlignment, Color, Table};
 
 use crate::report::fee_calc::{FeeBreakdown, FeeRates};
+use crate::wasm::parser::{ContractMeta, format_contract_meta};
 
-/// Compute what percentage `part` is of `total`.
-///
-/// Returns a formatted string like `"29.3%"`. Returns `"0.0%"` when the
-/// total is zero to avoid division by zero.
-pub fn fee_percentage(part: i64, total: i64) -> String {
-    if total == 0 {
-        "0.0%".to_string()
-    } else {
-        let pct = (part as f64 / total as f64) * 100.0;
-        format!("{pct:.1}%")
-    }
-}
+// fee_percentage removed since we now use the precalculated exact percentages
 
-/// Maximum width of the bar in the ASCII cost breakdown chart (characters).
-const CHART_BAR_WIDTH: usize = 40;
+/// Minimum terminal width (in columns) required before the fee bar chart is
+/// rendered. Narrower terminals receive the table only.
+pub const MIN_CHART_WIDTH: usize = 80;
 
-/// A single row in the ASCII cost breakdown chart.
-#[derive(Debug, Clone)]
-pub struct ChartEntry {
-    /// Display label for the fee component.
-    pub label: String,
+/// Terminal width assumed when the real width cannot be detected.
+pub const DEFAULT_CHART_WIDTH: usize = 80;
+
+/// Narrowest a chart bar may become after width scaling, so tiny shares stay
+/// visible instead of collapsing to an empty column.
+const MIN_BAR_WIDTH: usize = 10;
+
+/// Widest a chart bar may become after width scaling, keeping labels and bars
+/// readable on very wide terminals.
+const MAX_BAR_WIDTH: usize = 60;
+
+/// Block glyph used for a fully filled bar cell.
+const BLOCK_FULL: char = '█';
+
+/// One labelled fee component rendered as a row in the bar chart.
+struct BarRow {
+    /// Display label (e.g. `"CPU"`).
+    label: &'static str,
     /// Fee amount in stroops.
-    pub stroops: i64,
-    /// The rendered ASCII bar (e.g. `"########################"`).
-    pub bar: String,
-    /// Percentage of total (e.g. `" (29.1%)"`), empty when total is 0.
-    pub pct: String,
+    stroops: i64,
 }
 
-/// Render an ASCII bar chart showing the relative cost of each fee component.
+/// Render an ASCII/Unicode horizontal bar chart of the fee distribution.
 ///
-/// The chart is appended to the cost report output to give a quick visual
-/// summary of where the fee is going. Only non-zero components are shown.
+/// Each bar's length is proportional to that component's share of the total
+/// fee. The four displayed components are CPU instructions, read/write
+/// storage I/O, bandwidth (transaction size) and rent (the refundable
+/// portion); the fixed base-inclusion fee is intentionally left out of the
+/// distribution.
+///
+/// Sub-cell precision is expressed with the block glyphs `█` (full), `▓`
+/// (three-quarters), `▒` (half) and `░` (quarter); remaining cells are spaces.
+/// `width` is the number of terminal columns available, and the bar length is
+/// scaled so each rendered line fits within it.
+///
+/// Returns an empty string when `breakdown.total_stroops` is zero, since there
+/// is nothing to visualize.
 ///
 /// # Output format
 ///
 /// ```text
-/// Fee Breakdown Chart:
+/// Fee Distribution:
 ///
-///   Non-refundable | ########################              |  4496 (29.1%)
-///   Refundable     | ###################################### | 10931 (70.9%)
+///   CPU         | ██████████████████████████████████████ |  70.9%
+///   Storage I/O | ███████████████▒                       |  26.3%
 /// ```
 ///
-/// # Arguments
-/// * `total_stroops` — total fee in stroops (used for percentage calculation;
-///   if 0, percentages are omitted).
-/// * `non_refundable` — non-refundable fee in stroops.
-/// * `refundable` — refundable fee in stroops.
+/// # Network calls
+/// None — pure computation.
 #[must_use]
-pub fn format_cost_breakdown_chart(
-    total_stroops: i64,
-    non_refundable: i64,
-    refundable: i64,
-) -> String {
-    let entries = build_chart_entries(total_stroops, non_refundable, refundable);
-    render_chart(&entries)
+pub fn render_fee_bar_chart(breakdown: &FeeBreakdown, width: usize) -> String {
+    let total = breakdown.total_stroops;
+    if total <= 0 {
+        return String::new();
+    }
+
+    let rows = [
+        BarRow {
+            label: "CPU",
+            stroops: breakdown.cpu_fee_stroops,
+        },
+        BarRow {
+            label: "Storage I/O",
+            stroops: breakdown.storage_fee_stroops,
+        },
+        BarRow {
+            label: "Bandwidth",
+            stroops: breakdown.bandwidth_fee_stroops,
+        },
+        BarRow {
+            label: "Rent",
+            stroops: breakdown.refundable_stroops,
+        },
+    ];
+
+    let label_width = rows.iter().map(|row| row.label.len()).max().unwrap_or(0);
+    // 2 leading spaces + label + " | " + bar + " | " + a 6-column percentage.
+    let overhead = 2 + label_width + 3 + 3 + 6;
+    let bar_width = width
+        .saturating_sub(overhead)
+        .clamp(MIN_BAR_WIDTH, MAX_BAR_WIDTH);
+
+    let mut output = String::from("\nFee Distribution:\n\n");
+    for row in &rows {
+        let ratio = row.stroops.max(0) as f64 / total as f64;
+        let bar = render_bar(ratio, bar_width);
+        let pct = ratio * 100.0;
+        output.push_str(&format!(
+            "  {label:<label_width$} | {bar} | {pct:>5.1}%\n",
+            label = row.label,
+        ));
+    }
+    output
 }
 
-/// Build the chart entries from fee values.
+/// Render a single bar of `width` cells for `ratio` in `0.0..=1.0`.
 ///
-/// Returns a `Vec<ChartEntry>` sorted by descending stroops value. Zero-value
-/// components are excluded.
+/// The fractional trailing cell is represented with a partial-block glyph
+/// (`▓`, `▒`, `░`); a fraction within an eighth of a full cell rounds up to a
+/// full block instead. Unfilled cells are spaces, so every bar is exactly
+/// `width` cells wide.
 #[must_use]
-pub fn build_chart_entries(
-    total_stroops: i64,
-    non_refundable: i64,
-    refundable: i64,
-) -> Vec<ChartEntry> {
-    let max_stroops = non_refundable.max(refundable);
-    let has_total = total_stroops > 0;
-
-    let mut entries: Vec<ChartEntry> = Vec::new();
-
-    if non_refundable > 0 {
-        let bar = render_bar(non_refundable, max_stroops);
-        let pct = if has_total {
-            format!(
-                " ({:.1}%)",
-                non_refundable as f64 / total_stroops as f64 * 100.0
-            )
-        } else {
-            String::new()
-        };
-        entries.push(ChartEntry {
-            label: "Non-refundable".to_string(),
-            stroops: non_refundable,
-            bar,
-            pct,
-        });
+fn render_bar(ratio: f64, width: usize) -> String {
+    if width == 0 {
+        return String::new();
     }
+    let ratio = ratio.clamp(0.0, 1.0);
+    let exact = ratio * width as f64;
+    let whole = exact.floor() as usize;
+    let remainder = exact - whole as f64;
 
-    if refundable > 0 {
-        let bar = render_bar(refundable, max_stroops);
-        let pct = if has_total {
-            format!(
-                " ({:.1}%)",
-                refundable as f64 / total_stroops as f64 * 100.0
-            )
-        } else {
-            String::new()
-        };
-        entries.push(ChartEntry {
-            label: "Refundable".to_string(),
-            stroops: refundable,
-            bar,
-            pct,
-        });
+    let (full_cells, partial) = if remainder >= 0.875 {
+        ((whole + 1).min(width), None)
+    } else if remainder >= 0.625 {
+        (whole, Some('▓'))
+    } else if remainder >= 0.375 {
+        (whole, Some('▒'))
+    } else if remainder >= 0.125 {
+        (whole, Some('░'))
+    } else {
+        (whole, None)
+    };
+    let full_cells = full_cells.min(width);
+
+    let mut bar = String::with_capacity(width);
+    for _ in 0..full_cells {
+        bar.push(BLOCK_FULL);
     }
-
-    // Sort by descending stroops so the largest component is first.
-    entries.sort_by_key(|a| std::cmp::Reverse(a.stroops));
-    entries
+    if let Some(glyph) = partial {
+        if full_cells < width {
+            bar.push(glyph);
+        }
+    }
+    while bar.chars().count() < width {
+        bar.push(' ');
+    }
+    bar
 }
 
-/// Render the chart entries into a formatted string.
+/// Percentage of a protocol limit at which a [`ResourceWarning`] is raised.
+pub const RESOURCE_WARNING_THRESHOLD_PERCENT: u64 = 80;
+
+/// The subset of the network's resource-limit configuration needed to warn
+/// when a simulation approaches protocol ceilings.
+///
+/// Values mirror `ConfigSettingContractComputeV0`,
+/// `ConfigSettingContractLedgerCostV0`, and `ConfigSettingContractBandwidthV0`.
+/// A field is `None` when the corresponding config setting was unavailable —
+/// that check is then skipped rather than comparing against a bogus zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NetworkConfig {
+    /// `ConfigSettingContractComputeV0.tx_max_instructions`.
+    pub tx_max_instructions: Option<u64>,
+    /// `ConfigSettingContractLedgerCostV0.tx_max_disk_read_entries`.
+    pub tx_max_read_entries: Option<u64>,
+    /// `ConfigSettingContractLedgerCostV0.tx_max_write_ledger_entries`.
+    pub tx_max_write_entries: Option<u64>,
+    /// `ConfigSettingContractLedgerCostV0.tx_max_disk_read_bytes`.
+    pub tx_max_read_bytes: Option<u64>,
+    /// `ConfigSettingContractLedgerCostV0.tx_max_write_bytes`.
+    pub tx_max_write_bytes: Option<u64>,
+    /// `ConfigSettingContractBandwidthV0.tx_max_size_bytes`.
+    pub tx_max_size: Option<u64>,
+}
+
+impl NetworkConfig {
+    /// Build the limit set from a config snapshot.
+    ///
+    /// Missing sections leave the corresponding fields `None`, which disables
+    /// their checks instead of treating an unknown limit as zero. Limits that
+    /// are non-positive in the config are likewise treated as unknown.
+    #[must_use]
+    pub fn from_snapshot(snapshot: &crate::config_snapshot::model::ConfigSnapshot) -> Self {
+        let positive_u64 = |value: i64| u64::try_from(value).ok().filter(|v| *v > 0);
+        let positive_u32 = |value: u32| Some(u64::from(value)).filter(|v| *v > 0);
+
+        let mut config = Self::default();
+        if let Some(compute) = &snapshot.contract_compute {
+            config.tx_max_instructions = positive_u64(compute.tx_max_instructions);
+        }
+        if let Some(cost) = &snapshot.contract_ledger_cost {
+            config.tx_max_read_entries = positive_u32(cost.tx_max_disk_read_entries);
+            config.tx_max_write_entries = positive_u32(cost.tx_max_write_ledger_entries);
+            config.tx_max_read_bytes = positive_u32(cost.tx_max_disk_read_bytes);
+            config.tx_max_write_bytes = positive_u32(cost.tx_max_write_bytes);
+        }
+        if let Some(bandwidth) = &snapshot.contract_bandwidth {
+            config.tx_max_size = positive_u32(bandwidth.tx_max_size_bytes);
+        }
+        config
+    }
+}
+
+/// A warning that a simulated resource is approaching or exceeding a
+/// protocol limit.
+///
+/// `percent` is computed with integer arithmetic only (floor of
+/// `used * 100 / limit`), so it is stable across platforms and never depends
+/// on floating-point rounding.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResourceWarning {
+    /// Machine-readable resource key (e.g. `"cpu_instructions"`).
+    pub resource: String,
+    /// Human-readable resource label (e.g. `"CPU instructions"`).
+    pub label: String,
+    /// Amount consumed by the simulation.
+    pub used: u64,
+    /// Protocol limit for this resource.
+    pub limit: u64,
+    /// Percentage of the limit consumed, floored to a whole percent.
+    pub percent: u32,
+    /// Human-readable explanation suitable for a warning banner.
+    pub message: String,
+}
+
+/// Compare a cost report against network resource limits and return a warning
+/// for every resource at or above
+/// [`RESOURCE_WARNING_THRESHOLD_PERCENT`] of its limit.
+///
+/// Checks run in a fixed order (CPU, entries, bytes, tx size) so output is
+/// deterministic. Resources whose limit is unknown (`None`) or non-positive
+/// are skipped.
 #[must_use]
-fn render_chart(entries: &[ChartEntry]) -> String {
+pub fn check_resource_limits(report: &CostReport, config: &NetworkConfig) -> Vec<ResourceWarning> {
+    check_resource_limits_raw(
+        report.cpu_instructions,
+        report.read_entries,
+        report.write_entries,
+        report.read_bytes,
+        report.write_bytes,
+        report.tx_size,
+        config,
+    )
+}
+
+/// Threshold check against raw resource values, for callers that hold the
+/// simulator's output before a full [`CostReport`] has been assembled.
+#[must_use]
+pub fn check_resource_limits_raw(
+    cpu_instructions: u64,
+    read_entries: u32,
+    write_entries: u32,
+    read_bytes: u32,
+    write_bytes: u32,
+    tx_size: u32,
+    config: &NetworkConfig,
+) -> Vec<ResourceWarning> {
+    let mut warnings: Vec<ResourceWarning> = Vec::new();
+    push_resource_warning(
+        &mut warnings,
+        "cpu_instructions",
+        "CPU instructions",
+        cpu_instructions,
+        config.tx_max_instructions,
+    );
+    push_resource_warning(
+        &mut warnings,
+        "read_entries",
+        "Ledger read entries",
+        u64::from(read_entries),
+        config.tx_max_read_entries,
+    );
+    push_resource_warning(
+        &mut warnings,
+        "write_entries",
+        "Ledger write entries",
+        u64::from(write_entries),
+        config.tx_max_write_entries,
+    );
+    push_resource_warning(
+        &mut warnings,
+        "read_bytes",
+        "Ledger read bytes",
+        u64::from(read_bytes),
+        config.tx_max_read_bytes,
+    );
+    push_resource_warning(
+        &mut warnings,
+        "write_bytes",
+        "Ledger write bytes",
+        u64::from(write_bytes),
+        config.tx_max_write_bytes,
+    );
+    push_resource_warning(
+        &mut warnings,
+        "tx_size",
+        "Transaction size",
+        u64::from(tx_size),
+        config.tx_max_size,
+    );
+    warnings
+}
+
+/// Append a warning for `resource` when `used` is at or above the threshold
+/// of `limit`. No-op when the limit is unknown or non-positive.
+fn push_resource_warning(
+    out: &mut Vec<ResourceWarning>,
+    resource: &str,
+    label: &str,
+    used: u64,
+    limit: Option<u64>,
+) {
+    let Some(limit) = limit else {
+        return;
+    };
+    if limit == 0 {
+        return;
+    }
+    // Integer-only threshold comparison: used / limit >= threshold / 100.
+    if used.saturating_mul(100) < limit.saturating_mul(RESOURCE_WARNING_THRESHOLD_PERCENT) {
+        return;
+    }
+    let percent = u32::try_from(used.saturating_mul(100) / limit).unwrap_or(u32::MAX);
+    out.push(ResourceWarning {
+        resource: resource.to_string(),
+        label: label.to_string(),
+        used,
+        limit,
+        percent,
+        message: format!("{label} at {percent}% of the network limit ({used} of {limit})"),
+    });
+}
+
+/// Render resource-limit warnings as a human-readable banner.
+///
+/// Returns an empty string when there is nothing to warn about, so callers can
+/// append the result unconditionally without leaving a stray section header.
+#[must_use]
+pub fn format_resource_warnings(warnings: &[ResourceWarning]) -> String {
+    if warnings.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\nResource limit warnings:\n");
+    for warning in warnings {
+        out.push_str(&format!("  - {}\n", warning.message));
+    }
+    out
+}
+
+/// Direction of a historical fee change relative to the current run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CostTrend {
+    /// The historical fee is lower than the current run (cost decreased).
+    Improvement,
+    /// The historical fee is higher than the current run (cost increased).
+    Regression,
+    /// The historical fee equals the current run.
+    Unchanged,
+}
+
+impl CostTrend {
+    /// Classify a `delta = historical - current` fee difference.
+    #[must_use]
+    pub fn for_delta(delta_stroops: i64) -> Self {
+        match delta_stroops.cmp(&0) {
+            std::cmp::Ordering::Greater => Self::Regression,
+            std::cmp::Ordering::Less => Self::Improvement,
+            std::cmp::Ordering::Equal => Self::Unchanged,
+        }
+    }
+}
+
+/// One previous run of the same contract function, alongside its fee delta
+/// against the current run.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HistoryEntry {
+    /// ISO-8601 timestamp of the historical estimate.
+    pub timestamp: String,
+    /// Ledger sequence at the time of the historical estimate.
+    pub ledger: u32,
+    /// CPU instructions consumed by the historical estimate.
+    pub cpu_instructions: u64,
+    /// Total fee of the historical estimate, in stroops.
+    pub total_stroops: i64,
+    /// Total fee of the historical estimate, in XLM.
+    pub total_xlm: String,
+    /// `historical - current` in stroops: positive means a regression.
+    pub delta_stroops: i64,
+    /// Trend classification derived from `delta_stroops`.
+    pub trend: CostTrend,
+}
+
+/// Build [`HistoryEntry`] records from previous runs, computing each one's
+/// delta against the current run's total fee.
+///
+/// Entries are returned in the order supplied (callers pass them
+/// newest-first) with `delta_stroops = entry_fee - current_fee`.
+#[must_use]
+pub fn build_history_entries(
+    current_total_stroops: i64,
+    current_xlm_precision: u32,
+    runs: &[HistoricalRun],
+) -> Vec<HistoryEntry> {
+    runs.iter()
+        .map(|run| {
+            let delta_stroops = run.total_stroops.saturating_sub(current_total_stroops);
+            HistoryEntry {
+                timestamp: run.timestamp.clone(),
+                ledger: run.ledger,
+                cpu_instructions: run.cpu_instructions,
+                total_stroops: run.total_stroops,
+                total_xlm: crate::report::fee_calc::stroops_to_xlm(
+                    run.total_stroops,
+                    current_xlm_precision,
+                ),
+                delta_stroops,
+                trend: CostTrend::for_delta(delta_stroops),
+            }
+        })
+        .collect()
+}
+
+/// A raw previous run used to build [`HistoryEntry`] records.
+///
+/// Kept separate from [`HistoryEntry`] so callers can supply cache rows
+/// without knowing the current run's fee.
+#[derive(Debug, Clone)]
+pub struct HistoricalRun {
+    /// ISO-8601 timestamp of the run.
+    pub timestamp: String,
+    /// Ledger sequence at the time of the run.
+    pub ledger: u32,
+    /// CPU instructions consumed.
+    pub cpu_instructions: u64,
+    /// Total fee in stroops.
+    pub total_stroops: i64,
+}
+
+/// Render the historical cost trend table.
+///
+/// Regressions (cost increases vs the current run) are shown in red,
+/// improvements (cost reductions) in green, and unchanged runs in yellow.
+/// Returns an empty string when there is no history, so callers can append the
+/// result unconditionally.
+#[must_use]
+pub fn format_cost_history(entries: &[HistoryEntry]) -> String {
     if entries.is_empty() {
         return String::new();
     }
 
-    // Find the longest label to align the bars.
-    let label_width = entries.iter().map(|e| e.label.len()).max().unwrap_or(0);
-    let mut output = String::from("\nFee Breakdown Chart:\n\n");
+    let mut table = Table::new();
+    table.set_header(vec![
+        "Timestamp",
+        "Ledger",
+        "CPU Instructions",
+        "Total Fee",
+        "Delta vs current",
+    ]);
 
     for entry in entries {
-        let padded_label = format!("{:<width$}", entry.label, width = label_width);
-        let stroops_str = format_stroops_aligned(entry.stroops);
-        output.push_str(&format!(
-            "  {} | {} | {}{}\n",
-            padded_label, entry.bar, stroops_str, entry.pct
-        ));
+        let (delta_text, color) = match entry.trend {
+            CostTrend::Regression => (format!("+{}", entry.delta_stroops), Color::Red),
+            CostTrend::Improvement => (format!("{}", entry.delta_stroops), Color::Green),
+            CostTrend::Unchanged => ("0".to_string(), Color::Yellow),
+        };
+        table.add_row(vec![
+            Cell::new(&entry.timestamp),
+            Cell::new(entry.ledger),
+            Cell::new(entry.cpu_instructions),
+            Cell::new(format!("{} ({})", entry.total_stroops, entry.total_xlm)),
+            Cell::new(delta_text).fg(color),
+        ]);
     }
 
-    output
-}
-
-/// Render a single ASCII bar proportional to `value` relative to `max`.
-///
-/// The bar uses `#` characters and is right-padded with spaces to
-/// `CHART_BAR_WIDTH`. When `value` equals `max`, the bar is full width.
-/// When `value` is 0, the bar is empty.
-#[must_use]
-fn render_bar(value: i64, max: i64) -> String {
-    if max <= 0 {
-        return " ".repeat(CHART_BAR_WIDTH);
-    }
-    let filled = ((value as f64 / max as f64) * CHART_BAR_WIDTH as f64).round() as usize;
-    let filled = filled.min(CHART_BAR_WIDTH);
-    format!(
-        "{}{}",
-        "#".repeat(filled),
-        " ".repeat(CHART_BAR_WIDTH - filled)
-    )
-}
-
-/// Format a stroops value with right-alignment for column display.
-#[must_use]
-fn format_stroops_aligned(stroops: i64) -> String {
-    format!("{:>6}", stroops)
+    let mut out = String::from("\nCost history (previous runs, newest first):\n");
+    out.push_str(&table.to_string());
+    out.push('\n');
+    out
 }
 
 /// A complete cost report for a single contract invocation.
@@ -171,11 +487,18 @@ pub struct CostReport {
     pub function: String,
     /// WASM bytes SHA-256 hash (hex).
     pub wasm_hash: String,
-    /// WASM binary size in bytes.
+    /// Size of the compiled WASM artifact in bytes. Reported in the
+    /// side-by-side diff so a build-size regression is visible next to the
+    /// fee delta, and used by [`generate_optimization_tips`] to flag an
+    /// oversized binary. `0` when the caller did not supply it; `#[serde(default)]`
+    /// so reports serialized before this field existed still deserialize.
+    #[serde(default)]
     pub wasm_size: u64,
-    /// Total number of sections in the WASM module.
+    /// Number of sections in the compiled WASM artifact.
+    #[serde(default)]
     pub section_count: u32,
-    /// Names of the WASM custom sections (e.g. `contractspecv0`, `name`).
+    /// Names of custom sections found in the compiled WASM artifact.
+    #[serde(default)]
     pub custom_sections: Vec<String>,
     /// CPU instructions consumed.
     pub cpu_instructions: u64,
@@ -194,6 +517,10 @@ pub struct CostReport {
     /// Fee breakdown.
     pub fee: FeeBreakdown,
     /// The ledger sequence the simulation ran against.
+    ///
+    /// Serialized as `ledger_sequence` in JSON output (issue #329) while the
+    /// Rust field keeps its shorter name for source compatibility.
+    #[serde(rename = "ledger_sequence")]
     pub ledger: u32,
     /// Network the simulation ran on.
     pub network: String,
@@ -205,6 +532,38 @@ pub struct CostReport {
     /// serialized output; `None` when the rates were unavailable.
     #[serde(skip)]
     pub rates: Option<FeeRates>,
+    /// Resource-limit warnings for this run (#322). Always serialized so JSON
+    /// consumers see a stable `warnings` array (empty when nothing is near a
+    /// limit).
+    #[serde(default)]
+    pub warnings: Vec<ResourceWarning>,
+    /// Historical trend entries (#321). `None` unless the caller requested
+    /// history (via `--history`); when requested it is always an array in JSON
+    /// output, possibly empty when there are no previous runs to compare.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<Vec<HistoryEntry>>,
+    /// Optional batch invocation cost projections.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub projections: Option<Vec<CostProjection>>,
+    /// Contract metadata parsed from the WASM `contractmeta` custom
+    /// section. Empty (and rendered as absent) when the binary carries no
+    /// decodable section; deserialized as empty from older payloads.
+    #[serde(default)]
+    pub contract_meta: ContractMeta,
+}
+
+/// A cost projection for a specific batch invocation count.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CostProjection {
+    /// Number of simulated contract invocations.
+    pub invocations: u64,
+    /// Projected total fee in stroops (integer arithmetic).
+    pub total_stroops: i64,
+    /// Projected total fee in XLM.
+    pub total_xlm: String,
+    /// Projected fee in USD, if an XLM price was available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usd: Option<f64>,
 }
 
 /// A concrete, actionable cost-optimization suggestion derived from a report.
@@ -318,10 +677,628 @@ pub fn format_suggestions(suggestions: &[OptimizationSuggestion]) -> String {
     out
 }
 
-/// Formats the WASM section summary for a report.
+/// Contract WASM size, in bytes, above which a size-optimization tip is
+/// emitted (30 KB).
 ///
-/// Shows the total section count and, when present, the names of the custom
-/// sections (e.g. `contractspecv0`, `name`).
+/// Uploads are charged bandwidth per byte on every deploy, and a contract
+/// above this size is usually carrying debug symbols or unoptimized
+/// dependencies rather than logic.
+pub const WASM_SIZE_TIP_THRESHOLD_BYTES: u32 = 30 * 1024;
+
+/// Share of the total fee, in percent, at which a cost component is treated
+/// as the *dominant* factor and earns a targeted tip.
+pub const DOMINANT_COST_PCT: u64 = 40;
+
+/// Ledger-entry count from which batching/merging state becomes worth
+/// suggesting. One or two entries is normal for a contract instance; three or
+/// more usually means the footprint can be collapsed.
+pub const MULTI_ENTRY_THRESHOLD: u32 = 3;
+
+/// Transaction-envelope size, in bytes, above which a large-payload tip is
+/// eligible (1 KB).
+pub const LARGE_TX_BYTES: u32 = 1024;
+
+/// `part` as a whole percentage of `total`, using integer-only arithmetic.
+///
+/// Fee math in this crate stays in `stroops`/`i64` — no floats near a value
+/// that gets added up and compared. Returns `0` when `total` is not positive,
+/// and clamps negative `part` to `0` so a defensive negative component can
+/// never produce a nonsensical share.
+#[must_use]
+pub fn share_pct(part: i64, total: i64) -> u64 {
+    if total <= 0 || part <= 0 {
+        return 0;
+    }
+    let pct = i128::from(part) * 100 / i128::from(total);
+    u64::try_from(pct).unwrap_or(u64::MAX)
+}
+
+/// Generate contextual, actionable cost-optimization tips for a report.
+///
+/// Where [`CostReport::suggest_optimizations`] quantifies *per-unit* savings
+/// from the network's fee rates, this function answers the question a
+/// newcomer actually has: **which single factor dominates this fee, and what
+/// should I change?** Each tip names the dominant factor, quantifies its share
+/// of the total fee, and proposes a concrete change.
+///
+/// A factor earns a tip when it both has a meaningful footprint and accounts
+/// for at least [`DOMINANT_COST_PCT`]% of the total fee:
+///
+/// * **WASM size** — reported whenever the binary exceeds
+///   [`WASM_SIZE_TIP_THRESHOLD_BYTES`], independent of the fee split (the
+///   upload cost lands on the bandwidth component).
+/// * **Ledger writes** — [`MULTI_ENTRY_THRESHOLD`] or more write entries while
+///   storage dominates; suggests merging related state into one entry.
+/// * **Ledger reads** — same threshold, suggests caching/batching.
+/// * **CPU** — the instruction fee dominates.
+/// * **Argument payload** — a large transaction envelope whose bandwidth fee
+///   dominates; suggests trimming the payload.
+/// * **Refundable fee** — rent bumps and events dominate; suggests reducing
+///   state growth and emitted events.
+///
+/// Tips are returned in a fixed order (WASM, writes, reads, CPU, payload,
+/// refundable) so output is deterministic and snapshot-testable. An empty
+/// vector means no factor is dominant — callers should render nothing rather
+/// than a "nothing to say" block.
+///
+/// # Network calls
+/// None — pure computation over the report.
+#[must_use]
+pub fn generate_optimization_tips(report: &CostReport) -> Vec<String> {
+    let total = report.fee.total_stroops;
+    let mut tips: Vec<String> = Vec::new();
+
+    if report.wasm_size > u64::from(WASM_SIZE_TIP_THRESHOLD_BYTES) {
+        tips.push(format!(
+            "Tip: the contract WASM is {} bytes, over the {} KB threshold. Uploads are charged bandwidth on every byte, so consider a release build with LTO and `strip = true` to shrink the binary.",
+            report.wasm_size,
+            WASM_SIZE_TIP_THRESHOLD_BYTES / 1024
+        ));
+    }
+
+    let storage_share = share_pct(report.fee.storage_fee_stroops, total);
+    if report.write_entries >= MULTI_ENTRY_THRESHOLD && storage_share >= DOMINANT_COST_PCT {
+        tips.push(format!(
+            "Tip: writing {} ledger entries accounts for {}% of the total fee. Consider combining related state into a single entry.",
+            report.write_entries, storage_share
+        ));
+    }
+    if report.read_entries >= MULTI_ENTRY_THRESHOLD && storage_share >= DOMINANT_COST_PCT {
+        tips.push(format!(
+            "Tip: reading {} ledger entries accounts for {}% of the total fee. Consider caching hot state or batching the reads into one call.",
+            report.read_entries, storage_share
+        ));
+    }
+
+    let cpu_share = share_pct(report.fee.cpu_fee_stroops, total);
+    if report.cpu_instructions > 0 && cpu_share >= DOMINANT_COST_PCT {
+        tips.push(format!(
+            "Tip: CPU instructions account for {}% of the total fee ({} instructions consumed). Consider profiling the hot path and moving work off-chain.",
+            cpu_share, report.cpu_instructions
+        ));
+    }
+
+    let bandwidth_share = share_pct(report.fee.bandwidth_fee_stroops, total);
+    if report.tx_size >= LARGE_TX_BYTES && bandwidth_share >= DOMINANT_COST_PCT {
+        tips.push(format!(
+            "Tip: the transaction envelope is {} bytes and its bandwidth fee accounts for {}% of the total fee. Consider trimming large argument payloads or passing a reference instead of the full value.",
+            report.tx_size, bandwidth_share
+        ));
+    }
+
+    let refundable_share = share_pct(report.fee.refundable_stroops, total);
+    if report.fee.refundable_stroops > 0 && refundable_share >= DOMINANT_COST_PCT {
+        tips.push(format!(
+            "Tip: {}% of the total fee is refundable, which comes from ledger rent bumps and contract events. Consider reducing state growth and the number or size of emitted events.",
+            refundable_share
+        ));
+    }
+
+    tips
+}
+
+/// Render cost-optimization tips as a human-readable block.
+///
+/// Returns an empty string when there is nothing to say, so callers can
+/// append the result unconditionally and stay quiet for a report with no
+/// dominant cost factor.
+#[must_use]
+pub fn format_tips(tips: &[String]) -> String {
+    if tips.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("Optimization Tips:\n");
+    for tip in tips {
+        out.push_str(&format!("  {tip}\n"));
+    }
+    out
+}
+
+/// Aggregated metrics for a whole `estimate-all` batch.
+///
+/// Every value is a whole-unit aggregate over the successfully estimated
+/// functions; `functions_evaluated` is the number of reports the aggregates
+/// were computed from, so a caller can tell an empty batch from a single
+/// cheap function. All fee values are stroops; the XLM strings are rendered
+/// with the caller's chosen precision.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EstimateAllSummary {
+    /// Number of functions included in the aggregates.
+    pub functions_evaluated: usize,
+    /// Lowest per-function total fee, in stroops.
+    pub min_fee_stroops: i64,
+    /// Highest per-function total fee, in stroops.
+    pub max_fee_stroops: i64,
+    /// Mean per-function total fee, in stroops (integer division).
+    pub avg_fee_stroops: i64,
+    /// Sum of every per-function total fee, in stroops.
+    pub total_fee_stroops: i64,
+    /// Lowest per-function CPU instruction count.
+    pub min_cpu_instructions: u64,
+    /// Highest per-function CPU instruction count.
+    pub max_cpu_instructions: u64,
+    /// Sum of every per-function CPU instruction count.
+    pub total_cpu_instructions: u64,
+    /// Sum of every per-function ledger write entry count.
+    pub total_write_entries: u64,
+    /// Sum of every per-function ledger read entry count.
+    pub total_read_entries: u64,
+    /// Lowest XLM total across the batch.
+    pub min_total_xlm: String,
+    /// Highest XLM total across the batch.
+    pub max_total_xlm: String,
+    /// Mean XLM total across the batch.
+    pub avg_total_xlm: String,
+}
+
+/// Aggregate a batch of per-function reports into an [`EstimateAllSummary`].
+///
+/// Returns `None` for an empty batch — a summary over zero functions is
+/// undefined (there is no min, max, or average), so callers can render a
+/// "nothing was estimated" state instead of a row full of zeros.
+///
+/// The fee sum accumulates in `i128` so a large batch cannot overflow before
+/// being cast back to `i64`; the cast is lossless because the result is a sum
+/// of `i64` fees. The average uses integer division, matching
+/// [`crate::report::fee_calc::fee_range`] and keeping fee math float-free.
+#[must_use]
+pub fn summarize_estimate_all(
+    reports: &[CostReport],
+    precision: u32,
+) -> Option<EstimateAllSummary> {
+    let first = reports.first()?;
+    let mut min_fee = first.fee.total_stroops;
+    let mut max_fee = first.fee.total_stroops;
+    let mut min_cpu = first.cpu_instructions;
+    let mut max_cpu = first.cpu_instructions;
+    let mut total_fee: i128 = 0;
+    let mut total_cpu: u128 = 0;
+    let mut total_writes: u64 = 0;
+    let mut total_reads: u64 = 0;
+
+    for report in reports {
+        min_fee = min_fee.min(report.fee.total_stroops);
+        max_fee = max_fee.max(report.fee.total_stroops);
+        min_cpu = min_cpu.min(report.cpu_instructions);
+        max_cpu = max_cpu.max(report.cpu_instructions);
+        total_fee += i128::from(report.fee.total_stroops);
+        total_cpu += u128::from(report.cpu_instructions);
+        total_writes += u64::from(report.write_entries);
+        total_reads += u64::from(report.read_entries);
+    }
+
+    let count = reports.len();
+    let avg_fee = (total_fee / i128::try_from(count).unwrap_or(1)) as i64;
+
+    Some(EstimateAllSummary {
+        functions_evaluated: count,
+        min_fee_stroops: min_fee,
+        max_fee_stroops: max_fee,
+        avg_fee_stroops: avg_fee,
+        total_fee_stroops: total_fee as i64,
+        min_cpu_instructions: min_cpu,
+        max_cpu_instructions: max_cpu,
+        total_cpu_instructions: total_cpu as u64,
+        total_write_entries: total_writes,
+        total_read_entries: total_reads,
+        min_total_xlm: crate::report::fee_calc::stroops_to_xlm(min_fee, precision),
+        max_total_xlm: crate::report::fee_calc::stroops_to_xlm(max_fee, precision),
+        avg_total_xlm: crate::report::fee_calc::stroops_to_xlm(avg_fee, precision),
+    })
+}
+
+/// Narrowest column width comfy-table is given, so a column of short cells
+/// still renders a readable box.
+const MIN_COLUMN_WIDTH: u16 = 6;
+
+/// Builds the `estimate-all` table: one row per estimated function plus a
+/// visually separated summary footer row.
+///
+/// The footer is separated with real border styling, not a blank line: the
+/// table draws a `├───┼───┤` rule above every row (comfy-table's internal
+/// horizontal line), so the summary sits in its own band at the bottom of the
+/// box. The whole table is rendered in one pass by one `comfy_table::Table`,
+/// which sizes every column to its widest cell (footer included) — so nothing
+/// is truncated and the rows can never drift out of alignment.
+///
+/// Returns an empty string for an empty batch, so an empty `estimate-all` run
+/// adds nothing to the output.
+///
+/// # Arguments
+/// * `reports` — the successfully estimated functions, in run order.
+/// * `summary` — pre-computed aggregates via [`summarize_estimate_all`];
+///   `None` omits the footer row (e.g. when `--quiet` suppressed it).
+pub fn format_estimate_all_table(
+    reports: &[CostReport],
+    summary: Option<&EstimateAllSummary>,
+) -> String {
+    if reports.is_empty() && summary.is_none() {
+        return String::new();
+    }
+
+    let header = vec![
+        "Function".to_string(),
+        "CPU insns".to_string(),
+        "Fee (stroops)".to_string(),
+        "Fee (XLM)".to_string(),
+        "Ledger".to_string(),
+        "Write entries".to_string(),
+    ];
+    let mut rows: Vec<Vec<String>> = reports
+        .iter()
+        .map(|r| {
+            vec![
+                r.function.clone(),
+                r.cpu_instructions.to_string(),
+                r.fee.total_stroops.to_string(),
+                r.fee.total_xlm.clone(),
+                r.ledger.to_string(),
+                r.write_entries.to_string(),
+            ]
+        })
+        .collect();
+
+    if let Some(s) = summary {
+        // The footer is the last row, so comfy-table draws the separator rule
+        // immediately above it.
+        rows.push(vec![
+            format!("Summary: {} function(s)", s.functions_evaluated),
+            format!("{} - {}", s.min_cpu_instructions, s.max_cpu_instructions),
+            format!(
+                "min {} / max {} / avg {}",
+                s.min_fee_stroops, s.max_fee_stroops, s.avg_fee_stroops
+            ),
+            format!("{} - {}", s.min_total_xlm, s.max_total_xlm),
+            String::new(),
+            s.total_write_entries.to_string(),
+        ]);
+    }
+
+    let mut table = comfy_table::Table::new();
+    table.load_preset(comfy_table::presets::UTF8_BORDERS_ONLY);
+    // Turn on comfy-table's internal horizontal rule so the last row (the
+    // summary footer) is visually separated from the per-function rows, and
+    // close the header divider with proper intersections.
+    table.set_style(comfy_table::TableComponent::HorizontalLines, '─');
+    table.set_style(comfy_table::TableComponent::MiddleIntersections, '┼');
+    table.set_style(comfy_table::TableComponent::LeftBorderIntersections, '├');
+    table.set_style(comfy_table::TableComponent::RightBorderIntersections, '┤');
+    table.set_style(comfy_table::TableComponent::BottomBorderIntersections, '┴');
+    table.set_style(comfy_table::TableComponent::MiddleHeaderIntersections, '╪');
+
+    table.set_header(header);
+    for row in &rows {
+        table.add_row(row.clone());
+    }
+    // Keep very narrow columns (e.g. a single-digit write-entry count) from
+    // collapsing to an unreadable box.
+    let widths: Vec<u16> = table
+        .column_max_content_widths()
+        .into_iter()
+        .map(|width| width.max(MIN_COLUMN_WIDTH))
+        .collect();
+    for (index, width) in widths.iter().enumerate() {
+        if let Some(column) = table.column_mut(index) {
+            // `ColumnConstraint::Boundaries` pins both ends of the column to
+            // the same width, so comfy-table neither grows the column beyond
+            // its widest cell nor truncates one.
+            column.set_constraint(comfy_table::ColumnConstraint::Boundaries {
+                lower: comfy_table::Width::Fixed(*width),
+                upper: comfy_table::Width::Fixed(*width),
+            });
+        }
+    }
+
+    table.to_string()
+}
+
+/// Renders the batch [`EstimateAllSummary`] as a GitHub-flavored Markdown
+/// table, for `estimate-all --format markdown`.
+///
+/// Complements [`format_estimate_all_table`]: the same aggregate in the same
+/// shape, but expressed in Markdown so it renders in a PR comment or a
+/// GitBook page. Returns an empty string when there is no summary.
+#[must_use]
+pub fn format_estimate_all_summary_markdown(summary: &EstimateAllSummary) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "### Summary — {} function(s) evaluated\n\n",
+        summary.functions_evaluated
+    ));
+    out.push_str("| Metric | Value |\n| --- | --- |\n");
+    out.push_str(&format!(
+        "| Min fee | {} stroops ({}) |\n",
+        summary.min_fee_stroops, summary.min_total_xlm
+    ));
+    out.push_str(&format!(
+        "| Max fee | {} stroops ({}) |\n",
+        summary.max_fee_stroops, summary.max_total_xlm
+    ));
+    out.push_str(&format!(
+        "| Average fee | {} stroops ({}) |\n",
+        summary.avg_fee_stroops, summary.avg_total_xlm
+    ));
+    out.push_str(&format!(
+        "| Total fee | {} stroops |\n",
+        summary.total_fee_stroops
+    ));
+    out.push_str(&format!(
+        "| CPU instructions | {} - {} (total {}) |\n",
+        summary.min_cpu_instructions, summary.max_cpu_instructions, summary.total_cpu_instructions
+    ));
+    out.push_str(&format!(
+        "| Ledger entries | {} read / {} written |\n",
+        summary.total_read_entries, summary.total_write_entries
+    ));
+    out
+}
+
+/// Aggregate fee and CPU distribution across a batch of simulations.
+///
+/// Computed over the **successfully estimated** functions only; skipped and
+/// errored functions carry no fee or CPU figure and are excluded by the
+/// caller. Every field is an integer: fees in stroops, CPU in instructions.
+/// The standard deviation is derived from an integer population variance and
+/// an integer square root, so no floating point is used anywhere (issue #328).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FeeDistribution {
+    /// Number of simulations the statistics were computed over.
+    pub function_count: usize,
+    /// Lowest fee, in stroops.
+    pub min_fee_stroops: i64,
+    /// Highest fee, in stroops.
+    pub max_fee_stroops: i64,
+    /// Arithmetic mean fee, in stroops (integer division, truncated).
+    pub mean_fee_stroops: i64,
+    /// Median fee, in stroops. For an even count this is the truncated mean of
+    /// the two central values.
+    pub median_fee_stroops: i64,
+    /// Population standard deviation of the fees, in stroops (floored).
+    pub std_dev_fee_stroops: i64,
+    /// Lowest CPU instruction count.
+    pub min_cpu_instructions: u64,
+    /// Highest CPU instruction count.
+    pub max_cpu_instructions: u64,
+    /// Arithmetic mean CPU instruction count (integer division, truncated).
+    pub mean_cpu_instructions: u64,
+}
+
+impl FeeDistribution {
+    /// Compute the distribution from parallel slices of fee (stroops) and CPU
+    /// instruction samples.
+    ///
+    /// This is the shared core behind [`calculate_distribution_stats`]. It is
+    /// public so the `estimate-all` CLI can derive the distribution directly
+    /// from its per-function records, without first rebuilding full
+    /// [`CostReport`]s.
+    ///
+    /// When either slice is empty — or the slices differ in length, in which
+    /// case the shorter length wins — every statistic is zero and
+    /// `function_count` is `0`.
+    ///
+    /// # Network calls
+    /// None — pure computation.
+    #[must_use]
+    pub fn from_samples(fees: &[i64], cpu: &[u64]) -> Self {
+        let count = fees.len().min(cpu.len());
+        if count == 0 {
+            return Self {
+                function_count: 0,
+                min_fee_stroops: 0,
+                max_fee_stroops: 0,
+                mean_fee_stroops: 0,
+                median_fee_stroops: 0,
+                std_dev_fee_stroops: 0,
+                min_cpu_instructions: 0,
+                max_cpu_instructions: 0,
+                mean_cpu_instructions: 0,
+            };
+        }
+
+        let mut min_fee = i64::MAX;
+        let mut max_fee = i64::MIN;
+        let mut min_cpu = u64::MAX;
+        let mut max_cpu = 0u64;
+        // Accumulate in wider integers so a large batch cannot overflow.
+        let mut sum_fee: i128 = 0;
+        let mut sum_fee_sq: i128 = 0;
+        let mut sum_cpu: u128 = 0;
+        let mut sorted_fees: Vec<i64> = Vec::with_capacity(count);
+
+        for index in 0..count {
+            let fee = fees[index];
+            min_fee = min_fee.min(fee);
+            max_fee = max_fee.max(fee);
+            sum_fee += i128::from(fee);
+            sum_fee_sq += i128::from(fee) * i128::from(fee);
+            sorted_fees.push(fee);
+
+            let instructions = cpu[index];
+            min_cpu = min_cpu.min(instructions);
+            max_cpu = max_cpu.max(instructions);
+            sum_cpu += u128::from(instructions);
+        }
+
+        let n = count as i128;
+        let mean_fee = (sum_fee / n) as i64;
+        let mean_cpu = (sum_cpu / count as u128) as u64;
+
+        sorted_fees.sort_unstable();
+        let median_fee = if count % 2 == 1 {
+            sorted_fees[count / 2]
+        } else {
+            // Sum in `i128` so two near-`i64::MAX` values cannot overflow.
+            ((i128::from(sorted_fees[count / 2 - 1]) + i128::from(sorted_fees[count / 2])) / 2)
+                as i64
+        };
+
+        // Population variance = (n·Σx² − (Σx)²) / n², computed with exact
+        // integer arithmetic (the numerator is non-negative by Cauchy–Schwarz).
+        let variance_numerator = (n * sum_fee_sq - sum_fee * sum_fee).max(0);
+        let variance = variance_numerator / (n * n);
+        let std_dev_fee = isqrt_u128(variance as u128) as i64;
+
+        Self {
+            function_count: count,
+            min_fee_stroops: min_fee,
+            max_fee_stroops: max_fee,
+            mean_fee_stroops: mean_fee,
+            median_fee_stroops: median_fee,
+            std_dev_fee_stroops: std_dev_fee,
+            min_cpu_instructions: min_cpu,
+            max_cpu_instructions: max_cpu,
+            mean_cpu_instructions: mean_cpu,
+        }
+    }
+}
+
+/// Integer (floor) square root of a `u128`.
+///
+/// Uses Newton's method; returns `0` for `0` and `1` for `1`. Keeps the
+/// standard-deviation computation free of floating point.
+fn isqrt_u128(value: u128) -> u128 {
+    if value < 2 {
+        return value;
+    }
+    let mut x = value;
+    let mut y = x / 2 + 1;
+    while y < x {
+        x = y;
+        y = u128::midpoint(x, value / x);
+    }
+    x
+}
+
+/// Compute the distribution statistics for a batch of cost reports (issue
+/// #328).
+///
+/// Callers should pass only the successfully simulated reports so that
+/// skipped/errored functions do not skew the statistics. Returns an all-zero
+/// distribution when `reports` is empty.
+///
+/// # Network calls
+/// None — pure computation.
+#[must_use]
+pub fn calculate_distribution_stats(reports: &[CostReport]) -> FeeDistribution {
+    let fees: Vec<i64> = reports.iter().map(|r| r.fee.total_stroops).collect();
+    let cpu: Vec<u64> = reports.iter().map(|r| r.cpu_instructions).collect();
+    FeeDistribution::from_samples(&fees, &cpu)
+}
+
+/// Insert `,` thousands separators into a run of ASCII digits.
+fn group_digits(digits: &str) -> String {
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// Format a signed integer with `,` thousands separators.
+///
+/// Example: `format_thousands(1_234_567)` → `"1,234,567"`.
+#[must_use]
+pub fn format_thousands(value: i64) -> String {
+    let grouped = group_digits(&value.unsigned_abs().to_string());
+    if value < 0 {
+        format!("-{grouped}")
+    } else {
+        grouped
+    }
+}
+
+/// Format an unsigned integer with `,` thousands separators.
+#[must_use]
+pub fn format_thousands_u64(value: u64) -> String {
+    group_digits(&value.to_string())
+}
+
+/// Format a ledger sequence number with `,` thousands separators.
+///
+/// Example: `format_ledger_sequence(1_234_567)` → `"1,234,567"` (issue #329).
+#[must_use]
+pub fn format_ledger_sequence(ledger: u32) -> String {
+    group_digits(&ledger.to_string())
+}
+
+/// Render the distribution statistics as a human-readable box for the
+/// `estimate-all` summary (issue #328).
+///
+/// Returns an explanatory line instead of a zeroed box when nothing was
+/// successfully estimated, so the section is never silently empty.
+#[must_use]
+pub fn format_distribution_box(distribution: &FeeDistribution, precision: u32) -> String {
+    if distribution.function_count == 0 {
+        return "No functions estimated; no fee distribution to report.".to_string();
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "\nFee distribution across {} function(s):\n\n",
+        distribution.function_count
+    ));
+    out.push_str("  Fees (stroops):\n");
+    out.push_str(&format!(
+        "    min     : {}\n",
+        format_thousands(distribution.min_fee_stroops)
+    ));
+    out.push_str(&format!(
+        "    max     : {}\n",
+        format_thousands(distribution.max_fee_stroops)
+    ));
+    out.push_str(&format!(
+        "    mean    : {} ({})\n",
+        format_thousands(distribution.mean_fee_stroops),
+        crate::report::fee_calc::stroops_to_xlm(distribution.mean_fee_stroops, precision)
+    ));
+    out.push_str(&format!(
+        "    median  : {}\n",
+        format_thousands(distribution.median_fee_stroops)
+    ));
+    out.push_str(&format!(
+        "    std dev : {}\n",
+        format_thousands(distribution.std_dev_fee_stroops)
+    ));
+    out.push_str("\n  CPU instructions:\n");
+    out.push_str(&format!(
+        "    min     : {}\n",
+        format_thousands_u64(distribution.min_cpu_instructions)
+    ));
+    out.push_str(&format!(
+        "    max     : {}\n",
+        format_thousands_u64(distribution.max_cpu_instructions)
+    ));
+    out.push_str(&format!(
+        "    mean    : {}\n",
+        format_thousands_u64(distribution.mean_cpu_instructions)
+    ));
+    out
+}
+
+/// Formats section count and custom names consistently across report formats.
 #[must_use]
 pub fn format_section_summary(report: &CostReport) -> String {
     if report.custom_sections.is_empty() {
@@ -336,6 +1313,7 @@ pub fn format_section_summary(report: &CostReport) -> String {
 }
 
 /// Formats a cost report as a human-readable table.
+#[allow(clippy::too_many_lines)]
 pub fn format_report_table(report: &CostReport) -> String {
     let mut output = String::new();
 
@@ -343,6 +1321,10 @@ pub fn format_report_table(report: &CostReport) -> String {
     output.push_str(&format!(
         "Network: {} (ledger {})\n",
         report.network, report.ledger
+    ));
+    output.push_str(&format!(
+        "Simulated at ledger sequence: {}\n",
+        format_ledger_sequence(report.ledger)
     ));
     output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
     output.push_str(&format!("WASM hash: {}\n", report.wasm_hash));
@@ -352,7 +1334,17 @@ pub fn format_report_table(report: &CostReport) -> String {
         format_section_summary(report)
     ));
 
+    // Contract metadata from the WASM `contractmeta` section: present or
+    // absent, always rendered so the reader knows the section was checked.
+    output.push_str(&format_contract_meta(&report.contract_meta));
+    output.push_str("\n\n");
+
     let mut table = Table::new();
+    if crate::cli::should_colorize() {
+        table.enforce_styling();
+    } else {
+        table.force_no_tty();
+    }
 
     table.set_header(vec!["Resource", "Consumed", "Fee (stroops)"]);
 
@@ -371,45 +1363,81 @@ pub fn format_report_table(report: &CostReport) -> String {
     output.push_str(&table.to_string());
     output.push('\n');
 
-    output.push_str(&format!("\nFee Breakdown:\n"));
-    let total = report.fee.total_stroops;
-    output.push_str(&format!(
-        "  Non-refundable: {} stroops ({})\n",
-        report.fee.non_refundable_stroops,
-        fee_percentage(report.fee.non_refundable_stroops, total),
-    ));
-    output.push_str(&format!(
-        "  Refundable:     {} stroops ({})\n",
-        report.fee.refundable_stroops,
-        fee_percentage(report.fee.refundable_stroops, total),
-    ));
-    output.push_str(&format!("\n  Components (of non-refundable):\n"));
-    output.push_str(&format!(
-        "    CPU:        {} stroops ({})\n",
-        report.fee.cpu_fee_stroops,
-        fee_percentage(report.fee.cpu_fee_stroops, total),
-    ));
-    output.push_str(&format!(
-        "    Storage:    {} stroops ({})\n",
-        report.fee.storage_fee_stroops,
-        fee_percentage(report.fee.storage_fee_stroops, total),
-    ));
-    output.push_str(&format!(
-        "    Bandwidth:  {} stroops ({})\n",
-        report.fee.bandwidth_fee_stroops,
-        fee_percentage(report.fee.bandwidth_fee_stroops, total),
-    ));
-    output.push_str(&format!(
-        "\n  Total:          {} stroops ({})\n",
-        report.fee.total_stroops, report.fee.total_xlm,
-    ));
+    output.push_str("\nFee Breakdown:\n\n");
+    let pct = &report.fee.fee_percentages;
+    let mut fee_table = Table::new();
+    fee_table.set_header(vec!["Component", "Fee"]);
+    fee_table.add_row(vec![
+        "CPU Instructions",
+        &format!(
+            "{} stroops ({})",
+            report.fee.cpu_fee_stroops,
+            pct.get("cpu_instructions")
+                .map(String::as_str)
+                .unwrap_or("")
+        ),
+    ]);
+    fee_table.add_row(vec![
+        "Storage I/O",
+        &format!(
+            "{} stroops ({})",
+            report.fee.storage_fee_stroops,
+            pct.get("storage_read_write")
+                .map(String::as_str)
+                .unwrap_or("")
+        ),
+    ]);
+    fee_table.add_row(vec![
+        "Transaction Size",
+        &format!(
+            "{} stroops ({})",
+            report.fee.bandwidth_fee_stroops,
+            pct.get("transaction_size")
+                .map(String::as_str)
+                .unwrap_or("")
+        ),
+    ]);
+    fee_table.add_row(vec![
+        "Base Fee",
+        &format!(
+            "{} stroops ({})",
+            report.fee.base_fee_stroops,
+            pct.get("base_fee").map(String::as_str).unwrap_or("")
+        ),
+    ]);
+    fee_table.add_row(vec![
+        "Rent Fee",
+        &format!(
+            "{} stroops ({})",
+            report.fee.refundable_stroops,
+            pct.get("rent").map(String::as_str).unwrap_or("")
+        ),
+    ]);
+    fee_table.add_row(vec![
+        "Total",
+        &format!(
+            "{} stroops ({})",
+            report.fee.total_stroops, report.fee.total_xlm
+        ),
+    ]);
+
+    output.push_str(&fee_table.to_string());
+    output.push('\n');
 
     // ASCII bar chart for visual cost breakdown
-    output.push_str(&format_cost_breakdown_chart(
-        report.fee.total_stroops,
-        report.fee.non_refundable_stroops,
-        report.fee.refundable_stroops,
-    ));
+    output.push_str(&render_fee_bar_chart(&report.fee, DEFAULT_CHART_WIDTH));
+
+    // Resource-limit warnings (#322) — only when something nears a ceiling.
+    output.push_str(&format_resource_warnings(&report.warnings));
+
+    // Historical trend table (#321) — only populated with `--history`.
+    if let Some(history) = &report.history {
+        output.push_str(&format_cost_history(history));
+    }
+
+    if let Some(ref projections) = report.projections {
+        output.push_str(&format_projections_table(projections));
+    }
 
     output
 }
@@ -419,51 +1447,316 @@ pub fn format_report_json(report: &CostReport) -> String {
     serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// Signed change of a single metric between two estimate runs.
+///
+/// Fee arithmetic stays in integer stroops (`previous`, `current`,
+/// `absolute`); `percent` is derived for display only and is `None` when the
+/// baseline is zero, because a percentage change from zero is undefined.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct MetricDelta {
+    /// Baseline value from the previous estimate.
+    pub previous: i64,
+    /// Value from the current estimate.
+    pub current: i64,
+    /// `current - previous`, saturating rather than wrapping.
+    pub absolute: i64,
+    /// Percentage change, or `None` when `previous == 0`.
+    pub percent: Option<f64>,
+}
+
+impl MetricDelta {
+    /// Compute the delta between two values.
+    #[must_use]
+    pub fn new(previous: i64, current: i64) -> Self {
+        let absolute = current.saturating_sub(previous);
+        let percent = if previous == 0 {
+            None
+        } else {
+            Some(absolute as f64 / previous as f64 * 100.0)
+        };
+        Self {
+            previous,
+            current,
+            absolute,
+            percent,
+        }
+    }
+
+    /// Renders the signed change, e.g. `+12400 (+5.2%)`, `-100 (-1.0%)`,
+    /// `0 (0.0%)`, or just `+5` when the percentage is undefined.
+    #[must_use]
+    pub fn format_signed(&self) -> String {
+        let sign = if self.absolute > 0 { "+" } else { "" };
+        match self.percent {
+            Some(pct) => format!("{sign}{} ({sign}{pct:.1}%)", self.absolute),
+            None => format!("{sign}{}", self.absolute),
+        }
+    }
+}
+
+/// Cost deltas between a previous estimate and the current report.
+///
+/// CPU, memory, and fee are always present because every cached entry stores
+/// them. The ledger entry-count deltas are `None` when the previous estimate
+/// predates I/O recording.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct CostDelta {
+    /// CPU instruction delta.
+    pub cpu_instructions: MetricDelta,
+    /// Memory byte delta.
+    pub memory_bytes: MetricDelta,
+    /// Total fee delta, in stroops.
+    pub fee_stroops: MetricDelta,
+    /// Ledger read-entry delta, when the previous estimate recorded I/O.
+    pub read_entries: Option<MetricDelta>,
+    /// Ledger write-entry delta, when the previous estimate recorded I/O.
+    pub write_entries: Option<MetricDelta>,
+}
+
+impl CostDelta {
+    /// Computes the delta of `current` against a previous estimate's metrics.
+    ///
+    /// `previous_io` is `(read_entries, write_entries)` when the previous
+    /// estimate recorded its ledger I/O footprint.
+    #[must_use]
+    pub fn compute(
+        previous_cpu: u64,
+        previous_memory: u64,
+        previous_fee_stroops: i64,
+        previous_io: Option<(u32, u32)>,
+        current: &CostReport,
+    ) -> Self {
+        Self {
+            cpu_instructions: MetricDelta::new(
+                previous_cpu as i64,
+                current.cpu_instructions as i64,
+            ),
+            memory_bytes: MetricDelta::new(previous_memory as i64, current.memory_bytes as i64),
+            fee_stroops: MetricDelta::new(previous_fee_stroops, current.fee.total_stroops),
+            read_entries: previous_io.map(|(read, _)| {
+                MetricDelta::new(i64::from(read), i64::from(current.read_entries))
+            }),
+            write_entries: previous_io.map(|(_, write)| {
+                MetricDelta::new(i64::from(write), i64::from(current.write_entries))
+            }),
+        }
+    }
+
+    /// `(label, delta)` rows for every metric with a baseline to compare to.
+    fn rows(&self) -> Vec<(&'static str, MetricDelta)> {
+        let mut rows = vec![
+            ("CPU Instructions", self.cpu_instructions),
+            ("Memory Bytes", self.memory_bytes),
+        ];
+        if let Some(delta) = self.read_entries {
+            rows.push(("Read Entries", delta));
+        }
+        if let Some(delta) = self.write_entries {
+            rows.push(("Write Entries", delta));
+        }
+        rows.push(("Fee (stroops)", self.fee_stroops));
+        rows
+    }
+
+    /// Renders the comparison as a terminal table.
+    #[must_use]
+    pub fn format_text(&self) -> String {
+        let mut output = String::from("\nCost delta vs previous estimate:\n");
+        let mut table = Table::new();
+        table.set_header(vec!["Metric", "Previous", "Current", "Change"]);
+        for (label, delta) in self.rows() {
+            table.add_row(vec![
+                label.to_string(),
+                delta.previous.to_string(),
+                delta.current.to_string(),
+                delta.format_signed(),
+            ]);
+        }
+        output.push_str(&table.to_string());
+        output.push('\n');
+        output
+    }
+
+    /// Renders the comparison as a GitHub-flavored markdown table.
+    #[must_use]
+    pub fn format_markdown(&self) -> String {
+        let mut output = String::from("\n### Cost delta vs previous estimate\n\n");
+        output.push_str("| Metric | Previous | Current | Change |\n");
+        output.push_str("| --- | --- | --- | --- |\n");
+        for (label, delta) in self.rows() {
+            output.push_str(&format!(
+                "| {label} | {} | {} | {} |\n",
+                delta.previous,
+                delta.current,
+                delta.format_signed(),
+            ));
+        }
+        output
+    }
+
+    /// Renders the comparison as RFC 4180 CSV records.
+    ///
+    /// The percent column is empty when there is no baseline to divide by.
+    #[must_use]
+    pub fn format_csv(&self) -> String {
+        let mut output = String::from("metric,previous,current,absolute,percent\n");
+        for (label, delta) in self.rows() {
+            let percent = delta.percent.map(|p| format!("{p:.1}")).unwrap_or_default();
+            output.push_str(&format!(
+                "{label},{},{},{},{percent}\n",
+                delta.previous, delta.current, delta.absolute
+            ));
+        }
+        output
+    }
+}
+
+/// Parse a comma-separated list of invocation counts for cost projections.
+///
+/// Ensures each count is non-zero, unique, fits within `i64::MAX` so it can be
+/// multiplied by stroop fees safely, and maintains the order supplied by the user.
+pub fn parse_projection_counts(input: &str) -> crate::error::AppResult<Vec<u64>> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(crate::error::AppError::FeeCalc(
+            "projection counts cannot be empty".to_string(),
+        ));
+    }
+
+    let mut counts = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for raw_part in trimmed.split(',') {
+        let part = raw_part.trim();
+        if part.is_empty() {
+            return Err(crate::error::AppError::FeeCalc(
+                "projection counts contain an empty value".to_string(),
+            ));
+        }
+
+        if part.starts_with('-') {
+            return Err(crate::error::AppError::FeeCalc(format!(
+                "invalid projection count '{part}': count cannot be negative"
+            )));
+        }
+
+        let count: u64 = part.parse().map_err(|_| {
+            crate::error::AppError::FeeCalc(format!(
+                "invalid projection count '{part}': must be a positive integer"
+            ))
+        })?;
+
+        if count == 0 {
+            return Err(crate::error::AppError::FeeCalc(
+                "invalid projection count '0': count must be greater than zero".to_string(),
+            ));
+        }
+
+        if count > i64::MAX as u64 {
+            return Err(crate::error::AppError::FeeCalc(format!(
+                "invalid projection count '{part}': value exceeds maximum supported limit ({})",
+                i64::MAX
+            )));
+        }
+
+        if !seen.insert(count) {
+            return Err(crate::error::AppError::FeeCalc(format!(
+                "duplicate projection count: {count}"
+            )));
+        }
+
+        counts.push(count);
+    }
+
+    Ok(counts)
+}
+
+/// Calculate cost projections for given invocation counts.
+///
+/// Performs checked multiplication (`total_fee_stroops * count`) to prevent
+/// integer overflow. Stroop fees remain pure integers (`i64`), and XLM is
+/// formatted using the standard [`crate::report::fee_calc::stroops_to_xlm`] conversion.
+pub fn calculate_projections(
+    total_fee_stroops: i64,
+    counts: &[u64],
+    precision: u32,
+    xlm_usd_price: Option<f64>,
+) -> crate::error::AppResult<Vec<CostProjection>> {
+    let mut projections = Vec::with_capacity(counts.len());
+
+    for &count in counts {
+        let count_i64 = i64::try_from(count).map_err(|_| {
+            crate::error::AppError::FeeCalc(format!(
+                "projection count {count} exceeds maximum supported integer value"
+            ))
+        })?;
+
+        let projected_stroops = total_fee_stroops
+            .checked_mul(count_i64)
+            .ok_or_else(|| {
+                crate::error::AppError::FeeCalc(format!(
+                    "cost projection overflow: {total_fee_stroops} stroops * {count} invocations exceeds integer bounds"
+                ))
+            })?;
+
+        let total_xlm = crate::report::fee_calc::stroops_to_xlm(projected_stroops, precision);
+
+        let usd = xlm_usd_price.map(|price| (projected_stroops as f64 / 10_000_000.0) * price);
+
+        projections.push(CostProjection {
+            invocations: count,
+            total_stroops: projected_stroops,
+            total_xlm,
+            usd,
+        });
+    }
+
+    Ok(projections)
+}
+
+/// Formats a list of cost projections into a human-readable table.
+#[must_use]
+pub fn format_projections_table(projections: &[CostProjection]) -> String {
+    if projections.is_empty() {
+        return String::new();
+    }
+
+    let mut output = String::from("\nCost Projections:\n\n");
+    let mut table = Table::new();
+    if crate::cli::should_colorize() {
+        table.enforce_styling();
+    } else {
+        table.force_no_tty();
+    }
+
+    table.set_header(vec!["Invocations", "Total Stroops", "Total XLM", "USD"]);
+    for p in projections {
+        let usd_str = p
+            .usd
+            .map(|u| format!("${u:.2}"))
+            .unwrap_or_else(|| "-".to_string());
+        table.add_row(vec![
+            Cell::new(format_thousands_u64(p.invocations)).set_alignment(CellAlignment::Right),
+            Cell::new(format_thousands(p.total_stroops)).set_alignment(CellAlignment::Right),
+            Cell::new(&p.total_xlm).set_alignment(CellAlignment::Right),
+            Cell::new(usd_str).set_alignment(CellAlignment::Right),
+        ]);
+    }
+
+    output.push_str(&table.to_string());
+    output.push('\n');
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_fee_percentage_normal() {
-        assert_eq!(fee_percentage(50, 100), "50.0%");
-        assert_eq!(fee_percentage(1, 3), "33.3%");
-        assert_eq!(fee_percentage(0, 100), "0.0%");
-    }
-
-    #[test]
-    fn test_fee_percentage_zero_total() {
-        assert_eq!(fee_percentage(0, 0), "0.0%");
-        assert_eq!(fee_percentage(100, 0), "0.0%");
-    }
-
-    #[test]
-    fn test_fee_percentage_rounding() {
-        assert_eq!(fee_percentage(1, 10), "10.0%");
-        assert_eq!(fee_percentage(1, 3), "33.3%");
-        assert_eq!(fee_percentage(2, 3), "66.7%");
-    }
-
-    #[test]
-    fn test_format_section_summary_with_custom() {
-        let report = report_with_rates(sample_rates());
-        assert_eq!(
-            format_section_summary(&report),
-            "9 (custom: contractspecv0, name)"
-        );
-    }
-
-    #[test]
-    fn test_format_section_summary_none() {
-        let mut report = report_with_rates(sample_rates());
-        report.custom_sections = vec![];
-        assert_eq!(format_section_summary(&report), "9 (custom: none)");
-    }
 
     fn report_with_rates(rates: FeeRates) -> CostReport {
         CostReport {
             function: "increment".to_string(),
             wasm_hash: "abc".to_string(),
-            wasm_size: 7_312,
+            wasm_size: 14_432,
             section_count: 9,
             custom_sections: vec!["contractspecv0".to_string(), "name".to_string()],
             cpu_instructions: 532_502,
@@ -479,13 +1772,19 @@ mod tests {
                 cpu_fee_stroops: 372,
                 storage_fee_stroops: 4_063,
                 bandwidth_fee_stroops: 61,
-                total_stroops: 15_427,
-                total_xlm: "0.0015427".to_string(),
+                base_fee_stroops: 100,
+                total_stroops: 15_527,
+                total_xlm: "0.0015527".to_string(),
+                fee_percentages: std::collections::BTreeMap::new(),
             },
             ledger: 3_894_195,
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
             rates: Some(rates),
+            warnings: Vec::new(),
+            history: None,
+            projections: None,
+            contract_meta: ContractMeta::default(),
         }
     }
 
@@ -579,6 +1878,9 @@ mod tests {
         let report = CostReport {
             function: "(wasm upload)".to_string(),
             wasm_hash: "0000".to_string(),
+            wasm_size: 0,
+            section_count: 0,
+            custom_sections: Vec::new(),
             cpu_instructions: 0,
             memory_bytes: 0,
             tx_size: 0,
@@ -592,13 +1894,19 @@ mod tests {
                 cpu_fee_stroops: 0,
                 storage_fee_stroops: 0,
                 bandwidth_fee_stroops: 0,
+                base_fee_stroops: 0,
                 total_stroops: 0,
                 total_xlm: "0.0000000".to_string(),
+                fee_percentages: std::collections::BTreeMap::new(),
             },
             ledger: 0,
             network: "testnet".to_string(),
             rpc_latency_ms: 0,
             rates: None,
+            warnings: Vec::new(),
+            history: None,
+            projections: None,
+            contract_meta: ContractMeta::default(),
         };
 
         let table_out = format_report_table(&report);
@@ -611,5 +1919,339 @@ mod tests {
         assert_eq!(parsed["write_entries"], 0);
         assert_eq!(parsed["read_bytes"], 0);
         assert_eq!(parsed["write_bytes"], 0);
+    }
+
+    /// A breakdown with a clear 65/20/5/10 split so chart output is easy to
+    /// reason about in assertions.
+    fn chart_breakdown() -> FeeBreakdown {
+        FeeBreakdown {
+            non_refundable_stroops: 9_000,
+            refundable_stroops: 1_000,
+            cpu_fee_stroops: 6_500,
+            storage_fee_stroops: 2_000,
+            bandwidth_fee_stroops: 500,
+            base_fee_stroops: 100,
+            total_stroops: 10_000,
+            total_xlm: "0.0010000".to_string(),
+            fee_percentages: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_render_fee_bar_chart_zero_total_is_empty() {
+        let mut breakdown = chart_breakdown();
+        breakdown.total_stroops = 0;
+        assert_eq!(render_fee_bar_chart(&breakdown, DEFAULT_CHART_WIDTH), "");
+    }
+
+    #[test]
+    fn test_render_fee_bar_chart_lists_all_components() {
+        let chart = render_fee_bar_chart(&chart_breakdown(), DEFAULT_CHART_WIDTH);
+        assert!(chart.starts_with("\nFee Distribution:\n\n"));
+        for label in ["CPU", "Storage I/O", "Bandwidth", "Rent"] {
+            assert!(chart.contains(label), "missing {label} in:\n{chart}");
+        }
+        assert!(chart.contains("65.0%"), "missing 65.0% in:\n{chart}");
+        assert!(chart.contains("20.0%"), "missing 20.0% in:\n{chart}");
+        assert!(chart.contains("5.0%"), "missing 5.0% in:\n{chart}");
+        assert!(chart.contains("10.0%"), "missing 10.0% in:\n{chart}");
+        assert!(chart.contains('█'), "filled block missing in:\n{chart}");
+        assert!(
+            chart.contains('▓') || chart.contains('▒') || chart.contains('░'),
+            "partial block missing in:\n{chart}"
+        );
+    }
+
+    #[test]
+    fn test_render_fee_bar_chart_scales_to_width() {
+        let breakdown = chart_breakdown();
+        for width in [40usize, 80, 120] {
+            let chart = render_fee_bar_chart(&breakdown, width);
+            for line in chart.lines() {
+                assert!(
+                    line.chars().count() <= width,
+                    "line exceeds {width} columns: {line:?}"
+                );
+            }
+        }
+
+        // Wider terminals get longer bars (up to the configured maximum).
+        let cpu_bar_width = |width: usize| {
+            render_fee_bar_chart(&breakdown, width)
+                .lines()
+                .find(|line| line.contains("CPU"))
+                .and_then(|line| line.split(" | ").nth(1))
+                .map(|bar| bar.chars().count())
+                .unwrap_or(0)
+        };
+        assert!(
+            cpu_bar_width(120) > cpu_bar_width(40),
+            "bar should scale with terminal width"
+        );
+    }
+
+    #[test]
+    fn test_parse_projection_counts_valid_and_ordered() {
+        let counts = parse_projection_counts("100, 1000, 10000").expect("valid counts");
+        assert_eq!(counts, vec![100, 1000, 10000]);
+
+        // Order preserved
+        let reversed = parse_projection_counts("10000,100,1000").expect("valid counts");
+        assert_eq!(reversed, vec![10000, 100, 1000]);
+    }
+
+    #[test]
+    fn test_parse_projection_counts_invalid() {
+        assert!(parse_projection_counts("").is_err());
+        assert!(parse_projection_counts("   ").is_err());
+        assert!(parse_projection_counts("100,,1000").is_err());
+        assert!(parse_projection_counts("abc").is_err());
+        assert!(parse_projection_counts("100,abc,1000").is_err());
+        assert!(parse_projection_counts("0").is_err());
+        assert!(parse_projection_counts("100,0").is_err());
+        assert!(parse_projection_counts("-5").is_err());
+        assert!(parse_projection_counts("100,-5").is_err());
+        assert!(parse_projection_counts("100,1000,100").is_err());
+        let overflow_count = format!("{}0", u64::MAX);
+        assert!(parse_projection_counts(&overflow_count).is_err());
+    }
+
+    #[test]
+    fn test_calculate_projections_multiplication() {
+        let per_invocation_fee: i64 = 15_527;
+        let counts = [100, 1_000, 10_000];
+        let projections = calculate_projections(per_invocation_fee, &counts, 7, None)
+            .expect("calculation should succeed");
+
+        assert_eq!(projections.len(), 3);
+        assert_eq!(projections[0].invocations, 100);
+        assert_eq!(projections[0].total_stroops, 1_552_700);
+        assert_eq!(projections[0].total_xlm, "0.1552700");
+        assert_eq!(projections[0].usd, None);
+
+        assert_eq!(projections[1].invocations, 1_000);
+        assert_eq!(projections[1].total_stroops, 15_527_000);
+        assert_eq!(projections[1].total_xlm, "1.5527000");
+
+        assert_eq!(projections[2].invocations, 10_000);
+        assert_eq!(projections[2].total_stroops, 155_270_000);
+        assert_eq!(projections[2].total_xlm, "15.5270000");
+    }
+
+    #[test]
+    fn test_calculate_projections_large_no_overflow() {
+        let fee: i64 = 10_000;
+        let counts = [10_000_000_000u64];
+        let projections =
+            calculate_projections(fee, &counts, 7, None).expect("large multiplication succeeds");
+        assert_eq!(projections[0].total_stroops, 100_000_000_000_000);
+    }
+
+    #[test]
+    fn test_calculate_projections_overflow_error() {
+        let fee: i64 = i64::MAX / 2;
+        let counts = [3u64];
+        let err = calculate_projections(fee, &counts, 7, None).unwrap_err();
+        match err {
+            crate::error::AppError::FeeCalc(msg) => {
+                assert!(msg.contains('3'), "error must identify count: {msg}");
+                assert!(
+                    msg.contains("overflow"),
+                    "error must explain overflow: {msg}"
+                );
+            }
+            other => panic!("expected FeeCalc error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_calculate_projections_usd_available() {
+        let fee: i64 = 10_000_000; // 1 XLM
+        let counts = [100];
+        let projections =
+            calculate_projections(fee, &counts, 7, Some(0.12)).expect("calculation succeeds");
+        assert_eq!(projections[0].usd, Some(12.0));
+    }
+
+    #[test]
+    fn test_calculate_projections_usd_unavailable() {
+        let fee: i64 = 10_000_000;
+        let counts = [100];
+        let projections =
+            calculate_projections(fee, &counts, 7, None).expect("calculation succeeds");
+        assert_eq!(projections[0].usd, None);
+    }
+
+    #[test]
+    fn test_format_thousands() {
+        assert_eq!(format_thousands(0), "0");
+        assert_eq!(format_thousands(999), "999");
+        assert_eq!(format_thousands(1_000), "1,000");
+        assert_eq!(format_thousands(10_000), "10,000");
+        assert_eq!(format_thousands(1_234_567), "1,234,567");
+
+        assert_eq!(format_thousands(-1_234_567), "-1,234,567");
+        assert_eq!(format_thousands(500), "500");
+    }
+
+    #[test]
+    fn test_format_projections_table() {
+        let projections = vec![
+            CostProjection {
+                invocations: 100,
+                total_stroops: 1_552_700,
+                total_xlm: "0.1552700".to_string(),
+                usd: None,
+            },
+            CostProjection {
+                invocations: 1_000,
+                total_stroops: 15_527_000,
+                total_xlm: "1.5527000".to_string(),
+                usd: Some(1.86),
+            },
+        ];
+
+        let table = format_projections_table(&projections);
+        assert!(table.contains("Cost Projections:"));
+        assert!(table.contains("Invocations"));
+        assert!(table.contains("Total Stroops"));
+        assert!(table.contains("Total XLM"));
+        assert!(table.contains("USD"));
+        assert!(table.contains("100"));
+        assert!(table.contains("1,552,700"));
+        assert!(table.contains("0.1552700"));
+        assert!(table.contains('-'));
+        assert!(table.contains("1,000"));
+        assert!(table.contains("15,527,000"));
+        assert!(table.contains("1.5527000"));
+        assert!(table.contains("$1.86"));
+    }
+
+    #[test]
+    fn test_format_report_table_and_json_projections() {
+        let mut report = report_with_rates(sample_rates());
+        assert!(!format_report_table(&report).contains("Cost Projections:"));
+        assert!(!format_report_json(&report).contains("\"projections\""));
+
+        report.projections = Some(vec![CostProjection {
+            invocations: 100,
+            total_stroops: 1_552_700,
+            total_xlm: "0.1552700".to_string(),
+            usd: None,
+        }]);
+
+        let table_out = format_report_table(&report);
+        assert!(table_out.contains("Cost Projections:"));
+        assert!(table_out.contains("100"));
+        assert!(table_out.contains("1,552,700"));
+
+        let json_out = format_report_json(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json_out).expect("valid json");
+        assert!(parsed["projections"].is_array());
+        assert_eq!(parsed["projections"][0]["invocations"], 100);
+        assert_eq!(parsed["projections"][0]["total_stroops"], 1_552_700);
+        assert_eq!(parsed["projections"][0]["total_xlm"], "0.1552700");
+        assert!(parsed["projections"][0].get("usd").is_none());
+    }
+
+    // ── Cost delta math (#278) ──────────────────────────────────────────
+
+    #[test]
+    fn test_metric_delta_positive() {
+        let delta = MetricDelta::new(100, 200);
+        assert_eq!(delta.absolute, 100);
+        assert_eq!(delta.percent, Some(100.0));
+        assert_eq!(delta.format_signed(), "+100 (+100.0%)");
+    }
+
+    #[test]
+    fn test_metric_delta_negative() {
+        let delta = MetricDelta::new(200, 100);
+        assert_eq!(delta.absolute, -100);
+        assert_eq!(delta.percent, Some(-50.0));
+        assert_eq!(delta.format_signed(), "-100 (-50.0%)");
+    }
+
+    #[test]
+    fn test_metric_delta_zero() {
+        let delta = MetricDelta::new(200, 200);
+        assert_eq!(delta.absolute, 0);
+        assert_eq!(delta.percent, Some(0.0));
+        assert_eq!(delta.format_signed(), "0 (0.0%)");
+    }
+
+    #[test]
+    fn test_metric_delta_zero_baseline_has_no_percentage() {
+        let delta = MetricDelta::new(0, 500);
+        assert_eq!(delta.absolute, 500);
+        assert_eq!(delta.percent, None);
+        assert_eq!(delta.format_signed(), "+500");
+    }
+
+    #[test]
+    fn test_metric_delta_saturates_instead_of_wrapping() {
+        assert_eq!(MetricDelta::new(i64::MIN, i64::MAX).absolute, i64::MAX);
+    }
+
+    #[test]
+    fn test_cost_delta_without_previous_io_omits_entry_deltas() {
+        let report = report_with_rates(sample_rates());
+        let delta = CostDelta::compute(500_000, 10, 10_000, None, &report);
+
+        assert_eq!(delta.cpu_instructions.absolute, 32_502);
+        assert_eq!(delta.memory_bytes.absolute, -10);
+        assert_eq!(delta.fee_stroops.absolute, 5_527);
+        assert!(delta.read_entries.is_none());
+        assert!(delta.write_entries.is_none());
+        assert!(!delta.format_markdown().contains("Read Entries"));
+    }
+
+    #[test]
+    fn test_cost_delta_with_previous_io_includes_entry_deltas() {
+        let report = report_with_rates(sample_rates());
+        let delta = CostDelta::compute(532_502, 0, 15_527, Some((3, 0)), &report);
+
+        assert_eq!(delta.read_entries.map(|d| d.absolute), Some(-2));
+        assert_eq!(delta.write_entries.map(|d| d.absolute), Some(1));
+        assert!(delta.format_text().contains("Read Entries"));
+        assert!(delta.format_markdown().contains("Write Entries"));
+    }
+
+    #[test]
+    fn test_cost_delta_is_json_serializable() {
+        let report = report_with_rates(sample_rates());
+        let delta = CostDelta::compute(1, 2, 3, Some((1, 1)), &report);
+        let value = serde_json::to_value(delta).expect("serialize");
+
+        assert_eq!(value["cpu_instructions"]["previous"], 1);
+        assert_eq!(value["cpu_instructions"]["current"], 532_502);
+        assert_eq!(value["memory_bytes"]["absolute"], -2);
+        assert_eq!(value["fee_stroops"]["absolute"], 15_524);
+    }
+
+    #[test]
+    fn test_cost_delta_csv_has_header_and_one_row_per_metric() {
+        let report = report_with_rates(sample_rates());
+        let delta = CostDelta::compute(532_502, 0, 15_527, Some((1, 1)), &report);
+        let csv = delta.format_csv();
+        let lines: Vec<&str> = csv.lines().collect();
+
+        assert_eq!(lines[0], "metric,previous,current,absolute,percent");
+        // cpu, memory, read entries, write entries, fee
+        assert_eq!(lines.len(), 6);
+        assert!(lines[1].starts_with("CPU Instructions,532502,532502,0,0.0"));
+    }
+
+    #[test]
+    fn test_cost_delta_csv_leaves_percent_empty_without_baseline() {
+        let report = report_with_rates(sample_rates());
+        let delta = CostDelta::compute(0, 0, 0, None, &report);
+        let csv = delta.format_csv();
+        let cpu_row = csv.lines().nth(1).expect("cpu row");
+
+        assert!(
+            cpu_row.ends_with(','),
+            "percent column should be empty; got: {cpu_row}"
+        );
     }
 }

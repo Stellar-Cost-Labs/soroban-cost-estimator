@@ -4,10 +4,13 @@ expression: TableFormatter.format(&report)
 ---
 Function: increment
 Network: testnet (ledger 3894195)
+Simulated at ledger sequence: 3,894,195
 RPC round-trip: 87 ms
-WASM hash:  abc123def456
-WASM size:  7312 bytes
+WASM hash: abc123def456
+WASM size: 14432 bytes
 Sections:   9 (custom: contractspecv0, name)
+
+Contract meta: absent
 
 +------------------+----------+---------------+
 | Resource         | Consumed | Fee (stroops) |
@@ -28,20 +31,32 @@ Sections:   9 (custom: contractspecv0, name)
 +------------------+----------+---------------+
 
 Fee Breakdown:
-  Non-refundable: 4496 stroops (29.1%)
-  Refundable:     10931 stroops (70.9%)
 
-  Components (of non-refundable):
-    CPU:        372 stroops (2.4%)
-    Storage:    4063 stroops (26.3%)
-    Bandwidth:  61 stroops (0.4%)
++------------------+---------------------------+
+| Component        | Fee                       |
++==============================================+
+| CPU Instructions | 372 stroops ()            |
+|------------------+---------------------------|
+| Storage I/O      | 4063 stroops ()           |
+|------------------+---------------------------|
+| Transaction Size | 61 stroops ()             |
+|------------------+---------------------------|
+| Base Fee         | 100 stroops ()            |
+|------------------+---------------------------|
+| Rent Fee         | 10931 stroops ()          |
+|------------------+---------------------------|
+| Total            | 15427 stroops (0.0015427) |
++------------------+---------------------------+
 
-  Total:          15427 stroops (0.0015427)
+Fee Distribution:
 
-Fee Breakdown Chart:
+  CPU         | █░                                                      |   2.4%
+  Storage I/O | ██████████████▒                                         |  26.3%
+  Bandwidth   | ░                                                       |   0.4%
+  Rent        | ███████████████████████████████████████                 |  70.9%
 
-  Refundable     | ######################################## |  10931 (70.9%)
-  Non-refundable | ################                         |   4496 (29.1%)
+Optimization Tips:
+  Tip: 70% of the total fee is refundable, which comes from ledger rent bumps and contract events. Consider reducing state growth and the number or size of emitted events.
 
 Optimization Suggestions:
   No cost optimizations identified (fee rates unavailable or no reducible resources).

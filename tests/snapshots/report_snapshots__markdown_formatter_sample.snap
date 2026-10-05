@@ -5,9 +5,10 @@ expression: MarkdownFormatter.format(&report)
 ## Cost Report: `increment`
 
 - **Network:** testnet (ledger 3894195)
-- **RPC round-trip:** 87 ms
+- **Simulated at ledger sequence:** `3,894,195`
 - **WASM hash:** `abc123def456`
-- **WASM size:** 7312 bytes
+- **WASM size:** 14432 bytes
+- **RPC round-trip:** 87 ms
 - **Sections:** 9 (custom: contractspecv0, name)
 
 ### Resources
@@ -22,17 +23,26 @@ expression: MarkdownFormatter.format(&report)
 | Write Bytes | 136 |
 | Transaction Size | 156 |
 
+<details>
+<summary>Fee breakdown</summary>
+
 ### Fee Breakdown
 
 | Component | Stroops | % of Total |
 | --- | --- | --- |
-| Non-refundable | 4496 | 29.1% |
-| Refundable | 10931 | 70.9% |
-| CPU | 372 | 2.4% |
-| Storage | 4063 | 26.3% |
-| Bandwidth | 61 | 0.4% |
+| CPU Instructions | 372 |  |
+| Storage I/O | 4063 |  |
+| Transaction Size | 61 |  |
+| Base Fee | 100 |  |
+| Rent Fee | 10931 |  |
 | **Total** | **15427** (0.0015427) | **100.0%** |
+
+### Optimization Tips
+
+- Tip: 70% of the total fee is refundable, which comes from ledger rent bumps and contract events. Consider reducing state growth and the number or size of emitted events.
 
 ### Optimization Suggestions
 
 No cost optimizations identified (fee rates unavailable or no reducible resources).
+
+</details>

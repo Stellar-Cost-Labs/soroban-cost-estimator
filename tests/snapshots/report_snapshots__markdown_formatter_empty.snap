@@ -5,9 +5,10 @@ expression: MarkdownFormatter.format(&empty)
 ## Cost Report: `(wasm upload)`
 
 - **Network:** mainnet (ledger 0)
-- **RPC round-trip:** 0 ms
+- **Simulated at ledger sequence:** `0`
 - **WASM hash:** `0000000000000000`
 - **WASM size:** 0 bytes
+- **RPC round-trip:** 0 ms
 - **Sections:** 0 (custom: none)
 
 ### Resources
@@ -22,17 +23,22 @@ expression: MarkdownFormatter.format(&empty)
 | Write Bytes | 0 |
 | Transaction Size | 0 |
 
+<details>
+<summary>Fee breakdown</summary>
+
 ### Fee Breakdown
 
 | Component | Stroops | % of Total |
 | --- | --- | --- |
-| Non-refundable | 0 | 0.0% |
-| Refundable | 0 | 0.0% |
-| CPU | 0 | 0.0% |
-| Storage | 0 | 0.0% |
-| Bandwidth | 0 | 0.0% |
+| CPU Instructions | 0 |  |
+| Storage I/O | 0 |  |
+| Transaction Size | 0 |  |
+| Base Fee | 0 |  |
+| Rent Fee | 0 |  |
 | **Total** | **0** (0.0000000) | **100.0%** |
 
 ### Optimization Suggestions
 
 No cost optimizations identified (fee rates unavailable or no reducible resources).
+
+</details>

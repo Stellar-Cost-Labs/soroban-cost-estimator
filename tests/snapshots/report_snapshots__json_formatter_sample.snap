@@ -3,6 +3,7 @@ source: tests/report_snapshots.rs
 expression: JsonFormatter.format(&report)
 ---
 {
+  "contract_meta": {},
   "cpu_instructions": 532502,
   "custom_sections": [
     "contractspecv0",
@@ -10,7 +11,9 @@ expression: JsonFormatter.format(&report)
   ],
   "fee": {
     "bandwidth_fee_stroops": 61,
+    "base_fee_stroops": 100,
     "cpu_fee_stroops": 372,
+    "fee_percentages": {},
     "non_refundable_stroops": 4496,
     "refundable_stroops": 10931,
     "storage_fee_stroops": 4063,
@@ -18,17 +21,20 @@ expression: JsonFormatter.format(&report)
     "total_xlm": "0.0015427"
   },
   "function": "increment",
-  "ledger": 3894195,
+  "ledger_sequence": 3894195,
   "memory_bytes": 0,
   "network": "testnet",
+  "optimization_suggestions": [],
   "read_bytes": 0,
   "read_entries": 1,
   "rpc_latency_ms": 87,
-  "section_count": 9,
-  "suggestions": [],
+  "suggestions": [
+    "Tip: 70% of the total fee is refundable, which comes from ledger rent bumps and contract events. Consider reducing state growth and the number or size of emitted events."
+  ],
   "tx_size": 156,
+  "warnings": [],
   "wasm_hash": "abc123def456",
-  "wasm_size": 7312,
+  "wasm_size": 14432,
   "write_bytes": 136,
   "write_entries": 1
 }

@@ -13,6 +13,7 @@ fn make_snapshot(
         network: "testnet".to_string(),
         timestamp: timestamp.to_string(),
         ledger,
+        protocol_version: None,
         contract_compute: Some(ContractComputeV0 {
             ledger_max_instructions: 1_000_000,
             tx_max_instructions: 100_000,
