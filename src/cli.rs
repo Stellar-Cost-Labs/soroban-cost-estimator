@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::builder::{PossibleValue, TypedValueParser};
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -66,10 +68,14 @@ impl std::fmt::Display for OutputFormat {
 fn build_version() -> &'static str {
     concat!(
         env!("CARGO_PKG_VERSION"),
-        " (",
+        " (commit: ",
         env!("GIT_HASH"),
-        " ",
+        " built: ",
         env!("BUILD_DATE"),
+        " target: ",
+        env!("TARGET"),
+        " rustc: ",
+        env!("RUSTC_VERSION"),
         ")"
     )
 }
@@ -252,6 +258,12 @@ pub enum Command {
             default_missing_value = "100,1000,10000"
         )]
         project: Option<String>,
+
+        /// Number of times to repeat the simulation (1..=100, default 1).
+        /// Collects latency statistics (min, max, mean, stddev) and checks
+        /// fee/CPU consistency across runs.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=100))]
+        repeat: u32,
     },
     EstimateAll {
         #[arg(long, short)]
@@ -453,6 +465,44 @@ pub enum SnapshotAction {
         older_than: u32,
 
         /// Output as JSON instead of a human-readable summary.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Delete a saved snapshot file, or purge every snapshot older than N days.
+    Delete {
+        /// Snapshot filename (or path) to delete.
+        #[arg(value_name = "FILENAME")]
+        filename: Option<String>,
+
+        /// Delete snapshots older than this many days.
+        #[arg(long, value_name = "DAYS")]
+        older_than: Option<u64>,
+
+        /// Show which files would be removed without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip the confirmation prompt (required in non-interactive sessions).
+        #[arg(long, short = 'y')]
+        yes: bool,
+
+        /// Restrict `--older-than` to a single network's snapshots.
+        #[arg(long, value_name = "NETWORK")]
+        network: Option<String>,
+    },
+
+    /// Compare two saved snapshot files offline, without any network calls.
+    Diff {
+        /// First (older) snapshot file to compare.
+        #[arg(value_name = "SNAPSHOT_A")]
+        file_a: PathBuf,
+
+        /// Second (newer) snapshot file to compare.
+        #[arg(value_name = "SNAPSHOT_B")]
+        file_b: PathBuf,
+
+        /// Output as JSON instead of a human-readable diff.
         #[arg(long)]
         json: bool,
     },

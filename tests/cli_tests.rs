@@ -193,10 +193,38 @@ fn test_estimate_help() {
         "--clear-cache",
         "--no-cache",
         "--json",
+        "--repeat",
     ] {
         assert!(
             stdout.contains(flag),
             "estimate help should mention {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_estimate_repeat_flag_accepted() {
+    // `--repeat` must be a recognized estimate flag (the run fails on the
+    // missing WASM file, not on the argument).
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--repeat", "3"]);
+    assert_ne!(code, 0, "missing WASM file should still error");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--repeat should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_repeat_out_of_range_rejected() {
+    // The accepted range is 1..=100; clap must reject 0 and 101 up front.
+    for bad in ["0", "101"] {
+        let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--repeat", bad]);
+        assert_ne!(code, 0, "--repeat {bad} should be rejected");
+        assert!(
+            stderr.contains("invalid value")
+                || stderr.contains("not in")
+                || stderr.contains("range"),
+            "clap should reject --repeat {bad}; stderr: {stderr}"
         );
     }
 }
@@ -1892,7 +1920,7 @@ fn test_config_diff_against_previous_summary_output() {
 
     assert_eq!(code, 0, "--summary should exit 0 here; stderr: {stderr}");
     assert!(
-        stdout.contains("0 pricing changes, 0 non-pricing changes"),
+        stdout.contains("Network config up to date (ledger 200)"),
         "--summary should emit exactly the one-line summary; got: {stdout}"
     );
 }
@@ -3808,4 +3836,469 @@ fn test_no_cache_bypasses_cache_reads_and_writes() {
         "--no-cache must ignore the cached entry; got: {stdout}"
     );
     assert_eq!(parsed["cpu_instructions"], 532_502);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `estimate --repeat` benchmarking (Issue #289)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Args shared by the `--repeat` tests: a deterministic contract invocation
+/// served by the mock RPC server.
+fn repeat_estimate_args(rpc_url: &str) -> Vec<String> {
+    [
+        "estimate",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--id",
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        "--fn",
+        "increment",
+        "--arg",
+        "1",
+        "--rpc-url",
+        rpc_url,
+        "--repeat",
+        "3",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+#[test]
+fn test_estimate_repeat_table_reports_statistics() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-repeat-table");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(repeat_estimate_args(&rpc_url))
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .output()
+        .expect("failed to run estimate --repeat");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate --repeat should succeed; stderr: {stderr}"
+    );
+
+    for label in [
+        "Iteration count",
+        "Min latency (ms)",
+        "Max latency (ms)",
+        "Mean latency (ms)",
+        "Stddev latency (ms)",
+        "CPU Instructions",
+        "Total Fee (stroops)",
+    ] {
+        assert!(
+            stdout.contains(label),
+            "summary should include '{label}'; got: {stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("532502"),
+        "summary should report CPU instructions; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("15427"),
+        "summary should report total fee; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("identical"),
+        "deterministic runs should be marked identical; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_estimate_repeat_json_reports_latency_array() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("estimate-repeat-json");
+
+    let mut args = repeat_estimate_args(&rpc_url);
+    args.push("--json".to_string());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(&args)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate --repeat --json");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate --repeat --json should succeed; stderr: {stderr}"
+    );
+
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON output");
+    let _ = stderr;
+
+    assert_eq!(parsed["iterations"], 3);
+    assert_eq!(
+        parsed["latencies_ms"].as_array().map(|a| a.len()),
+        Some(3),
+        "latencies_ms should hold one sample per run; got: {stdout}"
+    );
+    for key in [
+        "min_latency_ms",
+        "max_latency_ms",
+        "mean_latency_ms",
+        "stddev_latency_ms",
+    ] {
+        assert!(
+            parsed.get(key).is_some(),
+            "JSON should include statistical metric {key}; got: {stdout}"
+        );
+    }
+    assert_eq!(parsed["cpu_instructions"], 532_502);
+    assert_eq!(parsed["cpu_identical"], true);
+    assert_eq!(parsed["total_fee_stroops"], 15_427);
+    assert_eq!(parsed["fee_identical"], true);
+}
+
+fn snapshot_json_fee(network: &str, ledger: u32, fee: i64) -> String {
+    format!(
+        r#"{{
+  "network": "{network}",
+  "ledger": {ledger},
+  "timestamp": "2026-01-01T00:00:00+00:00",
+  "contract_compute": {{
+    "ledger_max_instructions": 1000000,
+    "tx_max_instructions": 100000,
+    "fee_rate_per_instructions_increment": {fee},
+    "tx_memory_limit": 100
+  }},
+  "contract_ledger_cost": null,
+  "contract_historical_data": null,
+  "contract_events": null,
+  "contract_bandwidth": null,
+  "state_archival": null
+}}"#
+    )
+}
+
+/// Writes a snapshot named `name` into `home`'s snapshots directory and
+/// returns its full path.
+fn write_snapshot_file(home: &Path, name: &str, contents: &str) -> PathBuf {
+    let dir = home.join(".soroban-cost-estimator").join("snapshots");
+    std::fs::create_dir_all(&dir).expect("create snapshots dir");
+    let path = dir.join(name);
+    std::fs::write(&path, contents).expect("write snapshot fixture");
+    path
+}
+
+#[test]
+fn test_config_snapshot_help_lists_management_subcommands() {
+    let (stdout, stderr, code) = run_cli(&["config", "snapshot", "--help"]);
+    assert_eq!(code, 0, "snapshot --help should exit 0: {stderr}");
+    for subcommand in ["delete", "diff"] {
+        assert!(
+            stdout.contains(subcommand),
+            "snapshot help should list the {subcommand} subcommand; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_config_snapshot_delete_help() {
+    let (stdout, stderr, code) = run_cli(&["config", "snapshot", "delete", "--help"]);
+    assert_eq!(code, 0, "delete --help should exit 0: {stderr}");
+    for flag in ["--older-than", "--dry-run", "--yes"] {
+        assert!(
+            stdout.contains(flag),
+            "delete help should mention {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_config_snapshot_diff_help() {
+    let (stdout, stderr, code) = run_cli(&["config", "snapshot", "diff", "--help"]);
+    assert_eq!(code, 0, "diff --help should exit 0: {stderr}");
+    assert!(
+        stdout.contains("--json"),
+        "diff help should mention --json; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_delete_removes_named_file() {
+    let home = temp_home("snapshot-delete-named");
+    let name = "testnet-2026-01-01T00-00-00+00-00.json";
+    let path = write_snapshot_file(&home, name, &snapshot_json("testnet", 100));
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &["config", "snapshot", "delete", name, "--yes"],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "delete should succeed; stderr: {stderr}");
+    assert!(!path.exists(), "the named snapshot should be gone");
+    assert!(
+        stdout.contains("Deleted snapshot"),
+        "stdout should confirm the deletion; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_delete_missing_file_errors() {
+    let home = temp_home("snapshot-delete-missing");
+    let (_, stderr, code) = run_cli_in_home(
+        &["config", "snapshot", "delete", "nope.json", "--yes"],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "deleting a missing snapshot should exit 1");
+    assert!(
+        stderr.contains("not found") && stderr.contains("nope.json"),
+        "the error should name the missing snapshot; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_delete_requires_selector() {
+    let home = temp_home("snapshot-delete-no-selector");
+    let (_, stderr, code) =
+        run_cli_in_home(&["config", "snapshot", "delete", "--yes"], Some(&home));
+    assert_eq!(code, 1, "delete without a selector should exit 1");
+    assert!(
+        stderr.contains("nothing to delete"),
+        "the error should explain what to pass; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_delete_dry_run_keeps_file() {
+    let home = temp_home("snapshot-delete-dry-run");
+    let name = "testnet-2026-01-01T00-00-00+00-00.json";
+    let path = write_snapshot_file(&home, name, &snapshot_json("testnet", 100));
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &["config", "snapshot", "delete", name, "--dry-run"],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "a dry run should exit 0; stderr: {stderr}");
+    assert!(path.exists(), "a dry run must not delete anything");
+    assert!(
+        stdout.contains("Dry run"),
+        "stdout should announce the dry run; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_delete_older_than_purges_only_old() {
+    let home = temp_home("snapshot-delete-older-than");
+    let old = write_snapshot_file(
+        &home,
+        "testnet-2026-01-01T00-00-00+00-00.json",
+        &snapshot_json_at("testnet", 100, "2026-01-01T00:00:00+00:00"),
+    );
+    let recent = write_snapshot_file(
+        &home,
+        "testnet-recent.json",
+        &snapshot_json_at("testnet", 200, &chrono::Utc::now().to_rfc3339()),
+    );
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "snapshot",
+            "delete",
+            "--older-than",
+            "30",
+            "--network",
+            "testnet",
+            "--yes",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "the purge should succeed; stderr: {stderr}");
+    assert!(!old.exists(), "the stale snapshot should be purged");
+    assert!(recent.exists(), "the recent snapshot must be kept");
+    assert!(
+        stdout.contains("Deleted 1 of 1 snapshot file(s)"),
+        "stdout should report exactly one deletion; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_delete_older_than_dry_run() {
+    let home = temp_home("snapshot-delete-older-than-dry");
+    let old = write_snapshot_file(
+        &home,
+        "testnet-2026-01-01T00-00-00+00-00.json",
+        &snapshot_json_at("testnet", 100, "2026-01-01T00:00:00+00:00"),
+    );
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "snapshot",
+            "delete",
+            "--older-than",
+            "30",
+            "--dry-run",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "a dry run should exit 0; stderr: {stderr}");
+    assert!(old.exists(), "a dry run must not delete anything");
+    assert!(
+        stdout.contains("Dry run"),
+        "stdout should announce the dry run; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_diff_identical_exits_zero() {
+    let home = temp_home("snapshot-diff-identical");
+    let a = write_snapshot_file(&home, "a.json", &snapshot_json("testnet", 100));
+    let b = write_snapshot_file(&home, "b.json", &snapshot_json("testnet", 100));
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "snapshot",
+            "diff",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "identical snapshots should exit 0: {stderr}");
+    assert!(
+        stdout.contains("No changes detected"),
+        "stdout should report no changes across identical snapshots; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_diff_pricing_change_exits_one() {
+    let home = temp_home("snapshot-diff-pricing");
+    let a = write_snapshot_file(&home, "a.json", &snapshot_json_fee("testnet", 100, 100));
+    let b = write_snapshot_file(&home, "b.json", &snapshot_json_fee("testnet", 101, 200));
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "snapshot",
+            "diff",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "pricing changes must exit 1 like config diff");
+    assert!(
+        stdout.contains("Pricing changes detected"),
+        "stdout should warn about pricing changes; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_diff_json_flag() {
+    let home = temp_home("snapshot-diff-json");
+    let a = write_snapshot_file(&home, "a.json", &snapshot_json_fee("testnet", 100, 100));
+    let b = write_snapshot_file(&home, "b.json", &snapshot_json_fee("testnet", 101, 200));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "config",
+            "snapshot",
+            "diff",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "--json",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run config snapshot diff");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let status = output.status.code();
+    assert_eq!(status, Some(1), "pricing changes exit 1 under --json");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    assert_eq!(parsed["has_pricing_changes"], true);
+    assert_eq!(parsed["old_snapshot"]["ledger"], 100);
+    assert_eq!(parsed["new_snapshot"]["ledger"], 101);
+    assert_eq!(parsed["changes"].as_array().map(Vec::len), Some(1));
+}
+
+#[test]
+fn test_config_snapshot_diff_missing_file_errors() {
+    let home = temp_home("snapshot-diff-missing");
+    let a = write_snapshot_file(&home, "a.json", &snapshot_json("testnet", 100));
+
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "snapshot",
+            "diff",
+            a.to_str().unwrap(),
+            "no/such/snapshot.json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "a missing snapshot should exit 1");
+    assert!(
+        stderr.contains("File not found") && stderr.contains("no/such/snapshot.json"),
+        "the error should name the unreadable file; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_diff_malformed_file_errors() {
+    let home = temp_home("snapshot-diff-malformed");
+    let a = write_snapshot_file(&home, "a.json", &snapshot_json("testnet", 100));
+    let malformed = write_snapshot_file(&home, "broken.json", "{ not valid json");
+
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "snapshot",
+            "diff",
+            a.to_str().unwrap(),
+            malformed.to_str().unwrap(),
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "a malformed snapshot should exit 1");
+    assert!(
+        stderr.contains("failed to parse snapshot") && stderr.contains("broken.json"),
+        "the error should name the malformed file; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_diff_makes_no_network_calls() {
+    // Both files load from disk; an unknown network name inside them must not
+    // trigger any RPC resolution, so the command still succeeds offline.
+    let home = temp_home("snapshot-diff-offline");
+    let a = write_snapshot_file(&home, "a.json", &snapshot_json("not-a-network", 100));
+    let b = write_snapshot_file(&home, "b.json", &snapshot_json("not-a-network", 100));
+
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "snapshot",
+            "diff",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "offline diff should succeed: {stderr}");
+    assert!(
+        !stderr.contains("failed to locate RPC endpoint"),
+        "offline diff must not resolve a network; got: {stderr}"
+    );
 }
