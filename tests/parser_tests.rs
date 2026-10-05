@@ -435,6 +435,9 @@ fn test_parse_contract_meta_real_fixture() {
 #[test]
 fn test_validate_wasm_limits_valid() {
     let wasm = soroban_cost_estimator::wasm::parser::WasmInfo {
+        wasm_hash: String::new(),
+        has_debug_symbols: false,
+        debug_symbol_bytes: 0,
         bytes: vec![0; 50],
         functions: vec![],
         has_spec: false,
@@ -462,6 +465,9 @@ fn test_validate_wasm_limits_valid() {
 #[test]
 fn test_validate_wasm_limits_size_exceeded() {
     let wasm = soroban_cost_estimator::wasm::parser::WasmInfo {
+        wasm_hash: String::new(),
+        has_debug_symbols: false,
+        debug_symbol_bytes: 0,
         bytes: vec![0; 100],
         functions: vec![],
         has_spec: false,
@@ -491,6 +497,9 @@ fn test_validate_wasm_limits_size_exceeded() {
 #[test]
 fn test_validate_wasm_limits_initial_memory_exceeded() {
     let wasm = soroban_cost_estimator::wasm::parser::WasmInfo {
+        wasm_hash: String::new(),
+        has_debug_symbols: false,
+        debug_symbol_bytes: 0,
         bytes: vec![0; 10],
         functions: vec![],
         has_spec: false,
@@ -524,6 +533,9 @@ fn test_validate_wasm_limits_initial_memory_exceeded() {
 #[test]
 fn test_validate_wasm_limits_max_memory_exceeded() {
     let wasm = soroban_cost_estimator::wasm::parser::WasmInfo {
+        wasm_hash: String::new(),
+        has_debug_symbols: false,
+        debug_symbol_bytes: 0,
         bytes: vec![0; 10],
         functions: vec![],
         has_spec: false,
@@ -557,6 +569,9 @@ fn test_validate_wasm_limits_max_memory_exceeded() {
 #[test]
 fn test_validate_wasm_limits_unbounded_memory_allowed() {
     let wasm = soroban_cost_estimator::wasm::parser::WasmInfo {
+        wasm_hash: String::new(),
+        has_debug_symbols: false,
+        debug_symbol_bytes: 0,
         bytes: vec![0; 10],
         functions: vec![],
         has_spec: false,

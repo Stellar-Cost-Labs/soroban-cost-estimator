@@ -88,7 +88,7 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
     // Soroban identifies a contract on-chain by the SHA-256 hash of its WASM
     // bytes (the executable hash). Compute it once, here, so every command
     // reports the same identity for the same file without re-hashing.
-    let wasm_hash = hex::encode(sha2::Sha256::digest(&bytes));
+    let wasm_hash = wasm_sha256_hex(&bytes);
 
     trace!(functions = functions.len(), has_spec, "WASM parsed");
     let initial_pages = match metadata.memories.first() {
@@ -223,6 +223,11 @@ pub struct ModuleMetadata {
     pub exports: Vec<ExportInfo>,
     /// Number of tables declared by the module.
     pub tables_count: usize,
+    /// Whether the module carries a `name` or `.debug*` custom section —
+    /// the signature of an unoptimized/debug build.
+    pub has_debug_symbols: bool,
+    /// Combined byte size of the `name` and `.debug*` custom sections.
+    pub debug_symbol_bytes: usize,
 }
 
 /// Enumerates exported functions and captures module entry-point metadata:
@@ -244,6 +249,8 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
     let mut imports = Vec::new();
     let mut exports = Vec::new();
     let mut tables_count = 0;
+    let mut has_debug_symbols = false;
+    let mut debug_symbol_bytes = 0usize;
 
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
         let payload = payload.map_err(|e| AppError::WasmParse(e.to_string()))?;
@@ -363,6 +370,8 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
         imports,
         exports,
         tables_count,
+        has_debug_symbols,
+        debug_symbol_bytes,
     })
 }
 

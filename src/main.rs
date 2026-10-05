@@ -1079,7 +1079,6 @@ async fn cmd_estimate(
                 None,
             )?);
         }
-        maybe_emit_optimization_tip(&wasm_info, quiet, json_flag);
 
         // `--compare` takes precedence over the plain render below: it prints
         // the report *and* the delta section against the previous estimate.
@@ -1580,6 +1579,7 @@ async fn estimate_once(
             "WASM loaded"
         );
         emit_wasm_structure(&wasm_info, verbose, wasm_info_flag, json_flag);
+        maybe_emit_optimization_tip(&wasm_info, quiet, json_flag);
 
         // Interactive mode: resolve the function, arguments, and contract ID
         // by prompting on stdin, using the contract spec for names and
@@ -1881,6 +1881,23 @@ fn wasm_content_hash(path: &std::path::Path) -> std::io::Result<Option<String>> 
         Ok(bytes) => Ok(Some(hex::encode(sha2::Sha256::digest(&bytes)))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+/// Prints the "unoptimized WASM" tip to stderr when the loaded binary carries
+/// debug symbols, so users learn the upload cost is inflated before they pay
+/// for it.
+///
+/// The tip is suppressed in `--quiet` mode and in JSON output: the former
+/// explicitly asks for no non-essential output, and the latter promises
+/// machine-readable stdout (the tip goes to stderr, but honoring `--json`
+/// keeps the contract exact and avoids noise in scripted pipelines).
+fn maybe_emit_optimization_tip(info: &wasm::parser::WasmInfo, quiet: bool, json_flag: bool) {
+    if quiet || json_flag {
+        return;
+    }
+    if let Some(tip) = wasm::parser::format_optimization_tip(info) {
+        eprintln!("{tip}");
     }
 }
 
@@ -2516,6 +2533,7 @@ async fn cmd_estimate_all(
         // endpoint resolution or simulation, so the hash is visible even when
         // the network cannot be reached.
         let wasm_hash = wasm_info.wasm_hash.clone();
+        maybe_emit_optimization_tip(&wasm_info, quiet, json_flag);
 
         // `--fn` filter (#25): validate the requested names against the WASM
         // and keep only the matching functions for simulation. A typo must
@@ -2910,8 +2928,6 @@ async fn estimate_all_function(
 /// # Network calls
 /// None â€” pure file I/O + parsing.
 fn cmd_wasm_info(wasm_path: &str, format: cli::OutputFormat, quiet: bool) -> error::AppResult<()> {
-    use sha2::Digest;
-
     let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
     let hash = wasm_info.wasm_hash.clone();
 
@@ -2947,6 +2963,18 @@ fn cmd_wasm_info(wasm_path: &str, format: cli::OutputFormat, quiet: bool) -> err
         println!("WASM info: {wasm_path}");
         println!("  Size:      {} bytes", wasm_info.bytes.len());
         println!("  SHA-256:   {hash}");
+        println!(
+            "  Debug symbols: {}",
+            if wasm_info.has_debug_symbols {
+                format!(
+                    "present ({} bytes; ~{}% reclaimable)",
+                    wasm_info.debug_symbol_bytes,
+                    wasm_info.estimated_size_reduction_percent()
+                )
+            } else {
+                "absent".to_string()
+            }
+        );
         println!("  Functions: {}", wasm_info.functions.len());
         for (i, fn_info) in wasm_info.functions.iter().enumerate() {
             println!("    [{}] {}", i + 1, wasm::parser::format_function(fn_info));
