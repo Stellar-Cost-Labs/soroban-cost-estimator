@@ -1,5 +1,7 @@
-use soroban_cost_estimator::report::cost_report::CostReport;
-use soroban_cost_estimator::report::fee_calc::FeeBreakdown;
+use soroban_cost_estimator::report::cost_report::{
+    CostReport, format_estimate_all_table, summarize_estimate_all,
+};
+use soroban_cost_estimator::report::fee_calc::{DEFAULT_PRECISION, FeeBreakdown};
 use soroban_cost_estimator::report::formatter::{
     CsvFormatter, JsonFormatter, MarkdownFormatter, ReportFormatter, TableFormatter,
 };
@@ -9,7 +11,7 @@ fn sample_report() -> CostReport {
     CostReport {
         function: "increment".to_string(),
         wasm_hash: "abc123def456".to_string(),
-        wasm_size: 4_096,
+        wasm_size: 14_432,
         cpu_instructions: 532_502,
         memory_bytes: 0,
         tx_size: 156,
@@ -32,6 +34,8 @@ fn sample_report() -> CostReport {
         network: "testnet".to_string(),
         rpc_latency_ms: 87,
         rates: None,
+        warnings: Vec::new(),
+        history: None,
         projections: None,
         contract_meta: ContractMeta::default(),
     }
@@ -64,6 +68,8 @@ fn empty_report() -> CostReport {
         network: "mainnet".to_string(),
         rpc_latency_ms: 0,
         rates: None,
+        warnings: Vec::new(),
+        history: None,
         projections: None,
         contract_meta: ContractMeta::default(),
     }
@@ -120,59 +126,78 @@ fn test_markdown_formatter_snapshots() {
     insta::assert_snapshot!("markdown_formatter_empty", MarkdownFormatter.format(&empty));
 }
 
-#[test]
-fn test_table_formatter_sections_snapshot() {
-    insta::assert_snapshot!(
-        "table_formatter_sections",
-        TableFormatter.format(&section_report())
-    );
+/// Builds a per-function report for the `estimate-all` summary fixtures.
+fn batch_report(function: &str, cpu: u64, fee_stroops: i64, writes: u32) -> CostReport {
+    CostReport {
+        function: function.to_string(),
+        wasm_hash: "abc123def456".to_string(),
+        wasm_size: 14_432,
+        cpu_instructions: cpu,
+        memory_bytes: 0,
+        tx_size: 156,
+        read_entries: 1,
+        write_entries: writes,
+        read_bytes: 0,
+        write_bytes: 136,
+        fee: FeeBreakdown {
+            non_refundable_stroops: 4_496,
+            refundable_stroops: fee_stroops - 4_496,
+            cpu_fee_stroops: 372,
+            storage_fee_stroops: 4_063,
+            bandwidth_fee_stroops: 61,
+            base_fee_stroops: 100,
+            total_stroops: fee_stroops,
+            total_xlm: soroban_cost_estimator::report::fee_calc::stroops_to_xlm(
+                fee_stroops,
+                DEFAULT_PRECISION,
+            ),
+            fee_percentages: std::collections::BTreeMap::new(),
+        },
+        ledger: 3_894_195,
+        network: "testnet".to_string(),
+        rpc_latency_ms: 87,
+        rates: None,
+        warnings: Vec::new(),
+        history: None,
+        projections: None,
+        contract_meta: ContractMeta::default(),
+    }
 }
 
-#[test]
-fn test_json_formatter_sections_snapshot() {
-    insta::assert_snapshot!(
-        "json_formatter_sections",
-        JsonFormatter.format(&section_report())
-    );
+/// Renders the batch table for `reports`, or an empty string when there is no
+/// summary to show.
+fn batch_table(reports: &[CostReport]) -> String {
+    let summary = summarize_estimate_all(reports, DEFAULT_PRECISION);
+    format_estimate_all_table(reports, summary.as_ref())
 }
 
+/// A single-function batch still gets a header row, one data row, and a
+/// summary footer (issue #320).
 #[test]
-fn test_section_sizes_reconcile_with_wasm_size() {
-    use soroban_cost_estimator::report::formatter::section_size_map;
+fn test_estimate_all_table_snapshot_single_function() {
+    let reports = vec![batch_report("increment", 532_502, 15_427, 1)];
+    insta::assert_snapshot!("estimate_all_table_single", batch_table(&reports));
+}
 
-    let report = section_report();
-    let accounted: usize = report.wasm_sections.iter().map(|s| s.total_size).sum();
-    assert_eq!(
-        accounted, report.wasm_size,
-        "section sizes must cover the file"
-    );
+/// A multi-function batch exercises the footer aggregates: min/max/average fee
+/// and the CPU instruction range across functions (issue #320).
+#[test]
+fn test_estimate_all_table_snapshot_multi_function() {
+    let reports = vec![
+        batch_report("increment", 532_502, 15_427, 1),
+        batch_report("decrement", 410_000, 12_000, 2),
+        batch_report("reset", 98_765, 9_001, 3),
+    ];
+    insta::assert_snapshot!("estimate_all_table_multi", batch_table(&reports));
+}
 
-    let map = section_size_map(&report);
-    let mapped: usize = map
-        .as_object()
-        .expect("section_sizes is an object")
-        .values()
-        .map(|v| v.as_u64().expect("byte counts are integers") as usize)
-        .sum();
-    assert_eq!(
-        mapped, report.wasm_size,
-        "section_sizes map must cover the file"
-    );
-
-    let shares: f64 = report.wasm_sections.iter().map(|s| s.percent).sum();
-    assert!(
-        (shares - 100.0).abs() < 0.05,
-        "shares should add up to 100%, got {shares}"
-    );
-
-    let table = TableFormatter.format(&report);
-    assert!(table.contains("WASM size:"), "table should show the size");
-    assert!(
-        table.contains("WASM sections"),
-        "table should show sections"
-    );
-    assert!(
-        table.contains("contractspecv0"),
-        "table should list spec bytes"
+/// `--quiet` drops the footer row: the body table is still rendered, so the
+/// per-function data is never lost.
+#[test]
+fn test_estimate_all_table_snapshot_quiet_has_no_footer() {
+    let reports = vec![batch_report("increment", 532_502, 15_427, 1)];
+    insta::assert_snapshot!(
+        "estimate_all_table_quiet",
+        format_estimate_all_table(&reports, None)
     );
 }

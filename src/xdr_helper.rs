@@ -23,14 +23,14 @@ pub fn decode_config_entry_xdr(
         );
     }
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, xdr_b64)
-        .map_err(|e| AppError::XdrDecode(format!("base64 decode: {e}")))?;
+        .map_err(|e| AppError::XdrDecode(format!("invalid base64: {e}")))?;
 
     if verbose {
         eprintln!("[XDR] -> Decoded to {} bytes", bytes.len());
     }
 
     let entry_data = stellar_xdr::LedgerEntryData::from_xdr(&bytes, stellar_xdr::Limits::none())
-        .map_err(|e| AppError::XdrDecode(format!("LedgerEntryData from_xdr: {e}")))?;
+        .map_err(|e| AppError::XdrDecode(format!("ledger entry data: {e}")))?;
 
     if verbose {
         eprintln!(
@@ -172,7 +172,9 @@ pub fn build_simulation_tx_envelope(
 
             let fn_name_bytes: Vec<u8> = fn_name.as_bytes().to_vec();
             let sc_symbol = stellar_xdr::ScSymbol::try_from(fn_name_bytes).map_err(
-                |e: stellar_xdr::Error| AppError::TxConstruction(format!("ScSymbol: {e}")),
+                |e: stellar_xdr::Error| {
+                    AppError::TxConstruction(format!("invalid function symbol '{fn_name}': {e}"))
+                },
             )?;
 
             let contract_id = stellar_xdr::ContractId(stellar_xdr::Hash(id_bytes));
@@ -181,7 +183,7 @@ pub fn build_simulation_tx_envelope(
             let args_m: VecM<stellar_xdr::ScVal> = args
                 .to_vec()
                 .try_into()
-                .map_err(|e| AppError::TxConstruction(format!("ScVal args: {e}")))?;
+                .map_err(|e| AppError::TxConstruction(format!("invalid argument list: {e}")))?;
 
             stellar_xdr::HostFunction::InvokeContract(stellar_xdr::InvokeContractArgs {
                 contract_address: sc_address,
@@ -193,7 +195,7 @@ pub fn build_simulation_tx_envelope(
             let wasm_vec: Vec<u8> = wasm_bytes.to_vec();
             let bytes_m: stellar_xdr::BytesM =
                 wasm_vec.try_into().map_err(|e: stellar_xdr::Error| {
-                    AppError::TxConstruction(format!("BytesM: {e}"))
+                    AppError::TxConstruction(format!("invalid WASM upload payload: {e}"))
                 })?;
             stellar_xdr::HostFunction::UploadContractWasm(bytes_m)
         }
@@ -213,7 +215,7 @@ pub fn build_simulation_tx_envelope(
         vec![operation]
             .try_into()
             .map_err(|e: stellar_xdr::Error| {
-                AppError::TxConstruction(format!("VecM operations: {e}"))
+                AppError::TxConstruction(format!("invalid operation list: {e}"))
             })?;
 
     let tx = stellar_xdr::Transaction {
@@ -233,7 +235,7 @@ pub fn build_simulation_tx_envelope(
 
     let xdr_bytes = tx_env
         .to_xdr(stellar_xdr::Limits::none())
-        .map_err(|e| AppError::TxConstruction(format!("XDR encode: {e}")))?;
+        .map_err(|e| AppError::XdrEncode(format!("transaction envelope: {e}")))?;
 
     Ok(xdr_bytes)
 }
