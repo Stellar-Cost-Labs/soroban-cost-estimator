@@ -95,6 +95,8 @@ soroban-cost-estimator estimate \
     [--fn my_function --arg key=val] \
     [--rpc-url https://custom-rpc.example.com] \
     [--clear-cache] \
+    [--quiet] \
+    [--diff --wasm-new contract-new.wasm] \
     [--json]
 ```
 
@@ -118,11 +120,42 @@ soroban-cost-estimator estimate \
 
 Use `--json` for machine-readable output (e.g., for CI pipelines).
 
+Comparing two builds — `--diff` simulates both WASM files with identical
+arguments and prints a side-by-side comparison with the delta and percentage
+change for every resource (increases are red, decreases green):
+
+```bash
+soroban-cost-estimator estimate \
+    --wasm contract-v1.wasm \
+    --wasm-new contract-v2.wasm \
+    --diff \
+    --network testnet
+```
+
+```text
+Resource         | Old    | New    | Change (+/- %)
+WASM Size        | 4096   | 4800   | +704 (+17.2%)
+CPU Instructions | 500000 | 420000 | -80000 (-16.0%)
+...
+Total Fee        | 15000  | 18500  | +3500 (+23.3%)
+```
+
+`--diff --json` emits the same comparison as a structured object with an
+`identity` block and a `rows` array (`resource`, `old`, `new`, `delta`,
+`change_percent`, `direction`).
+
 Pass `--clear-cache` to wipe every cached estimate for `--network` before the
 simulation runs — handy after upgrading the tool, after a major network
 upgrade, or after debugging a bad estimate. It prints
 `Cleared N cached estimate(s) for <network>.` and can be combined with any
 other `estimate` flags (including `--cache-ttl`).
+
+Pass `--compare` to diff the fresh simulation against the estimate previously
+cached for the same function and arguments. The report is followed by a delta
+section covering CPU instructions, memory bytes, ledger read/write entries and
+the total fee (`+12400 (+5.2%)`). If no previous estimate is cached yet, it
+prints `No previous estimate found for comparison`; with `--json` the payload
+gains `previous_estimate` and `delta` objects instead.
 
 The read/write entry counts and byte sizes in the report are decoded from the
 simulation response's resource **footprint** — real values from the ledger
@@ -130,6 +163,52 @@ footprint, not zero-filled placeholders. If a fee-rate source
 (`ConfigSetting*`) can't be fetched, the tool prints a warning naming the
 source and zeroes only the affected rate (so the non-refundable fee is visibly
 understated) rather than silently reporting a wrong fee.
+
+#### Cost-optimization tips
+
+Every report ends with two advisory sections, driven purely by the measured
+simulation data:
+
+- **Optimization Tips** — contextual advice about the *dominant* cost factor
+  (`>= 40%` of the total fee), e.g.
+  `Tip: writing 3 ledger entries accounts for 72% of the total fee. Consider
+  combining related state into a single entry.` A WASM-size tip is added
+  independently whenever the binary exceeds 30 KB.
+- **Optimization Suggestions** — per-resource savings quantified against the
+  network's live fee rates (`Removing one write entry saves ~2500 stroops`).
+
+```bash
+soroban-cost-estimator estimate --wasm contract.wasm --network testnet --quiet
+```
+
+Pass `--quiet` to drop both sections. The measured cost data is unaffected, so
+`--quiet` is safe for pipelines that only want numbers. In `--json` mode the
+same data is available as `suggestions` (the `Tip: …` strings) and
+`optimization_suggestions` (the structured savings records); `--quiet` omits
+both keys.
+
+### Authenticated RPC endpoints
+
+Commercial Soroban RPC providers (QuickNode, Blockdaemon, NowNodes, …) require
+an API key or bearer token. `--header` / `-H` attaches custom HTTP headers to
+**every** outgoing RPC request, on any command:
+
+```bash
+soroban-cost-estimator estimate \
+    --wasm contract.wasm \
+    --network testnet \
+    -H "Authorization=Bearer $RPC_TOKEN" \
+    -H "X-API-Key=$PROVIDER_KEY"
+```
+
+- `KEY=VALUE` is the documented spelling; `KEY: VALUE` is accepted too.
+- Repeat `-H` to send several headers. A repeated name keeps the last value.
+- A malformed header (no separator, empty name, empty value, or characters the
+  HTTP grammar forbids) **fails the command** before any network traffic,
+  rather than being silently dropped and leaving the request unauthenticated.
+- Credential headers (`Authorization`, `Proxy-Authorization`, `X-API-Key`,
+  `API-Key`, `Cookie`) are replaced with `<redacted>` in verbose logs, so a
+  token never reaches a terminal, log file, or CI transcript.
 
 ### `estimate-all`
 
@@ -141,6 +220,7 @@ soroban-cost-estimator estimate-all \
     --wasm contract.wasm \
     --id <contract-id-hex> \
     --network testnet \
+    [--quiet] \
     [--json]
 ```
 
@@ -150,17 +230,106 @@ Functions requiring arguments are reported as `"Skipped — needs --fn/--arg"`
 A `[i/N] <function>` progress line is printed before each simulation, so you
 can watch progress on contracts with many functions.
 
+The run finishes with a **summary footer row** in the table, separated from the
+per-function rows by a border rule, so a 15-function contract does not have to
+be totalled by hand:
+
+```
+┌────────────────────────┬───────────┬────────────────────────────────┬───────────────────────┬─────────┬───────────────┐
+│ Function               │ CPU insns │ Fee (stroops)                 │ Fee (XLM)             │ Ledger  │ Write entries │
+╞════════════════════════╪═══════════╪════════════════════════════════╪═══════════════════════╪═════════╪═══════════════╡
+│ increment              │ 532502    │ 15427                          │ 0.0015427             │ 3894195 │ 1             │
+├────────────────────────┼───────────┼────────────────────────────────┼───────────────────────┼─────────┼───────────────┤
+│ Summary: 2 function(s) │ 100 - 900 │ min 900 / max 3000 / avg 1633  │ 0.0000900 - 0.0030000 │         │ 6             │
+└────────────────────────┴───────────┴────────────────────────────────┴───────────────────────┴─────────┴───────────────┘
+```
+
+With `--json` the same aggregate is available as a `summary` object next to the
+per-function `functions` array:
+
+```json
+{
+  "functions": [ { "function": "increment", "status": "ok", "...": "..." } ],
+  "summary": {
+    "functions_evaluated": 2,
+    "min_fee_stroops": 900, "max_fee_stroops": 3000, "avg_fee_stroops": 1633,
+    "total_fee_stroops": 3900,
+    "min_cpu_instructions": 100, "max_cpu_instructions": 900,
+    "total_cpu_instructions": 1000,
+    "total_read_entries": 2, "total_write_entries": 6,
+    "min_total_xlm": "0.0000900", "max_total_xlm": "0.0030000", "avg_total_xlm": "0.0016333"
+  }
+}
+```
+
+All aggregates are computed with integer arithmetic in stroops. Only functions
+that were actually simulated contribute; skipped and errored ones are counted
+and reported separately under the footer. `--quiet` suppresses the footer in
+the table, but the `summary` object always stays in `--json` output.
+
 ### `config snapshot`
 
 Fetch all 6 `ConfigSetting` ledger entries, decode them via XDR, timestamp,
 and save to disk.
 
 ```bash
-soroban-cost-estimator config snapshot --network testnet [--out /custom/path.json] [--json]
+soroban-cost-estimator config snapshot --network testnet [--out /custom/path.json] [--json] [--retain <N>]
+soroban-cost-estimator config snapshot --network testnet [--out /custom/path.json] [--json] [--retain N]
 ```
 
 Saved to `~/.soroban-cost-estimator/snapshots/<network>-<timestamp>.json`.
-`--json` also prints the snapshot as JSON (and still saves it).
+`--json` also prints the snapshot as JSON (and still saves it). Each snapshot
+also records the network protocol version from `getLatestLedger`.
+`--retain N` is a retention policy: snapshots for the network whose files are
+older than N days are deleted after saving, so the snapshots directory doesn't
+grow without bound.
+
+`--retain <N>` keeps only the N most recent snapshots, deleting older ones
+after the new snapshot is safely on disk. To drop stale files by age, or on a
+schedule:
+
+```bash
+soroban-cost-estimator config snapshot prune --network testnet --older-than 30
+```
+
+`prune` makes no RPC call and never deletes the newest snapshot, however old it
+is — so there is always a pair left for `config diff --against-previous`. Both
+retention paths log how many snapshots they pruned.
+
+### `config snapshot list`
+
+List saved snapshots as a table: Filename, Network, Timestamp, Ledger
+Sequence, Protocol Version.
+
+```bash
+soroban-cost-estimator config snapshot list                    # default network (testnet)
+soroban-cost-estimator config snapshot list --network mainnet  # one network
+soroban-cost-estimator config snapshot list --all              # every network
+soroban-cost-estimator config snapshot list --all --json       # JSON array
+```
+
+Networks are matched on the `network` stored in each file, not the filename.
+Snapshots saved before protocol versions were recorded show `-` (`null` in
+JSON). With no matching snapshots, the table mode prints a message and
+`--json` prints `[]`. A malformed snapshot file fails the listing and names
+the file.
+
+Managing saved snapshots (offline, no RPC calls):
+
+```bash
+# Delete one snapshot, or purge everything older than 30 days
+soroban-cost-estimator config snapshot delete testnet-2026-01-01T00-00-00+00-00.json --yes
+soroban-cost-estimator config snapshot delete --older-than 30 [--network testnet] [--dry-run] [--yes]
+
+# Compare two saved snapshots without touching the network
+soroban-cost-estimator config snapshot diff before.json after.json [--json]
+```
+
+`config snapshot delete` errors if the named snapshot does not exist and skips
+files whose timestamp cannot be parsed; `--dry-run` reports the affected files
+without deleting them. `config snapshot diff` uses the same diff and exit codes
+as [`config diff`](#config-diff) (`1` when pricing changed), and names the
+file in any read/parse error.
 
 ### `config diff`
 
@@ -177,8 +346,19 @@ instead of the full diff, handy for CI status lines:
 soroban-cost-estimator config diff --network testnet --summary
 ```
 
-- Exits **0** if no changes detected
-- Exits **1** with a detailed field-by-field diff if pricing changed
+- Exits **0** if no pricing changes, **1** with a detailed field-by-field
+  diff if pricing changed (default behavior)
+- `--ignore-pricing-exit` forces exit **0** even if pricing changed
+  (informative CI reports that must not fail the build)
+- `--fail-on-any-change` exits **1** if *any* config setting changed, even
+  non-pricing settings
+- Add `--against-previous` to diff the **two newest snapshots on disk** against
+  each other instead of the live network. It makes no network calls, so it works
+  offline and stays meaningful after the endpoint has moved on:
+
+  ```bash
+  soroban-cost-estimator config diff --network testnet --against-previous
+  ```
 - **Auto-saves a snapshot of the new config** when a protocol upgrade is
   detected (pricing changed), so it becomes the baseline for future diffs —
   no separate `config snapshot` run needed
@@ -201,16 +381,64 @@ the in-flight poll is cancelled rather than writing a partial snapshot.
 
 ### `cache verify`
 
-Check that every cached estimate in `~/.soroban-cost-estimator/cache/` is
-still valid JSON and parses as a cache entry — i.e. nothing was corrupted by
-a crash or disk issue.
+Check that every cached estimate in the SQLite cache database
+(`~/.soroban-cost-estimator/cache.db`) still parses as a cache entry and
+carries a schema version this tool can read — i.e. nothing was corrupted by a
+crash or disk issue.
 
 ```bash
 soroban-cost-estimator cache verify
 ```
 
 - Exits **0** if the cache is empty or every entry is valid
-- Exits **1** and lists the corrupted filenames if any entry fails
+- Exits **1** and lists the affected entries if any fail
+
+### `cache stats`
+
+Show cache size and composition against the configured quotas.
+
+```bash
+soroban-cost-estimator cache stats
+```
+
+```text
+Cache Statistics
+================
+  Total entries:  128
+  Disk usage:     96.0 KB
+  Live size:      88.0 KB
+  Oldest entry:   2026-09-01T10:00:00+00:00
+  Newest entry:   2026-09-27T08:30:00+00:00
+  Byte quota:     50.0 MB
+  Entry quota:    10000
+```
+
+### `cache prune`
+
+Evict least-recently-accessed entries until the cache fits its quota. Every
+`estimate` already prunes automatically as it writes; this exposes the same
+pass on demand.
+
+```bash
+soroban-cost-estimator cache prune --max-cache-size-mb 10
+```
+
+- Prints how many entries were evicted (0 when already within quota)
+- Evicts down to 90% of the quota so pruning is not needed on every write
+
+### Cache quotas
+
+Two global flags bound the on-disk cache (defaults: 50 MB / 10,000 entries):
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--max-cache-size-mb <MB>` | `50` | Maximum live cache size; `0` disables the byte quota |
+| `--max-cache-entries <N>` | `10000` | Maximum number of cached estimates; `0` disables the entry quota |
+
+Eviction is least-recently-*used*: reading a cached estimate refreshes its
+recency, and the oldest-accessed entries are deleted first. The cache is a
+single SQLite database, so deletes are transactional and safe under
+concurrent tool invocations.
 
 ### `cache clear`
 
@@ -228,6 +456,54 @@ soroban-cost-estimator cache clear --network mainnet
   untouched
 - The same clearing logic backs the `estimate --clear-cache` flag, so both
   paths behave identically
+
+### `cache export`
+
+Dump cached estimates to a single versioned JSON document (schema version,
+export timestamp, and estimate records) for backup or sharing across
+workstations.
+
+```bash
+soroban-cost-estimator cache export --out backup.json
+# → Exported 12 cache entries to backup.json.
+
+soroban-cost-estimator cache export --network testnet --out testnet-backup.json
+```
+
+- Without `--out`, the export is printed to standard output
+- `--network` restricts the export to one network (default: all networks)
+- An unwritable destination fails with an error naming the path
+
+### `config cache query`
+
+Search and filter cached simulation estimates by WASM hash, function name, network, fee range, or date.
+
+```bash
+# Query with search filters
+soroban-cost-estimator config cache query --network testnet --min-fee 100000
+
+# Filter by function name and date, outputting JSON
+soroban-cost-estimator config cache query --fn transfer --since 2026-01-01 --json
+```
+
+- When run with no filters, returns all cached estimates
+- Combines multiple filters using logical AND semantics
+- Supports `--wasm-hash`, `--fn`, `--network`, `--min-fee`, `--max-fee`, `--since`, and `--json`
+
+## Global flags
+
+Accepted by every command, before or after the subcommand:
+
+| Flag | Purpose |
+| --- | --- |
+| `--rps N` | Cap outbound RPC requests at N/second (0 disables) |
+| `--timeout SECS` | Per-request HTTP timeout (default `30`) |
+| `--max-retries N` | Retry transient RPC failures N times with backoff (default `3`, `0` disables) |
+| `--rpc-fallback-url URL` | Secondary endpoint used when the primary is unreachable |
+| `--header/-H KEY=VALUE` | Custom HTTP header sent with every RPC request (repeatable) |
+| `--quiet` | Drop advisory output (optimization tips/suggestions) while keeping the measured cost data |
+| `--verbose/-v` | Debug-level logging, including RPC payloads |
+| `--wasm-info` | Print the WASM structure summary (memory, imports, exports) |
 
 ## Installation
 
@@ -295,17 +571,44 @@ cargo install soroban-cost-estimator
    and stores them as versioned JSON snapshots.
 5. **Config drift detection**: Compares two snapshots field-by-field and reports
    which pricing parameters changed, flagging cached estimates that are now stale.
+6. **Advisory analysis**: Derives cost-optimization tips from the measured
+   footprint and fee breakdown, and aggregates a batch summary for
+   `estimate-all` — all with the same integer-only stroops math, so no advice
+   is ever derived from a float.
+
+## Error messages
+
+Every error in the crate follows one house style, so CLI output reads as a
+single system (see the `# Message style` docs on `AppError`):
+
+- lower-case the first word, unless it is an acronym or proper noun
+  (`WASM`, `RPC`, `XDR`, `XLM`, `JSON`, `HTTP`, `WebSocket`)
+- lead with **what failed**, then the underlying cause after a colon
+- no trailing period
+- never restate the prefix inside the payload
+
+```
+failed to parse HTTP header: 'X-Api-Key' is not a KEY=VALUE pair (or KEY: VALUE)
+failed to validate argument type: arg 'abc' cannot be used as 'i64'
+failed to decode XDR: invalid base64
+```
+
+A test enumerates every `AppError` variant and asserts the rendered message
+obeys the style, so a new variant cannot silently drift from the guidelines.
 
 ## Storage
 
-All data is stored locally — no database required:
+All data is stored locally in `~/.soroban-cost-estimator/`:
 
-| Directory | Purpose |
-|-----------|---------|
-| `~/.soroban-cost-estimator/snapshots/` | Timestamped config snapshots (JSON) |
-| `~/.soroban-cost-estimator/cache/` | Past `estimate` results, keyed by wasm hash + function + args hash |
+| Path | Purpose |
+|------|---------|
+| `cache.db` | Past `estimate` results in a single SQLite database, keyed by wasm hash + function + args hash and indexed by `(wasm_hash, function, network, timestamp)` |
+| `cache/` | Legacy per-entry JSON cache (only present after upgrading; imported into `cache.db` transparently on the first run, then removed) |
+| `snapshots/` | Timestamped config snapshots (JSON) |
 
-The cache enables `config diff` to tell you *which* of your past estimates are
+SQLite gives atomic reads and writes (no file-locking races), indexed lookups
+and listings instead of directory scans, and compact single-file storage. The
+cache enables `config diff` to tell you *which* of your past estimates are
 now stale after a network pricing change. Run `cache verify` to check the
 cache has not been corrupted.
 
@@ -348,13 +651,19 @@ Full reproduction steps (`stellar contract install` → `create` →
 | Watch graceful shutdown (SIGINT/SIGTERM) | ✅ |
 | `estimate-all` progress indicator | ✅ |
 | Fee-rate source degradation warnings | ✅ |
+| SQLite cache backend (indexed, atomic) | ✅ |
+| Cache schema versioning + transparent migration | ✅ |
+| Legacy JSON cache auto-import | ✅ |
+| LRU eviction with configurable quotas | ✅ |
+| Side-by-side `estimate --diff` comparison | ✅ |
 
 ## Testing & CI
 
-53 tests (unit + integration) cover the fee math — including the regression
+396 tests (unit + integration) cover the fee math — including the regression
 for the exact input that used to produce a negative refundable fee — plus RPC
-response parsing, XDR decoding, the cache, config diff, the WASM parser, and
-CLI behavior.
+response parsing, XDR decoding, the SQLite cache (schema migration, legacy
+JSON import, LRU eviction), config diff, the WASM parser, side-by-side cost
+diffs, and CLI behavior.
 
 ```bash
 cargo test --all
