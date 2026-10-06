@@ -1795,12 +1795,63 @@ async fn estimate_once(
             connect_timeout,
             max_retries,
             precision,
+        );
+
+        let report = report::cost_report::CostReport {
+            function: function_name.to_string(),
+            wasm_hash: wasm_hash.clone(),
+            cpu_instructions,
+            memory_bytes,
+            tx_size: tx_xdr.len() as u32,
+            read_entries,
+            write_entries,
+            read_bytes,
+            write_bytes,
+            fee: fee.clone(),
+            ledger: latest_ledger,
+            network: network.to_string(),
+            rpc_latency_ms,
+            delta: None,
+            rates: Some(fee_rates),
+        };
             extra_headers,
             quiet,
             verbose,
         })
         .await?;
 
+        // Load any previous cached estimate for the same function to
+        // compute the cost delta (historical comparison).
+        let delta = if let Ok(Some(prev)) =
+            cache::load_estimate(&wasm_hash, function_name, args)
+        {
+            Some(report::cost_report::compute_delta(
+                prev.total_stroops,
+                prev.cpu_instructions,
+                prev.memory_bytes,
+                prev.ledger,
+                0, // read_entries not stored in cache
+                0, // write_entries not stored in cache
+                &report,
+            ))
+        } else {
+            None
+        };
+        let mut report = report;
+        report.delta = delta;
+
+        let _ = cache::save_estimate(
+            &wasm_hash,
+            function_name,
+            args,
+            network,
+            report.ledger,
+            report.fee.total_stroops,
+            report.cpu_instructions,
+            report.memory_bytes,
+            Some(report.rpc_latency_ms),
+            true,
+        );
         // Load up to 5 previous runs for the trend table (#321). This must
         // happen before the cache write below so the current run is not
         // counted as its own history entry.
@@ -3139,6 +3190,23 @@ async fn estimate_all_function(
 
                 debug!(cpu, mem, total_fee, ledger, "simulation complete");
 
+                // Load any previous cached estimate for the same function
+                // to compute the cost delta (historical comparison).
+                let prev_estimate =
+                    cache::load_estimate(wasm_hash, &fn_info.name, &[]).ok().flatten();
+
+                let _ = cache::save_estimate(
+                    wasm_hash,
+                    &fn_info.name,
+                    &[],
+                    network,
+                    ledger,
+                    total_fee,
+                    cpu,
+                    mem,
+                    duration_ms,
+                    true,
+                );
                 // `--no-cache` suppresses the write so a bypassed batch run
                 // leaves the local cache untouched.
                 if !no_cache {
@@ -3187,6 +3255,14 @@ async fn estimate_all_function(
                     println!(
                         "CPU: {cpu} insns | Mem: {mem} bytes | Fee: {total_fee} stroops ({xlm} XLM) | Ledger: {ledger}"
                     );
+                    if let Some(prev) = &prev_estimate {
+                        let fee_delta = fee.total_stroops - prev.total_stroops;
+                        let cpu_delta = cpu as i64 - prev.cpu_instructions as i64;
+                        println!(
+                            "  Δ vs cached (ledger {}): fee {fee_delta:+} stroops | CPU {cpu_delta:+} insns",
+                            prev.ledger
+                        );
+                    }
                 }
 
                 // Warn when any resource approaches the network's protocol
