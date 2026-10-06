@@ -1,8 +1,9 @@
 use std::io::Cursor;
 use std::path::Path;
 
+use sha2::Digest;
 use stellar_xdr::ReadXdr;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::error::{AppError, AppResult};
 
@@ -14,11 +15,33 @@ use crate::error::{AppError, AppResult};
 /// initialization costs.
 pub const SOROBAN_MAX_MEMORY_PAGES: u64 = 16;
 
+/// Soroban network memory limit per transaction in bytes.
+/// Currently 40 MB (40,000,000 bytes).
+const SOROBAN_TX_MEMORY_LIMIT_BYTES: u64 = 40_000_000;
+
+/// Maximum number of WASM pages allowed by Soroban.
+/// Calculated as SOROBAN_TX_MEMORY_LIMIT_BYTES / WASM_PAGE_SIZE_BYTES.
+const SOROBAN_MAX_WASM_PAGES: u64 = SOROBAN_TX_MEMORY_LIMIT_BYTES / WASM_PAGE_SIZE_BYTES;
+
 /// Size of one WASM linear-memory page in bytes (64 KiB).
 pub const WASM_PAGE_SIZE_BYTES: u64 = 65_536;
 
 /// Import module used by Soroban contracts for host functions (`env._` imports).
 pub const HOST_IMPORT_MODULE: &str = "env";
+
+/// Computes the lowercase-hex SHA-256 of a contract's raw WASM bytes.
+///
+/// This is the hash the Stellar network uses to identify a build, and the
+/// key this tool's estimate cache is keyed on, so it is computed once per
+/// run over the whole binary. It lives here rather than being inlined at
+/// each CLI call site so the `wasm_benchmark` Criterion target measures this
+/// exact code path rather than re-implementing it.
+///
+/// Pure CPU work — no I/O, no allocation beyond the 64-char hex string.
+#[must_use]
+pub fn wasm_sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(sha2::Sha256::digest(bytes))
+}
 
 /// Loads a compiled Soroban contract `.wasm` file from disk.
 ///
@@ -43,6 +66,11 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
     validate_wasm(&bytes)?;
     debug!("WASM validated");
 
+    // Check WASM memory limits against Soroban constraints
+    if let Some(warning) = validate_wasm_memory_limits(&bytes) {
+        warn!(warning = %warning, "WASM memory exceeds Soroban limits");
+    }
+
     let metadata = enumerate_module_metadata(&bytes)?;
     let (spec_functions, has_spec) = parse_contract_spec(&bytes).unwrap_or_default();
     let contract_meta = parse_contract_meta(&bytes).unwrap_or_default();
@@ -56,6 +84,11 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
             }
         }
     }
+
+    // Soroban identifies a contract on-chain by the SHA-256 hash of its WASM
+    // bytes (the executable hash). Compute it once, here, so every command
+    // reports the same identity for the same file without re-hashing.
+    let wasm_hash = wasm_sha256_hex(&bytes);
 
     trace!(functions = functions.len(), has_spec, "WASM parsed");
     let initial_pages = match metadata.memories.first() {
@@ -76,7 +109,10 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
         tables_count: metadata.tables_count,
     };
     Ok(WasmInfo {
+        wasm_hash,
         bytes,
+        has_debug_symbols: metadata.has_debug_symbols,
+        debug_symbol_bytes: metadata.debug_symbol_bytes,
         functions,
         has_spec,
         contract_meta,
@@ -92,6 +128,79 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
 pub fn validate_wasm(bytes: &[u8]) -> AppResult<()> {
     wasmparser::validate(bytes).map_err(|e| AppError::WasmValidation(e.to_string()))?;
     Ok(())
+}
+
+/// Validates WASM memory limits against Soroban network constraints.
+///
+/// Returns a warning message if the WASM memory section exceeds Soroban limits,
+/// or `Ok(None)` if the memory is within limits.
+///
+/// Soroban enforces a per-transaction memory limit of 40 MB (approximately 610 WASM pages).
+/// If the WASM declares a memory that exceeds this limit, the contract will likely
+/// fail during simulation or execution.
+#[must_use]
+pub fn validate_wasm_memory_limits(bytes: &[u8]) -> Option<String> {
+    let mut memories = Vec::new();
+
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let Ok(wasmparser::Payload::MemorySection(section)) = payload {
+            for memory in section.into_iter().flatten() {
+                memories.push(MemoryInfo {
+                    initial_pages: memory.initial,
+                    maximum_pages: memory.maximum,
+                    memory64: memory.memory64,
+                });
+            }
+        }
+    }
+
+    if memories.is_empty() {
+        return None;
+    }
+
+    let mut warnings = Vec::new();
+
+    for (idx, memory) in memories.iter().enumerate() {
+        let memory_label = if memories.len() == 1 {
+            "Memory".to_string()
+        } else {
+            format!("Memory[{}]", idx)
+        };
+
+        // Check initial pages
+        if memory.initial_pages > SOROBAN_MAX_WASM_PAGES {
+            let initial_bytes = memory.initial_pages * WASM_PAGE_SIZE_BYTES;
+            warnings.push(format!(
+                "{}: initial size {} pages ({} bytes) exceeds Soroban limit of {} pages ({} bytes)",
+                memory_label,
+                memory.initial_pages,
+                initial_bytes,
+                SOROBAN_MAX_WASM_PAGES,
+                SOROBAN_TX_MEMORY_LIMIT_BYTES
+            ));
+        }
+
+        // Check maximum pages if specified
+        if let Some(max_pages) = memory.maximum_pages {
+            if max_pages > SOROBAN_MAX_WASM_PAGES {
+                let max_bytes = max_pages * WASM_PAGE_SIZE_BYTES;
+                warnings.push(format!(
+                    "{}: maximum size {} pages ({} bytes) exceeds Soroban limit of {} pages ({} bytes)",
+                    memory_label,
+                    max_pages,
+                    max_bytes,
+                    SOROBAN_MAX_WASM_PAGES,
+                    SOROBAN_TX_MEMORY_LIMIT_BYTES
+                ));
+            }
+        }
+    }
+
+    if warnings.is_empty() {
+        None
+    } else {
+        Some(warnings.join("; "))
+    }
 }
 
 /// Enumerates exported function names from a validated WASM binary.
@@ -114,6 +223,11 @@ pub struct ModuleMetadata {
     pub exports: Vec<ExportInfo>,
     /// Number of tables declared by the module.
     pub tables_count: usize,
+    /// Whether the module carries a `name` or `.debug*` custom section —
+    /// the signature of an unoptimized/debug build.
+    pub has_debug_symbols: bool,
+    /// Combined byte size of the `name` and `.debug*` custom sections.
+    pub debug_symbol_bytes: usize,
 }
 
 /// Enumerates exported functions and captures module entry-point metadata:
@@ -135,6 +249,8 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
     let mut imports = Vec::new();
     let mut exports = Vec::new();
     let mut tables_count = 0;
+    let mut has_debug_symbols = false;
+    let mut debug_symbol_bytes = 0usize;
 
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
         let payload = payload.map_err(|e| AppError::WasmParse(e.to_string()))?;
@@ -188,6 +304,15 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
                         maximum_pages: memory.maximum,
                         memory64: memory.memory64,
                     });
+                }
+            }
+            wasmparser::Payload::CustomSection(section) => {
+                // `name` carries the function/local symbol table; `.debug*`
+                // sections carry DWARF info. Both are stripped by
+                // `soroban contract optimize` / `wasm-opt -g`.
+                if is_debug_custom_section(section.name()) {
+                    has_debug_symbols = true;
+                    debug_symbol_bytes += section.data().len();
                 }
             }
             wasmparser::Payload::StartSection { func, .. } => start_function = Some(func),
@@ -245,6 +370,8 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
         imports,
         exports,
         tables_count,
+        has_debug_symbols,
+        debug_symbol_bytes,
     })
 }
 
@@ -331,39 +458,77 @@ pub fn parse_contract_spec(bytes: &[u8]) -> AppResult<(SpecFunctions, bool)> {
     Ok((spec_functions, has_spec))
 }
 
-/// Metadata parsed from the Soroban `contractmetaV0` custom section.
+/// Custom section names the Soroban toolchain uses for contract metadata.
+///
+/// The `contractmeta` macro emits the unversioned link-section name, while
+/// the SDK build pipeline writes the versioned `contractmetav0`. Both are
+/// accepted so either producer decodes.
+const CONTRACT_META_SECTION_NAMES: [&str; 2] = ["contractmeta", "contractmetav0"];
+
+/// Metadata parsed from the Soroban `contractmeta` custom section.
 ///
 /// Contract developers attach this section (typically via the SDK's
 /// `contractmetadata`/`contractmeta` macros) to carry human-readable
-/// information about the contract: a name, a version, and a description,
-/// plus arbitrary extra key/value pairs.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// information about the contract: a name, a version, a description, an
+/// author, the SDK version it was built with, plus arbitrary extra
+/// key/value pairs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContractMeta {
     /// Contract name, when the section carries a `name` key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Contract version, when the section carries a `version` key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     /// Contract description, when the section carries a `description`
     /// (or `desc`) key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Contract author, when the section carries an `author` (or
+    /// `authors`) key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    /// Soroban SDK version the contract was built with, when the section
+    /// carries an `rs_sdk_version`, `rssdkver`, or `sdk_version` key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdk_version: Option<String>,
     /// Every key/value pair found in the section, in section order —
     /// including the recognized keys above and any custom ones.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<(String, String)>,
 }
 
 impl ContractMeta {
-    /// True when the WASM carried no decodable `contractmetaV0` entries.
+    /// True when the WASM carried no decodable `contractmeta` entries.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 }
 
-/// Parses the Soroban contract metadata (`contractmetaV0` custom section).
+/// True when `key` is folded into one of [`ContractMeta`]'s typed fields
+/// rather than being reported only as a raw entry.
+#[must_use]
+fn is_recognized_meta_key(key: &str) -> bool {
+    matches!(
+        key,
+        "name"
+            | "version"
+            | "description"
+            | "desc"
+            | "author"
+            | "authors"
+            | "rs_sdk_version"
+            | "rssdkver"
+            | "sdk_version"
+    )
+}
+
+/// Parses the Soroban contract metadata (`contractmeta` custom section).
 ///
-/// Returns the parsed name/version/description plus the full ordered list of
-/// key/value pairs. The section is optional — a WASM without one yields an
-/// empty `ContractMeta`, never an error.
+/// Returns the parsed name/version/description/author/SDK version plus the
+/// full ordered list of key/value pairs. The section is optional — a WASM
+/// without one yields an empty `ContractMeta`, never an error.
 ///
 /// Like `contractspecv0`, the section payload is **not** a count-prefixed
 /// vector: it is a concatenation of raw `ScMetaEntry` XDR union values, each
@@ -377,7 +542,7 @@ pub fn parse_contract_meta(bytes: &[u8]) -> AppResult<ContractMeta> {
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
         let payload = payload.map_err(|e| AppError::WasmParse(e.to_string()))?;
         if let wasmparser::Payload::CustomSection(section) = payload {
-            if section.name() != "contractmetav0" {
+            if !CONTRACT_META_SECTION_NAMES.contains(&section.name()) {
                 continue;
             }
 
@@ -399,6 +564,10 @@ pub fn parse_contract_meta(bytes: &[u8]) -> AppResult<ContractMeta> {
                     "name" => meta.name = Some(val.clone()),
                     "version" => meta.version = Some(val.clone()),
                     "description" | "desc" => meta.description = Some(val.clone()),
+                    "author" | "authors" => meta.author = Some(val.clone()),
+                    "rs_sdk_version" | "rssdkver" | "sdk_version" => {
+                        meta.sdk_version = Some(val.clone());
+                    }
                     _ => {}
                 }
                 meta.entries.push((key, val));
@@ -411,9 +580,10 @@ pub fn parse_contract_meta(bytes: &[u8]) -> AppResult<ContractMeta> {
 
 /// Formats the parsed contract metadata for display.
 ///
-/// Prints the recognized fields (name/version/description) followed by any
-/// additional custom key/value pairs, so no metadata is hidden. WASMs without
-/// a section produce a single "absent" line.
+/// Prints the recognized fields (name/version/description/author/SDK
+/// version) followed by any additional custom key/value pairs, so no
+/// metadata is hidden. WASMs without a section produce a single "absent"
+/// line.
 #[must_use]
 pub fn format_contract_meta(meta: &ContractMeta) -> String {
     if meta.entries.is_empty() {
@@ -430,8 +600,14 @@ pub fn format_contract_meta(meta: &ContractMeta) -> String {
     if let Some(description) = &meta.description {
         lines.push(format!("  description: {description}"));
     }
+    if let Some(author) = &meta.author {
+        lines.push(format!("  author: {author}"));
+    }
+    if let Some(sdk_version) = &meta.sdk_version {
+        lines.push(format!("  sdk_version: {sdk_version}"));
+    }
     for (key, val) in &meta.entries {
-        if !matches!(key.as_str(), "name" | "version" | "description" | "desc") {
+        if !is_recognized_meta_key(key) {
             lines.push(format!("  {key}: {val}"));
         }
     }
@@ -662,13 +838,21 @@ pub struct WasmStructureSummary {
 /// Information extracted from a WASM file.
 #[derive(Debug, Clone)]
 pub struct WasmInfo {
+    /// SHA-256 hash of the raw WASM bytes (lowercase hex). Soroban uses this
+    /// 32-byte digest as the on-chain executable hash of the contract.
+    pub wasm_hash: String,
     /// Raw WASM bytes.
     pub bytes: Vec<u8>,
+    /// True when the binary carries a `name` or `.debug*` custom section,
+    /// which marks it as an unoptimized/debug build.
+    pub has_debug_symbols: bool,
+    /// Combined byte size of the `name` and `.debug*` custom sections.
+    pub debug_symbol_bytes: usize,
     /// Names and signatures of exported (public) functions.
     pub functions: Vec<FunctionInfo>,
     /// Whether the WASM carries a Soroban contract spec (`contractspecv0`).
     pub has_spec: bool,
-    /// Contract metadata parsed from the `contractmetaV0` custom section,
+    /// Contract metadata parsed from the `contractmeta` custom section,
     /// when present.
     pub contract_meta: ContractMeta,
     /// Index of the module start function, if one is declared.
@@ -681,6 +865,53 @@ pub struct WasmInfo {
     pub exports: Vec<ExportInfo>,
     /// WASM structure summary.
     pub summary: WasmStructureSummary,
+}
+
+impl WasmInfo {
+    /// Estimated percentage of the binary that can be reclaimed by stripping
+    /// its `name` / `.debug*` custom sections, rounded to whole percent.
+    ///
+    /// Returns `0` when the binary carries no debug sections. Real-world
+    /// `soroban contract optimize` runs typically shrink a debug build by
+    /// 40–70%; the value here is derived from the actual section sizes rather
+    /// than hard-coded.
+    #[must_use]
+    pub fn estimated_size_reduction_percent(&self) -> u32 {
+        if self.debug_symbol_bytes == 0 || self.bytes.is_empty() {
+            return 0;
+        }
+        let bytes = self.bytes.len() as u64;
+        let debug = self.debug_symbol_bytes as u64;
+        // Round to nearest percent, then floor at 1 so a detected debug
+        // section never reports "~0%".
+        let rounded = (debug * 100 + bytes / 2) / bytes;
+        u32::try_from(rounded.max(1)).unwrap_or(1)
+    }
+}
+
+/// True when a WASM custom section is a debug/optimization artifact: the
+/// `name` symbol section or any DWARF `.debug*` section.
+#[must_use]
+pub fn is_debug_custom_section(name: &str) -> bool {
+    name == "name" || name.starts_with(".debug")
+}
+
+/// Builds the "unoptimized WASM" tip for an unoptimized build, or `None` when
+/// the binary carries no debug symbols.
+///
+/// The returned string is meant for stderr so it never contaminates
+/// machine-readable stdout; callers are responsible for suppressing it in
+/// quiet/JSON modes.
+#[must_use]
+pub fn format_optimization_tip(info: &WasmInfo) -> Option<String> {
+    if !info.has_debug_symbols {
+        return None;
+    }
+    Some(format!(
+        "💡 Tip: Unoptimized WASM detected (contains debug symbols). \
+         Run `soroban contract optimize` or `wasm-opt` to reduce upload cost by ~{}%",
+        info.estimated_size_reduction_percent()
+    ))
 }
 
 /// Formats a human-readable diagnostic summary of a loaded module: the start
@@ -713,6 +944,10 @@ pub fn format_module_metadata(info: &WasmInfo) -> String {
                     memory.initial_pages
                 )),
             }
+            // Add memory limit validation warning
+            if let Some(warning) = validate_wasm_memory_limit_for_memory(memory) {
+                lines.push(format!("  WARNING: {warning}"));
+            }
         }
     }
     push_entries_generic(
@@ -730,6 +965,42 @@ pub fn format_module_metadata(info: &WasmInfo) -> String {
         |ex| format!("{} ({}) index {}", ex.name, ex.kind, ex.index),
     );
     lines.join("\n")
+}
+
+/// Validates a single memory entry against Soroban limits and returns a warning
+/// if it exceeds the limits.
+#[must_use]
+fn validate_wasm_memory_limit_for_memory(memory: &MemoryInfo) -> Option<String> {
+    let mut warnings = Vec::new();
+
+    // Check initial pages
+    if memory.initial_pages > SOROBAN_MAX_WASM_PAGES {
+        let initial_bytes = memory.initial_pages * WASM_PAGE_SIZE_BYTES;
+        warnings.push(format!(
+            "initial size {} pages ({} bytes) exceeds Soroban limit of {} pages ({} bytes)",
+            memory.initial_pages,
+            initial_bytes,
+            SOROBAN_MAX_WASM_PAGES,
+            SOROBAN_TX_MEMORY_LIMIT_BYTES
+        ));
+    }
+
+    // Check maximum pages if specified
+    if let Some(max_pages) = memory.maximum_pages {
+        if max_pages > SOROBAN_MAX_WASM_PAGES {
+            let max_bytes = max_pages * WASM_PAGE_SIZE_BYTES;
+            warnings.push(format!(
+                "maximum size {} pages ({} bytes) exceeds Soroban limit of {} pages ({} bytes)",
+                max_pages, max_bytes, SOROBAN_MAX_WASM_PAGES, SOROBAN_TX_MEMORY_LIMIT_BYTES
+            ));
+        }
+    }
+
+    if warnings.is_empty() {
+        None
+    } else {
+        Some(warnings.join("; "))
+    }
 }
 
 /// Appends a counted, truncated list to `lines`, formatted by `fmt`.

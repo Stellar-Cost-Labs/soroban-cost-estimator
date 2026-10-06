@@ -102,6 +102,23 @@ fn default_schema_version() -> u32 {
     INITIAL_SCHEMA_VERSION
 }
 
+/// Ledger I/O footprint of a simulated invocation.
+///
+/// Recorded alongside an estimate so a later run can diff I/O against it.
+/// Only runs that captured the footprint store this (older entries leave it
+/// absent), which is why it lives behind [`CachedEstimate::io`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct IoFootprint {
+    /// Ledger entries read.
+    pub read_entries: u32,
+    /// Ledger entries written.
+    pub write_entries: u32,
+    /// Bytes read from the ledger.
+    pub read_bytes: u32,
+    /// Bytes written to the ledger.
+    pub write_bytes: u32,
+}
+
 /// A cached estimate result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedEstimate {
@@ -141,6 +158,9 @@ pub struct CachedEstimate {
     /// Whether the simulation succeeded.
     #[serde(default = "default_true")]
     pub success: bool,
+    /// Ledger I/O footprint recorded with this estimate, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io: Option<IoFootprint>,
 }
 
 /// Filter criteria for querying cached simulation estimates.
@@ -438,11 +458,34 @@ pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
             duration_ms      INTEGER,
             success          INTEGER NOT NULL DEFAULT 1,
             last_accessed    TEXT NOT NULL DEFAULT '',
+            io_json          TEXT,
             PRIMARY KEY (wasm_hash, function, args_hash)
         );",
     )?;
+    // Append-only log of every estimate ever saved, used by `estimate
+    // --history` to show how a function's cost evolved across runs (#321).
+    // The `estimates` table upserts on its primary key, so it cannot answer
+    // "what did this function cost last build?" on its own.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS estimate_history (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            wasm_hash        TEXT NOT NULL,
+            function         TEXT NOT NULL,
+            network          TEXT NOT NULL,
+            ledger           INTEGER NOT NULL,
+            total_stroops    INTEGER NOT NULL,
+            cpu_instructions INTEGER NOT NULL,
+            memory_bytes     INTEGER NOT NULL,
+            timestamp        TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_estimate_history_lookup
+            ON estimate_history (wasm_hash, function, timestamp DESC);",
+    )?;
     // Migrate a pre-v3 table (created before LRU access tracking) in place.
     ensure_column(conn, "last_accessed", "TEXT NOT NULL DEFAULT ''")?;
+    // The ledger I/O footprint is additive and nullable, so adding it in
+    // place keeps older databases readable without a schema-version bump.
+    ensure_column(conn, "io_json", "TEXT")?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_estimates_lookup
              ON estimates (wasm_hash, function);
@@ -678,6 +721,9 @@ fn import_legacy_json_file(conn: &Connection, path: &Path) -> AppResult<bool> {
         timestamp: parsed.timestamp.clone(),
         duration_ms: parsed.duration_ms,
         success: parsed.success,
+        // A legacy JSON entry predates the I/O footprint, so there is none
+        // to carry over.
+        io: None,
     };
     let Ok(migrated) = migrate_to_latest(migrated) else {
         warn!(path = %path.display(), "legacy cache entry needs a newer tool; keeping file");
@@ -754,6 +800,9 @@ where
 /// * `duration_ms` - Wall-clock duration of the simulation in milliseconds.
 /// * `success` - Whether the simulation succeeded.
 ///
+/// The ledger I/O footprint is not recorded here — use
+/// [`save_estimate_with_io`] when it is available.
+///
 /// # Network calls
 /// None — local SQLite I/O.
 pub fn save_estimate(
@@ -777,6 +826,45 @@ pub fn save_estimate(
         total_stroops,
         cpu_instructions,
         memory_bytes,
+        None,
+        duration_ms,
+        success,
+        cache_limits(),
+    )
+}
+
+/// Save an estimate together with its ledger I/O footprint.
+///
+/// `save_estimate` records only the metrics the cache has always stored; this
+/// variant additionally persists the read/write entry and byte counts, so a
+/// later run can diff I/O against it (`estimate --compare`).
+///
+/// # Network calls
+/// None — local SQLite I/O.
+#[allow(clippy::too_many_arguments)]
+pub fn save_estimate_with_io(
+    wasm_hash: &str,
+    function: &str,
+    args: &[String],
+    network: &str,
+    ledger: u32,
+    total_stroops: i64,
+    cpu_instructions: u64,
+    memory_bytes: u64,
+    io: IoFootprint,
+    duration_ms: Option<u64>,
+    success: bool,
+) -> AppResult<()> {
+    save_estimate_with_limits(
+        wasm_hash,
+        function,
+        args,
+        network,
+        ledger,
+        total_stroops,
+        cpu_instructions,
+        memory_bytes,
+        Some(io),
         duration_ms,
         success,
         cache_limits(),
@@ -801,11 +889,16 @@ pub fn save_estimate_with_limits(
     total_stroops: i64,
     cpu_instructions: u64,
     memory_bytes: u64,
+    io: Option<IoFootprint>,
     duration_ms: Option<u64>,
     success: bool,
     limits: CacheLimits,
 ) -> AppResult<()> {
     let args_hash = hash_args(args);
+    let io_json = match io {
+        Some(io) => Some(serde_json::to_string(&io)?),
+        None => None,
+    };
 
     let _guard = WRITE_LOCK
         .lock()
@@ -816,8 +909,8 @@ pub fn save_estimate_with_limits(
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute(
         "INSERT INTO estimates \
-         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, duration_ms, success, last_accessed) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, duration_ms, success, last_accessed, io_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
          ON CONFLICT(wasm_hash, function, args_hash) DO UPDATE SET \
             version = excluded.version, \
             network = excluded.network, \
@@ -828,7 +921,8 @@ pub fn save_estimate_with_limits(
             timestamp = excluded.timestamp, \
             duration_ms = excluded.duration_ms, \
             success = excluded.success, \
-            last_accessed = excluded.last_accessed",
+            last_accessed = excluded.last_accessed, \
+            io_json = excluded.io_json",
         rusqlite::params![
             CACHE_SCHEMA_VERSION as i64,
             wasm_hash,
@@ -843,6 +937,26 @@ pub fn save_estimate_with_limits(
             duration_ms.map(|v| v as i64),
             success as i64,
             now,
+            io_json,
+        ],
+    )?;
+
+    // Append to the unbounded history log so `estimate --history` can show
+    // how this function's cost evolved across runs (#321). Unlike the
+    // `estimates` upsert above, every call adds a row here.
+    tx.execute(
+        "INSERT INTO estimate_history \
+         (wasm_hash, function, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            wasm_hash,
+            function,
+            network,
+            ledger as i64,
+            total_stroops,
+            cpu_instructions as i64,
+            memory_bytes as i64,
+            now,
         ],
     )?;
 
@@ -855,6 +969,76 @@ pub fn save_estimate_with_limits(
 
     debug!(function, network, ledger, "estimate cached (sqlite)");
     Ok(())
+}
+
+/// Default number of previous runs returned by [`load_estimate_history`].
+pub const DEFAULT_HISTORY_LIMIT: usize = 5;
+
+/// One entry in the append-only estimate history log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EstimateHistoryEntry {
+    /// SHA-256 hash of the WASM bytes (hex).
+    pub wasm_hash: String,
+    /// Contract function name.
+    pub function: String,
+    /// Network the simulation ran against.
+    pub network: String,
+    /// Ledger sequence at simulation time.
+    pub ledger: u32,
+    /// Total fee in stroops.
+    pub total_stroops: i64,
+    /// CPU instructions consumed.
+    pub cpu_instructions: u64,
+    /// Memory bytes consumed.
+    pub memory_bytes: u64,
+    /// ISO-8601 timestamp of when the estimate was made.
+    pub timestamp: String,
+}
+
+/// Load up to `limit` previous estimates for the same `(wasm_hash,
+/// function)`, newest first.
+///
+/// Reads the append-only history log written by [`save_estimate`]. Returns an
+/// empty vector when the function has never been estimated before. A `limit`
+/// of 0 yields no rows.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+pub fn load_estimate_history(
+    wasm_hash: &str,
+    function: &str,
+    limit: usize,
+) -> AppResult<Vec<EstimateHistoryEntry>> {
+    let conn = open_db()?;
+    let mut stmt = conn.prepare(
+        "SELECT wasm_hash, function, network, ledger, total_stroops, \
+         cpu_instructions, memory_bytes, timestamp \
+         FROM estimate_history WHERE wasm_hash = ?1 AND function = ?2 \
+         ORDER BY timestamp DESC, id DESC LIMIT ?3",
+    )?;
+
+    let rows = stmt.query_map(
+        rusqlite::params![wasm_hash, function, limit as i64],
+        |row| {
+            Ok(EstimateHistoryEntry {
+                wasm_hash: row.get(0)?,
+                function: row.get(1)?,
+                network: row.get(2)?,
+                ledger: row.get::<_, i64>(3)? as u32,
+                total_stroops: row.get(4)?,
+                cpu_instructions: row.get::<_, i64>(5)? as u64,
+                memory_bytes: row.get::<_, i64>(6)? as u64,
+                timestamp: row.get(7)?,
+            })
+        },
+    )?;
+
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(row?);
+    }
+    trace!(function, count = entries.len(), "loaded estimate history");
+    Ok(entries)
 }
 
 /// Log an eviction pass at info level so users notice disk pressure.
@@ -893,6 +1077,10 @@ fn enforce_limits_in_tx(tx: &Transaction<'_>, limits: CacheLimits) -> AppResult<
     for _ in 0..MAX_EVICTION_ROUNDS {
         let entries: usize =
             tx.query_row("SELECT COUNT(*) FROM estimates", [], |row| row.get(0))?;
+        let history_rows: usize =
+            tx.query_row("SELECT COUNT(*) FROM estimate_history", [], |row| {
+                row.get(0)
+            })?;
         let bytes = live_db_bytes(tx)?;
 
         let over_entries = limits.max_entries > 0 && entries > limits.max_entries;
@@ -901,28 +1089,42 @@ fn enforce_limits_in_tx(tx: &Transaction<'_>, limits: CacheLimits) -> AppResult<
             break;
         }
 
-        // A byte quota below SQLite's structural floor (page 1 plus one root
-        // page per table/index) can never be met, and evicting the last
-        // entry cannot free any space either — stop rather than wipe the
-        // cache chasing an impossible target.
-        if over_bytes && !over_entries && entries <= 1 {
-            break;
+        let mut removed_any = false;
+
+        // Delete a batch of the oldest estimate rows each round: enough to
+        // make progress toward the quota, small enough to avoid over-evicting
+        // a large cache. The newest entry is never the only casualty of a
+        // byte-driven pass.
+        if entries > 1 {
+            let batch = eviction_batch(entries, bytes, limits, target_entries);
+            let removed = tx.execute(
+                "DELETE FROM estimates WHERE rowid IN (\
+                     SELECT rowid FROM estimates \
+                     ORDER BY last_accessed ASC, timestamp ASC \
+                     LIMIT ?1\
+                 )",
+                [batch as i64],
+            )?;
+            evicted += removed;
+            removed_any |= removed > 0;
         }
 
-        // Delete a batch of the oldest rows each round: enough to make
-        // progress toward the quota, small enough to avoid over-evicting a
-        // large cache.
-        let batch = eviction_batch(entries, bytes, limits, target_entries);
-        let removed = tx.execute(
-            "DELETE FROM estimates WHERE rowid IN (\
-                 SELECT rowid FROM estimates \
-                 ORDER BY last_accessed ASC, timestamp ASC \
-                 LIMIT ?1\
-             )",
-            [batch as i64],
-        )?;
-        evicted += removed;
-        if removed == 0 {
+        // The append-only history log lives in the same database file, so a
+        // byte quota has to reclaim it as well: otherwise history rows alone
+        // can keep the cache permanently over budget no matter how many
+        // estimates are evicted. Oldest entries go first.
+        if over_bytes && history_rows > 0 {
+            let batch = history_eviction_batch(history_rows, bytes, limits);
+            let removed = tx.execute(
+                "DELETE FROM estimate_history WHERE id IN (\
+                     SELECT id FROM estimate_history ORDER BY id ASC LIMIT ?1\
+                 )",
+                [batch as i64],
+            )?;
+            removed_any |= removed > 0;
+        }
+
+        if !removed_any {
             // Nothing left to delete; the quota cannot be satisfied further
             // (e.g. a single entry larger than the byte quota).
             break;
@@ -936,6 +1138,22 @@ fn enforce_limits_in_tx(tx: &Transaction<'_>, limits: CacheLimits) -> AppResult<
     }
 
     Ok(evicted)
+}
+
+/// How many history rows to delete in one byte-driven eviction round.
+///
+/// Sized like [`eviction_batch`]: it targets roughly the number of rows whose
+/// average size covers the byte excess, bounded by the rows available so the
+/// log is never emptied by an impossible quota.
+fn history_eviction_batch(history_rows: usize, bytes: u64, limits: CacheLimits) -> usize {
+    if limits.max_bytes == 0 || bytes <= limits.max_bytes {
+        return 0;
+    }
+    let excess = bytes - limits.max_bytes;
+    let per_row = (bytes / history_rows.max(1) as u64).max(1);
+    usize::try_from(excess / per_row)
+        .unwrap_or(1)
+        .clamp(1, history_rows)
 }
 
 /// How many rows to evict in one round.
@@ -1014,6 +1232,11 @@ fn estimate_from_row(row: &rusqlite::Row<'_>) -> Result<CachedEstimate, rusqlite
         timestamp: row.get(9)?,
         duration_ms: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
         success: row.get::<_, i64>(11)? != 0,
+        // A footprint that cannot be decoded is treated as absent: better to
+        // omit I/O from a comparison than to fail the whole read.
+        io: row
+            .get::<_, Option<String>>(12)?
+            .and_then(|raw| serde_json::from_str(&raw).ok()),
     })
 }
 
@@ -1113,7 +1336,7 @@ pub fn load_estimate(
     let cached = {
         let mut stmt = conn.prepare(
             "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-             cpu_instructions, memory_bytes, timestamp, duration_ms, success \
+             cpu_instructions, memory_bytes, timestamp, duration_ms, success, io_json \
              FROM estimates WHERE wasm_hash = ?1 AND function = ?2 AND args_hash = ?3",
         )?;
         let mut rows = stmt.query(rusqlite::params![wasm_hash, function, args_hash.as_str()])?;
@@ -1189,7 +1412,7 @@ pub fn list_cached_estimates(network: &str) -> AppResult<Vec<CachedEstimate>> {
     let conn = open_db()?;
     let mut stmt = conn.prepare(
         "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-         cpu_instructions, memory_bytes, timestamp, duration_ms, success \
+         cpu_instructions, memory_bytes, timestamp, duration_ms, success, io_json \
          FROM estimates WHERE network = ?1 ORDER BY timestamp DESC",
     )?;
 
@@ -1275,7 +1498,7 @@ pub fn list_all_cached_estimates() -> AppResult<Vec<CachedEstimate>> {
     let conn = open_db()?;
     let mut stmt = conn.prepare(
         "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-         cpu_instructions, memory_bytes, timestamp, duration_ms, success \
+         cpu_instructions, memory_bytes, timestamp, duration_ms, success, io_json \
          FROM estimates ORDER BY timestamp DESC",
     )?;
 
@@ -1344,7 +1567,7 @@ pub fn export_cached_estimates() -> AppResult<Vec<CachedEstimate>> {
     let conn = open_db()?;
     let mut stmt = conn.prepare(
         "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-         cpu_instructions, memory_bytes, timestamp \
+         cpu_instructions, memory_bytes, timestamp, duration_ms, success, io_json \
          FROM estimates ORDER BY wasm_hash, function, args_hash",
     )?;
 
@@ -1358,6 +1581,63 @@ pub fn export_cached_estimates() -> AppResult<Vec<CachedEstimate>> {
 
     debug!(count = estimates.len(), "exported cached estimates");
     Ok(estimates)
+}
+
+/// Schema version of the `cache export` file format.
+///
+/// Independent from [`CACHE_SCHEMA_VERSION`] (which versions individual
+/// cache *entries*): this versions the *export envelope* so backups stay
+/// readable as the envelope gains fields.
+pub const CACHE_EXPORT_SCHEMA_VERSION: u32 = 1;
+
+/// A portable, self-describing dump of cached estimates.
+///
+/// Written by `cache export` for backup, sharing across workstations, and
+/// archiving. The envelope carries everything needed to interpret the
+/// records without the exporting tool's help.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheExport {
+    /// Version of the export envelope format ([`CACHE_EXPORT_SCHEMA_VERSION`]).
+    pub schema_version: u32,
+    /// RFC-3339 timestamp of when the export was created.
+    pub exported_at: String,
+    /// Network the export was filtered to, or `None` for all networks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    /// The exported estimates in deterministic
+    /// `(wasm_hash, function, args_hash)` order.
+    pub estimates: Vec<CachedEstimate>,
+}
+
+/// Build a versioned [`CacheExport`] of cached estimates.
+///
+/// * `network` - Only include estimates recorded for this network, or `None`
+///   for every network. Unknown networks simply yield an empty list.
+///
+/// Like [`export_cached_estimates`], a malformed or unsupported entry
+/// returns an error rather than producing an incomplete backup.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+pub fn export_cache(network: Option<&str>) -> AppResult<CacheExport> {
+    let estimates: Vec<CachedEstimate> = export_cached_estimates()?
+        .into_iter()
+        .filter(|e| match network {
+            Some(n) => e.network == n,
+            None => true,
+        })
+        .collect();
+
+    debug!(
+        count = estimates.len(),
+        network, "built cache export envelope"
+    );
+    Ok(CacheExport {
+        schema_version: CACHE_EXPORT_SCHEMA_VERSION,
+        exported_at: chrono::Utc::now().to_rfc3339(),
+        network: network.map(str::to_string),
+        estimates,
+    })
 }
 
 /// Integrity status of a single cache entry file.
@@ -1417,6 +1697,7 @@ pub fn verify_cache() -> AppResult<Vec<CacheEntryStatus>> {
             timestamp: String::new(),
             duration_ms: None,
             success: true,
+            io: None,
         };
         let valid = migrate_to_latest(cached).is_ok();
 
@@ -1578,6 +1859,11 @@ pub fn clear_cache(network: &str) -> AppResult<usize> {
     let conn = open_db()?;
     let removed =
         execute_with_retry(|| conn.execute("DELETE FROM estimates WHERE network = ?1", [network]))?;
+    // Keep the history log consistent with the current cache: clearing a
+    // network's estimates must not leave stale history behind (#321).
+    let _ = execute_with_retry(|| {
+        conn.execute("DELETE FROM estimate_history WHERE network = ?1", [network])
+    })?;
     debug!(network, removed, "cache cleared");
     Ok(removed)
 }
@@ -1597,6 +1883,14 @@ pub fn remove_cached_estimates_for_wasm(wasm_hash: &str) -> AppResult<usize> {
     let conn = open_db()?;
     let removed = execute_with_retry(|| {
         conn.execute("DELETE FROM estimates WHERE wasm_hash = ?1", [wasm_hash])
+    })?;
+    // Drop matching history rows too: entries from a previous build must not
+    // pollute the trend for the new one (#321).
+    let _ = execute_with_retry(|| {
+        conn.execute(
+            "DELETE FROM estimate_history WHERE wasm_hash = ?1",
+            [wasm_hash],
+        )
     })?;
     Ok(removed)
 }

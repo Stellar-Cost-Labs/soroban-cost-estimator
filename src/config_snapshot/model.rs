@@ -1,11 +1,59 @@
 use serde::{Deserialize, Serialize};
 
+use crate::rpc::config::ConfigSettingId;
+
+/// Maps a [`ConfigSettingId`] to a friendly, human-readable setting name.
+///
+/// Every user-facing rendering of a config setting (diff tables, diff
+/// headers, `--json` payloads) goes through this helper so raw enum
+/// numbers like `0`, `1`, `4` never reach an output on their own.
+///
+/// Examples
+/// --------
+/// - `ConfigSettingId::ContractComputeV0` → `Contract Compute V0`
+/// - `ConfigSettingId::ContractLedgerCostV0` → `Contract Ledger Cost V0`
+/// - `ConfigSettingId::StateArchival` → `State Archival`
+pub fn config_setting_human_name(id: &ConfigSettingId) -> &'static str {
+    match id {
+        ConfigSettingId::ContractComputeV0 => "Contract Compute V0",
+        ConfigSettingId::ContractLedgerCostV0 => "Contract Ledger Cost V0",
+        ConfigSettingId::ContractHistoricalDataV0 => "Contract Historical Data V0",
+        ConfigSettingId::ContractEventsV0 => "Contract Events V0",
+        ConfigSettingId::ContractBandwidthV0 => "Contract Bandwidth V0",
+        ConfigSettingId::StateArchival => "State Archival",
+    }
+}
+
+/// Maps a snapshot field-path prefix (e.g. `contract_compute`) to its
+/// [`ConfigSettingId`], or `None` when the prefix names no known setting.
+///
+/// This is the inverse bridge from stored snapshot paths (which carry no
+/// enum value) back to the id so [`config_setting_human_name`] can label
+/// them consistently.
+pub fn config_setting_id_for_prefix(prefix: &str) -> Option<ConfigSettingId> {
+    match prefix {
+        "contract_compute" => Some(ConfigSettingId::ContractComputeV0),
+        "contract_ledger_cost" => Some(ConfigSettingId::ContractLedgerCostV0),
+        "contract_historical_data" => Some(ConfigSettingId::ContractHistoricalDataV0),
+        "contract_events" => Some(ConfigSettingId::ContractEventsV0),
+        "contract_bandwidth" => Some(ConfigSettingId::ContractBandwidthV0),
+        "state_archival" => Some(ConfigSettingId::StateArchival),
+        _ => None,
+    }
+}
+
 /// A complete snapshot of the network's Soroban resource-pricing configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigSnapshot {
     pub network: String,
     pub timestamp: String,
     pub ledger: u32,
+    /// Network protocol version reported by `getLatestLedger` when the
+    /// snapshot was taken. `None` for snapshots saved before it was recorded
+    /// or when the RPC call failed; omitted from JSON in that case so older
+    /// files and outputs are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<u32>,
     pub contract_compute: Option<ContractComputeV0>,
     pub contract_ledger_cost: Option<ContractLedgerCostV0>,
     pub contract_historical_data: Option<ContractHistoricalDataV0>,
@@ -95,5 +143,38 @@ pub fn setting_unit_description(field_path: &str) -> Option<&'static str> {
         "state_archival.persistent_rent_rate_denominator"
         | "state_archival.temp_rent_rate_denominator" => Some("fractional fee scaling"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConfigSnapshot;
+
+    const LEGACY: &str = r#"{"network":"testnet","timestamp":"t","ledger":7,
+        "contract_compute":null,"contract_ledger_cost":null,
+        "contract_historical_data":null,"contract_events":null,
+        "contract_bandwidth":null,"state_archival":null}"#;
+
+    #[test]
+    fn snapshot_without_protocol_version_still_loads() {
+        let snap: ConfigSnapshot = serde_json::from_str(LEGACY).unwrap();
+        assert_eq!(snap.protocol_version, None);
+        assert_eq!(snap.ledger, 7);
+    }
+
+    #[test]
+    fn missing_protocol_version_is_not_written() {
+        let snap: ConfigSnapshot = serde_json::from_str(LEGACY).unwrap();
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(!json.contains("protocol_version"), "{json}");
+    }
+
+    #[test]
+    fn protocol_version_round_trips() {
+        let mut snap: ConfigSnapshot = serde_json::from_str(LEGACY).unwrap();
+        snap.protocol_version = Some(23);
+        let back: ConfigSnapshot =
+            serde_json::from_str(&serde_json::to_string(&snap).unwrap()).unwrap();
+        assert_eq!(back.protocol_version, Some(23));
     }
 }
