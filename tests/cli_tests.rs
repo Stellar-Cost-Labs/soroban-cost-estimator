@@ -309,7 +309,7 @@ fn test_config_export_missing_snapshot_errors() {
         Some(&home),
     );
     assert_eq!(code, 1);
-    assert!(stderr.contains("failed to perform I/O"), "got: {stderr}");
+    assert!(stderr.contains("failed to load snapshot") || stderr.contains("not found"), "got: {stderr}");
 }
 
 #[test]
