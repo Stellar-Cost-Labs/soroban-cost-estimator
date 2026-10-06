@@ -797,6 +797,8 @@ struct SimulationRequest<'a> {
     wasm_bytes: &'a [u8],
     wasm_hash: &'a str,
     wasm_size: u64,
+    section_count: u32,
+    custom_sections: &'a [String],
     functions: &'a [wasm::parser::FunctionInfo],
     contract_meta: &'a wasm::parser::ContractMeta,
     network: &'a str,
@@ -929,6 +931,8 @@ async fn simulate_report(
         function: req.fn_name.unwrap_or("(wasm upload)").to_string(),
         wasm_hash: req.wasm_hash.to_string(),
         wasm_size: req.wasm_size,
+        section_count: req.section_count,
+        custom_sections: req.custom_sections.to_vec(),
         cpu_instructions,
         memory_bytes,
         tx_size: tx_xdr.len() as u32,
@@ -1503,6 +1507,8 @@ async fn cmd_estimate_repeat(
                     function: function_name.to_string(),
                     wasm_hash: wasm_hash.clone(),
                     wasm_size,
+                    section_count: u32::try_from(wasm_info.sections.count).unwrap_or(u32::MAX),
+                    custom_sections: wasm_info.sections.custom_names.clone(),
                     cpu_instructions,
                     memory_bytes,
                     tx_size: tx_xdr.len() as u32,
@@ -1782,6 +1788,8 @@ async fn estimate_once(
             wasm_bytes: &wasm_info.bytes,
             wasm_hash: &wasm_hash,
             wasm_size,
+            section_count: u32::try_from(wasm_info.sections.count).unwrap_or(u32::MAX),
+            custom_sections: &wasm_info.sections.custom_names,
             functions: &wasm_info.functions,
             contract_meta: &wasm_info.contract_meta,
             network,
@@ -2616,6 +2624,8 @@ async fn cmd_estimate_diff(
         wasm_bytes: &old_info.bytes,
         wasm_hash: &old_hash,
         wasm_size: old_info.bytes.len() as u64,
+        section_count: u32::try_from(old_info.sections.count).unwrap_or(u32::MAX),
+        custom_sections: &old_info.sections.custom_names,
         functions: &old_info.functions,
         contract_meta: &old_info.contract_meta,
         network,
@@ -2639,6 +2649,8 @@ async fn cmd_estimate_diff(
         wasm_bytes: &new_info.bytes,
         wasm_hash: &new_hash,
         wasm_size: new_info.bytes.len() as u64,
+        section_count: u32::try_from(new_info.sections.count).unwrap_or(u32::MAX),
+        custom_sections: &new_info.sections.custom_names,
         functions: &new_info.functions,
         contract_meta: &new_info.contract_meta,
         network,
@@ -4984,7 +4996,9 @@ mod tests {
     use soroban_cost_estimator::config_snapshot::model::{
         ConfigSnapshot, ContractComputeV0, ContractLedgerCostV0,
     };
-    use soroban_cost_estimator::wasm::parser::{ContractMeta, FunctionInfo, ParamInfo, WasmInfo};
+    use soroban_cost_estimator::wasm::parser::{
+        ContractMeta, FunctionInfo, ParamInfo, SectionInfo, WasmInfo,
+    };
 
     fn snapshot_with_compute_fee(fee: i64) -> ConfigSnapshot {
         ConfigSnapshot {
@@ -5369,6 +5383,8 @@ mod tests {
             function: "increment".to_string(),
             wasm_hash: "deadbeef".to_string(),
             wasm_size: 1024,
+            section_count: 0,
+            custom_sections: Vec::new(),
             cpu_instructions: 532_502,
             memory_bytes: 0,
             tx_size: 156,

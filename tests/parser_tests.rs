@@ -88,6 +88,41 @@ fn test_nonexistent_wasm() {
     assert!(result.is_err(), "nonexistent file should error");
 }
 
+#[test]
+fn test_capture_sections_minimal_wasm() {
+    let path = Path::new("tests/fixtures/minimal.wasm");
+    let wasm_info =
+        soroban_cost_estimator::wasm::parser::load_wasm(path).expect("failed to load test WASM");
+
+    assert_eq!(
+        wasm_info.size,
+        wasm_info.bytes.len(),
+        "size must match bytes"
+    );
+    assert!(
+        wasm_info.sections.count >= 3,
+        "minimal module should have at least a type, function, and code section"
+    );
+}
+
+#[test]
+fn test_capture_sections_real_contract_has_contractspec() {
+    let path = Path::new("tests/fixtures/contract.wasm");
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(path)
+        .expect("failed to load contract fixture");
+
+    assert!(wasm_info.sections.count > 0, "module should have sections");
+    assert!(
+        wasm_info
+            .sections
+            .custom_names
+            .iter()
+            .any(|name| name == "contractspecv0"),
+        "custom section names must include contractspecv0, got: {:?}",
+        wasm_info.sections.custom_names
+    );
+}
+
 /// The bare fixture exports only the `add_one` function; the captured export
 /// structure must reflect that, and the module start function is absent.
 #[test]

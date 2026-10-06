@@ -5,6 +5,10 @@ expression: JsonFormatter.format(&report)
 {
   "contract_meta": {},
   "cpu_instructions": 532502,
+  "custom_sections": [
+    "contractspecv0",
+    "name"
+  ],
   "fee": {
     "bandwidth_fee_stroops": 61,
     "base_fee_stroops": 100,

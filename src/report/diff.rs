@@ -276,6 +276,8 @@ mod tests {
             function: "increment".to_string(),
             wasm_hash: format!("hash-{wasm_size}"),
             wasm_size,
+            section_count: 0,
+            custom_sections: Vec::new(),
             cpu_instructions: cpu,
             memory_bytes: 1_024,
             tx_size: 156,

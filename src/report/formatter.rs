@@ -189,6 +189,10 @@ impl TableFormatter {
         output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
         output.push_str(&format!("WASM hash: {}\n", report.wasm_hash));
         output.push_str(&format!("WASM size: {} bytes\n", report.wasm_size));
+        output.push_str(&format!(
+            "Sections:   {}\n",
+            crate::report::cost_report::format_section_summary(report)
+        ));
         output.push('\n');
 
         // Contract metadata from the WASM `contractmeta` section: always
@@ -330,8 +334,8 @@ pub struct CsvFormatter;
 impl ReportFormatter for CsvFormatter {
     fn format_with(&self, report: &CostReport, _options: ReportOptions) -> String {
         let mut output = String::from(
-            "function,network,ledger,wasm_hash,wasm_size,cpu_instructions,memory_bytes,\
-             read_entries,write_entries,read_bytes,write_bytes,tx_size,\
+            "function,network,ledger,wasm_hash,wasm_size,section_count,custom_sections,\
+             cpu_instructions,memory_bytes,read_entries,write_entries,read_bytes,write_bytes,tx_size,\
              non_refundable_stroops,refundable_stroops,total_stroops,total_xlm,\
              rpc_latency_ms\n",
         );
@@ -342,6 +346,8 @@ impl ReportFormatter for CsvFormatter {
             &report.ledger.to_string(),
             &report.wasm_hash,
             &report.wasm_size.to_string(),
+            &report.section_count.to_string(),
+            &report.custom_sections.join(";"),
             &report.cpu_instructions.to_string(),
             &report.memory_bytes.to_string(),
             &report.read_entries.to_string(),
@@ -395,8 +401,12 @@ impl ReportFormatter for MarkdownFormatter {
         output.push_str(&format!("- **WASM hash:** `{}`\n", report.wasm_hash));
         output.push_str(&format!("- **WASM size:** {} bytes\n", report.wasm_size));
         output.push_str(&format!(
-            "- **RPC round-trip:** {} ms\n\n",
+            "- **RPC round-trip:** {} ms\n",
             report.rpc_latency_ms
+        ));
+        output.push_str(&format!(
+            "- **Sections:** {}\n\n",
+            crate::report::cost_report::format_section_summary(report)
         ));
 
         // Resource table
@@ -571,6 +581,8 @@ mod tests {
             function: "increment".to_string(),
             wasm_hash: "abc123def456".to_string(),
             wasm_size: 14_432,
+            section_count: 9,
+            custom_sections: vec!["contractspecv0".to_string(), "name".to_string()],
             cpu_instructions: 532_502,
             memory_bytes: 0,
             tx_size: 156,
@@ -605,6 +617,8 @@ mod tests {
             function: "(wasm upload)".to_string(),
             wasm_hash: "0000000000000000".to_string(),
             wasm_size: 0,
+            section_count: 0,
+            custom_sections: Vec::new(),
             cpu_instructions: 0,
             memory_bytes: 0,
             tx_size: 0,
@@ -666,6 +680,14 @@ mod tests {
         let formatter = TableFormatter;
         let output = formatter.format(&sample_report());
         assert!(output.contains("RPC round-trip: 87 ms"));
+    }
+
+    #[test]
+    fn test_table_formatter_contains_wasm_sections() {
+        let formatter = TableFormatter;
+        let output = formatter.format(&sample_report());
+        assert!(output.contains("WASM size: 14432 bytes"));
+        assert!(output.contains("Sections:   9 (custom: contractspecv0, name)"));
     }
 
     #[test]
@@ -840,7 +862,7 @@ mod tests {
         let first_line = output.lines().next().unwrap();
         assert!(first_line.starts_with("function,"));
         let field_count = first_line.split(',').count();
-        assert_eq!(field_count, 17);
+        assert_eq!(field_count, 19);
     }
 
     #[test]
@@ -852,6 +874,7 @@ mod tests {
         let data = lines[1];
         assert!(data.contains("increment"));
         assert!(data.contains("testnet"));
+        assert!(data.contains("14432"));
         assert!(data.contains("532502"));
         assert!(data.contains("15427"));
     }
@@ -939,6 +962,8 @@ mod tests {
         assert!(output.contains("- **Simulated at ledger sequence:** `3,894,195`"));
         assert!(output.contains("**WASM hash:** `abc123def456`"));
         assert!(output.contains("**RPC round-trip:** 87 ms"));
+        assert!(output.contains("**WASM size:** 14432 bytes"));
+        assert!(output.contains("**Sections:** 9 (custom: contractspecv0, name)"));
     }
 
     #[test]

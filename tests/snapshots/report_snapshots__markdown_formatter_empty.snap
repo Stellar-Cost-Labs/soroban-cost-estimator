@@ -9,6 +9,7 @@ expression: MarkdownFormatter.format(&empty)
 - **WASM hash:** `0000000000000000`
 - **WASM size:** 0 bytes
 - **RPC round-trip:** 0 ms
+- **Sections:** 0 (custom: none)
 
 ### Resources
 

@@ -5,6 +5,7 @@ expression: JsonFormatter.format(&empty)
 {
   "contract_meta": {},
   "cpu_instructions": 0,
+  "custom_sections": [],
   "fee": {
     "bandwidth_fee_stroops": 0,
     "base_fee_stroops": 0,
@@ -24,6 +25,7 @@ expression: JsonFormatter.format(&empty)
   "read_bytes": 0,
   "read_entries": 0,
   "rpc_latency_ms": 0,
+  "section_count": 0,
   "suggestions": [],
   "tx_size": 0,
   "warnings": [],

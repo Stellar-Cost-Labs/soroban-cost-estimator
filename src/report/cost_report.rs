@@ -494,6 +494,12 @@ pub struct CostReport {
     /// so reports serialized before this field existed still deserialize.
     #[serde(default)]
     pub wasm_size: u64,
+    /// Number of sections in the compiled WASM artifact.
+    #[serde(default)]
+    pub section_count: u32,
+    /// Names of custom sections found in the compiled WASM artifact.
+    #[serde(default)]
+    pub custom_sections: Vec<String>,
     /// CPU instructions consumed.
     pub cpu_instructions: u64,
     /// Memory bytes used.
@@ -1292,6 +1298,20 @@ pub fn format_distribution_box(distribution: &FeeDistribution, precision: u32) -
     out
 }
 
+/// Formats section count and custom names consistently across report formats.
+#[must_use]
+pub fn format_section_summary(report: &CostReport) -> String {
+    if report.custom_sections.is_empty() {
+        format!("{} (custom: none)", report.section_count)
+    } else {
+        format!(
+            "{} (custom: {})",
+            report.section_count,
+            report.custom_sections.join(", ")
+        )
+    }
+}
+
 /// Formats a cost report as a human-readable table.
 #[allow(clippy::too_many_lines)]
 pub fn format_report_table(report: &CostReport) -> String {
@@ -1307,7 +1327,12 @@ pub fn format_report_table(report: &CostReport) -> String {
         format_ledger_sequence(report.ledger)
     ));
     output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
-    output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
+    output.push_str(&format!("WASM hash: {}\n", report.wasm_hash));
+    output.push_str(&format!("WASM size:  {} bytes\n", report.wasm_size));
+    output.push_str(&format!(
+        "Sections:   {}\n\n",
+        format_section_summary(report)
+    ));
 
     // Contract metadata from the WASM `contractmeta` section: present or
     // absent, always rendered so the reader knows the section was checked.
@@ -1732,6 +1757,8 @@ mod tests {
             function: "increment".to_string(),
             wasm_hash: "abc".to_string(),
             wasm_size: 14_432,
+            section_count: 9,
+            custom_sections: vec!["contractspecv0".to_string(), "name".to_string()],
             cpu_instructions: 532_502,
             memory_bytes: 0,
             tx_size: 156,
@@ -1852,6 +1879,8 @@ mod tests {
             function: "(wasm upload)".to_string(),
             wasm_hash: "0000".to_string(),
             wasm_size: 0,
+            section_count: 0,
+            custom_sections: Vec::new(),
             cpu_instructions: 0,
             memory_bytes: 0,
             tx_size: 0,

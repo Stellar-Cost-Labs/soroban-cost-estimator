@@ -74,6 +74,8 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
     let metadata = enumerate_module_metadata(&bytes)?;
     let (spec_functions, has_spec) = parse_contract_spec(&bytes).unwrap_or_default();
     let contract_meta = parse_contract_meta(&bytes).unwrap_or_default();
+    let size = bytes.len();
+    let sections = capture_sections(&bytes)?;
 
     let mut functions = metadata.functions;
     if !spec_functions.is_empty() {
@@ -116,11 +118,46 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
         functions,
         has_spec,
         contract_meta,
+        size,
+        sections,
         start_function: metadata.start_function,
         memories: metadata.memories,
         imports: metadata.imports,
         exports: metadata.exports,
         summary,
+    })
+}
+
+/// Counts WASM sections and records custom section names.
+pub fn capture_sections(bytes: &[u8]) -> AppResult<SectionInfo> {
+    let mut count = 0usize;
+    let mut custom_names = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        let payload = payload.map_err(|e| AppError::WasmParse(e.to_string()))?;
+        match payload {
+            wasmparser::Payload::TypeSection(_)
+            | wasmparser::Payload::ImportSection(_)
+            | wasmparser::Payload::FunctionSection(_)
+            | wasmparser::Payload::TableSection(_)
+            | wasmparser::Payload::MemorySection(_)
+            | wasmparser::Payload::TagSection(_)
+            | wasmparser::Payload::GlobalSection(_)
+            | wasmparser::Payload::ExportSection(_)
+            | wasmparser::Payload::StartSection { .. }
+            | wasmparser::Payload::ElementSection(_)
+            | wasmparser::Payload::DataCountSection { .. }
+            | wasmparser::Payload::CodeSectionStart { .. }
+            | wasmparser::Payload::DataSection(_) => count += 1,
+            wasmparser::Payload::CustomSection(section) => {
+                count += 1;
+                custom_names.push(section.name().to_string());
+            }
+            _ => {}
+        }
+    }
+    Ok(SectionInfo {
+        count,
+        custom_names,
     })
 }
 
@@ -825,6 +862,13 @@ pub fn format_function(fn_info: &FunctionInfo) -> String {
     format!("{}({params})", fn_info.name)
 }
 
+/// Information about a WASM module's section layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SectionInfo {
+    pub count: usize,
+    pub custom_names: Vec<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WasmStructureSummary {
     pub initial_pages: u64,
@@ -855,6 +899,8 @@ pub struct WasmInfo {
     /// Contract metadata parsed from the `contractmeta` custom section,
     /// when present.
     pub contract_meta: ContractMeta,
+    pub size: usize,
+    pub sections: SectionInfo,
     /// Index of the module start function, if one is declared.
     pub start_function: Option<u32>,
     /// Linear memories and their limits.
