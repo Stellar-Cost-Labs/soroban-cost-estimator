@@ -1,0 +1,5 @@
+---
+source: tests/report_snapshots.rs
+expression: format_diff_summary(&diff)
+---
+Config drift detected: 2 pricing changes, 1 non-pricing changes
