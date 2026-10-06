@@ -1,4 +1,4 @@
-use comfy_table::{Cell, CellAlignment, Table};
+use comfy_table::{Cell, CellAlignment, Color, Table};
 
 use crate::report::fee_calc::{FeeBreakdown, FeeRates};
 use crate::wasm::parser::{ContractMeta, format_contract_meta};
@@ -148,6 +148,338 @@ fn render_bar(ratio: f64, width: usize) -> String {
     bar
 }
 
+/// Percentage of a protocol limit at which a [`ResourceWarning`] is raised.
+pub const RESOURCE_WARNING_THRESHOLD_PERCENT: u64 = 80;
+
+/// The subset of the network's resource-limit configuration needed to warn
+/// when a simulation approaches protocol ceilings.
+///
+/// Values mirror `ConfigSettingContractComputeV0`,
+/// `ConfigSettingContractLedgerCostV0`, and `ConfigSettingContractBandwidthV0`.
+/// A field is `None` when the corresponding config setting was unavailable —
+/// that check is then skipped rather than comparing against a bogus zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NetworkConfig {
+    /// `ConfigSettingContractComputeV0.tx_max_instructions`.
+    pub tx_max_instructions: Option<u64>,
+    /// `ConfigSettingContractLedgerCostV0.tx_max_disk_read_entries`.
+    pub tx_max_read_entries: Option<u64>,
+    /// `ConfigSettingContractLedgerCostV0.tx_max_write_ledger_entries`.
+    pub tx_max_write_entries: Option<u64>,
+    /// `ConfigSettingContractLedgerCostV0.tx_max_disk_read_bytes`.
+    pub tx_max_read_bytes: Option<u64>,
+    /// `ConfigSettingContractLedgerCostV0.tx_max_write_bytes`.
+    pub tx_max_write_bytes: Option<u64>,
+    /// `ConfigSettingContractBandwidthV0.tx_max_size_bytes`.
+    pub tx_max_size: Option<u64>,
+}
+
+impl NetworkConfig {
+    /// Build the limit set from a config snapshot.
+    ///
+    /// Missing sections leave the corresponding fields `None`, which disables
+    /// their checks instead of treating an unknown limit as zero. Limits that
+    /// are non-positive in the config are likewise treated as unknown.
+    #[must_use]
+    pub fn from_snapshot(snapshot: &crate::config_snapshot::model::ConfigSnapshot) -> Self {
+        let positive_u64 = |value: i64| u64::try_from(value).ok().filter(|v| *v > 0);
+        let positive_u32 = |value: u32| Some(u64::from(value)).filter(|v| *v > 0);
+
+        let mut config = Self::default();
+        if let Some(compute) = &snapshot.contract_compute {
+            config.tx_max_instructions = positive_u64(compute.tx_max_instructions);
+        }
+        if let Some(cost) = &snapshot.contract_ledger_cost {
+            config.tx_max_read_entries = positive_u32(cost.tx_max_disk_read_entries);
+            config.tx_max_write_entries = positive_u32(cost.tx_max_write_ledger_entries);
+            config.tx_max_read_bytes = positive_u32(cost.tx_max_disk_read_bytes);
+            config.tx_max_write_bytes = positive_u32(cost.tx_max_write_bytes);
+        }
+        if let Some(bandwidth) = &snapshot.contract_bandwidth {
+            config.tx_max_size = positive_u32(bandwidth.tx_max_size_bytes);
+        }
+        config
+    }
+}
+
+/// A warning that a simulated resource is approaching or exceeding a
+/// protocol limit.
+///
+/// `percent` is computed with integer arithmetic only (floor of
+/// `used * 100 / limit`), so it is stable across platforms and never depends
+/// on floating-point rounding.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResourceWarning {
+    /// Machine-readable resource key (e.g. `"cpu_instructions"`).
+    pub resource: String,
+    /// Human-readable resource label (e.g. `"CPU instructions"`).
+    pub label: String,
+    /// Amount consumed by the simulation.
+    pub used: u64,
+    /// Protocol limit for this resource.
+    pub limit: u64,
+    /// Percentage of the limit consumed, floored to a whole percent.
+    pub percent: u32,
+    /// Human-readable explanation suitable for a warning banner.
+    pub message: String,
+}
+
+/// Compare a cost report against network resource limits and return a warning
+/// for every resource at or above
+/// [`RESOURCE_WARNING_THRESHOLD_PERCENT`] of its limit.
+///
+/// Checks run in a fixed order (CPU, entries, bytes, tx size) so output is
+/// deterministic. Resources whose limit is unknown (`None`) or non-positive
+/// are skipped.
+#[must_use]
+pub fn check_resource_limits(report: &CostReport, config: &NetworkConfig) -> Vec<ResourceWarning> {
+    check_resource_limits_raw(
+        report.cpu_instructions,
+        report.read_entries,
+        report.write_entries,
+        report.read_bytes,
+        report.write_bytes,
+        report.tx_size,
+        config,
+    )
+}
+
+/// Threshold check against raw resource values, for callers that hold the
+/// simulator's output before a full [`CostReport`] has been assembled.
+#[must_use]
+pub fn check_resource_limits_raw(
+    cpu_instructions: u64,
+    read_entries: u32,
+    write_entries: u32,
+    read_bytes: u32,
+    write_bytes: u32,
+    tx_size: u32,
+    config: &NetworkConfig,
+) -> Vec<ResourceWarning> {
+    let mut warnings: Vec<ResourceWarning> = Vec::new();
+    push_resource_warning(
+        &mut warnings,
+        "cpu_instructions",
+        "CPU instructions",
+        cpu_instructions,
+        config.tx_max_instructions,
+    );
+    push_resource_warning(
+        &mut warnings,
+        "read_entries",
+        "Ledger read entries",
+        u64::from(read_entries),
+        config.tx_max_read_entries,
+    );
+    push_resource_warning(
+        &mut warnings,
+        "write_entries",
+        "Ledger write entries",
+        u64::from(write_entries),
+        config.tx_max_write_entries,
+    );
+    push_resource_warning(
+        &mut warnings,
+        "read_bytes",
+        "Ledger read bytes",
+        u64::from(read_bytes),
+        config.tx_max_read_bytes,
+    );
+    push_resource_warning(
+        &mut warnings,
+        "write_bytes",
+        "Ledger write bytes",
+        u64::from(write_bytes),
+        config.tx_max_write_bytes,
+    );
+    push_resource_warning(
+        &mut warnings,
+        "tx_size",
+        "Transaction size",
+        u64::from(tx_size),
+        config.tx_max_size,
+    );
+    warnings
+}
+
+/// Append a warning for `resource` when `used` is at or above the threshold
+/// of `limit`. No-op when the limit is unknown or non-positive.
+fn push_resource_warning(
+    out: &mut Vec<ResourceWarning>,
+    resource: &str,
+    label: &str,
+    used: u64,
+    limit: Option<u64>,
+) {
+    let Some(limit) = limit else {
+        return;
+    };
+    if limit == 0 {
+        return;
+    }
+    // Integer-only threshold comparison: used / limit >= threshold / 100.
+    if used.saturating_mul(100) < limit.saturating_mul(RESOURCE_WARNING_THRESHOLD_PERCENT) {
+        return;
+    }
+    let percent = u32::try_from(used.saturating_mul(100) / limit).unwrap_or(u32::MAX);
+    out.push(ResourceWarning {
+        resource: resource.to_string(),
+        label: label.to_string(),
+        used,
+        limit,
+        percent,
+        message: format!("{label} at {percent}% of the network limit ({used} of {limit})"),
+    });
+}
+
+/// Render resource-limit warnings as a human-readable banner.
+///
+/// Returns an empty string when there is nothing to warn about, so callers can
+/// append the result unconditionally without leaving a stray section header.
+#[must_use]
+pub fn format_resource_warnings(warnings: &[ResourceWarning]) -> String {
+    if warnings.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\nResource limit warnings:\n");
+    for warning in warnings {
+        out.push_str(&format!("  - {}\n", warning.message));
+    }
+    out
+}
+
+/// Direction of a historical fee change relative to the current run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CostTrend {
+    /// The historical fee is lower than the current run (cost decreased).
+    Improvement,
+    /// The historical fee is higher than the current run (cost increased).
+    Regression,
+    /// The historical fee equals the current run.
+    Unchanged,
+}
+
+impl CostTrend {
+    /// Classify a `delta = historical - current` fee difference.
+    #[must_use]
+    pub fn for_delta(delta_stroops: i64) -> Self {
+        match delta_stroops.cmp(&0) {
+            std::cmp::Ordering::Greater => Self::Regression,
+            std::cmp::Ordering::Less => Self::Improvement,
+            std::cmp::Ordering::Equal => Self::Unchanged,
+        }
+    }
+}
+
+/// One previous run of the same contract function, alongside its fee delta
+/// against the current run.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HistoryEntry {
+    /// ISO-8601 timestamp of the historical estimate.
+    pub timestamp: String,
+    /// Ledger sequence at the time of the historical estimate.
+    pub ledger: u32,
+    /// CPU instructions consumed by the historical estimate.
+    pub cpu_instructions: u64,
+    /// Total fee of the historical estimate, in stroops.
+    pub total_stroops: i64,
+    /// Total fee of the historical estimate, in XLM.
+    pub total_xlm: String,
+    /// `historical - current` in stroops: positive means a regression.
+    pub delta_stroops: i64,
+    /// Trend classification derived from `delta_stroops`.
+    pub trend: CostTrend,
+}
+
+/// Build [`HistoryEntry`] records from previous runs, computing each one's
+/// delta against the current run's total fee.
+///
+/// Entries are returned in the order supplied (callers pass them
+/// newest-first) with `delta_stroops = entry_fee - current_fee`.
+#[must_use]
+pub fn build_history_entries(
+    current_total_stroops: i64,
+    current_xlm_precision: u32,
+    runs: &[HistoricalRun],
+) -> Vec<HistoryEntry> {
+    runs.iter()
+        .map(|run| {
+            let delta_stroops = run.total_stroops.saturating_sub(current_total_stroops);
+            HistoryEntry {
+                timestamp: run.timestamp.clone(),
+                ledger: run.ledger,
+                cpu_instructions: run.cpu_instructions,
+                total_stroops: run.total_stroops,
+                total_xlm: crate::report::fee_calc::stroops_to_xlm(
+                    run.total_stroops,
+                    current_xlm_precision,
+                ),
+                delta_stroops,
+                trend: CostTrend::for_delta(delta_stroops),
+            }
+        })
+        .collect()
+}
+
+/// A raw previous run used to build [`HistoryEntry`] records.
+///
+/// Kept separate from [`HistoryEntry`] so callers can supply cache rows
+/// without knowing the current run's fee.
+#[derive(Debug, Clone)]
+pub struct HistoricalRun {
+    /// ISO-8601 timestamp of the run.
+    pub timestamp: String,
+    /// Ledger sequence at the time of the run.
+    pub ledger: u32,
+    /// CPU instructions consumed.
+    pub cpu_instructions: u64,
+    /// Total fee in stroops.
+    pub total_stroops: i64,
+}
+
+/// Render the historical cost trend table.
+///
+/// Regressions (cost increases vs the current run) are shown in red,
+/// improvements (cost reductions) in green, and unchanged runs in yellow.
+/// Returns an empty string when there is no history, so callers can append the
+/// result unconditionally.
+#[must_use]
+pub fn format_cost_history(entries: &[HistoryEntry]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+
+    let mut table = Table::new();
+    table.set_header(vec![
+        "Timestamp",
+        "Ledger",
+        "CPU Instructions",
+        "Total Fee",
+        "Delta vs current",
+    ]);
+
+    for entry in entries {
+        let (delta_text, color) = match entry.trend {
+            CostTrend::Regression => (format!("+{}", entry.delta_stroops), Color::Red),
+            CostTrend::Improvement => (format!("{}", entry.delta_stroops), Color::Green),
+            CostTrend::Unchanged => ("0".to_string(), Color::Yellow),
+        };
+        table.add_row(vec![
+            Cell::new(&entry.timestamp),
+            Cell::new(entry.ledger),
+            Cell::new(entry.cpu_instructions),
+            Cell::new(format!("{} ({})", entry.total_stroops, entry.total_xlm)),
+            Cell::new(delta_text).fg(color),
+        ]);
+    }
+
+    let mut out = String::from("\nCost history (previous runs, newest first):\n");
+    out.push_str(&table.to_string());
+    out.push('\n');
+    out
+}
+
 /// A complete cost report for a single contract invocation.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CostReport {
@@ -157,7 +489,9 @@ pub struct CostReport {
     pub wasm_hash: String,
     /// Size of the compiled WASM artifact in bytes. Reported in the
     /// side-by-side diff so a build-size regression is visible next to the
-    /// fee delta. `0` when the caller did not supply it.
+    /// fee delta, and used by [`generate_optimization_tips`] to flag an
+    /// oversized binary. `0` when the caller did not supply it; `#[serde(default)]`
+    /// so reports serialized before this field existed still deserialize.
     #[serde(default)]
     pub wasm_size: u64,
     /// CPU instructions consumed.
@@ -192,6 +526,16 @@ pub struct CostReport {
     /// serialized output; `None` when the rates were unavailable.
     #[serde(skip)]
     pub rates: Option<FeeRates>,
+    /// Resource-limit warnings for this run (#322). Always serialized so JSON
+    /// consumers see a stable `warnings` array (empty when nothing is near a
+    /// limit).
+    #[serde(default)]
+    pub warnings: Vec<ResourceWarning>,
+    /// Historical trend entries (#321). `None` unless the caller requested
+    /// history (via `--history`); when requested it is always an array in JSON
+    /// output, possibly empty when there are no previous runs to compare.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<Vec<HistoryEntry>>,
     /// Optional batch invocation cost projections.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub projections: Option<Vec<CostProjection>>,
@@ -324,6 +668,382 @@ pub fn format_suggestions(suggestions: &[OptimizationSuggestion]) -> String {
             ));
         }
     }
+    out
+}
+
+/// Contract WASM size, in bytes, above which a size-optimization tip is
+/// emitted (30 KB).
+///
+/// Uploads are charged bandwidth per byte on every deploy, and a contract
+/// above this size is usually carrying debug symbols or unoptimized
+/// dependencies rather than logic.
+pub const WASM_SIZE_TIP_THRESHOLD_BYTES: u32 = 30 * 1024;
+
+/// Share of the total fee, in percent, at which a cost component is treated
+/// as the *dominant* factor and earns a targeted tip.
+pub const DOMINANT_COST_PCT: u64 = 40;
+
+/// Ledger-entry count from which batching/merging state becomes worth
+/// suggesting. One or two entries is normal for a contract instance; three or
+/// more usually means the footprint can be collapsed.
+pub const MULTI_ENTRY_THRESHOLD: u32 = 3;
+
+/// Transaction-envelope size, in bytes, above which a large-payload tip is
+/// eligible (1 KB).
+pub const LARGE_TX_BYTES: u32 = 1024;
+
+/// `part` as a whole percentage of `total`, using integer-only arithmetic.
+///
+/// Fee math in this crate stays in `stroops`/`i64` — no floats near a value
+/// that gets added up and compared. Returns `0` when `total` is not positive,
+/// and clamps negative `part` to `0` so a defensive negative component can
+/// never produce a nonsensical share.
+#[must_use]
+pub fn share_pct(part: i64, total: i64) -> u64 {
+    if total <= 0 || part <= 0 {
+        return 0;
+    }
+    let pct = i128::from(part) * 100 / i128::from(total);
+    u64::try_from(pct).unwrap_or(u64::MAX)
+}
+
+/// Generate contextual, actionable cost-optimization tips for a report.
+///
+/// Where [`CostReport::suggest_optimizations`] quantifies *per-unit* savings
+/// from the network's fee rates, this function answers the question a
+/// newcomer actually has: **which single factor dominates this fee, and what
+/// should I change?** Each tip names the dominant factor, quantifies its share
+/// of the total fee, and proposes a concrete change.
+///
+/// A factor earns a tip when it both has a meaningful footprint and accounts
+/// for at least [`DOMINANT_COST_PCT`]% of the total fee:
+///
+/// * **WASM size** — reported whenever the binary exceeds
+///   [`WASM_SIZE_TIP_THRESHOLD_BYTES`], independent of the fee split (the
+///   upload cost lands on the bandwidth component).
+/// * **Ledger writes** — [`MULTI_ENTRY_THRESHOLD`] or more write entries while
+///   storage dominates; suggests merging related state into one entry.
+/// * **Ledger reads** — same threshold, suggests caching/batching.
+/// * **CPU** — the instruction fee dominates.
+/// * **Argument payload** — a large transaction envelope whose bandwidth fee
+///   dominates; suggests trimming the payload.
+/// * **Refundable fee** — rent bumps and events dominate; suggests reducing
+///   state growth and emitted events.
+///
+/// Tips are returned in a fixed order (WASM, writes, reads, CPU, payload,
+/// refundable) so output is deterministic and snapshot-testable. An empty
+/// vector means no factor is dominant — callers should render nothing rather
+/// than a "nothing to say" block.
+///
+/// # Network calls
+/// None — pure computation over the report.
+#[must_use]
+pub fn generate_optimization_tips(report: &CostReport) -> Vec<String> {
+    let total = report.fee.total_stroops;
+    let mut tips: Vec<String> = Vec::new();
+
+    if report.wasm_size > u64::from(WASM_SIZE_TIP_THRESHOLD_BYTES) {
+        tips.push(format!(
+            "Tip: the contract WASM is {} bytes, over the {} KB threshold. Uploads are charged bandwidth on every byte, so consider a release build with LTO and `strip = true` to shrink the binary.",
+            report.wasm_size,
+            WASM_SIZE_TIP_THRESHOLD_BYTES / 1024
+        ));
+    }
+
+    let storage_share = share_pct(report.fee.storage_fee_stroops, total);
+    if report.write_entries >= MULTI_ENTRY_THRESHOLD && storage_share >= DOMINANT_COST_PCT {
+        tips.push(format!(
+            "Tip: writing {} ledger entries accounts for {}% of the total fee. Consider combining related state into a single entry.",
+            report.write_entries, storage_share
+        ));
+    }
+    if report.read_entries >= MULTI_ENTRY_THRESHOLD && storage_share >= DOMINANT_COST_PCT {
+        tips.push(format!(
+            "Tip: reading {} ledger entries accounts for {}% of the total fee. Consider caching hot state or batching the reads into one call.",
+            report.read_entries, storage_share
+        ));
+    }
+
+    let cpu_share = share_pct(report.fee.cpu_fee_stroops, total);
+    if report.cpu_instructions > 0 && cpu_share >= DOMINANT_COST_PCT {
+        tips.push(format!(
+            "Tip: CPU instructions account for {}% of the total fee ({} instructions consumed). Consider profiling the hot path and moving work off-chain.",
+            cpu_share, report.cpu_instructions
+        ));
+    }
+
+    let bandwidth_share = share_pct(report.fee.bandwidth_fee_stroops, total);
+    if report.tx_size >= LARGE_TX_BYTES && bandwidth_share >= DOMINANT_COST_PCT {
+        tips.push(format!(
+            "Tip: the transaction envelope is {} bytes and its bandwidth fee accounts for {}% of the total fee. Consider trimming large argument payloads or passing a reference instead of the full value.",
+            report.tx_size, bandwidth_share
+        ));
+    }
+
+    let refundable_share = share_pct(report.fee.refundable_stroops, total);
+    if report.fee.refundable_stroops > 0 && refundable_share >= DOMINANT_COST_PCT {
+        tips.push(format!(
+            "Tip: {}% of the total fee is refundable, which comes from ledger rent bumps and contract events. Consider reducing state growth and the number or size of emitted events.",
+            refundable_share
+        ));
+    }
+
+    tips
+}
+
+/// Render cost-optimization tips as a human-readable block.
+///
+/// Returns an empty string when there is nothing to say, so callers can
+/// append the result unconditionally and stay quiet for a report with no
+/// dominant cost factor.
+#[must_use]
+pub fn format_tips(tips: &[String]) -> String {
+    if tips.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("Optimization Tips:\n");
+    for tip in tips {
+        out.push_str(&format!("  {tip}\n"));
+    }
+    out
+}
+
+/// Aggregated metrics for a whole `estimate-all` batch.
+///
+/// Every value is a whole-unit aggregate over the successfully estimated
+/// functions; `functions_evaluated` is the number of reports the aggregates
+/// were computed from, so a caller can tell an empty batch from a single
+/// cheap function. All fee values are stroops; the XLM strings are rendered
+/// with the caller's chosen precision.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EstimateAllSummary {
+    /// Number of functions included in the aggregates.
+    pub functions_evaluated: usize,
+    /// Lowest per-function total fee, in stroops.
+    pub min_fee_stroops: i64,
+    /// Highest per-function total fee, in stroops.
+    pub max_fee_stroops: i64,
+    /// Mean per-function total fee, in stroops (integer division).
+    pub avg_fee_stroops: i64,
+    /// Sum of every per-function total fee, in stroops.
+    pub total_fee_stroops: i64,
+    /// Lowest per-function CPU instruction count.
+    pub min_cpu_instructions: u64,
+    /// Highest per-function CPU instruction count.
+    pub max_cpu_instructions: u64,
+    /// Sum of every per-function CPU instruction count.
+    pub total_cpu_instructions: u64,
+    /// Sum of every per-function ledger write entry count.
+    pub total_write_entries: u64,
+    /// Sum of every per-function ledger read entry count.
+    pub total_read_entries: u64,
+    /// Lowest XLM total across the batch.
+    pub min_total_xlm: String,
+    /// Highest XLM total across the batch.
+    pub max_total_xlm: String,
+    /// Mean XLM total across the batch.
+    pub avg_total_xlm: String,
+}
+
+/// Aggregate a batch of per-function reports into an [`EstimateAllSummary`].
+///
+/// Returns `None` for an empty batch — a summary over zero functions is
+/// undefined (there is no min, max, or average), so callers can render a
+/// "nothing was estimated" state instead of a row full of zeros.
+///
+/// The fee sum accumulates in `i128` so a large batch cannot overflow before
+/// being cast back to `i64`; the cast is lossless because the result is a sum
+/// of `i64` fees. The average uses integer division, matching
+/// [`crate::report::fee_calc::fee_range`] and keeping fee math float-free.
+#[must_use]
+pub fn summarize_estimate_all(
+    reports: &[CostReport],
+    precision: u32,
+) -> Option<EstimateAllSummary> {
+    let first = reports.first()?;
+    let mut min_fee = first.fee.total_stroops;
+    let mut max_fee = first.fee.total_stroops;
+    let mut min_cpu = first.cpu_instructions;
+    let mut max_cpu = first.cpu_instructions;
+    let mut total_fee: i128 = 0;
+    let mut total_cpu: u128 = 0;
+    let mut total_writes: u64 = 0;
+    let mut total_reads: u64 = 0;
+
+    for report in reports {
+        min_fee = min_fee.min(report.fee.total_stroops);
+        max_fee = max_fee.max(report.fee.total_stroops);
+        min_cpu = min_cpu.min(report.cpu_instructions);
+        max_cpu = max_cpu.max(report.cpu_instructions);
+        total_fee += i128::from(report.fee.total_stroops);
+        total_cpu += u128::from(report.cpu_instructions);
+        total_writes += u64::from(report.write_entries);
+        total_reads += u64::from(report.read_entries);
+    }
+
+    let count = reports.len();
+    let avg_fee = (total_fee / i128::try_from(count).unwrap_or(1)) as i64;
+
+    Some(EstimateAllSummary {
+        functions_evaluated: count,
+        min_fee_stroops: min_fee,
+        max_fee_stroops: max_fee,
+        avg_fee_stroops: avg_fee,
+        total_fee_stroops: total_fee as i64,
+        min_cpu_instructions: min_cpu,
+        max_cpu_instructions: max_cpu,
+        total_cpu_instructions: total_cpu as u64,
+        total_write_entries: total_writes,
+        total_read_entries: total_reads,
+        min_total_xlm: crate::report::fee_calc::stroops_to_xlm(min_fee, precision),
+        max_total_xlm: crate::report::fee_calc::stroops_to_xlm(max_fee, precision),
+        avg_total_xlm: crate::report::fee_calc::stroops_to_xlm(avg_fee, precision),
+    })
+}
+
+/// Narrowest column width comfy-table is given, so a column of short cells
+/// still renders a readable box.
+const MIN_COLUMN_WIDTH: u16 = 6;
+
+/// Builds the `estimate-all` table: one row per estimated function plus a
+/// visually separated summary footer row.
+///
+/// The footer is separated with real border styling, not a blank line: the
+/// table draws a `├───┼───┤` rule above every row (comfy-table's internal
+/// horizontal line), so the summary sits in its own band at the bottom of the
+/// box. The whole table is rendered in one pass by one `comfy_table::Table`,
+/// which sizes every column to its widest cell (footer included) — so nothing
+/// is truncated and the rows can never drift out of alignment.
+///
+/// Returns an empty string for an empty batch, so an empty `estimate-all` run
+/// adds nothing to the output.
+///
+/// # Arguments
+/// * `reports` — the successfully estimated functions, in run order.
+/// * `summary` — pre-computed aggregates via [`summarize_estimate_all`];
+///   `None` omits the footer row (e.g. when `--quiet` suppressed it).
+pub fn format_estimate_all_table(
+    reports: &[CostReport],
+    summary: Option<&EstimateAllSummary>,
+) -> String {
+    if reports.is_empty() && summary.is_none() {
+        return String::new();
+    }
+
+    let header = vec![
+        "Function".to_string(),
+        "CPU insns".to_string(),
+        "Fee (stroops)".to_string(),
+        "Fee (XLM)".to_string(),
+        "Ledger".to_string(),
+        "Write entries".to_string(),
+    ];
+    let mut rows: Vec<Vec<String>> = reports
+        .iter()
+        .map(|r| {
+            vec![
+                r.function.clone(),
+                r.cpu_instructions.to_string(),
+                r.fee.total_stroops.to_string(),
+                r.fee.total_xlm.clone(),
+                r.ledger.to_string(),
+                r.write_entries.to_string(),
+            ]
+        })
+        .collect();
+
+    if let Some(s) = summary {
+        // The footer is the last row, so comfy-table draws the separator rule
+        // immediately above it.
+        rows.push(vec![
+            format!("Summary: {} function(s)", s.functions_evaluated),
+            format!("{} - {}", s.min_cpu_instructions, s.max_cpu_instructions),
+            format!(
+                "min {} / max {} / avg {}",
+                s.min_fee_stroops, s.max_fee_stroops, s.avg_fee_stroops
+            ),
+            format!("{} - {}", s.min_total_xlm, s.max_total_xlm),
+            String::new(),
+            s.total_write_entries.to_string(),
+        ]);
+    }
+
+    let mut table = comfy_table::Table::new();
+    table.load_preset(comfy_table::presets::UTF8_BORDERS_ONLY);
+    // Turn on comfy-table's internal horizontal rule so the last row (the
+    // summary footer) is visually separated from the per-function rows, and
+    // close the header divider with proper intersections.
+    table.set_style(comfy_table::TableComponent::HorizontalLines, '─');
+    table.set_style(comfy_table::TableComponent::MiddleIntersections, '┼');
+    table.set_style(comfy_table::TableComponent::LeftBorderIntersections, '├');
+    table.set_style(comfy_table::TableComponent::RightBorderIntersections, '┤');
+    table.set_style(comfy_table::TableComponent::BottomBorderIntersections, '┴');
+    table.set_style(comfy_table::TableComponent::MiddleHeaderIntersections, '╪');
+
+    table.set_header(header);
+    for row in &rows {
+        table.add_row(row.clone());
+    }
+    // Keep very narrow columns (e.g. a single-digit write-entry count) from
+    // collapsing to an unreadable box.
+    let widths: Vec<u16> = table
+        .column_max_content_widths()
+        .into_iter()
+        .map(|width| width.max(MIN_COLUMN_WIDTH))
+        .collect();
+    for (index, width) in widths.iter().enumerate() {
+        if let Some(column) = table.column_mut(index) {
+            // `ColumnConstraint::Boundaries` pins both ends of the column to
+            // the same width, so comfy-table neither grows the column beyond
+            // its widest cell nor truncates one.
+            column.set_constraint(comfy_table::ColumnConstraint::Boundaries {
+                lower: comfy_table::Width::Fixed(*width),
+                upper: comfy_table::Width::Fixed(*width),
+            });
+        }
+    }
+
+    table.to_string()
+}
+
+/// Renders the batch [`EstimateAllSummary`] as a GitHub-flavored Markdown
+/// table, for `estimate-all --format markdown`.
+///
+/// Complements [`format_estimate_all_table`]: the same aggregate in the same
+/// shape, but expressed in Markdown so it renders in a PR comment or a
+/// GitBook page. Returns an empty string when there is no summary.
+#[must_use]
+pub fn format_estimate_all_summary_markdown(summary: &EstimateAllSummary) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "### Summary — {} function(s) evaluated\n\n",
+        summary.functions_evaluated
+    ));
+    out.push_str("| Metric | Value |\n| --- | --- |\n");
+    out.push_str(&format!(
+        "| Min fee | {} stroops ({}) |\n",
+        summary.min_fee_stroops, summary.min_total_xlm
+    ));
+    out.push_str(&format!(
+        "| Max fee | {} stroops ({}) |\n",
+        summary.max_fee_stroops, summary.max_total_xlm
+    ));
+    out.push_str(&format!(
+        "| Average fee | {} stroops ({}) |\n",
+        summary.avg_fee_stroops, summary.avg_total_xlm
+    ));
+    out.push_str(&format!(
+        "| Total fee | {} stroops |\n",
+        summary.total_fee_stroops
+    ));
+    out.push_str(&format!(
+        "| CPU instructions | {} - {} (total {}) |\n",
+        summary.min_cpu_instructions, summary.max_cpu_instructions, summary.total_cpu_instructions
+    ));
+    out.push_str(&format!(
+        "| Ledger entries | {} read / {} written |\n",
+        summary.total_read_entries, summary.total_write_entries
+    ));
     out
 }
 
@@ -573,6 +1293,7 @@ pub fn format_distribution_box(distribution: &FeeDistribution, precision: u32) -
 }
 
 /// Formats a cost report as a human-readable table.
+#[allow(clippy::too_many_lines)]
 pub fn format_report_table(report: &CostReport) -> String {
     let mut output = String::new();
 
@@ -683,6 +1404,14 @@ pub fn format_report_table(report: &CostReport) -> String {
 
     // ASCII bar chart for visual cost breakdown
     output.push_str(&render_fee_bar_chart(&report.fee, DEFAULT_CHART_WIDTH));
+
+    // Resource-limit warnings (#322) — only when something nears a ceiling.
+    output.push_str(&format_resource_warnings(&report.warnings));
+
+    // Historical trend table (#321) — only populated with `--history`.
+    if let Some(history) = &report.history {
+        output.push_str(&format_cost_history(history));
+    }
 
     if let Some(ref projections) = report.projections {
         output.push_str(&format_projections_table(projections));
@@ -1005,7 +1734,7 @@ mod tests {
         CostReport {
             function: "increment".to_string(),
             wasm_hash: "abc".to_string(),
-            wasm_size: 4_096,
+            wasm_size: 14_432,
             cpu_instructions: 532_502,
             memory_bytes: 0,
             tx_size: 156,
@@ -1028,6 +1757,8 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
             rates: Some(rates),
+            warnings: Vec::new(),
+            history: None,
             projections: None,
             contract_meta: ContractMeta::default(),
         }
@@ -1146,6 +1877,8 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 0,
             rates: None,
+            warnings: Vec::new(),
+            history: None,
             projections: None,
             contract_meta: ContractMeta::default(),
         };
