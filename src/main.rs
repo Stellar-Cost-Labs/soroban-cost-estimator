@@ -492,9 +492,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::History { network } => cmd_config_history(&network, quiet),
             cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network, quiet),
             cli::ConfigAction::Validate { network } => cmd_config_validate(&network, quiet),
-            cli::ConfigAction::Export { snapshot, out } => {
-                cmd_config_export(&snapshot, &out)
-            }
+            cli::ConfigAction::Export { snapshot, out } => cmd_config_export(&snapshot, &out),
             cli::ConfigAction::Import { snapshot } => cmd_config_import(&snapshot),
             cli::ConfigAction::Cache { action } => {
                 handle_cache_action(

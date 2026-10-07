@@ -636,7 +636,9 @@ pub fn export_snapshot(identifier: &str, output_path: &str) -> AppResult<PathBuf
     let _snapshot = load_snapshot_checked(&source)?;
     let dest = PathBuf::from(output_path);
     std::fs::copy(&source, &dest).map_err(|e| {
-        AppError::General(format!("failed to perform I/O: failed to copy snapshot: {e}"))
+        AppError::General(format!(
+            "failed to perform I/O: failed to copy snapshot: {e}"
+        ))
     })?;
     Ok(dest)
 }
@@ -647,9 +649,8 @@ pub fn import_snapshot(path_str: &str) -> AppResult<PathBuf> {
     if !source.exists() {
         return Err(AppError::SnapshotNotFound(path_str.to_string()));
     }
-    let content = std::fs::read_to_string(&source).map_err(|e| {
-        AppError::General(format!("failed to perform I/O: {e}"))
-    })?;
+    let content = std::fs::read_to_string(&source)
+        .map_err(|e| AppError::General(format!("failed to perform I/O: {e}")))?;
     let snapshot: ConfigSnapshot = serde_json::from_str(&content)
         .map_err(|e| AppError::SnapshotParse(format!("failed to parse snapshot: {e}")))?;
 
