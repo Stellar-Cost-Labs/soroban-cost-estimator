@@ -59,8 +59,9 @@ src/
 │   └── gen_test_wasm.rs  # Utility binary: generates minimal test WASM fixtures
 ├── rpc/
 │   ├── mod.rs            # Module re-exports
-│   ├── client.rs         # JSON-RPC 2.0 client, network-to-URL resolution
+│   ├── client.rs         # JSON-RPC 2.0 client, network-to-URL (HTTP/WS) resolution
 │   ├── simulate.rs       # simulateTransaction call + response parsing
+│   ├── ws.rs             # WebSocket JSON-RPC client, events + ledger-close subscriptions
 │   └── config.rs         # getLedgerEntries for ConfigSetting* entries
 ├── wasm/
 │   ├── mod.rs            # Module re-exports
@@ -104,7 +105,7 @@ struct contains a `Command` enum with five subcommands:
 | `config diff` | Compare current config against a stored snapshot |
 | `config history` | Show the full chronological change log |
 | `config last-changed` | Show when each setting last changed |
-| `watch` | Poll network config on an interval and print diffs |
+| `watch` | Watch network config over WebSocket ledger-close notifications (HTTP polling fallback) and print diffs |
 | `cache verify` | Check every cache entry for corruption |
 
 `main.rs` parses the CLI args, then dispatches to `cmd_estimate`,
@@ -138,6 +139,21 @@ JSON-RPC 2.0 requests to a Stellar Soroban RPC endpoint. The `call` method:
 `resolve_endpoint` maps a network name (`"testnet"`, `"mainnet"`,
 `"futurenet"`) to a well-known URL. A custom `--rpc-url` overrides this
 resolution.
+
+### `rpc/ws.rs` — WebSocket Client
+
+`WsRpcClient` speaks JSON-RPC 2.0 over a WebSocket (`wss://…/ws`), where the
+server pushes notifications in addition to answering requests. It backs two
+subscriptions:
+
+- `subscribe_events` / `next_event` — contract and diagnostic events.
+- `subscribe_ledger_closes` / `next_ledger_close` — ledger-close
+  notifications, which `watch` uses to re-check the network config the moment a
+  new ledger lands.
+
+`resolve_ws_endpoint` derives the WebSocket URL from the HTTP one, and
+`to_websocket_url` / `to_http_url` convert between the two schemes so a single
+`--rpc-url` value works for both transports.
 
 ### `rpc/simulate.rs` — Simulation
 
