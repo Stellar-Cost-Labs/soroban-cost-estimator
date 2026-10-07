@@ -3971,7 +3971,10 @@ async fn cmd_config_diff(
         )
         .await?;
 
-        let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
+        let mut diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
+        if pricing_only {
+            diff = config_snapshot::diff::pricing_only(&diff);
+        }
         debug!(
             change_count = diff.changes.len(),
             has_pricing = diff.has_pricing_changes,
@@ -4068,7 +4071,10 @@ fn cmd_config_diff_against_previous(
 ) -> error::AppResult<()> {
     debug!(network, "diffing the two most recent snapshots");
     let (old_snapshot, new_snapshot) = config_snapshot::store::load_last_two_snapshots(network)?;
-    let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
+    let mut diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
+    if pricing_only {
+        diff = config_snapshot::diff::pricing_only(&diff);
+    }
     debug!(
         change_count = diff.changes.len(),
         has_pricing = diff.has_pricing_changes,

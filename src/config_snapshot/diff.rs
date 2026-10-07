@@ -256,6 +256,25 @@ impl ConfigDiff {
     }
 }
 
+/// Returns a new `ConfigDiff` containing only the changes where `is_pricing_change` is true.
+pub fn pricing_only(diff: &ConfigDiff) -> ConfigDiff {
+    let changes: Vec<FieldDiff> = diff
+        .changes
+        .iter()
+        .filter(|c| c.is_pricing_change)
+        .cloned()
+        .collect();
+
+    let has_pricing_changes = changes.iter().any(|c| c.is_pricing_change);
+
+    ConfigDiff {
+        old_snapshot: diff.old_snapshot.clone(),
+        new_snapshot: diff.new_snapshot.clone(),
+        changes,
+        has_pricing_changes,
+    }
+}
+
 /// Resolve the process exit code for `config diff` from the diff and the
 /// CI-oriented flags.
 ///
