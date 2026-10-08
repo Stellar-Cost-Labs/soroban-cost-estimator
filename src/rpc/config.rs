@@ -71,6 +71,12 @@ impl ConfigSettingId {
     }
 }
 
+impl fmt::Display for ConfigSettingId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.human_name())
+    }
+}
+
 /// Request payload for `getLedgerEntries`.
 #[derive(Debug, Serialize)]
 pub struct GetLedgerEntriesParams {
@@ -112,6 +118,34 @@ pub struct ConfigSettingEntryRaw {
     pub id: ConfigSettingId,
     pub config_xdr: String,
     pub last_modified_ledger: u32,
+}
+
+impl fmt::Display for GetLedgerEntriesParams {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} ledger entrie(s)", self.keys.len())
+    }
+}
+
+impl fmt::Display for LedgerEntryResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Ledger entry {}", self.key)
+    }
+}
+
+impl fmt::Display for GetLedgerEntriesResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} ledger entrie(s)", self.entries.len())
+    }
+}
+
+impl fmt::Display for ConfigSettingEntryRaw {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} (last modified ledger {})",
+            self.id, self.last_modified_ledger
+        )
+    }
 }
 
 /// Fetches a specific config setting entry from the ledger.

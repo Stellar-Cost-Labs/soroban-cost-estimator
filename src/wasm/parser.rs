@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::{fmt, io::Cursor};
 use std::path::Path;
 
 use sha2::Digest;
@@ -797,6 +797,12 @@ pub struct ExportInfo {
     pub index: u32,
 }
 
+impl fmt::Display for ParamInfo {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.name, self.type_name)
+    }
+}
+
 /// Information about an exported function.
 #[derive(Debug, Clone)]
 pub struct FunctionInfo {
@@ -808,6 +814,12 @@ pub struct FunctionInfo {
     pub result_count: u32,
     /// Typed parameters from the contract spec, if the WASM has one.
     pub params: Vec<ParamInfo>,
+}
+
+impl fmt::Display for FunctionInfo {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&format_function(self))
+    }
 }
 
 /// Formats a function with its spec-derived signature, e.g. `increment(x: I64)`.

@@ -763,3 +763,25 @@ mod tests {
         }
     }
 }
+
+impl fmt::Display for Command {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Estimate { .. } => "estimate",
+            Self::EstimateAll { .. } => "estimate-all",
+            Self::Config { .. } => "config",
+            Self::Watch { .. } => "watch",
+        };
+        formatter.write_str(name)
+    }
+}
+
+impl fmt::Display for ConfigAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Snapshot { .. } => "snapshot",
+            Self::Diff { .. } => "diff",
+        };
+        formatter.write_str(name)
+    }
+}

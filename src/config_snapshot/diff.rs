@@ -3,6 +3,7 @@ use crate::config_snapshot::model::{
     ContractHistoricalDataV0, ContractLedgerCostV0, StateArchivalV0, config_setting_human_name,
     config_setting_id_for_prefix,
 };
+use std::fmt;
 
 /// Returns a human-readable explanation for a given config setting field path.
 ///
@@ -313,6 +314,16 @@ pub struct SnapshotInfo {
     pub network: String,
     pub timestamp: String,
     pub ledger: u32,
+}
+
+impl fmt::Display for SnapshotInfo {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} (ledger {}, {})",
+            self.timestamp, self.ledger, self.network
+        )
+    }
 }
 
 /// Compares two config snapshots and returns a detailed diff.
