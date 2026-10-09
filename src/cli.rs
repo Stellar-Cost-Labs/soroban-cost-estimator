@@ -307,6 +307,11 @@ pub enum Command {
         #[arg(long)]
         auto_snapshot: bool,
     },
+    /// Inspect WASM binaries: subcommands for local, offline contract info.
+    Wasm {
+        #[command(subcommand)]
+        action: WasmAction,
+    },
     WasmInfo {
         #[arg(long, short)]
         wasm: String,

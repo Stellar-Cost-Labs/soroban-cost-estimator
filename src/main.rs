@@ -360,6 +360,16 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             )
             .await
         }
+        cli::Command::Wasm { action } => match action {
+            cli::WasmAction::Info { wasm, json } => {
+                let format = match (args.format, json) {
+                    (Some(fmt), _) => fmt,
+                    (None, true) => cli::OutputFormat::Json,
+                    (None, false) => cli::OutputFormat::Table,
+                };
+                cmd_wasm_info(&wasm.to_string_lossy(), format, quiet)
+            }
+        },
         cli::Command::WasmInfo { wasm, json } => {
             let format = match (args.format, json) {
                 (Some(fmt), _) => fmt,
@@ -3248,7 +3258,7 @@ fn cmd_wasm_info(wasm_path: &str, format: cli::OutputFormat, quiet: bool) -> err
     if format == cli::OutputFormat::Json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&wasm_info_json(&path, &wasm_info, &hash))?
+            serde_json::to_string_pretty(&wasm_info_json(wasm_path, &wasm_info, &hash))?
         );
         return Ok(());
     }
@@ -3301,6 +3311,18 @@ fn cmd_wasm_info(wasm_path: &str, format: cli::OutputFormat, quiet: bool) -> err
                 "absent (bare WASM exports only)"
             }
         );
+        match (
+            wasm_info.contract_meta.name.as_deref(),
+            wasm_info.contract_meta.sdk_version.as_deref(),
+        ) {
+            (Some(name), Some(sdk)) => {
+                println!("  Contract name: {name} (soroban-sdk {sdk})");
+            }
+            (Some(name), None) => println!("  Contract name: {name}"),
+            (None, Some(sdk)) => println!("  SDK version:   {sdk}"),
+            (None, None) => println!("  Contract name: absent"),
+        }
+        println!("{}", wasm::parser::format_sections(&wasm_info));
         println!(
             "{}",
             wasm::parser::format_contract_meta(&wasm_info.contract_meta)
@@ -3320,9 +3342,20 @@ fn wasm_info_json(
         "size": wasm_info.bytes.len(),
         "sha256": hash,
         "has_spec": wasm_info.has_spec,
+        "sdk_version": wasm_info.contract_meta.sdk_version,
         "has_debug_symbols": wasm_info.has_debug_symbols,
         "debug_symbol_bytes": wasm_info.debug_symbol_bytes,
         "estimated_size_reduction_percent": wasm_info.estimated_size_reduction_percent(),
+        "sections": wasm_info.sections.iter().map(|s| {
+            serde_json::json!({
+                "id": s.id,
+                "name": s.name,
+                "custom": s.custom,
+                "offset": s.offset,
+                "end": s.end,
+                "size": s.size,
+            })
+        }).collect::<Vec<_>>(),
         "contract_meta": {
             "name": wasm_info.contract_meta.name,
             "version": wasm_info.contract_meta.version,
@@ -5163,6 +5196,7 @@ mod tests {
             memories: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
+            sections: Vec::new(),
             summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
                 initial_pages: 0,
                 max_pages: None,

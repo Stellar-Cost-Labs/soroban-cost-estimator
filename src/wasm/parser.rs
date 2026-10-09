@@ -1,6 +1,7 @@
 use std::io::Cursor;
 use std::path::Path;
 
+use serde_json::json;
 use sha2::Digest;
 use stellar_xdr::ReadXdr;
 use tracing::{debug, trace, warn};
@@ -71,9 +72,20 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
         warn!(warning = %warning, "WASM memory exceeds Soroban limits");
     }
 
-    let metadata = enumerate_module_metadata(&bytes)?;
-    let (spec_functions, has_spec) = parse_contract_spec(&bytes).unwrap_or_default();
-    let contract_meta = parse_contract_meta(&bytes).unwrap_or_default();
+    let ModuleMetadata {
+        mut functions,
+        start_function,
+        memories,
+        imports,
+        exports,
+        sections,
+        tables_count,
+        has_debug_symbols,
+        debug_symbol_bytes,
+    } = enumerate_module_metadata(&bytes)?;
+    let (spec_entries, has_spec) = parse_contract_spec_entries(&bytes)?;
+    let spec_functions = spec_functions_from_entries(&spec_entries);
+    let contract_meta = parse_contract_meta(&bytes)?;
 
     if !spec_functions.is_empty() {
         for fn_info in &mut functions {
@@ -92,36 +104,31 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
     let wasm_hash = wasm_sha256_hex(&bytes);
 
     trace!(functions = functions.len(), has_spec, "WASM parsed");
-    let initial_pages = match metadata.memories.first() {
-        Some(m) => m.initial_pages,
-        None => 0,
-    };
-    let max_pages = match metadata.memories.first() {
-        Some(m) => m.maximum_pages,
-        None => None,
-    };
+    let initial_pages = memories.first().map_or(0, |m| m.initial_pages);
+    let max_pages = memories.first().and_then(|m| m.maximum_pages);
 
     let summary = WasmStructureSummary {
         initial_pages,
         max_pages,
-        imports_count: metadata.imports.len(),
-        exports_count: metadata.exports.len(),
-        has_start_function: metadata.start_function.is_some(),
-        tables_count: metadata.tables_count,
+        imports_count: imports.len(),
+        exports_count: exports.len(),
+        has_start_function: start_function.is_some(),
+        tables_count,
     };
     Ok(WasmInfo {
         wasm_hash,
         bytes,
-        has_debug_symbols: metadata.has_debug_symbols,
-        debug_symbol_bytes: metadata.debug_symbol_bytes,
+        has_debug_symbols,
+        debug_symbol_bytes,
         functions,
         has_spec,
         spec_entries,
         contract_meta,
-        start_function: metadata.start_function,
-        memories: metadata.memories,
-        imports: metadata.imports,
-        exports: metadata.exports,
+        start_function,
+        memories,
+        imports,
+        exports,
+        sections,
         summary,
     })
 }
@@ -224,6 +231,8 @@ pub struct ModuleMetadata {
     pub imports: Vec<ImportInfo>,
     /// Exports declared by the module, including non-function exports.
     pub exports: Vec<ExportInfo>,
+    /// Every section found in the binary, with its name and byte size.
+    pub sections: Vec<SectionInfo>,
     /// Number of tables declared by the module.
     pub tables_count: usize,
     /// Whether the module carries a `name` or `.debug*` custom section —
@@ -251,6 +260,8 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
     let mut memories = Vec::new();
     let mut imports = Vec::new();
     let mut exports = Vec::new();
+    let mut sections = Vec::new();
+    let mut imported_function_count = 0usize;
     let mut tables_count = 0;
     let mut has_debug_symbols = false;
     let mut debug_symbol_bytes = 0usize;
@@ -394,6 +405,7 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
         memories,
         imports,
         exports,
+        sections,
         tables_count,
         has_debug_symbols,
         debug_symbol_bytes,
@@ -691,9 +703,8 @@ pub fn parse_contract_meta(bytes: &[u8]) -> AppResult<ContractMeta> {
                     }
                     _ => {}
                 }
-                _ => {}
+                meta.entries.push((key, val));
             }
-            meta.entries.push((key, val));
         }
     }
 
@@ -1150,6 +1161,9 @@ pub struct WasmInfo {
     pub functions: Vec<FunctionInfo>,
     /// Whether the WASM carries a Soroban contract spec (`contractspecv0`).
     pub has_spec: bool,
+    /// Every entry decoded from the `contractspecv0` custom section, in
+    /// section order (functions, UDTs, enums, error enums, and events).
+    pub spec_entries: Vec<stellar_xdr::ScSpecEntry>,
     /// Contract metadata parsed from the `contractmeta` custom section,
     /// when present.
     pub contract_meta: ContractMeta,
@@ -1161,6 +1175,8 @@ pub struct WasmInfo {
     pub imports: Vec<ImportInfo>,
     /// Exports declared by the module, including non-function exports.
     pub exports: Vec<ExportInfo>,
+    /// Every section in the binary, with its name and byte size.
+    pub sections: Vec<SectionInfo>,
     /// WASM structure summary.
     pub summary: WasmStructureSummary,
 }
@@ -1299,6 +1315,30 @@ fn validate_wasm_memory_limit_for_memory(memory: &MemoryInfo) -> Option<String> 
     } else {
         Some(warnings.join("; "))
     }
+}
+
+/// Formats a per-section size summary: every section in binary order with its
+/// name, id, and content size, plus how much of the file the sections
+/// account for.
+#[must_use]
+pub fn format_sections(info: &WasmInfo) -> String {
+    let content_bytes: usize = info.sections.iter().map(|s| s.size).sum();
+    let mut lines = vec![format!(
+        "Sections: {} ({} bytes of section content in a {} byte file)",
+        info.sections.len(),
+        content_bytes,
+        info.bytes.len()
+    )];
+    for (i, section) in info.sections.iter().enumerate() {
+        lines.push(format!(
+            "  [{}] {} (id {}): {} bytes",
+            i + 1,
+            section.name,
+            section.id,
+            section.size
+        ));
+    }
+    lines.join("\n")
 }
 
 /// Appends a counted, truncated list to `lines`, formatted by `fmt`.
