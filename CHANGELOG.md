@@ -66,6 +66,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "fee_distribution": { ... } }`) instead of a bare array; the per-function
   records moved under the `functions` key.
 
+### Changed
+
+- Renamed the report field `rpc_latency_ms` to `simulation_duration_ms`
+  (JSON key, CSV column, and Markdown/table labels) to match the simulation
+  round-trip semantics it measures.
+
 ### Fixed
 
 - Restore the `cache stats` subcommand wiring that a CLI refactor merge
