@@ -505,6 +505,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::List { network } => cmd_config_snapshot_list(&network, quiet),
             cli::ConfigAction::Diff {
                 network,
+                rpc_url,
                 against,
                 against_previous,
                 pricing_only,
