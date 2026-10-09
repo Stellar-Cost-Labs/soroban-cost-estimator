@@ -354,6 +354,12 @@ pub enum Command {
     Watch {
         #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
+
+        /// Explicit RPC URL (overrides network-based resolution).
+        #[arg(long)]
+        rpc_url: Option<String>,
+
+        /// Polling interval (e.g. "30m", "1h").
         #[arg(long, default_value = "1h")]
         interval: String,
         /// Percentage threshold for flagging significant changes (e.g. 10 for 10%).
@@ -586,6 +592,12 @@ pub enum ConfigAction {
         action: Option<SnapshotAction>,
         #[arg(long, default_value = "testnet")]
         network: String,
+
+        /// Explicit RPC URL (overrides network-based resolution).
+        #[arg(long)]
+        rpc_url: Option<String>,
+
+        /// Explicit output path (defaults to ~/.soroban-cost-estimator/snapshots/).
         #[arg(long)]
         out: Option<String>,
         #[arg(long)]
@@ -607,6 +619,12 @@ pub enum ConfigAction {
     Diff {
         #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
+
+        /// Explicit RPC URL (overrides network-based resolution).
+        #[arg(long)]
+        rpc_url: Option<String>,
+
+        /// Explicit snapshot path to compare against (defaults to latest).
         #[arg(long)]
         against: Option<String>,
 

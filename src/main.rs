@@ -505,6 +505,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::List { network } => cmd_config_snapshot_list(&network, quiet),
             cli::ConfigAction::Diff {
                 network,
+                rpc_url,
                 against,
                 against_previous,
                 pricing_only,
@@ -599,11 +600,12 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
         }
         cli::Command::Watch {
             network,
+            rpc_url,
             interval,
-            threshold_percent,
         } => {
             cmd_watch(
                 &network,
+                rpc_url.as_deref(),
                 fallback,
                 &interval,
                 threshold_percent,
@@ -3490,6 +3492,7 @@ fn wasm_info_json(
 /// Makes one batched `getLedgerEntries` RPC call.
 async fn fetch_config_snapshot(
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     rps: Option<u64>,
     timeout: u64,
@@ -3652,6 +3655,7 @@ fn prune_output<'a>(
 /// snapshots it would have pruned.
 async fn cmd_config_snapshot(
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     out_path: Option<&str>,
     format: cli::OutputFormat,
@@ -3672,6 +3676,7 @@ async fn cmd_config_snapshot(
         info!("taking config snapshot");
         let snapshot = fetch_config_snapshot(
             network,
+            rpc_url,
             rpc_fallback_url,
             rps,
             timeout,
@@ -4001,6 +4006,7 @@ fn stale_estimates_for(network: &str, ledger: u32) -> Vec<cache::CachedEstimate>
 #[allow(clippy::fn_params_excessive_bools)]
 async fn cmd_config_diff(
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     against_path: Option<&str>,
     pricing_only: bool,
@@ -4041,6 +4047,7 @@ async fn cmd_config_diff(
 
         let new_snapshot = fetch_config_snapshot(
             network,
+            rpc_url,
             rpc_fallback_url,
             rps,
             timeout,
@@ -4473,6 +4480,7 @@ async fn shutdown_signal() -> error::AppResult<()> {
 /// Makes one batched `getLedgerEntries` RPC call.
 async fn watch_poll_once(
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     first: &mut bool,
     threshold_percent: Option<f64>,
@@ -4488,6 +4496,7 @@ async fn watch_poll_once(
 
     let snapshot_result = fetch_config_snapshot(
         network,
+        rpc_url,
         rpc_fallback_url,
         rps,
         timeout,
@@ -4542,6 +4551,7 @@ async fn watch_poll_once(
 /// cancelled rather than writing a partial snapshot.
 async fn cmd_watch(
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     interval: &str,
     threshold_percent: Option<f64>,
@@ -4579,6 +4589,7 @@ async fn cmd_watch(
             () = async {
                 let _ = watch_poll_once(
                     network,
+                    rpc_url,
                     rpc_fallback_url,
                     &mut first,
                     threshold_percent,
