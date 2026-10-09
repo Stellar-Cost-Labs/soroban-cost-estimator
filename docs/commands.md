@@ -16,11 +16,14 @@ management**.
   - [`config history`](#config-history) — chronological change log
   - [`config last-changed`](#config-last-changed) — last-change timestamps
 - [Cache Management](#cache-management)
+  - [`cache stats`](#cache-stats) — cache health overview
   - [`cache verify`](#cache-verify) — check cache integrity
   - [`cache stats`](#cache-stats) — show cache size and quotas
   - [`cache prune`](#cache-prune) — evict least-recently-accessed entries
   - [`cache warm`](#cache-warm) — pre-populate cache
   - [`cache clear`](#cache-clear) — wipe cached estimates for a network
+- [WASM Inspection](#wasm-inspection)
+  - [`wasm info`](#wasm-info) — offline contract metadata report
 - [Monitoring](#monitoring)
   - [`watch`](#watch) — poll and diff on interval
 
@@ -640,6 +643,38 @@ Last-changed timestamps for testnet:
 ---
 
 ## Cache Management
+
+### `cache stats`
+
+Show a cache health overview: total entries, disk usage, age of the oldest and
+newest entries, and a per-network breakdown.
+
+**Usage**
+
+```
+soroban-cost-estimator cache stats
+```
+
+**Flags**
+
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--help` | `-h` | | Print help |
+
+**Behavior**
+
+- Purely local SQLite I/O — no network calls.
+- Prints a one-line summary when the cache is empty.
+
+**Example**
+
+```bash
+soroban-cost-estimator cache stats
+# → Total entries: 12
+#   Disk usage:     48.0 KB
+```
+
+---
 
 ### `cache verify`
 

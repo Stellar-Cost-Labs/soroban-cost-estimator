@@ -424,6 +424,16 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             };
             cmd_wasm_info(&wasm, format, quiet)
         }
+        cli::Command::Wasm { action } => match action {
+            cli::WasmAction::Info { wasm, json } => {
+                let format = match (args.format, json) {
+                    (Some(fmt), _) => fmt,
+                    (None, true) => cli::OutputFormat::Json,
+                    (None, false) => cli::OutputFormat::Table,
+                };
+                cmd_wasm_info(&wasm.to_string_lossy(), format, quiet)
+            }
+        },
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot {
                 action,
@@ -853,6 +863,7 @@ struct SimulationRequest<'a> {
     wasm_bytes: &'a [u8],
     wasm_hash: &'a str,
     wasm_size: u64,
+    wasm_sections: Vec<wasm::parser::SectionSize>,
     functions: &'a [wasm::parser::FunctionInfo],
     contract_meta: &'a wasm::parser::ContractMeta,
     network: &'a str,
@@ -985,6 +996,7 @@ async fn simulate_report(
         function: req.fn_name.unwrap_or("(wasm upload)").to_string(),
         wasm_hash: req.wasm_hash.to_string(),
         wasm_size: req.wasm_size,
+        wasm_sections: req.wasm_sections.clone(),
         cpu_instructions,
         memory_bytes,
         tx_size: tx_xdr.len() as u32,
@@ -1559,6 +1571,7 @@ async fn cmd_estimate_repeat(
                     function: function_name.to_string(),
                     wasm_hash: wasm_hash.clone(),
                     wasm_size,
+                    wasm_sections: wasm_info.section_breakdown().sections,
                     cpu_instructions,
                     memory_bytes,
                     tx_size: tx_xdr.len() as u32,
@@ -1838,6 +1851,7 @@ async fn estimate_once(
             wasm_bytes: &wasm_info.bytes,
             wasm_hash: &wasm_hash,
             wasm_size,
+            wasm_sections: wasm_info.section_breakdown().sections,
             functions: &wasm_info.functions,
             contract_meta: &wasm_info.contract_meta,
             network,
@@ -2672,6 +2686,7 @@ async fn cmd_estimate_diff(
         wasm_bytes: &old_info.bytes,
         wasm_hash: &old_hash,
         wasm_size: old_info.bytes.len() as u64,
+        wasm_sections: old_info.section_breakdown().sections,
         functions: &old_info.functions,
         contract_meta: &old_info.contract_meta,
         network,
@@ -2695,6 +2710,7 @@ async fn cmd_estimate_diff(
         wasm_bytes: &new_info.bytes,
         wasm_hash: &new_hash,
         wasm_size: new_info.bytes.len() as u64,
+        wasm_sections: new_info.section_breakdown().sections,
         functions: &new_info.functions,
         contract_meta: &new_info.contract_meta,
         network,
@@ -3290,7 +3306,7 @@ async fn estimate_all_function(
     .await
 }
 
-/// `wasm-info` command: print WASM metadata without making any RPC calls.
+/// `wasm info` command: print WASM metadata without making any RPC calls.
 ///
 /// Shows the exported functions, contract-spec presence, binary size, and
 /// SHA-256 hash â€” everything "cheap" to derive from the file itself.
@@ -3357,6 +3373,16 @@ fn cmd_wasm_info(wasm_path: &str, format: cli::OutputFormat, quiet: bool) -> err
                 "absent (bare WASM exports only)"
             }
         );
+        match (
+            wasm_info.contract_meta.name.as_deref(),
+            wasm_info.contract_meta.sdk_version.as_deref(),
+        ) {
+            (Some(name), Some(sdk)) => println!("  Contract name: {name} (soroban-sdk {sdk})"),
+            (Some(name), None) => println!("  Contract name: {name}"),
+            (None, Some(sdk)) => println!("  SDK version:   {sdk}"),
+            (None, None) => {}
+        }
+        println!("{}", wasm::parser::format_sections(&wasm_info));
         println!(
             "{}",
             wasm::parser::format_contract_meta(&wasm_info.contract_meta)
@@ -3365,17 +3391,19 @@ fn cmd_wasm_info(wasm_path: &str, format: cli::OutputFormat, quiet: bool) -> err
     Ok(())
 }
 
-/// Builds the JSON representation of WASM metadata for `wasm-info --json`.
+/// Builds the JSON representation of WASM metadata for `wasm info --json`.
 fn wasm_info_json(
     wasm_path: &str,
     wasm_info: &wasm::parser::WasmInfo,
     hash: &str,
 ) -> serde_json::Value {
+    let breakdown = wasm_info.section_breakdown();
     serde_json::json!({
         "path": wasm_path,
         "size": wasm_info.bytes.len(),
         "sha256": hash,
         "has_spec": wasm_info.has_spec,
+        "sdk_version": wasm_info.contract_meta.sdk_version,
         "has_debug_symbols": wasm_info.has_debug_symbols,
         "debug_symbol_bytes": wasm_info.debug_symbol_bytes,
         "estimated_size_reduction_percent": wasm_info.estimated_size_reduction_percent(),
@@ -3394,11 +3422,63 @@ fn wasm_info_json(
                 "name": f.name,
                 "param_count": f.param_count,
                 "result_count": f.result_count,
+                "signature": wasm::parser::format_function(f),
                 "params": f.params.iter().map(|p| {
-                    serde_json::json!({ "name": p.name, "type": p.type_name })
+                    serde_json::json!({
+                        "name": p.name,
+                        "type": p.type_name,
+                        "type_def": wasm::parser::spec_type_json(&p.type_def),
+                    })
+                }).collect::<Vec<_>>(),
+                "returns": f.returns.iter().map(|r| {
+                    serde_json::json!({
+                        "type": r.type_name,
+                        "type_def": wasm::parser::spec_type_json(&r.type_def),
+                    })
                 }).collect::<Vec<_>>(),
             })
         }).collect::<Vec<_>>(),
+        "spec_entries": wasm_info.spec_entries.iter()
+            .map(wasm::parser::spec_entry_json)
+            .collect::<Vec<_>>(),
+        "section_sizes": breakdown.size_map(),
+        "sections": breakdown.sections.iter().map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "id": s.id,
+                "offset": s.offset,
+                "end": s.end,
+                "size": s.size,
+                "header_size": s.header_size,
+                "total_size": s.total_size,
+                "percent": s.percent,
+                "custom": s.id == Some(0),
+            })
+        }).collect::<Vec<_>>(),
+        "module": {
+            "start_function": wasm_info.start_function,
+            "memories": wasm_info.memories.iter().map(|m| {
+                serde_json::json!({
+                    "initial_pages": m.initial_pages,
+                    "maximum_pages": m.maximum_pages,
+                    "memory64": m.memory64,
+                })
+            }).collect::<Vec<_>>(),
+            "imports": wasm_info.imports.iter().map(|i| {
+                serde_json::json!({
+                    "module": i.module,
+                    "name": i.name,
+                    "kind": i.kind,
+                })
+            }).collect::<Vec<_>>(),
+            "exports": wasm_info.exports.iter().map(|e| {
+                serde_json::json!({
+                    "name": e.name,
+                    "kind": e.kind,
+                    "index": e.index,
+                })
+            }).collect::<Vec<_>>(),
+        },
     })
 }
 
@@ -5364,7 +5444,9 @@ mod tests {
     use soroban_cost_estimator::config_snapshot::model::{
         ConfigSnapshot, ContractComputeV0, ContractLedgerCostV0,
     };
-    use soroban_cost_estimator::wasm::parser::{ContractMeta, FunctionInfo, ParamInfo, WasmInfo};
+    use soroban_cost_estimator::wasm::parser::{
+        ContractMeta, FunctionInfo, ParamInfo, SectionInfo, WasmInfo,
+    };
 
     fn snapshot_with_compute_fee(fee: i64) -> ConfigSnapshot {
         ConfigSnapshot {
@@ -5478,6 +5560,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_wasm_info_json_structure() {
         let info = WasmInfo {
             wasm_hash: "deadbeef".to_string(),
@@ -5485,6 +5568,7 @@ mod tests {
             has_debug_symbols: false,
             debug_symbol_bytes: 0,
             has_spec: true,
+            spec_entries: Vec::new(),
             contract_meta: ContractMeta::default(),
             functions: vec![FunctionInfo {
                 name: "increment".to_string(),
@@ -5495,11 +5579,44 @@ mod tests {
                     type_name: "I64".to_string(),
                     type_def: stellar_xdr::ScSpecTypeDef::I64,
                 }],
+                returns: vec![soroban_cost_estimator::wasm::parser::TypeInfo {
+                    type_name: "i64".to_string(),
+                    type_def: stellar_xdr::ScSpecTypeDef::I64,
+                }],
             }],
             start_function: None,
             memories: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
+            sections: vec![
+                SectionInfo {
+                    id: 1,
+                    name: "type".to_string(),
+                    custom: false,
+                    offset: 10,
+                    end: 16,
+                    size: 6,
+                    header_size: 2,
+                },
+                SectionInfo {
+                    id: 3,
+                    name: "function".to_string(),
+                    custom: false,
+                    offset: 18,
+                    end: 22,
+                    size: 4,
+                    header_size: 2,
+                },
+                SectionInfo {
+                    id: 10,
+                    name: "code".to_string(),
+                    custom: false,
+                    offset: 24,
+                    end: 44,
+                    size: 20,
+                    header_size: 2,
+                },
+            ],
             summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
                 initial_pages: 0,
                 max_pages: None,
@@ -5525,6 +5642,41 @@ mod tests {
         assert_eq!(value["functions"][0]["name"], "increment");
         assert_eq!(value["functions"][0]["params"][0]["name"], "step");
         assert_eq!(value["functions"][0]["params"][0]["type"], "I64");
+        assert_eq!(value["functions"][0]["returns"][0]["type"], "i64");
+        assert_eq!(
+            value["functions"][0]["signature"],
+            "increment(step: I64) -> i64"
+        );
+        assert_eq!(value["spec_entries"], serde_json::json!([]));
+        assert_eq!(value["module"]["imports"], serde_json::json!([]));
+
+        // Section accounting: 8 byte module header + 8 + 6 + 22 = 44 bytes.
+        let size_map = value["section_sizes"]
+            .as_object()
+            .expect("section_sizes map");
+        assert_eq!(
+            size_map.get("module header").and_then(|v| v.as_u64()),
+            Some(8)
+        );
+        assert_eq!(size_map.get("type").and_then(|v| v.as_u64()), Some(8));
+        assert_eq!(size_map.get("function").and_then(|v| v.as_u64()), Some(6));
+        assert_eq!(size_map.get("code").and_then(|v| v.as_u64()), Some(22));
+        let mapped: u64 = size_map
+            .values()
+            .filter_map(serde_json::Value::as_u64)
+            .sum();
+        assert_eq!(mapped, 44, "section_sizes must cover the whole file");
+
+        let sections = value["sections"].as_array().expect("sections array");
+        assert_eq!(sections.len(), 4, "module header plus three sections");
+        let code = sections
+            .iter()
+            .find(|s| s["name"] == "code")
+            .expect("code section entry");
+        assert_eq!(code["size"], 20);
+        assert_eq!(code["header_size"], 2);
+        assert_eq!(code["total_size"], 22);
+        assert!((code["percent"].as_f64().expect("percent") - 50.0).abs() < 0.01);
     }
 
     #[test]
@@ -5749,6 +5901,7 @@ mod tests {
             function: "increment".to_string(),
             wasm_hash: "deadbeef".to_string(),
             wasm_size: 1024,
+            wasm_sections: Vec::new(),
             cpu_instructions: 532_502,
             memory_bytes: 0,
             tx_size: 156,

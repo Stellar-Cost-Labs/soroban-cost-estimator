@@ -338,6 +338,11 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect a compiled Soroban WASM artifact (offline).
+    Wasm {
+        #[command(subcommand)]
+        action: WasmAction,
+    },
     Config {
         #[command(subcommand)]
         action: ConfigAction,
@@ -361,6 +366,20 @@ pub enum Command {
         /// Target shell for completion script generation.
         #[arg(value_enum)]
         shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum WasmAction {
+    /// Print size, SHA-256, exported signatures, embedded metadata, and the
+    /// section size summary for a WASM file. Fully offline: no RPC calls.
+    Info {
+        /// Path to the compiled Soroban contract `.wasm` file.
+        wasm: PathBuf,
+
+        /// Output the full parsed spec/metadata as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
