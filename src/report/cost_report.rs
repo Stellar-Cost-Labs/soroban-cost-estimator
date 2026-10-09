@@ -1,7 +1,7 @@
 use comfy_table::{Cell, CellAlignment, Color, Table};
 
 use crate::report::fee_calc::{FeeBreakdown, FeeRates};
-use crate::wasm::parser::{ContractMeta, format_contract_meta};
+use crate::wasm::parser::{ContractMeta, SectionSize, format_contract_meta};
 
 // fee_percentage removed since we now use the precalculated exact percentages
 
@@ -480,6 +480,15 @@ pub fn format_cost_history(entries: &[HistoryEntry]) -> String {
     out
 }
 
+/// Serde helper: `wasm_size` is omitted when `0` so a report built without a
+/// local WASM file keeps the same JSON shape it had before the field existed.
+///
+/// `serde` requires the predicate to take its argument by reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
 /// A complete cost report for a single contract invocation.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CostReport {
@@ -492,8 +501,12 @@ pub struct CostReport {
     /// fee delta, and used by [`generate_optimization_tips`] to flag an
     /// oversized binary. `0` when the caller did not supply it; `#[serde(default)]`
     /// so reports serialized before this field existed still deserialize.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub wasm_size: u64,
+    /// Byte size breakdown of the WASM file, largest section first. Empty
+    /// when the report was not built from a local WASM file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wasm_sections: Vec<SectionSize>,
     /// CPU instructions consumed.
     pub cpu_instructions: u64,
     /// Memory bytes used.
@@ -1292,6 +1305,51 @@ pub fn format_distribution_box(distribution: &FeeDistribution, precision: u32) -
     out
 }
 
+/// Renders the WASM section size breakdown carried by a [`CostReport`] as a
+/// table, largest section first.
+///
+/// Each row shows the section's full footprint (header + contents) and its
+/// share of the file, so the rows add up to the WASM size shown in the
+/// report header. WASM size drives upload fees and rent, and a bloated
+/// `contractspecv0` or oversized data segment shows up here immediately.
+#[must_use]
+pub fn format_section_size_table(sections: &[SectionSize]) -> String {
+    if sections.is_empty() {
+        return String::new();
+    }
+    let section_bytes: usize = sections
+        .iter()
+        .filter(|s| s.id.is_some())
+        .map(|s| s.total_size)
+        .sum();
+    let total: usize = sections.iter().map(|s| s.total_size).sum();
+    let mut out = format!(
+        "WASM sections ({} bytes of section data, largest first):\n",
+        section_bytes
+    );
+    let mut table = Table::new();
+    if crate::cli::should_colorize() {
+        table.enforce_styling();
+    } else {
+        table.force_no_tty();
+    }
+    table.set_header(vec!["Section", "Bytes", "Share"]);
+    for entry in sections {
+        table.add_row(vec![
+            &entry.name,
+            &entry.total_size.to_string(),
+            &format!("{:.1}%", entry.percent),
+        ]);
+    }
+    out.push_str(&table.to_string());
+    out.push('\n');
+    let shares: f64 = sections.iter().map(|s| s.percent).sum();
+    out.push_str(&format!(
+        "  {total} bytes accounted for ({shares:.1}% of the file)\n"
+    ));
+    out
+}
+
 /// Formats a cost report as a human-readable table.
 #[allow(clippy::too_many_lines)]
 pub fn format_report_table(report: &CostReport) -> String {
@@ -1340,6 +1398,10 @@ pub fn format_report_table(report: &CostReport) -> String {
 
     output.push_str(&table.to_string());
     output.push('\n');
+
+    if !report.wasm_sections.is_empty() {
+        output.push_str(&format_section_size_table(&report.wasm_sections));
+    }
 
     output.push_str("\nFee Breakdown:\n\n");
     let pct = &report.fee.fee_percentages;
@@ -1729,12 +1791,14 @@ pub fn format_projections_table(projections: &[CostProjection]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wasm::parser::SectionInfo;
 
     fn report_with_rates(rates: FeeRates) -> CostReport {
         CostReport {
             function: "increment".to_string(),
             wasm_hash: "abc".to_string(),
             wasm_size: 14_432,
+            wasm_sections: Vec::new(),
             cpu_instructions: 532_502,
             memory_bytes: 0,
             tx_size: 156,
@@ -1855,6 +1919,7 @@ mod tests {
             function: "(wasm upload)".to_string(),
             wasm_hash: "0000".to_string(),
             wasm_size: 0,
+            wasm_sections: Vec::new(),
             cpu_instructions: 0,
             memory_bytes: 0,
             tx_size: 0,

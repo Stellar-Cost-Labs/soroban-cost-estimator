@@ -1,6 +1,7 @@
 use std::io::Cursor;
 use std::path::Path;
 
+use serde_json::json;
 use sha2::Digest;
 use stellar_xdr::ReadXdr;
 use tracing::{debug, trace, warn};
@@ -28,6 +29,12 @@ pub const WASM_PAGE_SIZE_BYTES: u64 = 65_536;
 
 /// Import module used by Soroban contracts for host functions (`env._` imports).
 pub const HOST_IMPORT_MODULE: &str = "env";
+
+/// Size of the fixed WASM module header: the 4-byte magic number
+/// (`\0asm`) plus the 4-byte version field. Every byte of a module lives
+/// either in this header or in exactly one section, so section sizes that
+/// include their own headers add up to the file length.
+pub const WASM_MODULE_HEADER_SIZE: usize = 8;
 
 /// Computes the lowercase-hex SHA-256 of a contract's raw WASM bytes.
 ///
@@ -71,9 +78,20 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
         warn!(warning = %warning, "WASM memory exceeds Soroban limits");
     }
 
-    let metadata = enumerate_module_metadata(&bytes)?;
-    let (spec_functions, has_spec) = parse_contract_spec(&bytes).unwrap_or_default();
-    let contract_meta = parse_contract_meta(&bytes).unwrap_or_default();
+    let ModuleMetadata {
+        mut functions,
+        start_function,
+        memories,
+        imports,
+        exports,
+        sections,
+        tables_count,
+        has_debug_symbols,
+        debug_symbol_bytes,
+    } = enumerate_module_metadata(&bytes)?;
+    let (spec_entries, has_spec) = parse_contract_spec_entries(&bytes)?;
+    let spec_functions = spec_functions_from_entries(&spec_entries);
+    let contract_meta = parse_contract_meta(&bytes)?;
 
     if !spec_functions.is_empty() {
         for fn_info in &mut functions {
@@ -92,36 +110,31 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
     let wasm_hash = wasm_sha256_hex(&bytes);
 
     trace!(functions = functions.len(), has_spec, "WASM parsed");
-    let initial_pages = match metadata.memories.first() {
-        Some(m) => m.initial_pages,
-        None => 0,
-    };
-    let max_pages = match metadata.memories.first() {
-        Some(m) => m.maximum_pages,
-        None => None,
-    };
+    let initial_pages = memories.first().map_or(0, |m| m.initial_pages);
+    let max_pages = memories.first().and_then(|m| m.maximum_pages);
 
     let summary = WasmStructureSummary {
         initial_pages,
         max_pages,
-        imports_count: metadata.imports.len(),
-        exports_count: metadata.exports.len(),
-        has_start_function: metadata.start_function.is_some(),
-        tables_count: metadata.tables_count,
+        imports_count: imports.len(),
+        exports_count: exports.len(),
+        has_start_function: start_function.is_some(),
+        tables_count,
     };
     Ok(WasmInfo {
         wasm_hash,
         bytes,
-        has_debug_symbols: metadata.has_debug_symbols,
-        debug_symbol_bytes: metadata.debug_symbol_bytes,
+        has_debug_symbols,
+        debug_symbol_bytes,
         functions,
         has_spec,
         spec_entries,
         contract_meta,
-        start_function: metadata.start_function,
-        memories: metadata.memories,
-        imports: metadata.imports,
-        exports: metadata.exports,
+        start_function,
+        memories,
+        imports,
+        exports,
+        sections,
         summary,
     })
 }
@@ -235,6 +248,8 @@ pub struct ModuleMetadata {
     pub imports: Vec<ImportInfo>,
     /// Exports declared by the module, including non-function exports.
     pub exports: Vec<ExportInfo>,
+    /// Every section found in the binary, with its name and byte size.
+    pub sections: Vec<SectionInfo>,
     /// Number of tables declared by the module.
     pub tables_count: usize,
     /// Whether the module carries a `name` or `.debug*` custom section —
@@ -262,6 +277,12 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
     let mut memories = Vec::new();
     let mut imports = Vec::new();
     let mut exports = Vec::new();
+    let mut sections = Vec::new();
+    let mut imported_function_count = 0usize;
+    // End of the previous section's contents, starting just after the
+    // 8-byte magic + version header. The gap to the next section's contents
+    // is that section's header (id byte + LEB128 size prefix).
+    let mut cursor = WASM_MODULE_HEADER_SIZE;
     let mut tables_count = 0;
     let mut has_debug_symbols = false;
     let mut debug_symbol_bytes = 0usize;
@@ -407,6 +428,7 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
         memories,
         imports,
         exports,
+        sections,
         tables_count,
         has_debug_symbols,
         debug_symbol_bytes,
@@ -704,9 +726,8 @@ pub fn parse_contract_meta(bytes: &[u8]) -> AppResult<ContractMeta> {
                     }
                     _ => {}
                 }
-                _ => {}
+                meta.entries.push((key, val));
             }
-            meta.entries.push((key, val));
         }
     }
 
@@ -1167,6 +1188,9 @@ pub struct WasmInfo {
     pub functions: Vec<FunctionInfo>,
     /// Whether the WASM carries a Soroban contract spec (`contractspecv0`).
     pub has_spec: bool,
+    /// Every entry decoded from the `contractspecv0` custom section, in
+    /// section order (functions, UDTs, enums, error enums, and events).
+    pub spec_entries: Vec<stellar_xdr::ScSpecEntry>,
     /// Contract metadata parsed from the `contractmeta` custom section,
     /// when present.
     pub contract_meta: ContractMeta,
@@ -1178,11 +1202,20 @@ pub struct WasmInfo {
     pub imports: Vec<ImportInfo>,
     /// Exports declared by the module, including non-function exports.
     pub exports: Vec<ExportInfo>,
+    /// Every section in the binary, with its name and byte size.
+    pub sections: Vec<SectionInfo>,
     /// WASM structure summary.
     pub summary: WasmStructureSummary,
 }
 
 impl WasmInfo {
+    /// Size accounting for the whole file: the module header plus one entry
+    /// per section, each with its share of the file.
+    #[must_use]
+    pub fn section_breakdown(&self) -> SectionSizeBreakdown {
+        SectionSizeBreakdown::from_sections(&self.sections, self.bytes.len())
+    }
+
     /// Estimated percentage of the binary that can be reclaimed by stripping
     /// its `name` / `.debug*` custom sections, rounded to whole percent.
     ///
@@ -1316,6 +1349,221 @@ fn validate_wasm_memory_limit_for_memory(memory: &MemoryInfo) -> Option<String> 
     } else {
         Some(warnings.join("; "))
     }
+}
+
+/// Byte accounting for one part of a WASM file: either a section (with its
+/// header) or the fixed module header.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SectionSize {
+    /// Section name (`code`, `data`, `contractspecv0`, …), or
+    /// [`MODULE_HEADER_LABEL`] for the fixed module header.
+    pub name: String,
+    /// Raw section id (`0` = custom), or `None` for the module header.
+    pub id: Option<u8>,
+    /// Byte offset of the section contents, or `None` for the module header.
+    pub offset: Option<usize>,
+    /// Byte offset one past the end of the section contents.
+    pub end: Option<usize>,
+    /// Size of the section contents, in bytes (`0` for the module header).
+    pub size: usize,
+    /// Bytes taken by the section header, in bytes.
+    pub header_size: usize,
+    /// Full footprint: `header_size + size`.
+    pub total_size: usize,
+    /// Share of the whole file, in percent (`0.0`–`100.0`).
+    pub percent: f64,
+}
+
+/// Label used for the fixed 8-byte module header in size reports.
+pub const MODULE_HEADER_LABEL: &str = "module header";
+
+/// Size accounting for a whole WASM file.
+///
+/// A module is the 8-byte magic + version header followed by sections, so
+/// `header_size` plus the sum of every entry's `total_size` equals the file
+/// length exactly. Entries are sorted largest first, which is what makes a
+/// bloated `contractspecv0` or an oversized data segment obvious.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SectionSizeBreakdown {
+    /// Total size of the file, in bytes.
+    pub total_size: usize,
+    /// Size of the fixed module header, in bytes.
+    pub header_size: usize,
+    /// Per-section and module-header entries, largest first.
+    pub sections: Vec<SectionSize>,
+}
+
+impl SectionSizeBreakdown {
+    /// Builds a breakdown from the sections collected by
+    /// [`enumerate_module_metadata`] and the total file length.
+    ///
+    /// Sections are ordered by byte offset first, so the header sizes stay
+    /// correct no matter what order the caller supplies them in.
+    #[must_use]
+    pub fn from_sections(sections: &[SectionInfo], total_size: usize) -> Self {
+        let mut ordered: Vec<&SectionInfo> = sections.iter().collect();
+        ordered.sort_by_key(|s| s.offset);
+        let sections: Vec<SectionInfo> = ordered.into_iter().cloned().collect();
+        let mut cursor = WASM_MODULE_HEADER_SIZE;
+        let mut entries: Vec<SectionSize> = Vec::with_capacity(sections.len() + 1);
+        entries.push(SectionSize {
+            name: MODULE_HEADER_LABEL.to_string(),
+            id: None,
+            offset: None,
+            end: None,
+            size: 0,
+            header_size: WASM_MODULE_HEADER_SIZE,
+            total_size: WASM_MODULE_HEADER_SIZE,
+            percent: percent_of(WASM_MODULE_HEADER_SIZE, total_size),
+        });
+        for section in &sections {
+            let header_size = section
+                .offset
+                .saturating_sub(cursor)
+                .max(section.header_size);
+            cursor = section.end;
+            entries.push(SectionSize {
+                name: section.name.clone(),
+                id: Some(section.id),
+                offset: Some(section.offset),
+                end: Some(section.end),
+                size: section.size,
+                header_size,
+                total_size: header_size + section.size,
+                percent: percent_of(header_size + section.size, total_size),
+            });
+        }
+        // Any bytes after the last section (never present in a validated
+        // module, but possible in a hand-assembled binary) are reported
+        // explicitly so the breakdown always adds up to the file length.
+        if let Some(last) = sections.last() {
+            if total_size > last.end {
+                let trailing = total_size - last.end;
+                entries.push(SectionSize {
+                    name: "trailing bytes".to_string(),
+                    id: None,
+                    offset: Some(last.end),
+                    end: Some(total_size),
+                    size: trailing,
+                    header_size: 0,
+                    total_size: trailing,
+                    percent: percent_of(trailing, total_size),
+                });
+            }
+        }
+        entries.sort_by(|a, b| {
+            b.total_size
+                .cmp(&a.total_size)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        Self {
+            total_size,
+            header_size: WASM_MODULE_HEADER_SIZE,
+            sections: entries,
+        }
+    }
+
+    /// Total bytes taken by sections, excluding the module header.
+    #[must_use]
+    pub fn section_bytes(&self) -> usize {
+        self.sections
+            .iter()
+            .filter(|s| s.id.is_some())
+            .map(|s| s.total_size)
+            .sum()
+    }
+
+    /// Bytes accounted for by the breakdown; equal to `total_size` whenever
+    /// the module parses cleanly.
+    #[must_use]
+    pub fn accounted_bytes(&self) -> usize {
+        self.sections.iter().map(|s| s.total_size).sum()
+    }
+
+    /// Name-to-bytes map of the whole breakdown, including the module header.
+    ///
+    /// The values sum to `total_size`, so a caller can reconcile the map
+    /// against the file length. Repeated section names (two `name` custom
+    /// sections, for instance) are suffixed with `#2`, `#3`, … so no bytes
+    /// are lost.
+    #[must_use]
+    pub fn size_map(&self) -> std::collections::BTreeMap<String, usize> {
+        let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let mut map = std::collections::BTreeMap::new();
+        for entry in &self.sections {
+            let mut name = entry.name.clone();
+            let count = seen.entry(name.clone()).or_insert(0);
+            *count += 1;
+            if *count > 1 {
+                name = format!("{}#{count}", entry.name);
+            }
+            map.insert(name, entry.total_size);
+        }
+        map
+    }
+}
+
+/// Computes a share of the file in percent, rounded to two decimals.
+fn percent_of(bytes: usize, total_size: usize) -> f64 {
+    if total_size == 0 {
+        return 0.0;
+    }
+    (bytes as f64 / total_size as f64 * 10000.0).round() / 100.0
+}
+
+impl std::fmt::Display for SectionSizeBreakdown {
+    /// Renders an aligned table of the breakdown, largest section first.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let count = self.sections.iter().filter(|s| s.id.is_some()).count();
+        let mut headline = format!(
+            "WASM sections: {count} section(s), {} bytes of section data in a {} byte file \
+             ({} byte module header)",
+            self.section_bytes(),
+            self.total_size,
+            self.header_size
+        );
+        if self.accounted_bytes() != self.total_size {
+            let unaccounted = self.total_size.saturating_sub(self.accounted_bytes());
+            headline.push_str(&format!(" ({unaccounted} bytes unaccounted)"));
+        }
+        writeln!(f, "{headline}")?;
+        let name_width = self
+            .sections
+            .iter()
+            .map(|s| s.name.len())
+            .max()
+            .unwrap_or_default();
+        let size_width = self
+            .sections
+            .iter()
+            .map(|s| s.total_size.to_string().len())
+            .max()
+            .unwrap_or_default();
+        writeln!(
+            f,
+            "  {:<name_width$}  {:>size_width$}  share",
+            "section", "bytes"
+        )?;
+        for entry in &self.sections {
+            writeln!(
+                f,
+                "  {:<name_width$}  {:>size_width$}  {:>5.1}%",
+                entry.name, entry.total_size, entry.percent
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Formats the section size breakdown of a loaded module as an aligned table
+/// with each section's share of the file, largest first.
+///
+/// Rows include the section header bytes, so the sizes reconcile exactly with
+/// the file length. Byte offsets for each section are available from
+/// [`WasmInfo::sections`] and in the `wasm info --json` output.
+#[must_use]
+pub fn format_sections(info: &WasmInfo) -> String {
+    info.section_breakdown().to_string().trim_end().to_string()
 }
 
 /// Appends a counted, truncated list to `lines`, formatted by `fmt`.

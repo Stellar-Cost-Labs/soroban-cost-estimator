@@ -313,6 +313,11 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect a compiled Soroban WASM artifact (offline).
+    Wasm {
+        #[command(subcommand)]
+        action: WasmAction,
+    },
     Config {
         #[command(subcommand)]
         action: ConfigAction,
