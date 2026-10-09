@@ -355,7 +355,7 @@ pub enum WasmAction {
 
 #[derive(Subcommand, Debug)]
 pub enum CacheAction {
-@    /// Export cached estimates as a versioned JSON document (schema
+    /// Export cached estimates as a versioned JSON document (schema
     /// version, export timestamp, and estimate records) for backup or
     /// sharing across workstations.
     Export {
