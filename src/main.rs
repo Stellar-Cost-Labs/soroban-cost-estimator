@@ -558,10 +558,8 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::ConfigAction::History { network } => cmd_config_history(&network, quiet),
             cli::ConfigAction::LastChanged { network } => cmd_config_last_changed(&network, quiet),
             cli::ConfigAction::Validate { network } => cmd_config_validate(&network, quiet),
-            cli::ConfigAction::Export { network, output } => {
-                cmd_config_export(network.as_deref(), &output)
-            }
-            cli::ConfigAction::Import { bundle } => cmd_config_import(&bundle),
+            cli::ConfigAction::Export { snapshot, out } => cmd_config_export(&snapshot, &out),
+            cli::ConfigAction::Import { snapshot } => cmd_config_import(&snapshot),
             cli::ConfigAction::Cache { action } => {
                 handle_cache_action(
                     action,
@@ -5092,15 +5090,15 @@ async fn cmd_cache_warm(
     .await
 }
 
-fn cmd_config_export(network: Option<&str>, output: &str) -> error::AppResult<()> {
-    config_snapshot::store::export_snapshots(network, output)?;
-    println!("Exported snapshots to {}", output);
+fn cmd_config_export(snapshot: &str, output: &str) -> error::AppResult<()> {
+    let out_path = config_snapshot::store::export_snapshot(snapshot, output)?;
+    println!("Exported snapshot to {}", out_path.display());
     Ok(())
 }
 
-fn cmd_config_import(bundle: &str) -> error::AppResult<()> {
-    let count = config_snapshot::store::import_snapshots(bundle)?;
-    println!("Imported {} new snapshot(s) from {}", count, bundle);
+fn cmd_config_import(snapshot: &str) -> error::AppResult<()> {
+    let path = config_snapshot::store::import_snapshot(snapshot)?;
+    println!("Imported snapshot to {}", path.display());
     Ok(())
 }
 

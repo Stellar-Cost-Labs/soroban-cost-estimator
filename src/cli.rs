@@ -656,21 +656,22 @@ pub enum ConfigAction {
         network: String,
     },
 
-    /// Export network snapshots to a bundle file.
+    /// Export a single configuration snapshot.
     Export {
-        /// Network to export snapshots for.
+        /// Identifier or path of the snapshot to export.
         #[arg(long)]
-        network: Option<String>,
+        snapshot: String,
 
-        /// Output file path for the snapshot bundle.
+        /// Output file path for the exported snapshot.
         #[arg(long)]
-        output: String,
+        out: String,
     },
 
-    /// Import network snapshots from a bundle file.
+    /// Import a configuration snapshot.
     Import {
-        /// Path to the snapshot bundle file.
-        bundle: String,
+        /// Path to the snapshot file to import.
+        #[arg(long)]
+        snapshot: String,
     },
 
     /// Query or manage the estimate cache.

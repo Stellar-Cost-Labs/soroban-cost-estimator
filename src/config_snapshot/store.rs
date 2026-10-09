@@ -630,55 +630,31 @@ pub struct SnapshotBundle {
     pub snapshots: Vec<ConfigSnapshot>,
 }
 
-/// Exports snapshots to a single JSON bundle file.
-pub fn export_snapshots(network: Option<&str>, output_path: &str) -> AppResult<()> {
-    let dir = snapshots_dir()?;
-    let mut snapshots = Vec::new();
-
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let name_str = entry.file_name().to_string_lossy().into_owned();
-        if !name_str.ends_with(".json") {
-            continue;
-        }
-        if let Some(net) = network {
-            if !name_str.starts_with(&format!("{}-", net)) {
-                continue;
-            }
-        }
-        let content = std::fs::read_to_string(entry.path())?;
-        if let Ok(snapshot) = serde_json::from_str::<ConfigSnapshot>(&content) {
-            snapshots.push(snapshot);
-        }
-    }
-
-    let bundle = SnapshotBundle { snapshots };
-    let json = serde_json::to_string_pretty(&bundle)
-        .map_err(|e| AppError::General(format!("failed to serialize bundle: {e}")))?;
-    std::fs::write(output_path, json)?;
-    Ok(())
+/// Exports a single snapshot to the given path.
+pub fn export_snapshot(identifier: &str, output_path: &str) -> AppResult<PathBuf> {
+    let source = resolve_snapshot_path(identifier)?;
+    let _snapshot = load_snapshot_checked(&source)?;
+    let dest = PathBuf::from(output_path);
+    std::fs::copy(&source, &dest).map_err(|e| {
+        AppError::General(format!(
+            "failed to perform I/O: failed to copy snapshot: {e}"
+        ))
+    })?;
+    Ok(dest)
 }
 
-/// Imports snapshots from a JSON bundle file.
-pub fn import_snapshots(bundle_path: &str) -> AppResult<usize> {
-    let content = std::fs::read_to_string(bundle_path)?;
-    let bundle: SnapshotBundle = serde_json::from_str(&content)
-        .map_err(|e| AppError::SnapshotParse(format!("invalid bundle: {e}")))?;
-
-    let mut imported = 0;
-    for snapshot in bundle.snapshots {
-        let ts_safe = snapshot.timestamp.replace(':', "-");
-        let filename = format!("{}-{}.json", snapshot.network, ts_safe);
-        let path = snapshots_dir()?.join(&filename);
-        if !path.exists() {
-            let json = serde_json::to_string_pretty(&snapshot)
-                .map_err(|e| AppError::General(format!("failed to serialize snapshot: {e}")))?;
-            std::fs::write(&path, json)?;
-            imported += 1;
-            println!("  Imported snapshot: {}", filename);
-        }
+/// Imports a single snapshot.
+pub fn import_snapshot(path_str: &str) -> AppResult<PathBuf> {
+    let source = PathBuf::from(path_str);
+    if !source.exists() {
+        return Err(AppError::SnapshotNotFound(path_str.to_string()));
     }
-    Ok(imported)
+    let content = std::fs::read_to_string(&source)
+        .map_err(|e| AppError::General(format!("failed to perform I/O: {e}")))?;
+    let snapshot: ConfigSnapshot = serde_json::from_str(&content)
+        .map_err(|e| AppError::SnapshotParse(format!("failed to parse snapshot: {e}")))?;
+
+    save_snapshot(&snapshot, None)
 }
 
 /// Summary of one saved snapshot, read from the snapshot file itself.
