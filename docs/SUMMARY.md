@@ -19,6 +19,7 @@
 - [`config last-changed`](commands/config-last-changed.md)
 - [`cache verify`](commands/cache-verify.md)
 - [`cache warm`](commands/cache-warm.md)
+- [`wasm info`](commands/wasm-info.md)
 - [`watch`](commands/watch.md)
 
 # Reference

@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `estimate --history` — compare the current run against up to 5 previous
+  cached runs of the same contract function, rendered as a trend table
+  (regressions in red, improvements in green) with a `history` array in
+  `--json` output (#321).
+- Resource-limit warnings — `estimate` and `estimate-all` now warn when CPU
+  instructions, ledger read/write entries or bytes, or transaction size reach
+  80% of the network's protocol limits, with a `warnings` array in JSON output
+  (#322).
+- `estimate-all --format csv` — RFC 4180-compliant CSV export with one row per
+  function (`Function,Status,CPU_Instructions,...`, #324).
+- `estimate-all --format markdown` — GitHub-flavored Markdown summary table,
+  fee statistics, and collapsible per-function detail sections for CI PR
+  comments (#325).
 - `config diff --against-previous` — diff the two most recent on-disk
   snapshots against each other without contacting the live network. Works
   offline, honors `--summary` and `--json`, and errors with the snapshot count
@@ -55,6 +68,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Restore the `cache stats` subcommand wiring that a CLI refactor merge
+  dropped, leaving `cmd_cache_stats` unreachable dead code.
+- WASM function signatures are now resolved against the *defined* function
+  index space, so export arities stay correct for modules that import
+  functions.
+- Malformed `contractspecv0` / `contractmetav0` custom sections now fail with
+  the section name in the error instead of being silently discarded.
+- Invalid WebAssembly input reports `not a valid WebAssembly binary` instead
+  of a bare validator message.
 - Restore the WebSocket RPC client (`rpc::ws`) after the merge of `main`
   dropped its `AppError` variants and `resolve_ws_endpoint`, which broke
   compilation and red-flagged every CI job.
