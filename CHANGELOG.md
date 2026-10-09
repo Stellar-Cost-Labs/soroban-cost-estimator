@@ -68,6 +68,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Restore the `cache stats` subcommand wiring that a CLI refactor merge
+  dropped, leaving `cmd_cache_stats` unreachable dead code.
+- WASM function signatures are now resolved against the *defined* function
+  index space, so export arities stay correct for modules that import
+  functions.
+- Malformed `contractspecv0` / `contractmetav0` custom sections now fail with
+  the section name in the error instead of being silently discarded.
+- Invalid WebAssembly input reports `not a valid WebAssembly binary` instead
+  of a bare validator message.
 - Restore the WebSocket RPC client (`rpc::ws`) after the merge of `main`
   dropped its `AppError` variants and `resolve_ws_endpoint`, which broke
   compilation and red-flagged every CI job.

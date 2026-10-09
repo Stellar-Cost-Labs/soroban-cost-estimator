@@ -12,6 +12,7 @@ fn sample_report() -> CostReport {
         function: "increment".to_string(),
         wasm_hash: "abc123def456".to_string(),
         wasm_size: 14_432,
+        wasm_sections: Vec::new(),
         cpu_instructions: 532_502,
         memory_bytes: 0,
         tx_size: 156,
@@ -46,6 +47,7 @@ fn empty_report() -> CostReport {
         function: "(wasm upload)".to_string(),
         wasm_hash: "0000000000000000".to_string(),
         wasm_size: 0,
+        wasm_sections: Vec::new(),
         cpu_instructions: 0,
         memory_bytes: 0,
         tx_size: 0,
@@ -75,6 +77,18 @@ fn empty_report() -> CostReport {
     }
 }
 
+/// The same report, but carrying a real WASM section size breakdown so the
+/// table and JSON renderers are exercised with section data present.
+fn section_report() -> CostReport {
+    let bytes = std::fs::read("tests/fixtures/contract.wasm").expect("fixture readable");
+    let breakdown = soroban_cost_estimator::wasm::parser::section_size_breakdown(&bytes)
+        .expect("fixture is valid WASM");
+    let mut report = sample_report();
+    report.wasm_size = bytes.len() as u64;
+    report.wasm_sections = breakdown.sections;
+    report
+}
+
 #[test]
 fn test_table_formatter_snapshots() {
     let report = sample_report();
@@ -82,6 +96,26 @@ fn test_table_formatter_snapshots() {
 
     insta::assert_snapshot!("table_formatter_sample", TableFormatter.format(&report));
     insta::assert_snapshot!("table_formatter_empty", TableFormatter.format(&empty));
+}
+
+/// A report carrying a real section breakdown renders the per-section size
+/// table (issue #312).
+#[test]
+fn test_table_formatter_section_breakdown_snapshot() {
+    insta::assert_snapshot!(
+        "table_formatter_sections",
+        TableFormatter.format(&section_report())
+    );
+}
+
+/// The section breakdown also reaches the JSON output as a `section_sizes`
+/// map (issue #312).
+#[test]
+fn test_json_formatter_section_breakdown_snapshot() {
+    insta::assert_snapshot!(
+        "json_formatter_sections",
+        JsonFormatter.format(&section_report())
+    );
 }
 
 #[test]
@@ -120,6 +154,7 @@ fn batch_report(function: &str, cpu: u64, fee_stroops: i64, writes: u32) -> Cost
         function: function.to_string(),
         wasm_hash: "abc123def456".to_string(),
         wasm_size: 14_432,
+        wasm_sections: Vec::new(),
         cpu_instructions: cpu,
         memory_bytes: 0,
         tx_size: 156,
