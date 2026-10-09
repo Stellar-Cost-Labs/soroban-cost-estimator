@@ -1,7 +1,7 @@
-use comfy_table::{Cell, CellAlignment, Table};
+use comfy_table::{Cell, CellAlignment, Color, Table};
 
 use crate::report::fee_calc::{FeeBreakdown, FeeRates};
-use crate::wasm::parser::{ContractMeta, format_contract_meta};
+use crate::wasm::parser::{ContractMeta, SectionSize, format_contract_meta};
 
 // fee_percentage removed since we now use the precalculated exact percentages
 
@@ -148,6 +148,347 @@ fn render_bar(ratio: f64, width: usize) -> String {
     bar
 }
 
+/// Percentage of a protocol limit at which a [`ResourceWarning`] is raised.
+pub const RESOURCE_WARNING_THRESHOLD_PERCENT: u64 = 80;
+
+/// The subset of the network's resource-limit configuration needed to warn
+/// when a simulation approaches protocol ceilings.
+///
+/// Values mirror `ConfigSettingContractComputeV0`,
+/// `ConfigSettingContractLedgerCostV0`, and `ConfigSettingContractBandwidthV0`.
+/// A field is `None` when the corresponding config setting was unavailable —
+/// that check is then skipped rather than comparing against a bogus zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NetworkConfig {
+    /// `ConfigSettingContractComputeV0.tx_max_instructions`.
+    pub tx_max_instructions: Option<u64>,
+    /// `ConfigSettingContractLedgerCostV0.tx_max_disk_read_entries`.
+    pub tx_max_read_entries: Option<u64>,
+    /// `ConfigSettingContractLedgerCostV0.tx_max_write_ledger_entries`.
+    pub tx_max_write_entries: Option<u64>,
+    /// `ConfigSettingContractLedgerCostV0.tx_max_disk_read_bytes`.
+    pub tx_max_read_bytes: Option<u64>,
+    /// `ConfigSettingContractLedgerCostV0.tx_max_write_bytes`.
+    pub tx_max_write_bytes: Option<u64>,
+    /// `ConfigSettingContractBandwidthV0.tx_max_size_bytes`.
+    pub tx_max_size: Option<u64>,
+}
+
+impl NetworkConfig {
+    /// Build the limit set from a config snapshot.
+    ///
+    /// Missing sections leave the corresponding fields `None`, which disables
+    /// their checks instead of treating an unknown limit as zero. Limits that
+    /// are non-positive in the config are likewise treated as unknown.
+    #[must_use]
+    pub fn from_snapshot(snapshot: &crate::config_snapshot::model::ConfigSnapshot) -> Self {
+        let positive_u64 = |value: i64| u64::try_from(value).ok().filter(|v| *v > 0);
+        let positive_u32 = |value: u32| Some(u64::from(value)).filter(|v| *v > 0);
+
+        let mut config = Self::default();
+        if let Some(compute) = &snapshot.contract_compute {
+            config.tx_max_instructions = positive_u64(compute.tx_max_instructions);
+        }
+        if let Some(cost) = &snapshot.contract_ledger_cost {
+            config.tx_max_read_entries = positive_u32(cost.tx_max_disk_read_entries);
+            config.tx_max_write_entries = positive_u32(cost.tx_max_write_ledger_entries);
+            config.tx_max_read_bytes = positive_u32(cost.tx_max_disk_read_bytes);
+            config.tx_max_write_bytes = positive_u32(cost.tx_max_write_bytes);
+        }
+        if let Some(bandwidth) = &snapshot.contract_bandwidth {
+            config.tx_max_size = positive_u32(bandwidth.tx_max_size_bytes);
+        }
+        config
+    }
+}
+
+/// A warning that a simulated resource is approaching or exceeding a
+/// protocol limit.
+///
+/// `percent` is computed with integer arithmetic only (floor of
+/// `used * 100 / limit`), so it is stable across platforms and never depends
+/// on floating-point rounding.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResourceWarning {
+    /// Machine-readable resource key (e.g. `"cpu_instructions"`).
+    pub resource: String,
+    /// Human-readable resource label (e.g. `"CPU instructions"`).
+    pub label: String,
+    /// Amount consumed by the simulation.
+    pub used: u64,
+    /// Protocol limit for this resource.
+    pub limit: u64,
+    /// Percentage of the limit consumed, floored to a whole percent.
+    pub percent: u32,
+    /// Human-readable explanation suitable for a warning banner.
+    pub message: String,
+}
+
+/// Compare a cost report against network resource limits and return a warning
+/// for every resource at or above
+/// [`RESOURCE_WARNING_THRESHOLD_PERCENT`] of its limit.
+///
+/// Checks run in a fixed order (CPU, entries, bytes, tx size) so output is
+/// deterministic. Resources whose limit is unknown (`None`) or non-positive
+/// are skipped.
+#[must_use]
+pub fn check_resource_limits(report: &CostReport, config: &NetworkConfig) -> Vec<ResourceWarning> {
+    check_resource_limits_raw(
+        report.cpu_instructions,
+        report.read_entries,
+        report.write_entries,
+        report.read_bytes,
+        report.write_bytes,
+        report.tx_size,
+        config,
+    )
+}
+
+/// Threshold check against raw resource values, for callers that hold the
+/// simulator's output before a full [`CostReport`] has been assembled.
+#[must_use]
+pub fn check_resource_limits_raw(
+    cpu_instructions: u64,
+    read_entries: u32,
+    write_entries: u32,
+    read_bytes: u32,
+    write_bytes: u32,
+    tx_size: u32,
+    config: &NetworkConfig,
+) -> Vec<ResourceWarning> {
+    let mut warnings: Vec<ResourceWarning> = Vec::new();
+    push_resource_warning(
+        &mut warnings,
+        "cpu_instructions",
+        "CPU instructions",
+        cpu_instructions,
+        config.tx_max_instructions,
+    );
+    push_resource_warning(
+        &mut warnings,
+        "read_entries",
+        "Ledger read entries",
+        u64::from(read_entries),
+        config.tx_max_read_entries,
+    );
+    push_resource_warning(
+        &mut warnings,
+        "write_entries",
+        "Ledger write entries",
+        u64::from(write_entries),
+        config.tx_max_write_entries,
+    );
+    push_resource_warning(
+        &mut warnings,
+        "read_bytes",
+        "Ledger read bytes",
+        u64::from(read_bytes),
+        config.tx_max_read_bytes,
+    );
+    push_resource_warning(
+        &mut warnings,
+        "write_bytes",
+        "Ledger write bytes",
+        u64::from(write_bytes),
+        config.tx_max_write_bytes,
+    );
+    push_resource_warning(
+        &mut warnings,
+        "tx_size",
+        "Transaction size",
+        u64::from(tx_size),
+        config.tx_max_size,
+    );
+    warnings
+}
+
+/// Append a warning for `resource` when `used` is at or above the threshold
+/// of `limit`. No-op when the limit is unknown or non-positive.
+fn push_resource_warning(
+    out: &mut Vec<ResourceWarning>,
+    resource: &str,
+    label: &str,
+    used: u64,
+    limit: Option<u64>,
+) {
+    let Some(limit) = limit else {
+        return;
+    };
+    if limit == 0 {
+        return;
+    }
+    // Integer-only threshold comparison: used / limit >= threshold / 100.
+    if used.saturating_mul(100) < limit.saturating_mul(RESOURCE_WARNING_THRESHOLD_PERCENT) {
+        return;
+    }
+    let percent = u32::try_from(used.saturating_mul(100) / limit).unwrap_or(u32::MAX);
+    out.push(ResourceWarning {
+        resource: resource.to_string(),
+        label: label.to_string(),
+        used,
+        limit,
+        percent,
+        message: format!("{label} at {percent}% of the network limit ({used} of {limit})"),
+    });
+}
+
+/// Render resource-limit warnings as a human-readable banner.
+///
+/// Returns an empty string when there is nothing to warn about, so callers can
+/// append the result unconditionally without leaving a stray section header.
+#[must_use]
+pub fn format_resource_warnings(warnings: &[ResourceWarning]) -> String {
+    if warnings.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\nResource limit warnings:\n");
+    for warning in warnings {
+        out.push_str(&format!("  - {}\n", warning.message));
+    }
+    out
+}
+
+/// Direction of a historical fee change relative to the current run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CostTrend {
+    /// The historical fee is lower than the current run (cost decreased).
+    Improvement,
+    /// The historical fee is higher than the current run (cost increased).
+    Regression,
+    /// The historical fee equals the current run.
+    Unchanged,
+}
+
+impl CostTrend {
+    /// Classify a `delta = historical - current` fee difference.
+    #[must_use]
+    pub fn for_delta(delta_stroops: i64) -> Self {
+        match delta_stroops.cmp(&0) {
+            std::cmp::Ordering::Greater => Self::Regression,
+            std::cmp::Ordering::Less => Self::Improvement,
+            std::cmp::Ordering::Equal => Self::Unchanged,
+        }
+    }
+}
+
+/// One previous run of the same contract function, alongside its fee delta
+/// against the current run.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HistoryEntry {
+    /// ISO-8601 timestamp of the historical estimate.
+    pub timestamp: String,
+    /// Ledger sequence at the time of the historical estimate.
+    pub ledger: u32,
+    /// CPU instructions consumed by the historical estimate.
+    pub cpu_instructions: u64,
+    /// Total fee of the historical estimate, in stroops.
+    pub total_stroops: i64,
+    /// Total fee of the historical estimate, in XLM.
+    pub total_xlm: String,
+    /// `historical - current` in stroops: positive means a regression.
+    pub delta_stroops: i64,
+    /// Trend classification derived from `delta_stroops`.
+    pub trend: CostTrend,
+}
+
+/// Build [`HistoryEntry`] records from previous runs, computing each one's
+/// delta against the current run's total fee.
+///
+/// Entries are returned in the order supplied (callers pass them
+/// newest-first) with `delta_stroops = entry_fee - current_fee`.
+#[must_use]
+pub fn build_history_entries(
+    current_total_stroops: i64,
+    current_xlm_precision: u32,
+    runs: &[HistoricalRun],
+) -> Vec<HistoryEntry> {
+    runs.iter()
+        .map(|run| {
+            let delta_stroops = run.total_stroops.saturating_sub(current_total_stroops);
+            HistoryEntry {
+                timestamp: run.timestamp.clone(),
+                ledger: run.ledger,
+                cpu_instructions: run.cpu_instructions,
+                total_stroops: run.total_stroops,
+                total_xlm: crate::report::fee_calc::stroops_to_xlm(
+                    run.total_stroops,
+                    current_xlm_precision,
+                ),
+                delta_stroops,
+                trend: CostTrend::for_delta(delta_stroops),
+            }
+        })
+        .collect()
+}
+
+/// A raw previous run used to build [`HistoryEntry`] records.
+///
+/// Kept separate from [`HistoryEntry`] so callers can supply cache rows
+/// without knowing the current run's fee.
+#[derive(Debug, Clone)]
+pub struct HistoricalRun {
+    /// ISO-8601 timestamp of the run.
+    pub timestamp: String,
+    /// Ledger sequence at the time of the run.
+    pub ledger: u32,
+    /// CPU instructions consumed.
+    pub cpu_instructions: u64,
+    /// Total fee in stroops.
+    pub total_stroops: i64,
+}
+
+/// Render the historical cost trend table.
+///
+/// Regressions (cost increases vs the current run) are shown in red,
+/// improvements (cost reductions) in green, and unchanged runs in yellow.
+/// Returns an empty string when there is no history, so callers can append the
+/// result unconditionally.
+#[must_use]
+pub fn format_cost_history(entries: &[HistoryEntry]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+
+    let mut table = Table::new();
+    table.set_header(vec![
+        "Timestamp",
+        "Ledger",
+        "CPU Instructions",
+        "Total Fee",
+        "Delta vs current",
+    ]);
+
+    for entry in entries {
+        let (delta_text, color) = match entry.trend {
+            CostTrend::Regression => (format!("+{}", entry.delta_stroops), Color::Red),
+            CostTrend::Improvement => (format!("{}", entry.delta_stroops), Color::Green),
+            CostTrend::Unchanged => ("0".to_string(), Color::Yellow),
+        };
+        table.add_row(vec![
+            Cell::new(&entry.timestamp),
+            Cell::new(entry.ledger),
+            Cell::new(entry.cpu_instructions),
+            Cell::new(format!("{} ({})", entry.total_stroops, entry.total_xlm)),
+            Cell::new(delta_text).fg(color),
+        ]);
+    }
+
+    let mut out = String::from("\nCost history (previous runs, newest first):\n");
+    out.push_str(&table.to_string());
+    out.push('\n');
+    out
+}
+
+/// Serde helper: `wasm_size` is omitted when `0` so a report built without a
+/// local WASM file keeps the same JSON shape it had before the field existed.
+///
+/// `serde` requires the predicate to take its argument by reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
 /// A complete cost report for a single contract invocation.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CostReport {
@@ -160,8 +501,12 @@ pub struct CostReport {
     /// fee delta, and used by [`generate_optimization_tips`] to flag an
     /// oversized binary. `0` when the caller did not supply it; `#[serde(default)]`
     /// so reports serialized before this field existed still deserialize.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub wasm_size: u64,
+    /// Byte size breakdown of the WASM file, largest section first. Empty
+    /// when the report was not built from a local WASM file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wasm_sections: Vec<SectionSize>,
     /// CPU instructions consumed.
     pub cpu_instructions: u64,
     /// Memory bytes used.
@@ -194,6 +539,16 @@ pub struct CostReport {
     /// serialized output; `None` when the rates were unavailable.
     #[serde(skip)]
     pub rates: Option<FeeRates>,
+    /// Resource-limit warnings for this run (#322). Always serialized so JSON
+    /// consumers see a stable `warnings` array (empty when nothing is near a
+    /// limit).
+    #[serde(default)]
+    pub warnings: Vec<ResourceWarning>,
+    /// Historical trend entries (#321). `None` unless the caller requested
+    /// history (via `--history`); when requested it is always an array in JSON
+    /// output, possibly empty when there are no previous runs to compare.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<Vec<HistoryEntry>>,
     /// Optional batch invocation cost projections.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub projections: Option<Vec<CostProjection>>,
@@ -950,7 +1305,53 @@ pub fn format_distribution_box(distribution: &FeeDistribution, precision: u32) -
     out
 }
 
+/// Renders the WASM section size breakdown carried by a [`CostReport`] as a
+/// table, largest section first.
+///
+/// Each row shows the section's full footprint (header + contents) and its
+/// share of the file, so the rows add up to the WASM size shown in the
+/// report header. WASM size drives upload fees and rent, and a bloated
+/// `contractspecv0` or oversized data segment shows up here immediately.
+#[must_use]
+pub fn format_section_size_table(sections: &[SectionSize]) -> String {
+    if sections.is_empty() {
+        return String::new();
+    }
+    let section_bytes: usize = sections
+        .iter()
+        .filter(|s| s.id.is_some())
+        .map(|s| s.total_size)
+        .sum();
+    let total: usize = sections.iter().map(|s| s.total_size).sum();
+    let mut out = format!(
+        "WASM sections ({} bytes of section data, largest first):\n",
+        section_bytes
+    );
+    let mut table = Table::new();
+    if crate::cli::should_colorize() {
+        table.enforce_styling();
+    } else {
+        table.force_no_tty();
+    }
+    table.set_header(vec!["Section", "Bytes", "Share"]);
+    for entry in sections {
+        table.add_row(vec![
+            &entry.name,
+            &entry.total_size.to_string(),
+            &format!("{:.1}%", entry.percent),
+        ]);
+    }
+    out.push_str(&table.to_string());
+    out.push('\n');
+    let shares: f64 = sections.iter().map(|s| s.percent).sum();
+    out.push_str(&format!(
+        "  {total} bytes accounted for ({shares:.1}% of the file)\n"
+    ));
+    out
+}
+
 /// Formats a cost report as a human-readable table.
+#[allow(clippy::too_many_lines)]
 pub fn format_report_table(report: &CostReport) -> String {
     let mut output = String::new();
 
@@ -964,6 +1365,9 @@ pub fn format_report_table(report: &CostReport) -> String {
         format_ledger_sequence(report.ledger)
     ));
     output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
+    if report.wasm_size > 0 {
+        output.push_str(&format!("WASM size: {} bytes\n", report.wasm_size));
+    }
     output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
 
     // Contract metadata from the WASM `contractmeta` section: present or
@@ -994,6 +1398,10 @@ pub fn format_report_table(report: &CostReport) -> String {
 
     output.push_str(&table.to_string());
     output.push('\n');
+
+    if !report.wasm_sections.is_empty() {
+        output.push_str(&format_section_size_table(&report.wasm_sections));
+    }
 
     output.push_str("\nFee Breakdown:\n\n");
     let pct = &report.fee.fee_percentages;
@@ -1059,6 +1467,14 @@ pub fn format_report_table(report: &CostReport) -> String {
     // ASCII bar chart for visual cost breakdown
     output.push_str(&render_fee_bar_chart(&report.fee, DEFAULT_CHART_WIDTH));
 
+    // Resource-limit warnings (#322) — only when something nears a ceiling.
+    output.push_str(&format_resource_warnings(&report.warnings));
+
+    // Historical trend table (#321) — only populated with `--history`.
+    if let Some(history) = &report.history {
+        output.push_str(&format_cost_history(history));
+    }
+
     if let Some(ref projections) = report.projections {
         output.push_str(&format_projections_table(projections));
     }
@@ -1069,6 +1485,271 @@ pub fn format_report_table(report: &CostReport) -> String {
 /// Formats a cost report as a JSON string.
 pub fn format_report_json(report: &CostReport) -> String {
     serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Per-contract row in a multi-contract batch cost summary.
+///
+/// One row is produced for every `.wasm` file passed to a batch run (repeated
+/// `--wasm` flags or `--wasm-dir`). Fields are optional because a contract may
+/// fail part-way (unparseable file, failed upload simulation, or failed
+/// per-function simulation); the batch keeps going and records the reason in
+/// `error` rather than aborting the whole run.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ContractCostSummary {
+    /// WASM path exactly as given on the command line (or discovered under
+    /// `--wasm-dir`).
+    pub path: String,
+    /// SHA-256 of the WASM bytes (hex). `None` when the file could not be
+    /// parsed at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wasm_hash: Option<String>,
+    /// Number of exported functions discovered in the module.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_count: Option<usize>,
+    /// Cost of the bytecode-upload envelope, in stroops.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_cost_stroops: Option<i64>,
+    /// Lowest per-function invocation fee observed, in stroops.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_invocation_fee_stroops: Option<i64>,
+    /// Highest per-function invocation fee observed, in stroops.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_invocation_fee_stroops: Option<i64>,
+    /// How many functions were successfully simulated (excludes functions with
+    /// parameters, which need explicit `--arg` values, and functions whose
+    /// simulation failed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub functions_simulated: Option<usize>,
+    /// Human-readable reason the contract could not be fully evaluated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl ContractCostSummary {
+    /// Build a row for a contract whose WASM could not be read or parsed.
+    #[must_use]
+    pub fn unloadable(path: impl Into<String>, error: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            wasm_hash: None,
+            function_count: None,
+            upload_cost_stroops: None,
+            min_invocation_fee_stroops: None,
+            max_invocation_fee_stroops: None,
+            functions_simulated: None,
+            error: Some(error.into()),
+        }
+    }
+
+    /// Whether the contract was evaluated without any recorded error.
+    #[must_use]
+    pub fn is_ok(&self) -> bool {
+        self.error.is_none()
+    }
+
+    /// One-word status for tabular output: `ok`, `partial`, or `error`.
+    #[must_use]
+    pub fn status(&self) -> &'static str {
+        match (self.wasm_hash.is_some(), self.error.is_some()) {
+            (false, _) => "error",
+            (true, true) => "partial",
+            (true, false) => "ok",
+        }
+    }
+}
+
+/// Aggregated result of a multi-contract (`--wasm-dir` / repeated `--wasm`)
+/// batch run.
+///
+/// `succeeded` counts contracts evaluated without any recorded error;
+/// `failed` counts contracts that hit at least one error, whether the file was
+/// unreadable, the upload simulation failed, or a function simulation failed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BatchCostReport {
+    /// Network every contract was simulated against.
+    pub network: String,
+    /// Per-contract summary rows, in command-line order.
+    pub contracts: Vec<ContractCostSummary>,
+    /// Total number of contracts attempted.
+    pub total_contracts: usize,
+    /// Contracts evaluated without errors.
+    pub succeeded: usize,
+    /// Contracts that recorded at least one error.
+    pub failed: usize,
+}
+
+impl BatchCostReport {
+    /// Build a batch report, deriving the success/failure totals from the rows.
+    #[must_use]
+    pub fn new(network: impl Into<String>, contracts: Vec<ContractCostSummary>) -> Self {
+        let total_contracts = contracts.len();
+        let failed = contracts.iter().filter(|c| !c.is_ok()).count();
+        let succeeded = total_contracts - failed;
+        Self {
+            network: network.into(),
+            contracts,
+            total_contracts,
+            succeeded,
+            failed,
+        }
+    }
+}
+
+/// Render an optional numeric field for tabular output, using `-` for values
+/// that were not produced (parse or simulation failure).
+#[must_use]
+pub fn optional_num<T: std::fmt::Display>(value: Option<T>) -> String {
+    value.map_or_else(|| "-".to_string(), |v| v.to_string())
+}
+
+/// Formats a batch cost report as a human-readable summary table.
+///
+/// The table shows, per contract, its function count, bytecode-upload cost,
+/// and the min/max invocation fee. Contracts that failed are marked in the
+/// status column and their reasons are listed underneath the table.
+#[must_use]
+pub fn format_batch_report_table(report: &BatchCostReport) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "Batch cost summary — {} contract(s) on {}\n\n",
+        report.total_contracts, report.network
+    ));
+
+    let mut table = Table::new();
+    table.set_header(vec![
+        "Contract",
+        "Functions",
+        "Upload (stroops)",
+        "Min Fee (stroops)",
+        "Max Fee (stroops)",
+        "Status",
+    ]);
+
+    for contract in &report.contracts {
+        table.add_row(vec![
+            Cell::new(&contract.path),
+            Cell::new(optional_num(contract.function_count)),
+            Cell::new(optional_num(contract.upload_cost_stroops)),
+            Cell::new(optional_num(contract.min_invocation_fee_stroops)),
+            Cell::new(optional_num(contract.max_invocation_fee_stroops)),
+            Cell::new(contract.status()),
+        ]);
+    }
+
+    output.push_str(&table.to_string());
+    output.push('\n');
+    output.push_str(&format!(
+        "\n{} succeeded, {} failed.\n",
+        report.succeeded, report.failed
+    ));
+
+    let errors: Vec<&ContractCostSummary> = report
+        .contracts
+        .iter()
+        .filter(|c| c.error.is_some())
+        .collect();
+    if !errors.is_empty() {
+        output.push_str("\nErrors:\n");
+        for contract in errors {
+            output.push_str(&format!(
+                "  - {}: {}\n",
+                contract.path,
+                contract.error.as_deref().unwrap_or("unknown error")
+            ));
+        }
+    }
+
+    output
+}
+
+/// Formats a batch cost report as a JSON string.
+#[must_use]
+pub fn format_batch_report_json(report: &BatchCostReport) -> String {
+    serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Formats a batch cost report as a CSV document (header + one row per
+/// contract).
+#[must_use]
+pub fn format_batch_report_csv(report: &BatchCostReport) -> String {
+    let mut output = String::from(
+        "path,wasm_hash,function_count,upload_cost_stroops,min_invocation_fee_stroops,\
+         max_invocation_fee_stroops,functions_simulated,status,error\n",
+    );
+    for contract in &report.contracts {
+        let fields = [
+            contract.path.clone(),
+            contract.wasm_hash.clone().unwrap_or_default(),
+            optional_num(contract.function_count),
+            optional_num(contract.upload_cost_stroops),
+            optional_num(contract.min_invocation_fee_stroops),
+            optional_num(contract.max_invocation_fee_stroops),
+            optional_num(contract.functions_simulated),
+            contract.status().to_string(),
+            contract.error.clone().unwrap_or_default(),
+        ];
+        let row = fields
+            .iter()
+            .map(|f| csv_escape_batch(f))
+            .collect::<Vec<_>>()
+            .join(",");
+        output.push_str(&row);
+        output.push('\n');
+    }
+    output
+}
+
+/// Escape a batch CSV field per RFC 4180.
+fn csv_escape_batch(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+/// Formats a batch cost report as a GitHub-flavored Markdown document.
+#[must_use]
+pub fn format_batch_report_markdown(report: &BatchCostReport) -> String {
+    let mut output = String::new();
+    output.push_str("## Batch Cost Summary\n\n");
+    output.push_str(&format!("- **Network:** {}\n", report.network));
+    output.push_str(&format!(
+        "- **Contracts:** {} ({} succeeded, {} failed)\n\n",
+        report.total_contracts, report.succeeded, report.failed
+    ));
+    output.push_str("| Contract | Functions | Upload (stroops) | Min Fee (stroops) | ");
+    output.push_str("Max Fee (stroops) | Status |\n");
+    output.push_str("| --- | --- | --- | --- | --- | --- |\n");
+    for contract in &report.contracts {
+        output.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} | {} |\n",
+            contract.path,
+            optional_num(contract.function_count),
+            optional_num(contract.upload_cost_stroops),
+            optional_num(contract.min_invocation_fee_stroops),
+            optional_num(contract.max_invocation_fee_stroops),
+            contract.status(),
+        ));
+    }
+
+    let errors: Vec<&ContractCostSummary> = report
+        .contracts
+        .iter()
+        .filter(|c| c.error.is_some())
+        .collect();
+    if !errors.is_empty() {
+        output.push_str("\n### Errors\n\n");
+        for contract in errors {
+            output.push_str(&format!(
+                "- `{}`: {}\n",
+                contract.path,
+                contract.error.as_deref().unwrap_or("unknown error")
+            ));
+        }
+    }
+
+    output
 }
 
 /// Signed change of a single metric between two estimate runs.
@@ -1375,12 +2056,74 @@ pub fn format_projections_table(projections: &[CostProjection]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wasm::parser::SectionInfo;
+
+    #[test]
+    fn test_batch_report_totals_and_status() {
+        let contracts = vec![
+            ContractCostSummary {
+                path: "a.wasm".to_string(),
+                wasm_hash: Some("aa".to_string()),
+                function_count: Some(3),
+                upload_cost_stroops: Some(1_000),
+                min_invocation_fee_stroops: Some(200),
+                max_invocation_fee_stroops: Some(400),
+                functions_simulated: Some(3),
+                error: None,
+            },
+            ContractCostSummary::unloadable("b.wasm", "failed to load WASM: bad magic"),
+        ];
+        let report = BatchCostReport::new("testnet", contracts);
+        assert_eq!(report.total_contracts, 2);
+        assert_eq!(report.succeeded, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.contracts[0].status(), "ok");
+        assert_eq!(report.contracts[1].status(), "error");
+    }
+
+    #[test]
+    fn test_format_batch_report_table_lists_error() {
+        let report = BatchCostReport::new(
+            "testnet",
+            vec![ContractCostSummary::unloadable("bad.wasm", "boom")],
+        );
+        let out = format_batch_report_table(&report);
+        assert!(out.contains("bad.wasm"));
+        assert!(out.contains("Errors:"));
+        assert!(out.contains("boom"));
+        assert!(out.contains("0 succeeded, 1 failed."));
+    }
+
+    #[test]
+    fn test_format_batch_report_json_is_parseable() {
+        let report = BatchCostReport::new(
+            "testnet",
+            vec![ContractCostSummary {
+                path: "a.wasm".to_string(),
+                wasm_hash: Some("aa".to_string()),
+                function_count: Some(2),
+                upload_cost_stroops: Some(1_000),
+                min_invocation_fee_stroops: Some(200),
+                max_invocation_fee_stroops: Some(400),
+                functions_simulated: Some(2),
+                error: None,
+            }],
+        );
+        let json = format_batch_report_json(&report);
+        let parsed: serde_json::Value = match serde_json::from_str(&json) {
+            Ok(value) => value,
+            Err(err) => panic!("batch report JSON must parse: {err}"),
+        };
+        assert_eq!(parsed["total_contracts"], 1);
+        assert_eq!(parsed["contracts"][0]["function_count"], 2);
+    }
 
     fn report_with_rates(rates: FeeRates) -> CostReport {
         CostReport {
             function: "increment".to_string(),
             wasm_hash: "abc".to_string(),
             wasm_size: 14_432,
+            wasm_sections: Vec::new(),
             cpu_instructions: 532_502,
             memory_bytes: 0,
             tx_size: 156,
@@ -1403,6 +2146,8 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
             rates: Some(rates),
+            warnings: Vec::new(),
+            history: None,
             projections: None,
             contract_meta: ContractMeta::default(),
         }
@@ -1499,6 +2244,7 @@ mod tests {
             function: "(wasm upload)".to_string(),
             wasm_hash: "0000".to_string(),
             wasm_size: 0,
+            wasm_sections: Vec::new(),
             cpu_instructions: 0,
             memory_bytes: 0,
             tx_size: 0,
@@ -1521,6 +2267,8 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 0,
             rates: None,
+            warnings: Vec::new(),
+            history: None,
             projections: None,
             contract_meta: ContractMeta::default(),
         };
@@ -1535,6 +2283,66 @@ mod tests {
         assert_eq!(parsed["write_entries"], 0);
         assert_eq!(parsed["read_bytes"], 0);
         assert_eq!(parsed["write_bytes"], 0);
+        assert!(
+            parsed.get("wasm_size").is_none(),
+            "reports without a local file keep their original shape"
+        );
+    }
+
+    #[test]
+    fn test_format_report_table_renders_section_breakdown() {
+        let mut report = report_with_rates(FeeRates {
+            fee_per_10k_insns: 30,
+            fee_per_read_entry: 1,
+            fee_per_write_entry: 1,
+            fee_per_read_1kb: 0,
+            fee_per_1kb: 1,
+        });
+        report.wasm_size = 44;
+        // 44 byte module: 8 byte header, then type at 10..16 (8 bytes with
+        // its header) and code at 18..44 (28 bytes with its header).
+        report.wasm_sections = crate::wasm::parser::SectionSizeBreakdown::from_sections(
+            &[
+                SectionInfo {
+                    id: 10,
+                    name: "code".to_string(),
+                    custom: false,
+                    offset: 18,
+                    end: 44,
+                    size: 26,
+                    header_size: 2,
+                },
+                SectionInfo {
+                    id: 1,
+                    name: "type".to_string(),
+                    custom: false,
+                    offset: 10,
+                    end: 16,
+                    size: 6,
+                    header_size: 2,
+                },
+            ],
+            44,
+        )
+        .sections;
+
+        let table_out = format_report_table(&report);
+        assert!(
+            table_out.contains("WASM size: 44 bytes"),
+            "got: {table_out}"
+        );
+        assert!(table_out.contains("WASM sections"), "got: {table_out}");
+        assert!(table_out.contains("code"), "got: {table_out}");
+        assert!(table_out.contains("63.6%"), "got: {table_out}");
+        assert!(
+            table_out.contains("44 bytes accounted for (100.0% of the file)"),
+            "got: {table_out}"
+        );
+    }
+
+    #[test]
+    fn test_format_section_size_table_is_empty_without_sections() {
+        assert_eq!(format_section_size_table(&[]), "");
     }
 
     /// A breakdown with a clear 65/20/5/10 split so chart output is easy to

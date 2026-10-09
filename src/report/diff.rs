@@ -276,6 +276,7 @@ mod tests {
             function: "increment".to_string(),
             wasm_hash: format!("hash-{wasm_size}"),
             wasm_size,
+            wasm_sections: Vec::new(),
             cpu_instructions: cpu,
             memory_bytes: 1_024,
             tx_size: 156,
@@ -298,6 +299,8 @@ mod tests {
             network: "testnet".to_string(),
             rpc_latency_ms: 42,
             rates: None,
+            warnings: Vec::new(),
+            history: None,
             projections: None,
             contract_meta: crate::wasm::parser::ContractMeta::default(),
         }
