@@ -46,24 +46,6 @@ fn run_cli_in_home(args: &[&str], home: Option<&Path>) -> (String, String, i32) 
     (stdout, stderr, code)
 }
 
-/// Runs the CLI with tracing output silenced (`RUST_LOG=error`) so stdout holds
-/// only the command's own report, which is what the `wasm info` assertions
-/// parse.
-fn run_cli_quiet(args: &[&str], home: &Path) -> (String, String, i32) {
-    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
-        .args(args)
-        .env("HOME", home)
-        .env("USERPROFILE", home)
-        .env("RUST_LOG", "error")
-        .output()
-        .expect("failed to run CLI");
-    (
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
-        output.status.code().unwrap_or(-1),
-    )
-}
-
 /// Creates a unique temporary directory for one test, removing any leftover
 /// from a previous run. Kept dependency-free on purpose — the crate has no
 /// dev-dependencies and this is all the isolation the suite needs.
@@ -352,7 +334,7 @@ fn test_cache_help() {
 #[test]
 fn test_cache_stats_empty_cache_succeeds() {
     let home = temp_home("cache-stats-empty");
-    let (stdout, stderr, code) = run_cli_quiet(&["cache", "stats"], &home);
+    let (stdout, stderr, code) = run_cli_quiet(&["cache", "stats"], Some(&home));
     assert_eq!(code, 0, "cache stats should exit 0; stderr: {stderr}");
     assert!(
         stdout.contains("Cache is empty"),
@@ -524,7 +506,7 @@ fn test_cache_stats_help() {
 
 #[test]
 fn test_cache_stats_on_empty_cache_succeeds() {
-    let home = temp_home("cache-stats-empty");
+    let home = temp_home("cache-stats-on-empty");
     let (stdout, stderr, code) = run_cli_in_home(&["cache", "stats"], Some(&home));
     assert_eq!(
         code, 0,
@@ -2124,8 +2106,10 @@ fn test_wasm_info_reports_absent_contract_meta() {
 #[test]
 fn test_wasm_info_nested_subcommand_reports_offline_metadata() {
     let home = temp_home("wasm-info-nested");
-    let (stdout, stderr, code) =
-        run_cli_quiet(&["wasm", "info", "tests/fixtures/contract.wasm"], &home);
+    let (stdout, stderr, code) = run_cli_quiet(
+        &["wasm", "info", "tests/fixtures/contract.wasm"],
+        Some(&home),
+    );
     assert_eq!(code, 0, "`wasm info` should succeed; stderr: {stderr}");
     assert!(stdout.contains("WASM info:"), "got: {stdout}");
     assert!(stdout.contains("Size:"), "got: {stdout}");
@@ -2153,7 +2137,7 @@ fn test_wasm_info_nested_json_emits_full_spec() {
     let home = temp_home("wasm-info-nested-json");
     let (stdout, stderr, code) = run_cli_quiet(
         &["wasm", "info", "tests/fixtures/contract.wasm", "--json"],
-        &home,
+        Some(&home),
     );
     assert_eq!(
         code, 0,
@@ -2250,8 +2234,10 @@ fn test_wasm_info_nested_rejects_non_wasm_file() {
     let path = home.join("not-a-wasm.bin");
     std::fs::write(&path, b"this is definitely not a wasm module").expect("write file");
 
-    let (stdout, stderr, code) =
-        run_cli_quiet(&["wasm", "info", path.to_str().expect("utf-8 path")], &home);
+    let (stdout, stderr, code) = run_cli_quiet(
+        &["wasm", "info", path.to_str().expect("utf-8 path")],
+        Some(&home),
+    );
     assert_ne!(code, 0, "invalid input should fail");
     assert!(
         stderr.contains("not a valid WebAssembly binary"),
@@ -2266,11 +2252,13 @@ fn test_wasm_info_nested_rejects_non_wasm_file() {
 #[test]
 fn test_wasm_info_nested_and_flat_agree() {
     let home = temp_home("wasm-info-both-forms");
-    let (nested, _, nested_code) =
-        run_cli_quiet(&["wasm", "info", "tests/fixtures/contract.wasm"], &home);
+    let (nested, _, nested_code) = run_cli_quiet(
+        &["wasm", "info", "tests/fixtures/contract.wasm"],
+        Some(&home),
+    );
     let (flat, _, flat_code) = run_cli_quiet(
         &["wasm-info", "--wasm", "tests/fixtures/contract.wasm"],
-        &home,
+        Some(&home),
     );
     assert_eq!(nested_code, 0);
     assert_eq!(flat_code, 0);

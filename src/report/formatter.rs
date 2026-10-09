@@ -203,6 +203,12 @@ impl TableFormatter {
         output.push_str(&table.to_string());
         output.push('\n');
 
+        if !report.wasm_sections.is_empty() {
+            output.push_str(&crate::report::cost_report::format_section_size_table(
+                &report.wasm_sections,
+            ));
+        }
+
         output.push_str("\nFee Breakdown:\n\n");
         output.push_str(&fee_table(report));
         output.push('\n');
@@ -304,6 +310,9 @@ impl ReportFormatter for JsonFormatter {
                     .unwrap_or(serde_json::Value::Null);
                 map.insert("suggestions".to_string(), tips);
                 map.insert("optimization_suggestions".to_string(), structured);
+            }
+            if !report.wasm_sections.is_empty() {
+                map.insert("section_sizes".to_string(), section_size_map(report));
             }
         }
         serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
@@ -593,6 +602,7 @@ mod tests {
             function: "increment".to_string(),
             wasm_hash: "abc123def456".to_string(),
             wasm_size: 14_432,
+            wasm_sections: Vec::new(),
             cpu_instructions: 532_502,
             memory_bytes: 0,
             tx_size: 156,
@@ -627,6 +637,7 @@ mod tests {
             function: "(wasm upload)".to_string(),
             wasm_hash: "0000000000000000".to_string(),
             wasm_size: 0,
+            wasm_sections: Vec::new(),
             cpu_instructions: 0,
             memory_bytes: 0,
             tx_size: 0,

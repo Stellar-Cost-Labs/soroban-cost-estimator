@@ -751,6 +751,8 @@ fn test_validate_wasm_limits_valid() {
         bytes: vec![0; 50],
         functions: vec![],
         has_spec: false,
+        spec_entries: vec![],
+        sections: vec![],
         contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
         start_function: None,
         memories: vec![soroban_cost_estimator::wasm::parser::MemoryInfo {
@@ -781,6 +783,8 @@ fn test_validate_wasm_limits_size_exceeded() {
         bytes: vec![0; 100],
         functions: vec![],
         has_spec: false,
+        spec_entries: vec![],
+        sections: vec![],
         contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
         start_function: None,
         memories: vec![],
@@ -813,6 +817,8 @@ fn test_validate_wasm_limits_initial_memory_exceeded() {
         bytes: vec![0; 10],
         functions: vec![],
         has_spec: false,
+        spec_entries: vec![],
+        sections: vec![],
         contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
         start_function: None,
         memories: vec![soroban_cost_estimator::wasm::parser::MemoryInfo {
@@ -849,6 +855,8 @@ fn test_validate_wasm_limits_max_memory_exceeded() {
         bytes: vec![0; 10],
         functions: vec![],
         has_spec: false,
+        spec_entries: vec![],
+        sections: vec![],
         contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
         start_function: None,
         memories: vec![soroban_cost_estimator::wasm::parser::MemoryInfo {
@@ -885,6 +893,8 @@ fn test_validate_wasm_limits_unbounded_memory_allowed() {
         bytes: vec![0; 10],
         functions: vec![],
         has_spec: false,
+        spec_entries: vec![],
+        sections: vec![],
         contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
         start_function: None,
         memories: vec![soroban_cost_estimator::wasm::parser::MemoryInfo {
