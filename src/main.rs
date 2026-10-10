@@ -416,6 +416,16 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 .await
             }
         }
+        cli::Command::Wasm { action } => match action {
+            cli::WasmAction::Info { wasm, json } => {
+                let format = match (args.format, json) {
+                    (Some(fmt), _) => fmt,
+                    (None, true) => cli::OutputFormat::Json,
+                    (None, false) => cli::OutputFormat::Table,
+                };
+                cmd_wasm_info(&wasm.to_string_lossy(), format, quiet)
+            }
+        },
         cli::Command::WasmInfo { wasm, json } => {
             let format = match (args.format, json) {
                 (Some(fmt), _) => fmt,
@@ -3407,6 +3417,16 @@ fn wasm_info_json(
         "has_debug_symbols": wasm_info.has_debug_symbols,
         "debug_symbol_bytes": wasm_info.debug_symbol_bytes,
         "estimated_size_reduction_percent": wasm_info.estimated_size_reduction_percent(),
+        "sections": wasm_info.sections.iter().map(|s| {
+            serde_json::json!({
+                "id": s.id,
+                "name": s.name,
+                "custom": s.custom,
+                "offset": s.offset,
+                "end": s.end,
+                "size": s.size,
+            })
+        }).collect::<Vec<_>>(),
         "contract_meta": {
             "name": wasm_info.contract_meta.name,
             "version": wasm_info.contract_meta.version,
