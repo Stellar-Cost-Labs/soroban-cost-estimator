@@ -2784,3 +2784,265 @@ fn test_legacy_database_without_io_column_still_loads() {
         );
     });
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Concurrent async access (Issue #361)
+//
+// `estimate-all` can simulate several functions at once and more than one CLI
+// process can share a cache directory, so the store must stay correct when
+// many writers and readers meet. The cache is a single SQLite database (WAL
+// journal mode, one process-wide write lock, `busy_timeout` plus retry
+// backoff on contention), so "no corruption" here means: every write is
+// all-or-nothing, every read deserializes into a complete entry, and the
+// database file passes SQLite's own integrity check afterwards. There are no
+// per-entry JSON files to check any more — the SQLite database replaced them —
+// so the file-level assertions below run against `cache.db` directly.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Concurrent async tasks the issue asks for.
+const CONCURRENT_ASYNC_TASKS: usize = 50;
+/// Entries each task writes and reads back.
+const ENTRIES_PER_ASYNC_TASK: usize = 5;
+
+/// Builds the runtime the async tasks run on.
+///
+/// The cache API is synchronous (`rusqlite`), so the tasks are
+/// `spawn_blocking`: the blocking pool is sized past the task count so all 50
+/// are genuinely in flight at once rather than queued behind the workers.
+fn concurrent_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .max_blocking_threads(CONCURRENT_ASYNC_TASKS * 2)
+        .enable_all()
+        .build()
+        .expect("build tokio runtime")
+}
+
+/// Opens the cache database directly, so a test asserts on the raw file rather
+/// than through the library that wrote it.
+fn raw_cache_db(home: &Path) -> rusqlite::Connection {
+    let db = home.join(".soroban-cost-estimator").join("cache.db");
+    rusqlite::Connection::open(&db).expect("open cache db for verification")
+}
+
+/// SQLite's own consistency check over the database file; `"ok"` means the
+/// file is intact.
+fn sqlite_integrity_check(conn: &rusqlite::Connection) -> String {
+    conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+        .expect("run PRAGMA integrity_check")
+}
+
+/// Runs a scalar `i64` query, for concise raw-database assertions.
+fn query_i64(conn: &rusqlite::Connection, sql: &str) -> i64 {
+    conn.query_row(sql, [], |row| row.get(0)).expect(sql)
+}
+
+/// Asserts that every column of an entry comes from the same save.
+///
+/// The concurrency tests stamp one generation number into four columns, so a
+/// torn read (half of one write, half of another) shows up as columns that
+/// disagree.
+#[track_caller]
+fn assert_entry_is_a_whole_generation(entry: &cache::CachedEstimate) {
+    assert_eq!(entry.network, "testnet");
+    assert!(entry.ledger >= 1, "unexpected generation: {entry:?}");
+    assert_eq!(
+        entry.total_stroops,
+        i64::from(entry.ledger) * 1_000,
+        "torn write: {entry:?}"
+    );
+    assert_eq!(entry.cpu_instructions, u64::from(entry.ledger));
+    assert_eq!(entry.memory_bytes, u64::from(entry.ledger) * 2);
+}
+
+/// 50 concurrent async tasks each write and read back their own entries.
+///
+/// Afterwards every entry must still be present and deserializable, the
+/// database must pass `PRAGMA integrity_check`, and no row may mix columns
+/// from different writes.
+#[test]
+fn test_fifty_concurrent_async_tasks_preserve_cache_integrity() {
+    with_temp_home(|home| {
+        let runtime = concurrent_runtime();
+        runtime.block_on(async {
+            let tasks: Vec<_> = (0..CONCURRENT_ASYNC_TASKS)
+                .map(|task| {
+                    tokio::task::spawn_blocking(move || {
+                        let wasm_hash = format!("async-hash-{task}");
+                        let function = format!("async-func-{task}");
+                        for entry in 0..ENTRIES_PER_ASYNC_TASK {
+                            let args = vec![format!("async-arg-{task}-{entry}")];
+                            let ledger = u32::try_from(entry).expect("entry index fits u32");
+
+                            cache::save_estimate(
+                                &wasm_hash,
+                                &function,
+                                &args,
+                                "testnet",
+                                ledger,
+                                1_000 + entry as i64,
+                                10_000 + entry as u64,
+                                500 + entry as u64,
+                                None,
+                                true,
+                            )
+                            .expect("concurrent async save");
+
+                            // Read straight back: only this task writes this
+                            // key, so the values must be exactly what it wrote.
+                            let loaded = cache::load_estimate(&wasm_hash, &function, &args)
+                                .expect("concurrent async load")
+                                .expect("an entry written by this task must load");
+                            assert_eq!(loaded.ledger, ledger);
+                            assert_eq!(loaded.total_stroops, 1_000 + entry as i64);
+                            assert_eq!(loaded.cpu_instructions, 10_000 + entry as u64);
+                            assert_eq!(loaded.memory_bytes, 500 + entry as u64);
+                            assert_eq!(loaded.network, "testnet");
+                        }
+                    })
+                })
+                .collect();
+
+            for result in futures_util::future::join_all(tasks).await {
+                result.expect("concurrent async task panicked");
+            }
+        });
+
+        let expected = CONCURRENT_ASYNC_TASKS * ENTRIES_PER_ASYNC_TASK;
+
+        // Every write survived and deserializes back into a valid entry.
+        let estimates =
+            cache::list_cached_estimates("testnet").expect("list after concurrent async writes");
+        assert_eq!(
+            estimates.len(),
+            expected,
+            "every concurrently written estimate should survive"
+        );
+        let statuses = cache::verify_cache().expect("verify after concurrent async writes");
+        assert_eq!(statuses.len(), expected);
+        assert!(
+            statuses.iter().all(|s| s.valid),
+            "concurrent async writes must not corrupt entries: {statuses:?}"
+        );
+
+        // The database file itself is intact, holds exactly the expected rows,
+        // and was never left half-written.
+        let conn = raw_cache_db(home);
+        assert_eq!(
+            sqlite_integrity_check(&conn),
+            "ok",
+            "the cache database must not be corrupted by concurrent writers"
+        );
+        assert_eq!(
+            query_i64(&conn, "SELECT COUNT(*) FROM estimates"),
+            expected as i64,
+            "raw row count should match the number of writes"
+        );
+        assert_eq!(
+            query_i64(
+                &conn,
+                "SELECT COUNT(*) FROM estimates \
+                 WHERE total_stroops <> 1000 + ledger \
+                    OR cpu_instructions <> 10000 + ledger \
+                    OR memory_bytes <> 500 + ledger"
+            ),
+            0,
+            "no row may mix columns from different writes"
+        );
+    });
+}
+
+/// Readers racing writers on the *same* key never observe a partial entry.
+///
+/// Every writer stamps a generation number into the ledger, fee, CPU and
+/// memory columns. A reader that ever saw half of one write and half of
+/// another would fail the consistency check below, which is what makes this a
+/// test of write atomicity rather than just of "no error returned".
+#[test]
+fn test_async_readers_racing_writers_never_see_a_partial_entry() {
+    with_temp_home(|home| {
+        let runtime = concurrent_runtime();
+        let writers = CONCURRENT_ASYNC_TASKS / 2;
+        let generations = 10u32;
+
+        runtime.block_on(async move {
+            let write_tasks: Vec<_> = (0..writers)
+                .map(|_| {
+                    tokio::task::spawn_blocking(move || {
+                        for generation in 1..=generations {
+                            cache::save_estimate(
+                                "shared-async-hash",
+                                "shared-async-func",
+                                &["shared".to_string()],
+                                "testnet",
+                                generation,
+                                i64::from(generation) * 1_000,
+                                u64::from(generation),
+                                u64::from(generation) * 2,
+                                None,
+                                true,
+                            )
+                            .expect("concurrent same-key save");
+                        }
+                    })
+                })
+                .collect();
+
+            let read_tasks: Vec<_> = (0..writers)
+                .map(|_| {
+                    tokio::task::spawn_blocking(move || {
+                        for _ in 0..generations {
+                            let loaded = cache::load_estimate(
+                                "shared-async-hash",
+                                "shared-async-func",
+                                &["shared".to_string()],
+                            )
+                            .expect("concurrent same-key load");
+                            if let Some(entry) = loaded {
+                                assert_entry_is_a_whole_generation(&entry);
+                            }
+                        }
+                    })
+                })
+                .collect();
+
+            let mut tasks = write_tasks;
+            tasks.extend(read_tasks);
+            for result in futures_util::future::join_all(tasks).await {
+                result.expect("concurrent same-key task panicked");
+            }
+        });
+
+        // The surviving row is one of the written generations, still valid,
+        // and the database was never left in a torn state.
+        let surviving = cache::load_estimate(
+            "shared-async-hash",
+            "shared-async-func",
+            &["shared".to_string()],
+        )
+        .expect("load shared key")
+        .expect("the shared key must exist after concurrent writes");
+        assert_entry_is_a_whole_generation(&surviving);
+
+        let statuses = cache::verify_cache().expect("verify after same-key races");
+        assert_eq!(statuses.len(), 1, "one entry for the shared key");
+        assert!(
+            statuses[0].valid,
+            "the shared-key entry must stay valid: {statuses:?}"
+        );
+
+        let conn = raw_cache_db(home);
+        assert_eq!(sqlite_integrity_check(&conn), "ok");
+        assert_eq!(
+            query_i64(
+                &conn,
+                "SELECT COUNT(*) FROM estimates \
+                 WHERE total_stroops <> ledger * 1000 \
+                    OR cpu_instructions <> ledger \
+                    OR memory_bytes <> ledger * 2"
+            ),
+            0,
+            "the surviving row must be a single whole generation"
+        );
+    });
+}
