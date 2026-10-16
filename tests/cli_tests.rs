@@ -4491,3 +4491,273 @@ fn test_config_snapshot_diff_makes_no_network_calls() {
         "offline diff must not resolve a network; got: {stderr}"
     );
 }
+
+// ────────────────────────────────────────────────────────────────
+// Error propagation and exit codes (Issue #360)
+//
+// The contract these tests pin down:
+//
+//   * a command that fails at runtime prints one friendly `Error: …` line on
+//     stderr and exits 1;
+//   * an argument clap cannot accept is a *usage* error, reported before the
+//     command runs, and exits 2;
+//   * neither path ever panics, prints a stack trace, or dumps an internal
+//     type — a user should never see Rust's own error machinery.
+//
+// Exit code 1 for a runtime failure is produced by `main`, which prints
+// `Error: {err}` and calls `std::process::exit(1)`; exit code 2 is clap's own
+// convention for usage errors, which it raises before `run` is reached.
+// ────────────────────────────────────────────────────────────────
+
+/// Markers that only a panic or an internal debug dump would produce. None of
+/// them may ever reach the user (issue #360).
+const INTERNAL_LEAK_MARKERS: &[&str] = &[
+    "panicked at",
+    "stack backtrace",
+    "RUST_BACKTRACE",
+    "thread 'main'",
+    "AppError::",
+];
+
+/// Fails when stderr contains a panic, a backtrace, or an internal type name.
+#[track_caller]
+fn assert_no_internal_leak(stderr: &str) {
+    for marker in INTERNAL_LEAK_MARKERS {
+        assert!(
+            !stderr.contains(marker),
+            "stderr must not contain {marker:?}; got: {stderr}"
+        );
+    }
+}
+/// Asserts the full contract for a runtime failure: exit 1, one `Error: …`
+/// message naming the cause, and no leaked internals.
+///
+/// The surrounding output is deliberately not constrained: diagnostics such as
+/// the "unoptimized WASM" tip may precede the failure, and a structured cause
+/// (wasmparser reports mismatched byte sequences as a bracketed list) may wrap
+/// the message across several lines. What must hold is that exactly one
+/// failure is reported, it opens its line with `Error: `, and it never falls
+/// back to Rust's own error machinery.
+#[track_caller]
+fn assert_runtime_error(stderr: &str, code: i32, expected: &str) {
+    assert_eq!(code, 1, "a runtime failure must exit 1; stderr: {stderr}");
+    assert!(
+        stderr.lines().any(|line| line.starts_with("Error: ")),
+        "runtime failures are reported as `Error: …` on stderr; got: {stderr}"
+    );
+    assert!(
+        stderr.contains(expected),
+        "the error should mention {expected:?}; got: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("Error: ").count(),
+        1,
+        "one failure should be reported once, not repeated: {stderr}"
+    );
+    assert_no_internal_leak(stderr);
+}
+
+/// Asserts the contract for a command line clap rejects: exit 2, an
+/// explanation, and usage help — all before the command does any work.
+#[track_caller]
+fn assert_usage_error(stderr: &str, code: i32) {
+    assert_eq!(
+        code, 2,
+        "a usage error must exit 2 (clap's convention); stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("error:"),
+        "clap should explain what was wrong; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("Usage:") || stderr.contains("--help"),
+        "a usage error should show how to call the command; got: {stderr}"
+    );
+    assert_no_internal_leak(stderr);
+}
+
+/// Every runtime error path exits 1 with a single, friendly, leak-free line —
+/// whatever the underlying `AppError` variant.
+#[test]
+fn test_runtime_errors_exit_1_with_a_friendly_message() {
+    let home = temp_home("error-propagation");
+
+    // (label, args, fragment the message must contain)
+    let cases: Vec<(&str, Vec<&str>, &str)> = vec![
+        // FileNotFound
+        (
+            "missing wasm file",
+            vec!["estimate", "--wasm", "no/such/file.wasm"],
+            "file not found: no/such/file.wasm",
+        ),
+        // UnknownNetwork
+        (
+            "unknown network",
+            vec![
+                "estimate",
+                "--wasm",
+                "tests/fixtures/minimal.wasm",
+                "--network",
+                "not-a-network",
+            ],
+            "not configured for network not-a-network",
+        ),
+        // TxConstruction (a contract id is required to invoke a function)
+        (
+            "function without contract id",
+            vec![
+                "estimate",
+                "--wasm",
+                "tests/fixtures/contract.wasm",
+                "--rpc-url",
+                DEAD_RPC,
+                "--fn",
+                "increment",
+            ],
+            "contract id required",
+        ),
+        // TxConstruction (malformed contract id)
+        (
+            "malformed contract id",
+            vec![
+                "estimate",
+                "--wasm",
+                "tests/fixtures/contract.wasm",
+                "--rpc-url",
+                DEAD_RPC,
+                "--fn",
+                "increment",
+                "--id",
+                "not-a-contract-id",
+            ],
+            "invalid contract id",
+        ),
+        // InvalidHeader — a bad --header fails before any network traffic
+        (
+            "malformed header",
+            vec![
+                "estimate",
+                "--wasm",
+                "tests/fixtures/minimal.wasm",
+                "--rpc-url",
+                DEAD_RPC,
+                "--header",
+                "Broken",
+            ],
+            "failed to parse HTTP header",
+        ),
+        // Http — the endpoint never answers
+        (
+            "unreachable rpc",
+            vec![
+                "estimate",
+                "--wasm",
+                "tests/fixtures/minimal.wasm",
+                "--rpc-url",
+                DEAD_RPC,
+            ],
+            "error sending request",
+        ),
+        // General — invalid cache filter
+        (
+            "negative fee filter",
+            vec!["cache", "query", "--min-fee=-5"],
+            "min-fee cannot be negative: -5",
+        ),
+        // NoSnapshots
+        (
+            "nothing to diff",
+            vec!["config", "diff", "--network", "testnet"],
+            "none available for network testnet",
+        ),
+        // Io (via the snapshot loader): the OS error is the whole message,
+        // so this one pins the `failed to perform I/O` prefix.
+        (
+            "unreadable snapshot",
+            vec!["config", "diff", "--against", "no/such/snapshot.json"],
+            "failed to perform I/O",
+        ),
+    ];
+
+    for (label, args, expected) in cases {
+        let (_, stderr, code) = run_cli_quiet(&args, Some(&home));
+        assert_runtime_error(&stderr, code, expected);
+        // Guard against a case that silently starts passing for another reason.
+        assert!(
+            !stderr.is_empty(),
+            "{label} should report a failure on stderr"
+        );
+    }
+}
+
+/// A structurally invalid WASM file is rejected with a validation message
+/// naming what failed — not with a panic from the parser.
+#[test]
+fn test_invalid_wasm_error_is_reported_not_panicked() {
+    let home = temp_home("error-propagation-invalid-wasm");
+    let bogus = home.join("not-really.wasm");
+    std::fs::write(&bogus, b"this is not a wasm module").expect("write fixture");
+
+    let (_, stderr, code) = run_cli_quiet(
+        &["estimate", "--wasm", bogus.to_str().unwrap()],
+        Some(&home),
+    );
+    assert_runtime_error(&stderr, code, "failed to validate WASM");
+}
+
+/// Arguments clap rejects are usage errors: exit 2, explained, and refused
+/// before the command runs.
+#[test]
+fn test_usage_errors_exit_2() {
+    let home = temp_home("error-propagation-usage");
+
+    let cases: Vec<(&str, Vec<&str>)> = vec![
+        ("unknown flag", vec!["--not-a-flag", "cache", "list"]),
+        ("missing required flag", vec!["estimate"]),
+        (
+            "invalid enum value",
+            vec!["estimate-all", "--wasm", "x.wasm", "--format", "xml"],
+        ),
+        ("missing option value", vec!["estimate", "--wasm"]),
+        (
+            "non-numeric number",
+            vec![
+                "--precision",
+                "abc",
+                "estimate",
+                "--wasm",
+                "tests/fixtures/minimal.wasm",
+            ],
+        ),
+    ];
+
+    for (label, args) in cases {
+        let (_, stderr, code) = run_cli_quiet(&args, Some(&home));
+        assert_usage_error(&stderr, code);
+        assert!(
+            !stderr.contains("Error: "),
+            "{label} is a usage error, not a runtime `Error: …` line; got: {stderr}"
+        );
+    }
+}
+
+/// The successful path writes nothing to stderr and exits 0, so a non-empty
+/// stderr is always a real diagnostic.
+#[test]
+fn test_successful_command_is_silent_on_stderr() {
+    let home = temp_home("error-propagation-success");
+    let (stdout, stderr, code) = run_cli_quiet(
+        &["wasm-info", "--wasm", "tests/fixtures/contract.wasm"],
+        Some(&home),
+    );
+
+    assert_eq!(code, 0, "a valid command should exit 0; stderr: {stderr}");
+    assert!(
+        stderr.is_empty(),
+        "a successful command must keep stderr empty; got: {stderr}"
+    );
+    assert!(
+        !stdout.is_empty(),
+        "the command's own output should go to stdout"
+    );
+}
