@@ -245,52 +245,6 @@ fn prune_snapshots_in(
     Ok(doomed)
 }
 
-/// Deletes a single snapshot file from disk.
-///
-/// # Network calls
-/// None — pure file I/O.
-pub fn delete_snapshot_file(path: &Path) -> AppResult<()> {
-    std::fs::remove_file(path)?;
-    debug!(path = %path.display(), "snapshot deleted");
-    Ok(())
-}
-
-/// Deletes every stored snapshot for `network` older than `days` days.
-///
-/// Age is derived from each file's recorded `timestamp` field. Files whose
-/// timestamp is missing or unparseable are skipped rather than deleted.
-/// Returns the deleted paths, oldest first.
-///
-/// # Network calls
-/// None — pure file I/O.
-pub fn delete_snapshots_older_than(network: &str, days: u64) -> AppResult<Vec<PathBuf>> {
-    let stale = find_snapshots_older_than(days, Some(network))?;
-    let mut deleted = Vec::new();
-    for path in stale {
-        delete_snapshot_file(&path)?;
-        deleted.push(path);
-    }
-    debug!(network, deleted = deleted.len(), "old snapshots deleted");
-    Ok(deleted)
-}
-
-/// Deletes every stored snapshot for `network`.
-///
-/// Returns the deleted paths, oldest first.
-///
-/// # Network calls
-/// None — pure file I/O.
-pub fn delete_all_snapshots(network: &str) -> AppResult<Vec<PathBuf>> {
-    let paths = list_snapshots(network)?;
-    let mut deleted = Vec::new();
-    for path in paths {
-        delete_snapshot_file(&path)?;
-        deleted.push(path);
-    }
-    debug!(network, deleted = deleted.len(), "all snapshots deleted");
-    Ok(deleted)
-}
-
 /// Whole days between a snapshot's recorded timestamp and `now`.
 ///
 /// # Network calls
@@ -835,6 +789,41 @@ pub fn resolve_snapshot_path(identifier: &str) -> AppResult<PathBuf> {
     }
 
     Err(AppError::SnapshotNotFound(identifier.to_string()))
+}
+
+/// Deletes a single snapshot file from disk.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn delete_snapshot_file(path: &Path) -> AppResult<()> {
+    std::fs::remove_file(path)?;
+    debug!(path = %path.display(), "snapshot deleted");
+    Ok(())
+}
+
+/// Deletes multiple snapshot files from disk.
+///
+/// Each path is removed in turn; the paths that were deleted successfully are
+/// returned. A missing file is treated as already deleted and skipped rather
+/// than failing the whole batch, so a bulk delete is idempotent.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn delete_snapshot_files(paths: &[PathBuf]) -> AppResult<Vec<PathBuf>> {
+    let mut deleted = Vec::new();
+    for path in paths {
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                debug!(path = %path.display(), "snapshot deleted");
+                deleted.push(path.clone());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                trace!(path = %path.display(), "snapshot already gone, skipping");
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(deleted)
 }
 
 /// Lists every stored snapshot file, across all networks.
