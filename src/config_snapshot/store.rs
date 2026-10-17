@@ -245,6 +245,52 @@ fn prune_snapshots_in(
     Ok(doomed)
 }
 
+/// Deletes a single snapshot file from disk.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn delete_snapshot_file(path: &Path) -> AppResult<()> {
+    std::fs::remove_file(path)?;
+    debug!(path = %path.display(), "snapshot deleted");
+    Ok(())
+}
+
+/// Deletes every stored snapshot for `network` older than `days` days.
+///
+/// Age is derived from each file's recorded `timestamp` field. Files whose
+/// timestamp is missing or unparseable are skipped rather than deleted.
+/// Returns the deleted paths, oldest first.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn delete_snapshots_older_than(network: &str, days: u64) -> AppResult<Vec<PathBuf>> {
+    let stale = find_snapshots_older_than(days, Some(network))?;
+    let mut deleted = Vec::new();
+    for path in stale {
+        delete_snapshot_file(&path)?;
+        deleted.push(path);
+    }
+    debug!(network, deleted = deleted.len(), "old snapshots deleted");
+    Ok(deleted)
+}
+
+/// Deletes every stored snapshot for `network`.
+///
+/// Returns the deleted paths, oldest first.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn delete_all_snapshots(network: &str) -> AppResult<Vec<PathBuf>> {
+    let paths = list_snapshots(network)?;
+    let mut deleted = Vec::new();
+    for path in paths {
+        delete_snapshot_file(&path)?;
+        deleted.push(path);
+    }
+    debug!(network, deleted = deleted.len(), "all snapshots deleted");
+    Ok(deleted)
+}
+
 /// Whole days between a snapshot's recorded timestamp and `now`.
 ///
 /// # Network calls
@@ -791,94 +837,6 @@ pub fn resolve_snapshot_path(identifier: &str) -> AppResult<PathBuf> {
     Err(AppError::SnapshotNotFound(identifier.to_string()))
 }
 
-/// Deletes a single snapshot file from disk.
-///
-/// # Network calls
-/// None — pure file I/O.
-pub fn delete_snapshot_file(path: &Path) -> AppResult<()> {
-    std::fs::remove_file(path)?;
-    debug!(path = %path.display(), "snapshot deleted");
-    Ok(())
-}
-
-/// Deletes snapshots for `network` older than `days` days.
-///
-/// Age is derived from each file's recorded `timestamp` field, matching
-/// [`find_snapshots_older_than`]. Files whose timestamp is missing or
-/// unparseable are skipped (and warned about) rather than deleted, so a
-/// single odd file cannot fail the whole purge.
-///
-/// Returns the deleted paths, oldest first.
-///
-/// # Network calls
-/// None — pure file I/O.
-pub fn delete_snapshots_older_than(network: &str, days: u64) -> AppResult<Vec<PathBuf>> {
-    let stale = find_snapshots_older_than(days, Some(network))?;
-    let mut deleted = Vec::new();
-    for path in stale {
-        std::fs::remove_file(&path)?;
-        deleted.push(path);
-    }
-    debug!(
-        network,
-        deleted = deleted.len(),
-        days,
-        "old snapshots deleted"
-    );
-    Ok(deleted)
-}
-
-/// Deletes every stored snapshot for `network`.
-///
-/// Returns the deleted paths, oldest first.
-///
-/// # Network calls
-/// None — pure file I/O.
-pub fn delete_all_snapshots(network: &str) -> AppResult<Vec<PathBuf>> {
-    let paths = list_snapshots(network)?;
-    let mut deleted = Vec::new();
-    for path in paths {
-        std::fs::remove_file(&path)?;
-        deleted.push(path);
-    }
-    debug!(
-        network,
-        deleted = deleted.len(),
-        "all snapshots for network deleted"
-    );
-    Ok(deleted)
-}
-
-/// Deletes snapshots matching an explicit list of identifiers.
-///
-/// Each identifier is resolved with [`resolve_snapshot_path`], so it may be a
-/// path or a bare filename inside the snapshots directory. Resolution happens
-/// for every identifier before anything is removed, so a single unknown
-/// identifier fails the run and leaves the directory untouched.
-///
-/// Returns the deleted paths in the order the identifiers were supplied.
-///
-/// # Errors
-/// [`AppError::SnapshotNotFound`] when any identifier does not resolve to a
-/// file.
-///
-/// # Network calls
-/// None — pure file I/O.
-pub fn delete_snapshots_by_identifier(identifiers: &[String]) -> AppResult<Vec<PathBuf>> {
-    let mut resolved = Vec::with_capacity(identifiers.len());
-    for identifier in identifiers {
-        resolved.push(resolve_snapshot_path(identifier)?);
-    }
-
-    let mut deleted = Vec::new();
-    for path in resolved {
-        std::fs::remove_file(&path)?;
-        deleted.push(path);
-    }
-    debug!(deleted = deleted.len(), "snapshots deleted by identifier");
-    Ok(deleted)
-}
-
 /// Lists every stored snapshot file, across all networks.
 ///
 /// # Network calls
@@ -1039,75 +997,5 @@ mod offline_tests {
     fn is_older_than_overflowing_window_matches_nothing() {
         let now = fixed_now();
         assert!(!is_older_than(now - TimeDelta::days(10), u64::MAX, now));
-    }
-
-    #[test]
-    fn delete_snapshots_by_identifier_removes_named_files() {
-        let dir = temp_dir("delete-by-id");
-        let now = Utc::now();
-        let first = write_snapshot(&dir, "testnet", now - Duration::days(2), 1);
-        let second = write_snapshot(&dir, "testnet", now - Duration::days(1), 2);
-        let kept = write_snapshot(&dir, "testnet", now, 3);
-
-        let identifiers = vec![
-            first.to_string_lossy().into_owned(),
-            second.to_string_lossy().into_owned(),
-        ];
-        let deleted = delete_snapshots_by_identifier(&identifiers).expect("delete");
-
-        assert_eq!(deleted, vec![first.clone(), second.clone()]);
-        assert!(!first.exists(), "first identifier removed");
-        assert!(!second.exists(), "second identifier removed");
-        assert!(kept.exists(), "unnamed snapshot survives");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn delete_snapshots_by_identifier_fails_before_deleting_on_unknown() {
-        let dir = temp_dir("delete-by-id-missing");
-        let now = Utc::now();
-        let existing = write_snapshot(&dir, "testnet", now, 1);
-
-        let identifiers = vec![
-            existing.to_string_lossy().into_owned(),
-            dir.join("does-not-exist.json").to_string_lossy().into_owned(),
-        ];
-        let err = delete_snapshots_by_identifier(&identifiers)
-            .expect_err("an unknown identifier fails the run");
-
-        assert!(matches!(err, AppError::SnapshotNotFound(_)), "got: {err}");
-        assert!(existing.exists(), "a failed run deletes nothing");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn delete_snapshots_older_than_removes_only_stale_files() {
-        let dir = temp_dir("delete-older");
-        let now = Utc::now();
-        let stale = write_snapshot(&dir, "testnet", now - Duration::days(40), 1);
-        let recent = write_snapshot(&dir, "testnet", now - Duration::days(10), 2);
-
-        let deleted = delete_snapshots_older_than(&dir, "testnet", 30).expect("delete");
-
-        assert_eq!(deleted, vec![stale.clone()]);
-        assert!(!stale.exists(), "the 40-day-old snapshot is removed");
-        assert!(recent.exists(), "the 10-day-old snapshot survives");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn delete_all_snapshots_removes_only_the_named_network() {
-        let dir = temp_dir("delete-all");
-        let now = Utc::now();
-        write_snapshot(&dir, "testnet", now - Duration::days(1), 1);
-        write_snapshot(&dir, "testnet", now, 2);
-        let other = write_snapshot(&dir, "mainnet", now, 9);
-
-        let deleted = delete_all_snapshots(&dir, "testnet").expect("delete");
-
-        assert_eq!(deleted.len(), 2);
-        assert_eq!(count_snapshots(&dir, "testnet"), 0);
-        assert!(other.exists(), "another network's snapshots are untouched");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
