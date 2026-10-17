@@ -13,7 +13,7 @@ Options:
       --network <NETWORK>  Network to fetch config from [default: testnet]
       --out <OUT>          Explicit output path (defaults to ~/.soroban-cost-estimator/snapshots/)
       --json               Print the snapshot as JSON instead of the summary lines
-      --retain <COUNT>     Keep only the N most recent snapshots for the network
+      --retain <COUNT>     Keep only the NN most recent snapshots for the network
   -h, --help               Print help
 
 Commands:
@@ -27,7 +27,7 @@ Commands:
 
 - Fetches all six `ConfigSetting*` entries in **one batched**
   `getLedgerEntries` RPC call.
-- Decodes each entry's XDR (`stellar-xdr` 27.x, big-endian) into a typed
+- Decodes each entry's XDR (`stellar-sdr` 27.x, big-endian) into a typed
   snapshot model.
 - Saves the snapshot as
   `~/.soroban-cost-estimator/snapshots/{network}-{timestamp}.json` — the
@@ -54,7 +54,7 @@ Time:    2026-08-04T07:15:38.487702259+00:00
 
 The printed `Ledger` is the last ledger at which the config entries were
 modified on-chain — it is *not* the network's current ledger, and that is
-intentional:  it is the ledger against which stale-cache checks are made.
+intentional: it is the ledger against which stale-cache checks are made.
 
 ## What you get
 
@@ -105,6 +105,10 @@ Options:
 
 ## Offline snapshot diff
 
+`config snapshot diff <SNAPSHOT_A> <SNAPSHOT_B>` compares two saved snapshots
+without contacting the network at all, which makes it suitable for comparing
+historical snapshots (e.g. before and after a protocol upgrade) or for CI.
+
 ```
 Usage: soroban-cost-estimator config snapshot diff [OPTIONS] <SNAPSHOT_A> <SNAPSHOT_B>
 
@@ -114,7 +118,7 @@ Arguments:
 
 Options:
       --json   Output as JSON instead of a human-readable diff
-  --help   Print help
+  -h, --help   Print help
 ```
 
 The output is the same field-by-field diff used by
@@ -183,10 +187,11 @@ cannot reach the network. Add `--json` for a machine-readable summary:
 
 `--older-than 0` deletes everything except the newest snapshot.
 
-### The latest snapshot is never deleted
+## The latest snapshot is never deleted
 
 Every rule protects the newest snapshot for the network, however old it is and
-however small `--retain is (`--retain 0` behaves like `--retain 1`). A retention run must never leave you with nothing to diff against, so
+however small `--retain` is (`--retain 0` behaves like `--retain 1`). A retention
+run must never leave you with nothing to diff against, so
 [`config diff --against-previous`](config-diff.md#against-previous--comparing-two-snapshots-on-disk)
 always has a pair to compare.
 

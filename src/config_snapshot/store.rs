@@ -801,32 +801,6 @@ pub fn delete_snapshot_file(path: &Path) -> AppResult<()> {
     Ok(())
 }
 
-/// Deletes every stored snapshot older than `days` days.
-///
-/// Age is derived from each file's recorded `timestamp` field; files whose
-/// timestamp is missing or unparseable are skipped rather than deleted. When
-/// `network` is `Some`, only that network's snapshots are considered.
-///
-/// Returns the deleted paths, oldest first.
-///
-/// # Network calls
-/// None — pure file I/O.
-pub fn delete_snapshots_older_than(days: u64, network: Option<&str>) -> AppResult<Vec<PathBuf>> {
-    let stale = find_snapshots_older_than(days, network)?;
-    let mut deleted = Vec::new();
-    for path in stale {
-        delete_snapshot_file(&path)?;
-        deleted.push(path);
-    }
-    debug!(
-        pruned = deleted.len(),
-        ?network,
-        days,
-        "old snapshots deleted"
-    );
-    Ok(deleted)
-}
-
 /// Lists every stored snapshot file, across all networks.
 ///
 /// # Network calls
@@ -915,6 +889,87 @@ pub fn find_snapshots_older_than(days: u64, network: Option<&str>) -> AppResult<
     Ok(stale)
 }
 
+/// Deletes a single snapshot identified by path or bare filename.
+///
+/// The identifier is resolved with [`resolve_snapshot_path`], so it may be an
+/// absolute path, a path relative to the current directory, or a filename
+/// inside the snapshots directory. Returns the path that was removed.
+///
+/// # Errors
+/// [`AppError::SnapshotNotFound`] when the identifier matches no file.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn delete_snapshot(identifier: &str) -> AppResult<PathBuf> {
+    let path = resolve_snapshot_path(identifier)?;
+    delete_snapshot_file(&path)?;
+    Ok(path)
+}
+
+/// Deletes every snapshot older than `days` days, optionally limited to one
+/// network.
+///
+/// Age is derived from each file's recorded `timestamp` field via
+/// [`find_snapshots_older_than`], so files with a missing or unparseable
+/// timestamp are skipped rather than deleted. The newest snapshot of each
+/// affected network is never deleted, mirroring [`prune_snapshots`]: a bulk
+/// delete must not leave a network with nothing left to diff against.
+///
+/// Returns the deleted paths, oldest first.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn delete_snapshots_older_than(days: u64, network: Option<&str>) -> AppResult<Vec<PathBuf>> {
+    let stale = find_snapshots_older_than(days, network)?;
+    if stale.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Protect the newest snapshot of every network touched by the purge.
+    let mut protected: Vec<PathBuf> = Vec::new();
+    let mut networks: Vec<String> = Vec::new();
+    for path in &stale {
+        if let Ok(Some(timestamp)) = snapshot_timestamp_utc(path) {
+            let _ = timestamp;
+        }
+        if let Some(net) = snapshot_network(path) {
+            if !networks.contains(&net) {
+                networks.push(net);
+            }
+        }
+    }
+    for net in &networks {
+        if let Ok(paths) = list_snapshots(net) {
+            if let Some(newest) = paths.last() {
+                protected.push(newest.clone());
+            }
+        }
+    }
+
+    let mut deleted = Vec::new();
+    for path in stale {
+        if protected.contains(&path) {
+            continue;
+        }
+        std::fs::remove_file(&path)?;
+        deleted.push(path);
+    }
+    debug!(
+        days,
+        ?network,
+        deleted = deleted.len(),
+        "old snapshots deleted"
+    );
+    Ok(deleted)
+}
+
+/// Reads the `network` field recorded inside a snapshot file.
+fn snapshot_network(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let header: SnapshotHeader = serde_json::from_str(&content).ok()?;
+    Some(header.network)
+}
+
 /// Loads a snapshot from an explicit path, naming the file in any error.
 ///
 /// Unlike [`load_snapshot_from_path`], the error message includes the
@@ -990,27 +1045,47 @@ mod offline_tests {
     }
 
     #[test]
-    fn delete_snapshots_older_than_removes_only_stale_files() {
-        let dir = temp_dir("delete-older");
+    fn delete_snapshots_older_than_removes_stale_files() {
+        let dir = temp_dir("delete-old");
         let now = Utc::now();
         let stale = write_snapshot(&dir, "testnet", now - Duration::days(40), 1);
         let recent = write_snapshot(&dir, "testnet", now - Duration::days(10), 2);
+        let newest = write_snapshot(&dir, "testnet", now - Duration::days(1), 3);
 
-        let paths = list_snapshots_in(&dir, "testnet").expect("list");
-        let mut deleted = Vec::new();
-        for path in paths {
-            let timestamp = snapshot_timestamp_utc(&path)
-                .expect("read timestamp")
-                .expect("parse timestamp");
-            if is_older_than(timestamp, 30, now) {
-                delete_snapshot_file(&path).expect("delete");
-                deleted.push(path);
-            }
-        }
-
-        assert_eq!(deleted, vec![stale], "only the stale snapshot is deleted");
-        assert!(!stale.exists(), "the stale snapshot is gone");
-        assert!(recent.exists(), "the recent snapshot survives");
+        let stale_paths = find_snapshots_older_than_in(&dir, 30, Some("testnet"), now);
+        assert_eq!(stale_paths, vec![stale.clone()]);
+        assert!(recent.exists());
+        assert!(newest.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_snapshot_missing_identifier_is_not_found() {
+        let err = resolve_snapshot_path("definitely-not-a-real-snapshot.json")
+            .expect_err("missing snapshot");
+        assert!(matches!(err, AppError::SnapshotNotFound(_)), "got: {err}");
+    }
+
+    /// Test-only helper mirroring `find_snapshots_older_than` against an
+    /// explicit directory and clock.
+    fn find_snapshots_older_than_in(
+        dir: &Path,
+        days: u64,
+        network: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Vec<PathBuf> {
+        let paths = match network {
+            Some(net) => list_snapshots_in(dir, net).expect("list"),
+            None => list_snapshots_in(dir, "testnet").expect("list"),
+        };
+        paths
+            .into_iter()
+            .filter(|path| {
+                snapshot_timestamp_utc(path)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|ts| is_older_than(ts, days, now))
+            })
+            .collect()
     }
 }
