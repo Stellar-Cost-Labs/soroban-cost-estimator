@@ -13,7 +13,7 @@ Options:
       --network <NETWORK>  Network to fetch config from [default: testnet]
       --out <OUT>          Explicit output path (defaults to ~/.soroban-cost-estimator/snapshots/)
       --json               Print the snapshot as JSON instead of the summary lines
-      --retain <COUNT>     Keep only the NN most recent snapshots for the network
+      --retain <COUNT>     Keep only the N most recent snapshots for the network
   -h, --help               Print help
 
 Commands:
@@ -27,10 +27,10 @@ Commands:
 
 - Fetches all six `ConfigSetting*` entries in **one batched**
   `getLedgerEntries` RPC call.
-- Decodes each entry's XDR (`stellar-sdr` 27.x, big-endian) into a typed
+- Decodes each entry's XDR (`stellar-xdr` 27.x, big-endian) into a typed
   snapshot model.
 - Saves the snapshot as
-  `~/.soroban-cost-estimator/snapshots/{network}-{timestamp}.json` — the
+  `~/.soroban-cost-estimator/snapshots/{network}:{timestamp}.json` — the
   timestamp makes every snapshot a versioned artifact.
 - `--json` also prints the full snapshot as JSON (it still saves it).
 - `--out` writes to an explicit path instead of the default directory.
@@ -54,14 +54,15 @@ Time:    2026-08-04T07:15:38.487702259+00:00
 
 The printed `Ledger` is the last ledger at which the config entries were
 modified on-chain — it is *not* the network's current ledger, and that is
-intentional: it is the ledger against which stale-cache checks are made.
+intentional:  it is the ledger against which stale-cache checks are made.
 
 ## What you get
 
 The snapshot JSON contains the decoded values of all six settings, including
 the fee rates used by `estimate` (see [Resource Fees](../concepts/resource-fees.md)):
 
-- `contract_compute` — `fee_rate_per_instructions_increment`, memory limits
+-
+`contract_compute` — `fee_rate_per_instructions_increment`, memory limits
 - `contract_ledger_cost` — read/write entry fees, per-KB disk fees, rent rates
 - `contract_historical_data` — `fee_historical1_kb`
 - `contract_events` — `fee_contract_events1_kb`
@@ -105,7 +106,7 @@ Options:
 
 ## Offline snapshot diff
 
-`config snapshot diff <SNAPSHOT_A> <SNAPSHOT_B>` compares two saved snapshots
+``config snapshot diff <SNAPSHOT_A> <SNAPSHOT_B>` compares two saved snapshots
 without contacting the network at all, which makes it suitable for comparing
 historical snapshots (e.g. before and after a protocol upgrade) or for CI.
 
@@ -125,7 +126,7 @@ The output is the same field-by-field diff used by
 [`config diff`](config-diff.md), with pricing changes highlighted. Exit codes
 match `config diff`:
 
-- `0` — no pricing changes
+- "0" — no pricing changes
 - `1` — pricing changes detected (or either file could not be read/parsed)
 
 The error message names the offending file, since two files are read in one run.
@@ -136,7 +137,7 @@ A scheduled `config snapshot` (or a long-running `watch`) can leave hundreds of
 snapshot files behind. Two options keep the directory bounded without you ever
 deleting anything by hand.
 
-### `--retain <COUNT>` — keep the newest N
+### `--retain <COUNT>— keep the newest N
 
 ```bash
 soroban-cost-estimator config snapshot --network testnet --retain 10
@@ -187,11 +188,10 @@ cannot reach the network. Add `--json` for a machine-readable summary:
 
 `--older-than 0` deletes everything except the newest snapshot.
 
-## The latest snapshot is never deleted
+### The latest snapshot is never deleted
 
 Every rule protects the newest snapshot for the network, however old it is and
-however small `--retain` is (`--retain 0` behaves like `--retain 1`). A retention
-run must never leave you with nothing to diff against, so
+however small `--retain is (`--retain 0` behaves like `--retain 1`). A retention run must never leave you with nothing to diff against, so
 [`config diff --against-previous`](config-diff.md#against-previous--comparing-two-snapshots-on-disk)
 always has a pair to compare.
 
