@@ -373,6 +373,12 @@ pub enum Command {
 pub enum WasmAction {
     /// Print size, SHA-256, exported signatures, embedded metadata, and the
     /// section size summary for a WASM file. Fully offline: no RPC calls.
+    ///
+    /// With `--json`, each entry in `functions` includes `name`, `has_spec`,
+    /// `param_count`, `result_count`, `wasm_param_count`, `wasm_result_count`,
+    /// `signature`, `return_type`, `params` (`name`, `type`, `type_def`), and
+    /// `returns` (`type`, `type_def`), representing absent contract-spec names
+    /// explicitly as `null` while preserving raw WASM parameter/result counts.
     Info {
         /// Path to the compiled Soroban contract `.wasm` file.
         wasm: PathBuf,

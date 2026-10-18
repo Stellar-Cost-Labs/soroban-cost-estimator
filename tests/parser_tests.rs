@@ -1028,3 +1028,81 @@ fn test_load_wasm_detects_synthetic_debug_section() {
 
     let _ = std::fs::remove_file(&temp);
 }
+
+#[test]
+fn test_contract_fixture_function_signatures_golden_json() {
+    use soroban_cost_estimator::wasm::parser::{load_wasm, wasm_info_json};
+
+    let path = Path::new("tests/fixtures/contract.wasm");
+    let info = load_wasm(path).expect("failed to load contract fixture");
+    let json = wasm_info_json("tests/fixtures/contract.wasm", &info, &info.wasm_hash);
+
+    let expected_functions = serde_json::json!([
+        {
+            "name": "increment",
+            "has_spec": true,
+            "param_count": 1,
+            "result_count": 1,
+            "wasm_param_count": 1,
+            "wasm_result_count": 1,
+            "signature": "increment(step: i64) -> i64",
+            "return_type": "i64",
+            "params": [
+                {
+                    "name": "step",
+                    "type": "i64",
+                    "type_def": {
+                        "type": "i64"
+                    }
+                }
+            ],
+            "returns": [
+                {
+                    "type": "i64",
+                    "type_def": {
+                        "type": "i64"
+                    }
+                }
+            ]
+        }
+    ]);
+    assert_eq!(json["functions"], expected_functions);
+}
+
+#[test]
+fn test_minimal_fixture_function_signatures_without_spec_json() {
+    use soroban_cost_estimator::wasm::parser::{load_wasm, wasm_info_json};
+
+    let path = Path::new("tests/fixtures/minimal.wasm");
+    let info = load_wasm(path).expect("failed to load minimal fixture");
+    let json = wasm_info_json("tests/fixtures/minimal.wasm", &info, &info.wasm_hash);
+
+    let expected_functions = serde_json::json!([
+        {
+            "name": "add_one",
+            "has_spec": false,
+            "param_count": 1,
+            "result_count": 1,
+            "wasm_param_count": 1,
+            "wasm_result_count": 1,
+            "signature": "add_one()",
+            "return_type": null,
+            "params": [
+                {
+                    "index": 0,
+                    "name": null,
+                    "type": null,
+                    "type_def": null
+                }
+            ],
+            "returns": [
+                {
+                    "index": 0,
+                    "type": null,
+                    "type_def": null
+                }
+            ]
+        }
+    ]);
+    assert_eq!(json["functions"], expected_functions);
+}

@@ -1235,6 +1235,182 @@ impl WasmInfo {
         let rounded = (debug * 100 + bytes / 2) / bytes;
         u32::try_from(rounded.max(1)).unwrap_or(1)
     }
+
+    /// True when the module carries a `contractspecv0` entry for `fn_name`.
+    #[must_use]
+    pub fn has_spec_for_function(&self, fn_info: &FunctionInfo) -> bool {
+        if !fn_info.params.is_empty() || !fn_info.returns.is_empty() {
+            return true;
+        }
+        self.has_spec
+            && self.spec_entries.iter().any(|entry| match entry {
+                stellar_xdr::ScSpecEntry::FunctionV0(f) => {
+                    f.name.as_slice() == fn_info.name.as_bytes()
+                }
+                _ => false,
+            })
+    }
+}
+
+/// Serializes an exported function signature into stable JSON for `wasm info --json`.
+///
+/// ### Schema
+/// - `name`: exported function name (`String`)
+/// - `has_spec`: whether contract-spec metadata (`contractspecv0`) is available for this function (`bool`)
+/// - `param_count`: parameter count (`u32`, preserving raw WASM parameter count when no spec is present)
+/// - `result_count`: return value count (`u32`, preserving raw WASM result count when no spec is present)
+/// - `wasm_param_count`: raw WASM parameter count (`u32`)
+/// - `wasm_result_count`: raw WASM result count (`u32`)
+/// - `signature`: human-readable signature string (`String`)
+/// - `return_type`: primary return type name (`String` or `null` when void or when contract spec is absent)
+/// - `params`: array of parameter descriptors; when contract spec names/types are absent, each raw WASM
+///   parameter is represented with `"name": null, "type": null, "type_def": null`
+/// - `returns`: array of return type descriptors; when contract spec types are absent, each raw WASM
+///   result is represented with `"type": null, "type_def": null`
+#[must_use]
+pub fn function_signature_json(fn_info: &FunctionInfo, has_fn_spec: bool) -> serde_json::Value {
+    let params = if !fn_info.params.is_empty() || has_fn_spec {
+        fn_info
+            .params
+            .iter()
+            .map(|p| {
+                let name = if p.name.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(p.name.clone())
+                };
+                json!({
+                    "name": name,
+                    "type": p.type_name,
+                    "type_def": spec_type_json(&p.type_def),
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        (0..fn_info.param_count)
+            .map(|index| {
+                json!({
+                    "index": index,
+                    "name": serde_json::Value::Null,
+                    "type": serde_json::Value::Null,
+                    "type_def": serde_json::Value::Null,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let returns = if !fn_info.returns.is_empty() || has_fn_spec {
+        fn_info
+            .returns
+            .iter()
+            .map(|r| {
+                json!({
+                    "type": r.type_name,
+                    "type_def": spec_type_json(&r.type_def),
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        (0..fn_info.result_count)
+            .map(|index| {
+                json!({
+                    "index": index,
+                    "type": serde_json::Value::Null,
+                    "type_def": serde_json::Value::Null,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let return_type = fn_info
+        .returns
+        .first()
+        .map_or(serde_json::Value::Null, |r| {
+            serde_json::Value::String(r.type_name.clone())
+        });
+
+    json!({
+        "name": fn_info.name,
+        "has_spec": has_fn_spec,
+        "param_count": fn_info.param_count,
+        "result_count": fn_info.result_count,
+        "wasm_param_count": fn_info.param_count,
+        "wasm_result_count": fn_info.result_count,
+        "signature": format_function(fn_info),
+        "return_type": return_type,
+        "params": params,
+        "returns": returns,
+    })
+}
+
+/// Builds the JSON representation of WASM metadata for `wasm info --json`.
+#[must_use]
+pub fn wasm_info_json(wasm_path: &str, wasm_info: &WasmInfo, hash: &str) -> serde_json::Value {
+    let breakdown = wasm_info.section_breakdown();
+    json!({
+        "path": wasm_path,
+        "size": wasm_info.bytes.len(),
+        "sha256": hash,
+        "has_spec": wasm_info.has_spec,
+        "sdk_version": wasm_info.contract_meta.sdk_version,
+        "has_debug_symbols": wasm_info.has_debug_symbols,
+        "debug_symbol_bytes": wasm_info.debug_symbol_bytes,
+        "estimated_size_reduction_percent": wasm_info.estimated_size_reduction_percent(),
+        "contract_meta": {
+            "name": wasm_info.contract_meta.name,
+            "version": wasm_info.contract_meta.version,
+            "description": wasm_info.contract_meta.description,
+            "author": wasm_info.contract_meta.author,
+            "sdk_version": wasm_info.contract_meta.sdk_version,
+            "entries": wasm_info.contract_meta.entries.iter().map(|(key, value)| {
+                json!({ "key": key, "value": value })
+            }).collect::<Vec<_>>(),
+        },
+        "functions": wasm_info.functions.iter().map(|f| {
+            function_signature_json(f, wasm_info.has_spec_for_function(f))
+        }).collect::<Vec<_>>(),
+        "spec_entries": wasm_info.spec_entries.iter()
+            .map(spec_entry_json)
+            .collect::<Vec<_>>(),
+        "section_sizes": breakdown.size_map(),
+        "sections": breakdown.sections.iter().map(|s| {
+            json!({
+                "name": s.name,
+                "id": s.id,
+                "offset": s.offset,
+                "end": s.end,
+                "size": s.size,
+                "header_size": s.header_size,
+                "total_size": s.total_size,
+                "percent": s.percent,
+                "custom": s.id == Some(0),
+            })
+        }).collect::<Vec<_>>(),
+        "module": {
+            "start_function": wasm_info.start_function,
+            "memories": wasm_info.memories.iter().map(|m| {
+                json!({
+                    "initial_pages": m.initial_pages,
+                    "maximum_pages": m.maximum_pages,
+                    "memory64": m.memory64,
+                })
+            }).collect::<Vec<_>>(),
+            "imports": wasm_info.imports.iter().map(|i| {
+                json!({
+                    "module": i.module,
+                    "name": i.name,
+                    "kind": i.kind,
+                })
+            }).collect::<Vec<_>>(),
+            "exports": wasm_info.exports.iter().map(|e| {
+                json!({
+                    "name": e.name,
+                    "kind": e.kind,
+                    "index": e.index,
+                })
+            }).collect::<Vec<_>>(),
+        },
+    })
 }
 
 /// True when a WASM custom section is a debug/optimization artifact: the
