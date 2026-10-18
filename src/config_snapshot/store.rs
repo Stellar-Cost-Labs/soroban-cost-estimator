@@ -16,10 +16,10 @@ fn snapshots_path() -> AppResult<PathBuf> {
     Ok(data_dir()?.join("snapshots"))
 }
 
-/// Returns the snapshots directory, creating it if needed.
+/// Returns the snapshots directory, creating it with private permissions if needed.
 fn snapshots_dir() -> AppResult<PathBuf> {
     let dir = snapshots_path()?;
-    std::fs::create_dir_all(&dir)?;
+    crate::paths::ensure_private_dir(&dir)?;
     Ok(dir)
 }
 
@@ -28,24 +28,47 @@ fn snapshots_dir() -> AppResult<PathBuf> {
 /// The filename is `{network}-{timestamp}.json` within the snapshots directory,
 /// unless an explicit `--out` path is provided.
 ///
+/// On Unix-like systems, new snapshot files are created with mode `0o600`
+/// before writing payload bytes. If an explicit `out_path` already exists on
+/// disk, its existing permissions are preserved.
+///
 /// # Network calls
 /// None — pure file I/O.
 pub fn save_snapshot(snapshot: &ConfigSnapshot, out_path: Option<&str>) -> AppResult<PathBuf> {
-    let path = match out_path {
-        Some(p) => PathBuf::from(p),
+    match out_path {
+        Some(p) => save_snapshot_in(&snapshots_path()?, snapshot, Some(Path::new(p))),
         None => {
             let dir = snapshots_dir()?;
+            save_snapshot_in(&dir, snapshot, None)
+        }
+    }
+}
+
+/// Saves a config snapshot into `dir` (when `out_path` is `None`) or to an explicit
+/// `out_path` (preserving existing caller permissions if the file already exists).
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn save_snapshot_in(
+    dir: &Path,
+    snapshot: &ConfigSnapshot,
+    out_path: Option<&Path>,
+) -> AppResult<PathBuf> {
+    let (path, preserve_existing) = match out_path {
+        Some(p) => (p.to_path_buf(), true),
+        None => {
+            crate::paths::ensure_private_dir(dir)?;
             let filename = format!(
                 "{}-{}.json",
                 snapshot.network,
                 snapshot.timestamp.replace(':', "-")
             );
-            dir.join(filename)
+            (dir.join(filename), false)
         }
     };
 
     let json = serde_json::to_string_pretty(snapshot)?;
-    std::fs::write(&path, json)?;
+    crate::paths::write_snapshot_bytes(&path, json.as_bytes(), preserve_existing)?;
     debug!(path = %path.display(), network = snapshot.network, ledger = snapshot.ledger, "snapshot saved");
     Ok(path)
 }
@@ -655,7 +678,7 @@ pub fn export_snapshots(network: Option<&str>, output_path: &str) -> AppResult<(
     let bundle = SnapshotBundle { snapshots };
     let json = serde_json::to_string_pretty(&bundle)
         .map_err(|e| AppError::General(format!("failed to serialize bundle: {e}")))?;
-    std::fs::write(output_path, json)?;
+    crate::paths::write_snapshot_bytes(Path::new(output_path), json.as_bytes(), true)?;
     Ok(())
 }
 
@@ -673,7 +696,7 @@ pub fn import_snapshots(bundle_path: &str) -> AppResult<usize> {
         if !path.exists() {
             let json = serde_json::to_string_pretty(&snapshot)
                 .map_err(|e| AppError::General(format!("failed to serialize snapshot: {e}")))?;
-            std::fs::write(&path, json)?;
+            crate::paths::write_snapshot_bytes(&path, json.as_bytes(), false)?;
             imported += 1;
             println!("  Imported snapshot: {}", filename);
         }

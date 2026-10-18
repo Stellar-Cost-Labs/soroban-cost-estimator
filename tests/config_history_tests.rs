@@ -127,3 +127,109 @@ fn test_last_changed_tracks_independent_fields_separately() {
     );
     assert_eq!(last[1].timestamp, "2026-01-02T00:00:00Z");
 }
+
+#[cfg(test)]
+mod snapshot_permission_tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use soroban_cost_estimator::config_snapshot::store::{
+        load_snapshot_from_path, save_snapshot_in,
+    };
+    use soroban_cost_estimator::paths::{DATA_DIR_MODE_UNIX, SNAPSHOT_FILE_MODE_UNIX};
+
+    use super::*;
+
+    static PERM_DIR_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let id = PERM_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "sce-snap-perms-{label}-{}-{id}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn test_save_snapshot_in_creates_readable_snapshot_and_applies_private_permissions() {
+        let dir = unique_temp_dir("managed");
+        let snap = make_snapshot("2026-01-01T00:00:00Z", 123, 100, 5);
+
+        let saved_path =
+            save_snapshot_in(&dir, &snap, None).expect("save managed snapshot in temp dir");
+        assert!(saved_path.is_file());
+
+        // Verify normal read remains functional
+        let loaded = load_snapshot_from_path(&saved_path.to_string_lossy())
+            .expect("load saved snapshot from path");
+        assert_eq!(loaded.network, "testnet");
+        assert_eq!(loaded.ledger, 123);
+        assert_eq!(loaded.timestamp, "2026-01-01T00:00:00Z");
+
+        // Verify constants match documented policy
+        assert_eq!(DATA_DIR_MODE_UNIX, 0o700);
+        assert_eq!(SNAPSHOT_FILE_MODE_UNIX, 0o600);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(&dir)
+                .expect("dir metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, DATA_DIR_MODE_UNIX);
+
+            let file_mode = std::fs::metadata(&saved_path)
+                .expect("file metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(file_mode, SNAPSHOT_FILE_MODE_UNIX);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_caller_specified_output_path_preserves_existing_file_and_remains_readable() {
+        let dir = unique_temp_dir("caller-out");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let existing_out = dir.join("custom-caller-snapshot.json");
+        std::fs::write(&existing_out, "{}").expect("pre-create caller file");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&existing_out, std::fs::Permissions::from_mode(0o644))
+                .expect("set 0o644 on caller file");
+        }
+
+        let snap = make_snapshot("2026-01-02T00:00:00Z", 456, 200, 10);
+        let written_path = save_snapshot_in(&dir, &snap, Some(&existing_out))
+            .expect("write snapshot to caller-specified file");
+        assert_eq!(written_path, existing_out);
+
+        let loaded =
+            load_snapshot_from_path(&written_path.to_string_lossy()).expect("read caller snapshot");
+        assert_eq!(loaded.ledger, 456);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file_mode = std::fs::metadata(&existing_out)
+                .expect("file metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                file_mode, 0o644,
+                "existing caller-specified file permissions should not be changed unexpectedly"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
