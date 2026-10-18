@@ -22,6 +22,11 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Matches the CLI's `--connect-timeout` default (5 seconds).
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Default maximum response body size (10 MiB) accepted from an RPC endpoint
+/// before JSON decoding. Large enough for legitimate Soroban ledger and
+/// simulation XDR payloads while bounding memory against runaway responses.
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
 /// Resolves a network name to its well-known Soroban RPC endpoint.
 ///
 /// # Network calls
@@ -192,6 +197,8 @@ pub struct RpcClient {
     /// request timeout.
     #[cfg_attr(not(test), allow(dead_code))]
     connect_timeout: Duration,
+    /// Maximum number of response body bytes accepted before JSON decoding.
+    max_response_bytes: usize,
     /// Custom HTTP headers attached to every outbound request.
     pub headers: HeaderMap,
     /// Whether to print verbose RPC request/response diagnostics to stderr.
@@ -439,9 +446,28 @@ impl RpcClient {
             limiter: rps.and_then(build_rate_limiter),
             max_retries,
             connect_timeout,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             headers,
             verbose,
         }
+    }
+
+    /// Override the maximum response body size (in bytes) accepted before JSON
+    /// deserialization.
+    ///
+    /// Responses whose `Content-Length` header or streamed payload exceeds
+    /// `max_response_bytes` are rejected with [`AppError::ResponseTooLarge`].
+    #[must_use]
+    pub fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
+        self.max_response_bytes = max_response_bytes;
+        self
+    }
+
+    /// Returns the maximum response body size (in bytes) accepted before JSON
+    /// deserialization.
+    #[must_use]
+    pub const fn max_response_bytes(&self) -> usize {
+        self.max_response_bytes
     }
 
     /// Returns the custom HTTP headers configured for this client.
@@ -691,6 +717,7 @@ impl RpcClient {
         connect_timeout: Duration,
     ) -> AppResult<Value> {
         let client = self.client.clone();
+        let endpoint_url = url.to_string();
         let url = url.to_string();
         let request_body = body.clone();
         let limiter = self.limiter.clone();
@@ -756,7 +783,8 @@ impl RpcClient {
             });
         }
 
-        let response_body: Value = response.json().await?;
+        let response_body =
+            read_bounded_json_response(response, &endpoint_url, self.max_response_bytes).await?;
 
         if let Some(error) = response_body.get("error") {
             let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
@@ -793,6 +821,62 @@ impl RpcClient {
         trace!(method, "RPC call succeeded");
         Ok(result.clone())
     }
+}
+
+/// Reads the HTTP response body in chunks while enforcing `max_bytes`, then
+/// decodes the bounded buffer as JSON.
+///
+/// Rejects responses whose `Content-Length` header or streamed chunk total
+/// exceeds `max_bytes` with [`AppError::ResponseTooLarge`], without logging or
+/// including the oversized body contents in diagnostics.
+async fn read_bounded_json_response(
+    mut response: reqwest::Response,
+    endpoint: &str,
+    max_bytes: usize,
+) -> AppResult<Value> {
+    let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    if let Some(declared_len) = response.content_length()
+        && declared_len > max_bytes_u64
+    {
+        debug!(
+            endpoint,
+            observed_bytes = declared_len,
+            max_bytes,
+            "rejecting RPC response exceeding max_response_bytes via Content-Length"
+        );
+        return Err(AppError::ResponseTooLarge {
+            endpoint: endpoint.to_string(),
+            max_bytes,
+            observed_bytes: declared_len,
+        });
+    }
+
+    let initial_cap = response
+        .content_length()
+        .and_then(|len| usize::try_from(len).ok())
+        .map_or(0, |len| len.min(max_bytes));
+    let mut buf = Vec::with_capacity(initial_cap);
+    let mut observed_bytes: u64 = 0;
+
+    while let Some(chunk) = response.chunk().await? {
+        observed_bytes = observed_bytes.saturating_add(chunk.len() as u64);
+        if observed_bytes > max_bytes_u64 {
+            debug!(
+                endpoint,
+                observed_bytes,
+                max_bytes,
+                "rejecting streamed RPC response exceeding max_response_bytes"
+            );
+            return Err(AppError::ResponseTooLarge {
+                endpoint: endpoint.to_string(),
+                max_bytes,
+                observed_bytes,
+            });
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice(&buf).map_err(AppError::from)
 }
 
 /// Rewrap a reqwest error whose connect phase timed out into an

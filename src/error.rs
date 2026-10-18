@@ -70,6 +70,17 @@ pub enum AppError {
         source: reqwest::Error,
     },
 
+    /// The RPC response body exceeded the configured maximum byte size before
+    /// JSON deserialization.
+    #[error(
+        "RPC response too large: endpoint {endpoint} returned {observed_bytes} bytes (max {max_bytes} bytes)"
+    )]
+    ResponseTooLarge {
+        endpoint: String,
+        max_bytes: usize,
+        observed_bytes: u64,
+    },
+
     // ── WebSocket ────────────────────────────────────────────────
     #[error("failed to open WebSocket connection: {0}")]
     WsConnect(String),
@@ -201,6 +212,11 @@ mod tests {
             AppError::Rpc {
                 status: -32000,
                 message: "boom".to_string(),
+            },
+            AppError::ResponseTooLarge {
+                endpoint: "https://soroban-testnet.stellar.org".to_string(),
+                max_bytes: 1_048_576,
+                observed_bytes: 2_097_152,
             },
             AppError::InvalidHeader("missing '=' separator".to_string()),
             AppError::WsConnect("wss://host/ws: refused".to_string()),
