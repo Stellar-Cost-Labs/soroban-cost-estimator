@@ -63,6 +63,8 @@ tests/
   config_diff_tests.rs
 ```
 
+For a detailed walkthrough of the 6 core architectural layers, Mermaid data-flow diagrams, and design invariants, see the [Architecture Overview](docs/architecture.md).
+
 ## License
 
 By contributing, you agree that your contributions will be licensed under

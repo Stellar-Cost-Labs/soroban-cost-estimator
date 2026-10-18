@@ -22,6 +22,17 @@ It works by:
 The tool supports three Stellar networks out of the box (`testnet`,
 `mainnet`, `futurenet`) and accepts a custom RPC URL via `--rpc-url`.
 
+## Six Core Architectural Layers
+
+| Layer | Module(s) | Responsibility |
+|---|---|---|
+| **1. WASM Parser & Spec Inspector** | `src/wasm/` | Validates `.wasm` binaries, computes SHA-256 identity hashes, enumerates exports, and decodes `contractspecv0` / `contractmetav0` sections |
+| **2. JSON-RPC & WebSocket Client** | `src/rpc/` | Executes `simulateTransaction`, `getLedgerEntries`, and `getLatestLedger` calls with exponential-backoff retry, rate limiting, and WebSocket streaming |
+| **3. XDR Helper & Envelope Builder** | `src/xdr_helper.rs` | Encodes `TransactionEnvelope` (`InvokeHostFunctionOp`) payloads, parses `ScVal` CLI arguments, and decodes `ConfigSettingEntry` ledger XDR |
+| **4. Deterministic Fee Calculator & Reporter** | `src/report/` | Computes integer-only stroop fees (splitting non-refundable and refundable tiers) and formats output via `ReportFormatter` (Table, JSON, CSV, Markdown, HTML, Flamegraph) |
+| **5. Config Snapshot & Drift Engine** | `src/config_snapshot/` | Models, persists, diffs, and audits historical changes across all 6 Soroban `CONFIG_SETTING` ledger entries |
+| **6. Estimate Cache** | `src/cache.rs` | Stores and queries content-addressed simulation estimates (`wasm_hash + fn + args_hash`) and flags entries made stale by network config drift |
+
 ## High-Level Pipeline
 
 Every `estimate` call follows a five-stage pipeline. The WASM-parsing,
@@ -397,6 +408,19 @@ User invokes: soroban-cost-estimator estimate --wasm contract.wasm --fn incremen
 ```
 
 ## Data Flow: `config diff` Command
+
+```mermaid
+flowchart TD
+    A["CLI: config diff --network testnet"] --> B["Load Baseline Snapshot<br/>config_snapshot::store::load_latest_snapshot"]
+    A --> C["Fetch Live Ledger Entries<br/>rpc::config::fetch_all_config_settings"]
+    C --> D["Decode XDR ConfigSettingEntry<br/>xdr_helper::decode_config_entry_xdr"]
+    B --> E["Field-by-Field Diff Engine<br/>config_snapshot::diff::diff_snapshots"]
+    D --> E
+    E --> F{"Pricing Change<br/>Detected?"}
+    F -->|Yes| G["Auto-Save Post-Upgrade Snapshot<br/>& Check Stale Cache Entries"]
+    F -->|No| H["Render Diff Report<br/>Exit Code 0"]
+    G --> I["Render Pricing Drift Warning<br/>Exit Code 1 (or threshold gate)"]
+```
 
 ```
 1. Load latest snapshot for network   (config_snapshot::store::load_latest_snapshot)
