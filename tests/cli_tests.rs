@@ -4475,3 +4475,113 @@ fn test_config_snapshot_diff_makes_no_network_calls() {
         "offline diff must not resolve a network; got: {stderr}"
     );
 }
+
+#[test]
+fn test_batch_ndjson_streams_one_json_object_per_line_including_error_records() {
+    let home = temp_home("batch-ndjson");
+    let bad_wasm = home.join("corrupt.wasm");
+    std::fs::write(&bad_wasm, b"not a valid wasm binary").expect("write corrupt wasm");
+
+    let (rpc_url, stop) = start_mock_rpc_server("", "1000", 100);
+    let args = [
+        "--format",
+        "ndjson",
+        "estimate",
+        "--wasm",
+        "tests/fixtures/minimal.wasm",
+        "--wasm",
+        bad_wasm.to_str().unwrap(),
+        "--rpc-url",
+        &rpc_url,
+    ];
+
+    let (stdout1, stderr1, code1) = run_cli_in_home(&args, Some(&home));
+    let (stdout2, _stderr2, code2) = run_cli_in_home(&args, Some(&home));
+    let _ = stop.send(());
+
+    assert_eq!(
+        code1, 1,
+        "batch with a failing item should exit 1; stderr: {stderr1}"
+    );
+    assert_eq!(code2, 1);
+    assert_eq!(
+        stdout1, stdout2,
+        "NDJSON batch output must be deterministic for fixed input"
+    );
+
+    let lines: Vec<&str> = stdout1.lines().collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "must emit one NDJSON line per contract; got: {stdout1}"
+    );
+
+    let first: serde_json::Value =
+        serde_json::from_str(lines[0]).expect("first line must be valid JSON");
+    assert_eq!(first["path"], "tests/fixtures/minimal.wasm");
+    assert_eq!(first["network"], "testnet");
+    assert_eq!(first["status"], "ok");
+    assert_eq!(first["upload_cost_stroops"], 1000);
+
+    let second: serde_json::Value =
+        serde_json::from_str(lines[1]).expect("second line must be valid JSON");
+    assert_eq!(second["path"], bad_wasm.to_str().unwrap());
+    assert_eq!(second["network"], "testnet");
+    assert_eq!(second["status"], "error");
+    assert!(
+        second["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("failed to load WASM")
+    );
+
+    assert!(
+        stderr1.contains("[1/2]") && stderr1.contains("[2/2]"),
+        "progress indicators must be written to stderr; got: {stderr1}"
+    );
+}
+
+#[test]
+fn test_estimate_all_ndjson_streams_per_function_records() {
+    let home = temp_home("estimate-all-ndjson");
+    let (rpc_url, stop) = start_mock_rpc_server("", "1000", 100);
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "--format",
+            "ndjson",
+            "estimate-all",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--rpc-url",
+            &rpc_url,
+        ],
+        Some(&home),
+    );
+    let _ = stop.send(());
+
+    assert_eq!(
+        code, 0,
+        "estimate-all --format ndjson should exit 0; stderr: {stderr}"
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(
+        !lines.is_empty(),
+        "must emit at least one NDJSON line; got: {stdout}"
+    );
+    for line in &lines {
+        let parsed: serde_json::Value =
+            serde_json::from_str(line).expect("each line must be a valid JSON object");
+        assert!(
+            parsed.get("function").is_some(),
+            "line missing function key: {line}"
+        );
+        assert!(
+            parsed.get("status").is_some(),
+            "line missing status key: {line}"
+        );
+    }
+    assert!(
+        stderr.contains("[1/"),
+        "progress must be sent to stderr in ndjson mode; got: {stderr}"
+    );
+}

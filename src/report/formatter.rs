@@ -282,6 +282,26 @@ impl fmt::Display for TableFormatter {
 /// Formats a cost report as pretty-printed JSON.
 pub struct JsonFormatter;
 
+fn report_json_value(report: &CostReport, options: ReportOptions) -> serde_json::Value {
+    let mut value = serde_json::to_value(report).unwrap_or(serde_json::Value::Null);
+    if let serde_json::Value::Object(ref mut map) = value {
+        if !options.quiet {
+            let tips = serde_json::to_value(
+                crate::report::cost_report::generate_optimization_tips(report),
+            )
+            .unwrap_or(serde_json::Value::Null);
+            let structured = serde_json::to_value(report.suggest_optimizations())
+                .unwrap_or(serde_json::Value::Null);
+            map.insert("suggestions".to_string(), tips);
+            map.insert("optimization_suggestions".to_string(), structured);
+        }
+        if !report.wasm_sections.is_empty() {
+            map.insert("section_sizes".to_string(), section_size_map(report));
+        }
+    }
+    value
+}
+
 impl ReportFormatter for JsonFormatter {
     /// Emits the report plus two derived keys:
     ///
@@ -299,28 +319,60 @@ impl ReportFormatter for JsonFormatter {
     /// `--quiet` omits both keys (issue #323) so a machine consumer that
     /// wants the data simply leaves the flag off.
     fn format_with(&self, report: &CostReport, options: ReportOptions) -> String {
-        let mut value = serde_json::to_value(report).unwrap_or(serde_json::Value::Null);
-        if let serde_json::Value::Object(ref mut map) = value {
-            if !options.quiet {
-                let tips = serde_json::to_value(
-                    crate::report::cost_report::generate_optimization_tips(report),
-                )
-                .unwrap_or(serde_json::Value::Null);
-                let structured = serde_json::to_value(report.suggest_optimizations())
-                    .unwrap_or(serde_json::Value::Null);
-                map.insert("suggestions".to_string(), tips);
-                map.insert("optimization_suggestions".to_string(), structured);
-            }
-            if !report.wasm_sections.is_empty() {
-                map.insert("section_sizes".to_string(), section_size_map(report));
-            }
-        }
+        let value = report_json_value(report, options);
         serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
     }
 
     fn name(&self) -> &'static str {
         "json"
     }
+}
+
+/// Formats a cost report as a single compact JSON line (NDJSON).
+pub struct NdjsonFormatter;
+
+impl ReportFormatter for NdjsonFormatter {
+    fn format_with(&self, report: &CostReport, options: ReportOptions) -> String {
+        let value = report_json_value(report, options);
+        serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    fn name(&self) -> &'static str {
+        "ndjson"
+    }
+}
+
+impl fmt::Display for NdjsonFormatter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ndjson")
+    }
+}
+
+/// Formats a single [`crate::report::cost_report::ContractCostSummary`] record
+/// as one newline-free JSON object for `--format ndjson` batch streaming.
+#[must_use]
+pub fn format_batch_record_ndjson(
+    network: &str,
+    contract: &crate::report::cost_report::ContractCostSummary,
+) -> String {
+    let mut value = serde_json::to_value(contract).unwrap_or(serde_json::Value::Null);
+    if let serde_json::Value::Object(ref mut map) = value {
+        map.insert("network".to_string(), serde_json::json!(network));
+        map.insert("status".to_string(), serde_json::json!(contract.status()));
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Formats an entire [`crate::report::cost_report::BatchCostReport`] as
+/// newline-delimited JSON (one JSON object per contract line).
+#[must_use]
+pub fn format_batch_report_ndjson(report: &crate::report::cost_report::BatchCostReport) -> String {
+    report
+        .contracts
+        .iter()
+        .map(|contract| format_batch_record_ndjson(&report.network, contract))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Name-to-bytes map of the report's WASM section breakdown.
@@ -580,12 +632,13 @@ fn csv_row(fields: &[&str]) -> String {
 
 /// Returns the formatter for the given format name.
 ///
-/// Recognized names: `"table"`, `"json"`, `"csv"`, `"markdown"`.
+/// Recognized names: `"table"`, `"json"`, `"ndjson"`, `"csv"`, `"markdown"`.
 /// Returns `None` for unknown names.
 pub fn formatter_by_name(name: &str) -> Option<Box<dyn ReportFormatter>> {
     match name {
         "table" => Some(Box::new(TableFormatter)),
         "json" => Some(Box::new(JsonFormatter)),
+        "ndjson" => Some(Box::new(NdjsonFormatter)),
         "csv" => Some(Box::new(CsvFormatter)),
         "markdown" => Some(Box::new(MarkdownFormatter)),
         _ => None,
@@ -1302,5 +1355,62 @@ mod tests {
         let md_out = MarkdownFormatter.format(&report);
         assert!(md_out.contains("### Cost Projections"));
         assert!(md_out.contains("| 100 | 1,552,700 | 0.1552700 | $0.18 |"));
+    }
+
+    #[test]
+    fn test_ndjson_formatter_emits_single_line_json() {
+        let report = sample_report();
+        let line = NdjsonFormatter.format(&report);
+        assert!(
+            !line.contains('\n'),
+            "NDJSON record must not contain newlines"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&line).expect("valid JSON line");
+        assert_eq!(parsed["function"], "increment");
+        assert_eq!(parsed["wasm_size"], 14_432);
+        assert_eq!(
+            formatter_by_name("ndjson")
+                .expect("ndjson formatter")
+                .name(),
+            "ndjson"
+        );
+    }
+
+    #[test]
+    fn test_format_batch_report_ndjson_parses_each_line_independently() {
+        use crate::report::cost_report::{BatchCostReport, ContractCostSummary};
+
+        let ok = ContractCostSummary {
+            path: "a.wasm".to_string(),
+            wasm_hash: Some("deadbeef".to_string()),
+            function_count: Some(2),
+            upload_cost_stroops: Some(1_000),
+            min_invocation_fee_stroops: Some(500),
+            max_invocation_fee_stroops: Some(900),
+            functions_simulated: Some(2),
+            error: None,
+        };
+        let err = ContractCostSummary::unloadable("bad.wasm", "failed to load WASM: invalid magic");
+        let batch = BatchCostReport::new("testnet", vec![ok, err]);
+        let ndjson = format_batch_report_ndjson(&batch);
+        let lines: Vec<&str> = ndjson.lines().collect();
+        assert_eq!(lines.len(), 2);
+
+        let first: serde_json::Value = serde_json::from_str(lines[0]).expect("line 1 JSON");
+        assert_eq!(first["path"], "a.wasm");
+        assert_eq!(first["network"], "testnet");
+        assert_eq!(first["status"], "ok");
+        assert_eq!(first["upload_cost_stroops"], 1_000);
+
+        let second: serde_json::Value = serde_json::from_str(lines[1]).expect("line 2 JSON");
+        assert_eq!(second["path"], "bad.wasm");
+        assert_eq!(second["network"], "testnet");
+        assert_eq!(second["status"], "error");
+        assert!(
+            second["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("invalid magic")
+        );
     }
 }

@@ -206,6 +206,7 @@ async fn main() {
         "info"
     };
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level)),
         )
@@ -1682,7 +1683,7 @@ async fn estimate_once(
     verbose: bool,
     dry_run: bool,
 ) -> error::AppResult<EstimateRun> {
-    let json_flag = format == "json";
+    let json_flag = format == "json" || format == "ndjson";
     let table_mode = format == "table";
     use tracing::{Instrument, info_span};
 
@@ -2892,10 +2893,10 @@ async fn cmd_estimate_all(
     let span = info_span!("cmd_estimate_all", wasm_path, network);
     async {
         let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
-        let json_flag = format == "json";
+        let json_flag = format == "json" || format == "ndjson";
         emit_wasm_structure(&wasm_info, verbose, wasm_info_flag, json_flag);
 
-        // Confirm the exact file being estimated up front â€” printed before any
+        // Confirm the exact file being estimated up front — printed before any
         // endpoint resolution or simulation, so the hash is visible even when
         // the network cannot be reached.
         let wasm_hash = wasm_info.wasm_hash.clone();
@@ -2931,7 +2932,6 @@ async fn cmd_estimate_all(
                 .collect()
         };
 
-        let json_flag = format == "json";
         let text_mode = format == "table" || format == "markdown";
         if text_mode && !quiet {
             println!("WASM SHA-256: {wasm_hash}");
@@ -2948,7 +2948,7 @@ async fn cmd_estimate_all(
                 {
                     String::new()
                 } else {
-                    "  â€” Skipped: filtered out".to_string()
+                    "  — Skipped: filtered out".to_string()
                 };
                 println!(
                     "  {}. {}{suffix}",
@@ -3010,6 +3010,8 @@ async fn cmd_estimate_all(
         for (i, fn_info) in selected.iter().enumerate() {
             if text_mode {
                 println!("[{}/{}] {}", i + 1, total, fn_info.name);
+            } else if format == "ndjson" && !quiet {
+                eprintln!("[{}/{}] {}", i + 1, total, fn_info.name);
             }
             let result = estimate_all_function(
                 &client,
@@ -3034,7 +3036,7 @@ async fn cmd_estimate_all(
                 println!("### {}\n", r.function);
                 if r.status == EstimateAllStatus::Ok {
                     println!("| Metric | Value |\n|--------|-------|");
-                    println!("| Status | âœ… ok |");
+                    println!("| Status | ✅ ok |");
                     println!("| CPU Instructions | {} |", r.cpu_instructions.unwrap_or(0));
                     println!("| Memory Bytes | {} |", r.memory_bytes.unwrap_or(0));
                     if let Some(fee) = &r.fee {
@@ -3052,6 +3054,9 @@ async fn cmd_estimate_all(
                     }
                 }
                 println!();
+            } else if format == "ndjson" {
+                println!("{}", serde_json::to_string(&result)?);
+                json_results.push(result);
             } else {
                 json_results.push(result);
             }
@@ -3089,7 +3094,7 @@ async fn cmd_estimate_all(
             .filter_map(|r| r.cpu_instructions)
             .collect();
         let fee_distribution = report::cost_report::FeeDistribution::from_samples(&fees, &cpu);
-        emit_fee_distribution_summary(&fee_distribution, format == "json", precision);
+        emit_fee_distribution_summary(&fee_distribution, json_flag, precision);
 
         if format == "json" {
             let report = EstimateAllJsonReport {
@@ -5378,6 +5383,8 @@ async fn cmd_batch(
         for (i, path) in wasm_paths.iter().enumerate() {
             if text_mode {
                 println!("[{}/{}] {}", i + 1, total, path.display());
+            } else if format == "ndjson" && !cli::is_quiet() {
+                eprintln!("[{}/{}] {}", i + 1, total, path.display());
             }
             let summary = batch_contract_summary(
                 &client,
@@ -5400,6 +5407,11 @@ async fn cmd_batch(
                         report::cost_report::optional_num(summary.max_invocation_fee_stroops),
                     ),
                 }
+            } else if format == "ndjson" {
+                println!(
+                    "{}",
+                    report::formatter::format_batch_record_ndjson(network, &summary)
+                );
             }
             contracts.push(summary);
         }
@@ -5408,6 +5420,7 @@ async fn cmd_batch(
 
         match format {
             "json" => println!("{}", report::cost_report::format_batch_report_json(&batch)),
+            "ndjson" => {}
             "csv" => print!("{}", report::cost_report::format_batch_report_csv(&batch)),
             "markdown" => println!(
                 "{}",
