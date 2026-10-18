@@ -148,6 +148,133 @@ pub enum AppError {
     // ── General ─────────────────────────────────────────────────────
     #[error("operation failed: {0}")]
     General(String),
+
+    // ── Structured Context Variants ─────────────────────────────────
+    #[error("failed to read file {}: {source}", path.display())]
+    IoWithPath {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to contact RPC endpoint {endpoint}: {source}")]
+    RpcEndpoint {
+        endpoint: String,
+        #[source]
+        source: reqwest::Error,
+    },
+
+    #[error("failed to validate argument '{param}': expected {expected}, got '{got}'")]
+    ArgumentMismatch {
+        param: String,
+        expected: String,
+        got: String,
+    },
+}
+
+impl AppError {
+    /// Short description of the high-level action that failed.
+    #[must_use]
+    pub const fn action(&self) -> &'static str {
+        match self {
+            Self::Io(_) | Self::IoWithPath { .. } | Self::FileNotFound(_) => "file I/O",
+            Self::Rpc { .. }
+            | Self::RpcUnavailable { .. }
+            | Self::Http(_)
+            | Self::InvalidHeader(_)
+            | Self::HttpStatus { .. }
+            | Self::ConnectTimeout { .. }
+            | Self::RpcEndpoint { .. }
+            | Self::UnknownNetwork(_) => "RPC communication",
+            Self::WsConnect(_) | Self::WsProtocol(_) | Self::WsClosed => "WebSocket connection",
+            Self::XdrDecode(_) | Self::XdrEncode(_) => "XDR serialization",
+            Self::WasmParse(_) | Self::WasmValidation(_) => "WASM loading",
+            Self::TypeValidation(_) | Self::ArgumentMismatch { .. } => "argument validation",
+            Self::SnapshotNotFound(_)
+            | Self::SnapshotParse(_)
+            | Self::NoSnapshots(_)
+            | Self::NotEnoughSnapshots { .. } => "config snapshot loading",
+            Self::SimulationFailed(_) | Self::TxConstruction(_) => "transaction simulation",
+            Self::FeeCalc(_) => "fee calculation",
+            Self::Config(_) | Self::ConfigFetch(_) | Self::ConfigSettingNotFound(_) => {
+                "configuration resolution"
+            }
+            Self::Json(_) => "JSON processing",
+            Self::Sqlite(_) => "cache database access",
+            Self::General(_) => "command execution",
+        }
+    }
+
+    /// Actionable suggestion helping the user resolve the error.
+    #[must_use]
+    pub const fn suggestion(&self) -> &'static str {
+        match self {
+            Self::Io(_) | Self::IoWithPath { .. } => {
+                "check file permissions and available disk space"
+            }
+            Self::FileNotFound(_) => {
+                "verify the --wasm or snapshot file path exists before running the command"
+            }
+            Self::Rpc { .. } => {
+                "inspect the RPC error message and verify --network and --rpc-url settings"
+            }
+            Self::RpcUnavailable { .. } | Self::HttpStatus { .. } => {
+                "retry after a moment or pass --rpc-fallback-url with a backup Soroban RPC node"
+            }
+            Self::Http(_) | Self::RpcEndpoint { .. } | Self::ConnectTimeout { .. } => {
+                "check network connectivity, --rpc-url, and --timeout / --connect-timeout flags"
+            }
+            Self::InvalidHeader(_) => "pass headers as --header KEY=VALUE or --header 'KEY: VALUE'",
+            Self::WsConnect(_) | Self::WsProtocol(_) | Self::WsClosed => {
+                "verify the WebSocket RPC endpoint URL and network connectivity"
+            }
+            Self::UnknownNetwork(_) => {
+                "use a supported network (testnet, mainnet, futurenet, local) or pass --rpc-url"
+            }
+            Self::XdrDecode(_) | Self::XdrEncode(_) => {
+                "ensure the RPC node runs a compatible Soroban protocol version"
+            }
+            Self::WasmParse(_) | Self::WasmValidation(_) => {
+                "compile the contract with `stellar contract build` targeting wasm32-unknown-unknown"
+            }
+            Self::TypeValidation(_) | Self::ArgumentMismatch { .. } => {
+                "run `wasm info <path>` to inspect expected parameter names and types"
+            }
+            Self::SnapshotNotFound(_) | Self::NoSnapshots(_) | Self::NotEnoughSnapshots { .. } => {
+                "run `soroban-cost-estimator config snapshot --network <net>` to capture a snapshot"
+            }
+            Self::SnapshotParse(_) => {
+                "re-capture the snapshot or validate stored snapshots with `config snapshot validate --all`"
+            }
+            Self::SimulationFailed(_) | Self::TxConstruction(_) => {
+                "verify --id (64-hex or C... strkey), --fn, and --arg values against the deployed contract"
+            }
+            Self::FeeCalc(_) => "provide a valid non-negative XLM or stroop amount",
+            Self::Config(_) | Self::ConfigFetch(_) | Self::ConfigSettingNotFound(_) => {
+                "check your config.toml syntax and ensure the RPC node exposes Soroban config settings"
+            }
+            Self::Json(_) => "verify that the input JSON file or RPC payload is well-formed",
+            Self::Sqlite(_) => {
+                "run `cache verify` or `cache clear` if the local cache database is locked or corrupted"
+            }
+            Self::General(_) => {
+                "run with `--help` or `--verbose` for detailed usage and diagnostics"
+            }
+        }
+    }
+
+    /// Formats the error with structured action context, underlying cause, and
+    /// actionable suggestion:
+    /// `error: <action failed>: <underlying cause>. Suggestion: <hint>`
+    #[must_use]
+    pub fn format_with_suggestion(&self) -> String {
+        format!(
+            "error: {}: {}. Suggestion: {}",
+            self.action(),
+            self,
+            self.suggestion()
+        )
+    }
 }
 
 /// Convenience alias for `Result<T, AppError>`.
@@ -155,6 +282,9 @@ pub type AppResult<T> = Result<T, AppError>;
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as StdError;
+    use std::path::PathBuf;
+
     use super::AppError;
 
     /// First word of `message`, lower-cased, for case checks.
@@ -222,11 +352,49 @@ mod tests {
             AppError::ConfigSettingNotFound("CONFIG_SETTING_CONTRACT_COMPUTE_V0".to_string()),
             AppError::Json(serde_json::from_str::<u8>("nope").unwrap_err()),
             AppError::General("could not determine home directory".to_string()),
+            AppError::IoWithPath {
+                path: PathBuf::from("contract.wasm"),
+                source: std::io::Error::other("permission denied"),
+            },
+            AppError::ArgumentMismatch {
+                param: "amount".to_string(),
+                expected: "i64".to_string(),
+                got: "abc".to_string(),
+            },
         ];
 
         for case in cases {
             assert_house_style(&case.to_string());
+            let formatted = case.format_with_suggestion();
+            assert!(
+                formatted.starts_with("error: "),
+                "structured format must start with 'error: ': {formatted}"
+            );
+            assert!(
+                formatted.contains(". Suggestion: "),
+                "structured format must include '. Suggestion: ': {formatted}"
+            );
         }
+    }
+
+    #[test]
+    fn structured_variants_preserve_source_chain() {
+        let io_err = AppError::IoWithPath {
+            path: PathBuf::from("/tmp/missing.wasm"),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+        };
+        assert!(io_err.source().is_some());
+        assert!(io_err.to_string().contains("/tmp/missing.wasm"));
+
+        let arg_err = AppError::ArgumentMismatch {
+            param: "step".to_string(),
+            expected: "i64".to_string(),
+            got: "xyz".to_string(),
+        };
+        assert_eq!(
+            arg_err.to_string(),
+            "failed to validate argument 'step': expected i64, got 'xyz'"
+        );
     }
 
     /// Every `thiserror` template must read `failed to …` / `<noun> …` and
