@@ -1028,3 +1028,70 @@ fn test_load_wasm_detects_synthetic_debug_section() {
 
     let _ = std::fs::remove_file(&temp);
 }
+
+#[test]
+fn test_validate_wasm_diagnoses_unsupported_proposals_with_remediation() {
+    use soroban_cost_estimator::error::AppError;
+    use soroban_cost_estimator::wasm::parser::validate_wasm;
+
+    // Valid WASM module header + Type section (id 1) declaring 1 function type
+    // with a v128 (0x7b) SIMD parameter: (v128) -> ().
+    let simd_wasm: [u8; 15] = [
+        0x00, 0x61, 0x73, 0x6d, // \0asm
+        0x01, 0x00, 0x00, 0x00, // version 1
+        0x01, 0x05, // Type section, 5 bytes
+        0x01, 0x60, 0x01, 0x7b, 0x00, // 1 func type: (v128) -> ()
+    ];
+
+    let err = validate_wasm(&simd_wasm).expect_err("SIMD module should be rejected");
+    match &err {
+        AppError::UnsupportedWasmFeature {
+            feature,
+            remediation,
+            ..
+        } => {
+            assert_eq!(feature, "simd");
+            assert!(
+                remediation.contains("wasm32v1-none"),
+                "remediation should guide target flags, got: {remediation}"
+            );
+        }
+        other => panic!("expected UnsupportedWasmFeature for SIMD module, got: {other:?}"),
+    }
+    let rendered = err.to_string();
+    assert!(rendered.contains("unsupported WebAssembly proposal 'simd'"));
+    assert!(rendered.contains("remediation:"));
+
+    // Shared memory (threads proposal): Memory section (id 5) with flags 0x03 (shared + max).
+    let threads_wasm: [u8; 14] = [
+        0x00, 0x61, 0x73, 0x6d, // \0asm
+        0x01, 0x00, 0x00, 0x00, // version 1
+        0x05, 0x04, // Memory section, 4 bytes
+        0x01, 0x03, 0x01, 0x02, // 1 shared memory, min 1, max 2
+    ];
+    let threads_err = validate_wasm(&threads_wasm).expect_err("threads module should be rejected");
+    assert!(matches!(
+        threads_err,
+        AppError::UnsupportedWasmFeature { ref feature, .. } if feature == "threads"
+    ));
+}
+
+#[test]
+fn test_validate_wasm_distinguishes_structurally_malformed_module() {
+    use soroban_cost_estimator::error::AppError;
+    use soroban_cost_estimator::wasm::parser::validate_wasm;
+
+    // Structurally malformed WASM: Type section claims 20 bytes of payload but EOF follows.
+    let malformed_wasm: [u8; 11] = [
+        0x00, 0x61, 0x73, 0x6d, // \0asm
+        0x01, 0x00, 0x00, 0x00, // version 1
+        0x01, 0x14, 0x01, // Type section claiming 20 bytes, truncated after 1 byte
+    ];
+
+    let err = validate_wasm(&malformed_wasm).expect_err("truncated module should be rejected");
+    assert!(
+        matches!(err, AppError::WasmValidation(_)),
+        "expected WasmValidation for structurally malformed module, got: {err:?}"
+    );
+    assert!(err.to_string().contains("not a valid WebAssembly binary"));
+}

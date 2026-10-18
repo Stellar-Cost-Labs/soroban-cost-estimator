@@ -97,6 +97,16 @@ pub enum AppError {
     #[error("failed to validate WASM: {0}")]
     WasmValidation(String),
 
+    #[error(
+        "WASM uses unsupported WebAssembly proposal '{feature}': {detail} \
+         (remediation: {remediation})"
+    )]
+    UnsupportedWasmFeature {
+        feature: String,
+        detail: String,
+        remediation: String,
+    },
+
     #[error("failed to validate argument type: {0}")]
     TypeValidation(String),
 
@@ -211,6 +221,12 @@ mod tests {
             AppError::XdrEncode("ledger key".to_string()),
             AppError::WasmParse("no exported functions".to_string()),
             AppError::WasmValidation("invalid magic bytes".to_string()),
+            AppError::UnsupportedWasmFeature {
+                feature: "simd".to_string(),
+                detail: "SIMD support is not enabled".to_string(),
+                remediation: "compile with target 'wasm32v1-none' and disable '+simd128'"
+                    .to_string(),
+            },
             AppError::TypeValidation("arg 'abc' cannot be used as 'i64'".to_string()),
             AppError::SnapshotNotFound("/tmp/s.json".to_string()),
             AppError::SnapshotParse("invalid bundle".to_string()),

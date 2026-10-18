@@ -139,10 +139,118 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
     })
 }
 
-/// Basic structural validation of a WASM binary.
+/// WebAssembly feature set supported by Soroban contracts (`wasm32v1-none`).
+///
+/// Post-MVP proposals not supported by the Soroban VM (such as SIMD, threads,
+/// exceptions, GC, function-references, tail calls, multi-memory, memory64, and
+/// the component model) are disabled so `wasmparser::Validator` reports the
+/// exact unsupported proposal when validating a binary.
+#[must_use]
+pub fn soroban_wasm_features() -> wasmparser::WasmFeatures {
+    use wasmparser::WasmFeatures;
+    let mut features = WasmFeatures::default();
+    features.remove(
+        WasmFeatures::SIMD
+            | WasmFeatures::RELAXED_SIMD
+            | WasmFeatures::THREADS
+            | WasmFeatures::SHARED_EVERYTHING_THREADS
+            | WasmFeatures::EXCEPTIONS
+            | WasmFeatures::LEGACY_EXCEPTIONS
+            | WasmFeatures::TAIL_CALL
+            | WasmFeatures::GC
+            | WasmFeatures::FUNCTION_REFERENCES
+            | WasmFeatures::COMPONENT_MODEL
+            | WasmFeatures::MULTI_MEMORY
+            | WasmFeatures::MEMORY64,
+    );
+    features
+}
+
+/// Classifies a `wasmparser::BinaryReaderError` into either
+/// [`AppError::UnsupportedWasmFeature`] (when `wasmparser` indicates an
+/// unsupported WebAssembly proposal) or [`AppError::WasmValidation`] (when the
+/// binary is structurally malformed).
+#[must_use]
+pub fn classify_wasm_validation_error(err: &wasmparser::BinaryReaderError) -> AppError {
+    let msg = err.message();
+    let lower = msg.to_ascii_lowercase();
+
+    let proposal: Option<(&str, &str)> = if lower.contains("relaxed simd") {
+        Some((
+            "relaxed-simd",
+            "compile with target 'wasm32v1-none' and disable '+relaxed-simd'",
+        ))
+    } else if lower.contains("simd") {
+        Some((
+            "simd",
+            "compile with target 'wasm32v1-none' and disable '+simd128'",
+        ))
+    } else if lower.contains("threads") || lower.contains("shared memory") {
+        Some((
+            "threads",
+            "compile with target 'wasm32v1-none' without '+atomics' or shared linear memory",
+        ))
+    } else if lower.contains("exception") {
+        Some((
+            "exceptions",
+            "compile with target 'wasm32v1-none' without WebAssembly exception handling",
+        ))
+    } else if lower.contains("tail call") || lower.contains("return_call") {
+        Some((
+            "tail-call",
+            "compile with target 'wasm32v1-none' and disable '+tail-call'",
+        ))
+    } else if lower.contains("component model") || lower.contains("component") {
+        Some((
+            "component-model",
+            "compile a core WebAssembly module ('wasm32v1-none') instead of a WebAssembly component",
+        ))
+    } else if lower.contains("multi-memory") || lower.contains("multiple memories") {
+        Some((
+            "multi-memory",
+            "declare at most one linear memory as required by Soroban",
+        ))
+    } else if lower.contains("memory64") || lower.contains("64-bit memory") {
+        Some((
+            "memory64",
+            "compile a 32-bit WebAssembly module ('wasm32v1-none') instead of 64-bit memory64",
+        ))
+    } else if lower.contains("gc ")
+        || lower.contains("garbage collection")
+        || lower.contains("function references")
+    {
+        Some((
+            "gc",
+            "compile with target 'wasm32v1-none' and disable GC and function-references proposals",
+        ))
+    } else if lower.contains("is not enabled") || lower.contains("must be enabled") {
+        Some((
+            "post-mvp-proposal",
+            "compile with target 'wasm32v1-none' so only Soroban-supported WebAssembly features are emitted",
+        ))
+    } else {
+        None
+    };
+
+    if let Some((feature, remediation)) = proposal {
+        AppError::UnsupportedWasmFeature {
+            feature: feature.to_string(),
+            detail: err.to_string(),
+            remediation: remediation.to_string(),
+        }
+    } else {
+        AppError::WasmValidation(format!("not a valid WebAssembly binary: {err}"))
+    }
+}
+
+/// Basic structural validation of a WASM binary, diagnosing unsupported
+/// WebAssembly proposals explicitly while keeping malformed binary errors
+/// distinguishable.
 pub fn validate_wasm(bytes: &[u8]) -> AppResult<()> {
-    wasmparser::validate(bytes)
-        .map_err(|e| AppError::WasmValidation(format!("not a valid WebAssembly binary: {e}")))?;
+    let mut validator = wasmparser::Validator::new_with_features(soroban_wasm_features());
+    validator
+        .validate_all(bytes)
+        .map_err(|e| classify_wasm_validation_error(&e))?;
     Ok(())
 }
 
