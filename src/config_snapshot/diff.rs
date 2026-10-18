@@ -167,8 +167,35 @@ pub fn field_display_name(field_path: &str) -> String {
     }
 }
 
+/// Explicit change state distinguishing numeric value modifications from
+/// added, removed, and unrecognized setting fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingChangeState {
+    /// Known setting present on both sides with a changed value.
+    Modified,
+    /// Setting or section absent in the older snapshot and present in the newer snapshot.
+    Added,
+    /// Setting or section present in the older snapshot and absent in the newer snapshot.
+    Removed,
+    /// Unrecognized setting or field not part of the known schema.
+    Unknown,
+}
+
+impl SettingChangeState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Modified => "modified",
+            Self::Added => "added",
+            Self::Removed => "removed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// A single changed field between two snapshots.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FieldDiff {
     pub field_path: String,
     /// Raw `ConfigSettingId` number (e.g. `0` for contract compute), or
@@ -180,6 +207,25 @@ pub struct FieldDiff {
     pub new_value: String,
     pub is_pricing_change: bool,
     pub explanation: Option<&'static str>,
+}
+
+impl serde::Serialize for FieldDiff {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("FieldDiff", 8)?;
+        s.serialize_field("field_path", &self.field_path)?;
+        s.serialize_field("setting_id", &self.setting_id)?;
+        s.serialize_field("setting_name", &self.setting_name)?;
+        s.serialize_field("state", &self.state())?;
+        s.serialize_field("old_value", &self.old_value)?;
+        s.serialize_field("new_value", &self.new_value)?;
+        s.serialize_field("is_pricing_change", &self.is_pricing_change)?;
+        s.serialize_field("explanation", &self.explanation)?;
+        s.end()
+    }
 }
 
 impl FieldDiff {
@@ -208,6 +254,21 @@ impl FieldDiff {
             new_value,
             is_pricing_change,
             explanation,
+        }
+    }
+
+    /// Classify whether this diff record represents a modified known value,
+    /// an added setting/section, a removed setting/section, or an unknown setting.
+    #[must_use]
+    pub fn state(&self) -> SettingChangeState {
+        if !crate::config_snapshot::model::is_known_setting_field_path(&self.field_path) {
+            SettingChangeState::Unknown
+        } else if self.old_value == "(missing)" {
+            SettingChangeState::Added
+        } else if self.new_value == "(missing)" {
+            SettingChangeState::Removed
+        } else {
+            SettingChangeState::Modified
         }
     }
 }
@@ -354,6 +415,63 @@ pub fn diff_snapshots(old: &ConfigSnapshot, new: &ConfigSnapshot) -> ConfigDiff 
         changes,
         has_pricing_changes,
     }
+}
+
+fn format_json_scalar(val: &serde_json::Value) -> String {
+    match val {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => "(missing)".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Compare two [`crate::config_snapshot::model::ParsedConfigSnapshot`] instances,
+/// surfacing both known setting changes and any unrecognized forward-compatible
+/// fields stored in either snapshot.
+///
+/// Unrecognized fields are reported with [`SettingChangeState::Unknown`] and
+/// treated conservatively as pricing-relevant when added, removed, or modified.
+pub fn diff_parsed_snapshots(
+    old: &crate::config_snapshot::model::ParsedConfigSnapshot,
+    new: &crate::config_snapshot::model::ParsedConfigSnapshot,
+) -> ConfigDiff {
+    let mut diff = diff_snapshots(&old.snapshot, &new.snapshot);
+
+    let mut all_unknown_keys: std::collections::BTreeSet<&String> =
+        old.unknown_fields.keys().collect();
+    all_unknown_keys.extend(new.unknown_fields.keys());
+
+    for key in all_unknown_keys {
+        match (old.unknown_fields.get(key), new.unknown_fields.get(key)) {
+            (Some(old_val), Some(new_val)) if old_val == new_val => {}
+            (old_opt, new_opt) => {
+                let old_str = old_opt
+                    .map(format_json_scalar)
+                    .unwrap_or_else(|| "(missing)".to_string());
+                let new_str = new_opt
+                    .map(format_json_scalar)
+                    .unwrap_or_else(|| "(missing)".to_string());
+                diff.changes.push(FieldDiff::new(
+                    key,
+                    old_str,
+                    new_str,
+                    true,
+                    Some("Unrecognized setting preserved from snapshot JSON"),
+                ));
+            }
+        }
+    }
+
+    diff.has_pricing_changes = diff.changes.iter().any(|c| c.is_pricing_change);
+    diff
+}
+
+/// Parse two serialized snapshot JSON strings while preserving unknown fields
+/// and compute their [`ConfigDiff`].
+pub fn diff_snapshot_json(old_json: &str, new_json: &str) -> Result<ConfigDiff, serde_json::Error> {
+    let old = crate::config_snapshot::model::parse_snapshot_preserving_unknown(old_json)?;
+    let new = crate::config_snapshot::model::parse_snapshot_preserving_unknown(new_json)?;
+    Ok(diff_parsed_snapshots(&old, &new))
 }
 
 fn compare_contract_compute(
@@ -874,6 +992,12 @@ pub fn format_diff(
             "🔄"
         };
         let display = field_display_name(&change.field_path);
+        let state_label = match change.state() {
+            SettingChangeState::Modified => None,
+            SettingChangeState::Added => Some("added (absent in older snapshot)"),
+            SettingChangeState::Removed => Some("removed (absent in newer snapshot)"),
+            SettingChangeState::Unknown => Some("unknown setting"),
+        };
         if change.is_pricing_change {
             let color = if is_exceeding {
                 if colorize { ANSI_RED } else { "" }
@@ -881,6 +1005,9 @@ pub fn format_diff(
                 pricing_change_color(&change.old_value, &change.new_value, colorize)
             };
             output.push_str(&format!("  {color}{icon} {display}{reset_code}\n"));
+            if let Some(state_text) = state_label {
+                output.push_str(&format!("      State: {state_text}\n"));
+            }
             if let Some(explanation) = change.explanation {
                 output.push_str(&format!("      ℹ️  {explanation}\n"));
             }
@@ -891,6 +1018,9 @@ pub fn format_diff(
             ));
         } else {
             output.push_str(&format!("  {icon} {display}\n"));
+            if let Some(state_text) = state_label {
+                output.push_str(&format!("      State: {state_text}\n"));
+            }
             if let Some(explanation) = change.explanation {
                 output.push_str(&format!("      ℹ️  {explanation}\n"));
             }

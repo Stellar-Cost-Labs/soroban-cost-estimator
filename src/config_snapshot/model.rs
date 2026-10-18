@@ -43,7 +43,7 @@ pub fn config_setting_id_for_prefix(prefix: &str) -> Option<ConfigSettingId> {
 }
 
 /// A complete snapshot of the network's Soroban resource-pricing configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigSnapshot {
     pub network: String,
     pub timestamp: String,
@@ -144,6 +144,133 @@ pub fn setting_unit_description(field_path: &str) -> Option<&'static str> {
         | "state_archival.temp_rent_rate_denominator" => Some("fractional fee scaling"),
         _ => None,
     }
+}
+
+/// Top-level JSON keys recognized by [`ConfigSnapshot`].
+const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
+    "network",
+    "timestamp",
+    "ledger",
+    "protocol_version",
+    "contract_compute",
+    "contract_ledger_cost",
+    "contract_historical_data",
+    "contract_events",
+    "contract_bandwidth",
+    "state_archival",
+];
+
+/// Returns `true` if `field_path` names a known setting section or field in [`ConfigSnapshot`].
+#[must_use]
+pub fn is_known_setting_field_path(field_path: &str) -> bool {
+    match field_path {
+        "contract_compute"
+        | "contract_compute.ledger_max_instructions"
+        | "contract_compute.tx_max_instructions"
+        | "contract_compute.fee_rate_per_instructions_increment"
+        | "contract_compute.tx_memory_limit"
+        | "contract_ledger_cost"
+        | "contract_ledger_cost.ledger_max_disk_read_entries"
+        | "contract_ledger_cost.ledger_max_disk_read_bytes"
+        | "contract_ledger_cost.ledger_max_write_ledger_entries"
+        | "contract_ledger_cost.ledger_max_write_bytes"
+        | "contract_ledger_cost.tx_max_disk_read_entries"
+        | "contract_ledger_cost.tx_max_disk_read_bytes"
+        | "contract_ledger_cost.tx_max_write_ledger_entries"
+        | "contract_ledger_cost.tx_max_write_bytes"
+        | "contract_ledger_cost.fee_disk_read_ledger_entry"
+        | "contract_ledger_cost.fee_write_ledger_entry"
+        | "contract_ledger_cost.fee_disk_read1_kb"
+        | "contract_ledger_cost.soroban_state_target_size_bytes"
+        | "contract_ledger_cost.rent_fee1_kb_soroban_state_size_low"
+        | "contract_ledger_cost.rent_fee1_kb_soroban_state_size_high"
+        | "contract_ledger_cost.soroban_state_rent_fee_growth_factor"
+        | "contract_historical_data"
+        | "contract_historical_data.fee_historical1_kb"
+        | "contract_events"
+        | "contract_events.tx_max_contract_events_size_bytes"
+        | "contract_events.fee_contract_events1_kb"
+        | "contract_bandwidth"
+        | "contract_bandwidth.ledger_max_txs_size_bytes"
+        | "contract_bandwidth.tx_max_size_bytes"
+        | "contract_bandwidth.fee_tx_size1_kb"
+        | "state_archival"
+        | "state_archival.max_entry_ttl"
+        | "state_archival.min_temporary_ttl"
+        | "state_archival.min_persistent_ttl"
+        | "state_archival.persistent_rent_rate_denominator"
+        | "state_archival.temp_rent_rate_denominator"
+        | "state_archival.max_entries_to_archive"
+        | "state_archival.live_soroban_state_size_window_sample_size"
+        | "state_archival.live_soroban_state_size_window_sample_period"
+        | "state_archival.eviction_scan_size"
+        | "state_archival.starting_eviction_scan_level" => true,
+        _ => false,
+    }
+}
+
+/// A parsed [`ConfigSnapshot`] paired with any unrecognized top-level or nested
+/// setting fields encountered in the serialized JSON.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedConfigSnapshot {
+    pub snapshot: ConfigSnapshot,
+    pub unknown_fields: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// Extract unrecognized top-level or section-level setting fields from a raw
+/// snapshot JSON object without mapping missing values to numeric defaults.
+#[must_use]
+pub fn extract_unknown_snapshot_fields(
+    raw: &serde_json::Value,
+) -> std::collections::BTreeMap<String, serde_json::Value> {
+    let mut unknown = std::collections::BTreeMap::new();
+    let Some(obj) = raw.as_object() else {
+        return unknown;
+    };
+
+    for (key, value) in obj {
+        if !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str()) {
+            if let Some(nested_obj) = value.as_object() {
+                if nested_obj.is_empty() {
+                    unknown.insert(key.clone(), value.clone());
+                } else {
+                    for (sub_k, sub_v) in nested_obj {
+                        unknown.insert(format!("{key}.{sub_k}"), sub_v.clone());
+                    }
+                }
+            } else {
+                unknown.insert(key.clone(), value.clone());
+            }
+            continue;
+        }
+
+        if config_setting_id_for_prefix(key).is_some() {
+            if let Some(section_obj) = value.as_object() {
+                for (sub_k, sub_v) in section_obj {
+                    let full_path = format!("{key}.{sub_k}");
+                    if !is_known_setting_field_path(&full_path) {
+                        unknown.insert(full_path, sub_v.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    unknown
+}
+
+/// Parse a [`ConfigSnapshot`] from JSON while preserving any unknown top-level
+/// sections or unknown nested fields for explicit diff reporting.
+pub fn parse_snapshot_preserving_unknown(
+    json: &str,
+) -> Result<ParsedConfigSnapshot, serde_json::Error> {
+    let raw: serde_json::Value = serde_json::from_str(json)?;
+    let unknown_fields = extract_unknown_snapshot_fields(&raw);
+    let snapshot: ConfigSnapshot = serde_json::from_value(raw)?;
+    Ok(ParsedConfigSnapshot {
+        snapshot,
+        unknown_fields,
+    })
 }
 
 #[cfg(test)]

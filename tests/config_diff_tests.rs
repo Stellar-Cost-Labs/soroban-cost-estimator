@@ -1345,3 +1345,112 @@ fn test_format_diff_markdown_no_changes() {
     assert!(md.contains("✅ No changes detected."));
     assert!(!md.contains("| Setting |"));
 }
+
+#[test]
+fn test_missing_optional_sections_and_unknown_serialized_fields_in_diff() {
+    // 1. Added and removed optional sections carry explicit Added / Removed states and conservative pricing status.
+    let old_sec = snapshot_with(false, true, false, false, false, false);
+    let new_sec = snapshot_with(true, false, false, false, false, false);
+    let sec_diff = diff::diff_snapshots(&old_sec, &new_sec);
+    assert_eq!(sec_diff.changes.len(), 2);
+    assert!(sec_diff.has_pricing_changes);
+
+    let compute_change = sec_diff
+        .changes
+        .iter()
+        .find(|c| c.field_path == "contract_compute")
+        .expect("compute change");
+    assert_eq!(compute_change.state(), diff::SettingChangeState::Added);
+    assert!(compute_change.is_pricing_change);
+
+    let ledger_change = sec_diff
+        .changes
+        .iter()
+        .find(|c| c.field_path == "contract_ledger_cost")
+        .expect("ledger_cost change");
+    assert_eq!(ledger_change.state(), diff::SettingChangeState::Removed);
+    assert!(ledger_change.is_pricing_change);
+
+    let rendered = diff::format_diff(&sec_diff, false, false, None);
+    assert!(rendered.contains("State: added (absent in older snapshot)"));
+    assert!(rendered.contains("State: removed (absent in newer snapshot)"));
+
+    // 2. Forward-compatible deserialization preserves unknown serialized fields and reports them as Unknown.
+    let old_json = r#"{
+        "network": "testnet",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "ledger": 100,
+        "contract_compute": {
+            "ledger_max_instructions": 1000000,
+            "tx_max_instructions": 100000,
+            "fee_rate_per_instructions_increment": 10,
+            "tx_memory_limit": 41943040
+        },
+        "contract_ledger_cost": null,
+        "contract_historical_data": null,
+        "contract_events": null,
+        "contract_bandwidth": null,
+        "state_archival": null
+    }"#;
+    let new_json = r#"{
+        "network": "testnet",
+        "timestamp": "2026-01-02T00:00:00Z",
+        "ledger": 200,
+        "contract_compute": {
+            "ledger_max_instructions": 1000000,
+            "tx_max_instructions": 100000,
+            "fee_rate_per_instructions_increment": 20,
+            "tx_memory_limit": 41943040,
+            "future_compute_surge_fee": 500
+        },
+        "contract_ledger_cost": null,
+        "contract_historical_data": null,
+        "contract_events": null,
+        "contract_bandwidth": null,
+        "state_archival": null,
+        "future_parallel_execution_v1": {
+            "fee_per_cluster_lane": 250
+        }
+    }"#;
+
+    let json_diff = diff::diff_snapshot_json(old_json, new_json).expect("diff_snapshot_json");
+    assert_eq!(json_diff.changes.len(), 3);
+    assert!(json_diff.has_pricing_changes);
+
+    let known_mod = json_diff
+        .changes
+        .iter()
+        .find(|c| c.field_path == "contract_compute.fee_rate_per_instructions_increment")
+        .expect("modified known field");
+    assert_eq!(known_mod.state(), diff::SettingChangeState::Modified);
+
+    let unknown_nested = json_diff
+        .changes
+        .iter()
+        .find(|c| c.field_path == "contract_compute.future_compute_surge_fee")
+        .expect("unknown nested field");
+    assert_eq!(unknown_nested.state(), diff::SettingChangeState::Unknown);
+    assert_eq!(unknown_nested.old_value, "(missing)");
+    assert_eq!(unknown_nested.new_value, "500");
+    assert!(unknown_nested.is_pricing_change);
+
+    let unknown_top = json_diff
+        .changes
+        .iter()
+        .find(|c| c.field_path == "future_parallel_execution_v1.fee_per_cluster_lane")
+        .expect("unknown top-level section field");
+    assert_eq!(unknown_top.state(), diff::SettingChangeState::Unknown);
+    assert_eq!(unknown_top.old_value, "(missing)");
+    assert_eq!(unknown_top.new_value, "250");
+    assert!(unknown_top.is_pricing_change);
+
+    let serialized = serde_json::to_value(&json_diff).expect("serialize diff");
+    let states: Vec<&str> = serialized["changes"]
+        .as_array()
+        .expect("changes array")
+        .iter()
+        .filter_map(|c| c["state"].as_str())
+        .collect();
+    assert!(states.contains(&"modified"));
+    assert!(states.contains(&"unknown"));
+}
