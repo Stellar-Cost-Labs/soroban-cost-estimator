@@ -4475,3 +4475,101 @@ fn test_config_snapshot_diff_makes_no_network_calls() {
         "offline diff must not resolve a network; got: {stderr}"
     );
 }
+
+#[test]
+fn test_manifest_validation_fails_before_rpc_call() {
+    let home = temp_home("manifest-fail-before-rpc");
+    let sub = home.join("contracts");
+    std::fs::create_dir_all(&sub).expect("create sub");
+    std::fs::copy("tests/fixtures/contract.wasm", sub.join("counter.wasm")).expect("copy counter");
+
+    // Second entry has an invalid function name; point rpc_url at a closed port
+    // and verify the failure is the manifest validation error for #contracts[1],
+    // NOT an RPC connection failure.
+    let manifest_path = home.join("batch.toml");
+    std::fs::write(
+        &manifest_path,
+        r#"version = 1
+network = "local"
+rpc_url = "http://127.0.0.1:9"
+
+[[contracts]]
+wasm = "contracts/counter.wasm"
+function = "increment"
+args = ["step=1"]
+
+[[contracts]]
+wasm = "contracts/counter.wasm"
+function = "nonexistent_fn"
+"#,
+    )
+    .expect("write manifest");
+
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "estimate",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "invalid manifest entry should exit 1");
+    assert!(
+        stderr.contains("#contracts[1] (line 10)") && stderr.contains("nonexistent_fn"),
+        "should report failing entry index and line before any RPC call; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_manifest_valid_batch_execution_json() {
+    let (rpc_url, _stop) = start_mock_rpc_server("", "2222", 900);
+
+    let home = temp_home("manifest-valid-batch");
+    let sub = home.join("contracts");
+    std::fs::create_dir_all(&sub).expect("create sub");
+    std::fs::copy("tests/fixtures/contract.wasm", sub.join("counter.wasm")).expect("copy counter");
+
+    let manifest_path = home.join("manifest.json");
+    std::fs::write(
+        &manifest_path,
+        serde_json::json!({
+            "version": 1,
+            "network": "local",
+            "rpc_url": rpc_url,
+            "contracts": [
+                {
+                    "wasm": "contracts/counter.wasm",
+                    "function": "increment",
+                    "id": "0000000000000000000000000000000000000000000000000000000000000001",
+                    "args": ["step=1"]
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .expect("write manifest.json");
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "estimate",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--json",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(
+        code, 0,
+        "valid manifest batch should succeed; stderr: {stderr}; stdout: {stdout}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid batch JSON output");
+    assert_eq!(parsed["succeeded"], 1);
+    assert_eq!(parsed["failed"], 0);
+    assert_eq!(
+        parsed["contracts"][0]["upload_cost_stroops"],
+        serde_json::json!(2222)
+    );
+}

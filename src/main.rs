@@ -290,6 +290,24 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 (None, true) => cli::OutputFormat::Json,
                 (None, false) => cli::OutputFormat::Table,
             };
+            if let Some(ref manifest_path) = args.manifest {
+                let effective_net = env_string(network, &default_network, "SOROBAN_NETWORK");
+                let effective_rpc = rpc_url.as_deref().or(default_rpc_url.as_deref());
+                let manifest =
+                    cli::load_and_validate_manifest(manifest_path, &effective_net, effective_rpc)?;
+                return cmd_manifest_batch(
+                    &manifest,
+                    fallback,
+                    format.as_str(),
+                    rps,
+                    timeout,
+                    connect_timeout,
+                    max_retries,
+                    verbose,
+                    &headers,
+                )
+                .await;
+            }
             let paths = resolve_wasm_paths(&wasm, wasm_dir.as_deref())?;
             if wasm.len() > 1 || wasm_dir.is_some() {
                 // Multi-contract run: aggregate every contract into a single
@@ -368,6 +386,24 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 (None, true) => cli::OutputFormat::Json,
                 (None, false) => cli::OutputFormat::Table,
             };
+            if let Some(ref manifest_path) = args.manifest {
+                let effective_net = env_string(network, &default_network, "SOROBAN_NETWORK");
+                let effective_rpc = rpc_url.as_deref().or(default_rpc_url.as_deref());
+                let manifest =
+                    cli::load_and_validate_manifest(manifest_path, &effective_net, effective_rpc)?;
+                return cmd_manifest_batch(
+                    &manifest,
+                    fallback,
+                    format.as_str(),
+                    rps,
+                    timeout,
+                    connect_timeout,
+                    max_retries,
+                    verbose,
+                    &headers,
+                )
+                .await;
+            }
             let paths = resolve_wasm_paths(&wasm, wasm_dir.as_deref())?;
             if wasm.len() > 1 || wasm_dir.is_some() {
                 cmd_batch(
@@ -5418,6 +5454,111 @@ async fn cmd_batch(
 
         // Surface partial failures to scripts; the summary above is already
         // printed, so callers still get the full report.
+        if batch.failed > 0 {
+            std::process::exit(1);
+        }
+
+        Ok(())
+    }
+    .instrument(span)
+    .await
+}
+
+/// Execute a pre-validated batch estimate manifest (#481).
+///
+/// Because [`cli::load_and_validate_manifest`] already validated every entry's
+/// WASM file, function name, argument types, contract ID, and network/RPC
+/// endpoint before this function is called, no RPC call is ever made if any
+/// entry in the manifest is malformed.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+async fn cmd_manifest_batch(
+    manifest: &cli::ValidatedManifest,
+    rpc_fallback_url: Option<&str>,
+    format: &str,
+    rps: Option<u64>,
+    timeout: u64,
+    connect_timeout: u64,
+    max_retries: usize,
+    verbose: bool,
+    extra_headers: &[String],
+) -> error::AppResult<()> {
+    use tracing::Instrument;
+    use tracing::info_span;
+
+    let total = manifest.contracts.len();
+    let span = info_span!(
+        "cmd_manifest_batch",
+        manifest = %manifest.manifest_path.display(),
+        contracts = total
+    );
+    async move {
+        let text_mode = format == "table" || format == "markdown";
+        let mut contracts: Vec<report::cost_report::ContractCostSummary> =
+            Vec::with_capacity(total);
+
+        for (i, entry) in manifest.contracts.iter().enumerate() {
+            if text_mode {
+                println!("[{}/{}] {}", i + 1, total, entry.wasm_path.display());
+            }
+
+            let client = rpc::client::RpcClient::with_fallback_headers_connect_timeout(
+                &entry.endpoint,
+                rpc_fallback_url,
+                rps,
+                std::time::Duration::from_secs(timeout),
+                std::time::Duration::from_secs(connect_timeout),
+                max_retries,
+                extra_headers,
+                verbose,
+            )?;
+
+            client.health_check().await?;
+
+            let sc_vals: Vec<stellar_xdr::ScVal> = entry
+                .args
+                .iter()
+                .map(|a| xdr_helper::parse_arg_scval(a))
+                .collect();
+
+            let summary = batch_contract_summary(
+                &client,
+                &entry.wasm_path,
+                &entry.network,
+                entry.id.as_deref(),
+                entry.function.as_deref(),
+                &sc_vals,
+                &entry.args,
+            )
+            .await;
+
+            if text_mode {
+                match &summary.error {
+                    Some(err) => println!("  error: {err}"),
+                    None => println!(
+                        "  functions: {} | upload: {} stroops | invocation: {}..{} stroops",
+                        report::cost_report::optional_num(summary.function_count),
+                        report::cost_report::optional_num(summary.upload_cost_stroops),
+                        report::cost_report::optional_num(summary.min_invocation_fee_stroops),
+                        report::cost_report::optional_num(summary.max_invocation_fee_stroops),
+                    ),
+                }
+            }
+            contracts.push(summary);
+        }
+
+        let batch =
+            report::cost_report::BatchCostReport::new(manifest.default_network.clone(), contracts);
+
+        match format {
+            "json" => println!("{}", report::cost_report::format_batch_report_json(&batch)),
+            "csv" => print!("{}", report::cost_report::format_batch_report_csv(&batch)),
+            "markdown" => println!(
+                "{}",
+                report::cost_report::format_batch_report_markdown(&batch)
+            ),
+            _ => println!("{}", report::cost_report::format_batch_report_table(&batch)),
+        }
+
         if batch.failed > 0 {
             std::process::exit(1);
         }

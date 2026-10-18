@@ -1621,3 +1621,32 @@ impl WasmInfo {
         Ok(())
     }
 }
+
+/// Loads and validates a WASM binary referenced by a batch estimate manifest
+/// entry, verifying WASM size/memory limits and (when `function` and `args`
+/// are supplied) checking the function signature and argument types before any
+/// RPC traffic is sent.
+pub fn validate_manifest_wasm_entry(
+    path: &Path,
+    function: Option<&str>,
+    args: &[String],
+) -> AppResult<WasmInfo> {
+    let info = load_wasm(path)?;
+    info.validate_wasm_limits(65536, 2048)?;
+    crate::xdr_helper::validate_args_against_spec(function, args, &info.functions)?;
+    if let Some(fn_name) = function {
+        if !info.functions.is_empty() && !info.functions.iter().any(|f| f.name == fn_name) {
+            let available = info
+                .functions
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(AppError::TypeValidation(format!(
+                "function '{fn_name}' not found in WASM '{}' (available: {available})",
+                path.display()
+            )));
+        }
+    }
+    Ok(info)
+}

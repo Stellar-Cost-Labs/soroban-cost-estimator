@@ -176,6 +176,15 @@ pub struct Cli {
     )]
     pub precision: u32,
 
+    /// Path to a versioned JSON or TOML batch estimate manifest (version 1).
+    ///
+    /// Evaluates every contract entry in the manifest after validating all
+    /// WASM paths, functions, arguments, and network overrides upfront before
+    /// making any RPC call. Relative `wasm` paths are resolved from the
+    /// manifest file's parent directory.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub manifest: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -189,7 +198,12 @@ pub enum Command {
     Estimate {
         /// Path to a compiled Soroban contract `.wasm` file. Repeat the flag
         /// to evaluate multiple contracts in a single batch run.
-        #[arg(long, short, value_name = "PATH", required_unless_present = "wasm_dir")]
+        #[arg(
+            long,
+            short,
+            value_name = "PATH",
+            required_unless_present_any = ["wasm_dir", "manifest"]
+        )]
         wasm: Vec<PathBuf>,
 
         /// Directory of `.wasm` files to evaluate as a batch (non-recursive).
@@ -295,7 +309,12 @@ pub enum Command {
     EstimateAll {
         /// Path to a compiled Soroban contract `.wasm` file. Repeat the flag
         /// to estimate multiple contracts in a single batch run.
-        #[arg(long, short, value_name = "PATH", required_unless_present = "wasm_dir")]
+        #[arg(
+            long,
+            short,
+            value_name = "PATH",
+            required_unless_present_any = ["wasm_dir", "manifest"]
+        )]
         wasm: Vec<PathBuf>,
 
         /// Directory of `.wasm` files to estimate as a batch (non-recursive).
@@ -758,6 +777,332 @@ pub fn should_colorize() -> bool {
     }
 }
 
+/// Current supported schema version for batch estimate manifests (`--manifest`, issue #481).
+pub const BATCH_MANIFEST_VERSION: u32 = 1;
+
+/// Raw top-level batch estimate manifest deserialized from JSON or TOML (#481).
+///
+/// # Example (TOML)
+/// ```toml
+/// version = 1
+/// network = "testnet"
+///
+/// [[contracts]]
+/// wasm = "contracts/counter.wasm"
+/// function = "increment"
+/// args = ["step=1"]
+/// id = "0000000000000000000000000000000000000000000000000000000000000001"
+/// network = "testnet"
+/// ```
+///
+/// # Example (JSON)
+/// ```json
+/// {
+///   "version": 1,
+///   "network": "testnet",
+///   "contracts": [
+///     {
+///       "wasm": "contracts/counter.wasm",
+///       "function": "increment",
+///       "args": ["step=1"]
+///     }
+///   ]
+/// }
+/// ```
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBatchManifest {
+    #[serde(alias = "schema_version")]
+    version: Option<u32>,
+    network: Option<String>,
+    rpc_url: Option<String>,
+    contracts: Option<Vec<RawManifestContractEntry>>,
+}
+
+/// Raw per-contract manifest entry before path resolution and validation.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawManifestContractEntry {
+    wasm: Option<String>,
+    #[serde(alias = "fn")]
+    function: Option<String>,
+    #[serde(alias = "contract_id")]
+    id: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    network: Option<String>,
+    rpc_url: Option<String>,
+}
+
+/// Validated, ready-to-execute contract entry from a batch manifest (#481).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedManifestEntry {
+    /// Original index (0-based) in the manifest's `contracts` array.
+    pub index: usize,
+    /// 1-based source line number of this entry in the manifest file.
+    pub line: usize,
+    /// Resolved path to the `.wasm` file (relative paths resolved from the
+    /// manifest file's parent directory).
+    pub wasm_path: PathBuf,
+    /// Optional function name to simulate (or `None` for all zero-param functions).
+    pub function: Option<String>,
+    /// Optional 64-hex-char contract ID override.
+    pub id: Option<String>,
+    /// Validated `KEY=VAL` argument strings.
+    pub args: Vec<String>,
+    /// Effective network name for this entry.
+    pub network: String,
+    /// Effective RPC URL override for this entry, if any.
+    pub rpc_url: Option<String>,
+    /// Resolved RPC endpoint URL for this entry.
+    pub endpoint: String,
+}
+
+/// Validated batch estimate manifest ready for execution without any further
+/// structural or file checks (#481).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedManifest {
+    /// Path to the manifest file.
+    pub manifest_path: PathBuf,
+    /// Schema version (always [`BATCH_MANIFEST_VERSION`]).
+    pub version: u32,
+    /// Default network for the batch summary header.
+    pub default_network: String,
+    /// Validated contract entries in manifest order.
+    pub contracts: Vec<ValidatedManifestEntry>,
+}
+
+/// Locate the 1-based line number of the `idx`-th contract entry in `raw`.
+fn find_manifest_entry_line(raw: &str, is_toml: bool, idx: usize) -> usize {
+    if is_toml {
+        let mut seen = 0usize;
+        for (line_no, line) in raw.lines().enumerate() {
+            if line.trim_start().starts_with("[[contracts]]") {
+                if seen == idx {
+                    return line_no + 1;
+                }
+                seen += 1;
+            }
+        }
+        1
+    } else {
+        // Scan for `"contracts"` and then locate the `idx`-th object `{` at array depth 1.
+        let Some(pos) = raw.find("\"contracts\"") else {
+            return 1;
+        };
+        let mut in_string = false;
+        let mut escape = false;
+        let mut bracket_depth = 0i32;
+        let mut brace_depth = 0i32;
+        let mut seen = 0usize;
+        for (offset, ch) in raw[pos..].char_indices() {
+            if escape {
+                escape = false;
+                continue;
+            }
+            if in_string {
+                if ch == '\\' {
+                    escape = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match ch {
+                '"' => in_string = true,
+                '[' => bracket_depth += 1,
+                ']' => {
+                    bracket_depth -= 1;
+                    if bracket_depth <= 0 {
+                        break;
+                    }
+                }
+                '{' => {
+                    if bracket_depth == 1 && brace_depth == 0 {
+                        if seen == idx {
+                            let total_offset = pos + offset;
+                            return raw[..total_offset].bytes().filter(|&b| b == b'\n').count() + 1;
+                        }
+                        seen += 1;
+                    }
+                    brace_depth += 1;
+                }
+                '}' => brace_depth -= 1,
+                _ => {}
+            }
+        }
+        1
+    }
+}
+
+/// Load, parse, and validate an entire JSON or TOML batch estimate manifest
+/// before any RPC call is made (#481).
+///
+/// Relative `wasm` paths are resolved against the manifest file's parent
+/// directory. If any entry fails validation, returns an error identifying the
+/// failing entry and its source location (`<path>#contracts[<i>] (line <N>): ...`).
+#[allow(clippy::too_many_lines)]
+pub fn load_and_validate_manifest(
+    path: &std::path::Path,
+    fallback_network: &str,
+    fallback_rpc_url: Option<&str>,
+) -> crate::error::AppResult<ValidatedManifest> {
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        crate::error::AppError::General(format!(
+            "failed to read manifest file '{}': {e}",
+            path.display()
+        ))
+    })?;
+
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    let is_toml = match ext.as_deref() {
+        Some("toml") => true,
+        Some("json") => false,
+        _ => !raw.trim_start().starts_with('{'),
+    };
+
+    let parsed: RawBatchManifest = if is_toml {
+        toml::from_str(&raw).map_err(|e| {
+            crate::error::AppError::General(format!(
+                "invalid TOML in manifest '{}': {e}",
+                path.display()
+            ))
+        })?
+    } else {
+        serde_json::from_str(&raw).map_err(|e| {
+            crate::error::AppError::General(format!(
+                "invalid JSON in manifest '{}': {e}",
+                path.display()
+            ))
+        })?
+    };
+
+    let version = parsed.version.ok_or_else(|| {
+        crate::error::AppError::General(format!(
+            "manifest '{}': missing required field 'version' (expected version = {BATCH_MANIFEST_VERSION})",
+            path.display()
+        ))
+    })?;
+
+    if version != BATCH_MANIFEST_VERSION {
+        return Err(crate::error::AppError::General(format!(
+            "manifest '{}': unsupported manifest version {version} (supported version: {BATCH_MANIFEST_VERSION})",
+            path.display()
+        )));
+    }
+
+    let raw_contracts = parsed.contracts.ok_or_else(|| {
+        crate::error::AppError::General(format!(
+            "manifest '{}': missing required field 'contracts'",
+            path.display()
+        ))
+    })?;
+
+    if raw_contracts.is_empty() {
+        return Err(crate::error::AppError::General(format!(
+            "manifest '{}': 'contracts' must contain at least one entry",
+            path.display()
+        )));
+    }
+
+    let manifest_dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let top_network = parsed
+        .network
+        .as_deref()
+        .unwrap_or(fallback_network)
+        .to_string();
+    let top_rpc_url = parsed
+        .rpc_url
+        .as_deref()
+        .or(fallback_rpc_url)
+        .map(str::to_owned);
+
+    let mut validated_entries = Vec::with_capacity(raw_contracts.len());
+
+    for (idx, entry) in raw_contracts.into_iter().enumerate() {
+        let line = find_manifest_entry_line(&raw, is_toml, idx);
+        let loc = |reason: &str| -> crate::error::AppError {
+            crate::error::AppError::General(format!(
+                "{}#contracts[{idx}] (line {line}): {reason}",
+                path.display()
+            ))
+        };
+
+        let wasm_raw = entry
+            .wasm
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| loc("missing required field 'wasm'"))?;
+
+        let raw_wasm_path = std::path::Path::new(wasm_raw);
+        let wasm_path = if raw_wasm_path.is_relative() {
+            manifest_dir.join(raw_wasm_path)
+        } else {
+            raw_wasm_path.to_path_buf()
+        };
+
+        crate::wasm::parser::validate_manifest_wasm_entry(
+            &wasm_path,
+            entry.function.as_deref(),
+            &entry.args,
+        )
+        .map_err(|e| loc(&e.to_string()))?;
+
+        // Also validate contract ID and envelope construction offline before any RPC call.
+        if let Some(ref cid) = entry.id {
+            let trimmed = cid.trim();
+            let valid_hex = trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit());
+            if !valid_hex {
+                return Err(loc(&format!(
+                    "invalid contract id '{cid}': expected 64 hex characters"
+                )));
+            }
+        }
+
+        let effective_network = entry
+            .network
+            .as_deref()
+            .unwrap_or(&top_network)
+            .trim()
+            .to_string();
+        let effective_rpc_url = entry
+            .rpc_url
+            .as_deref()
+            .or(top_rpc_url.as_deref())
+            .map(str::to_owned);
+
+        let endpoint =
+            crate::rpc::client::resolve_endpoint(&effective_network, effective_rpc_url.as_deref())
+                .map_err(|e| loc(&format!("invalid network/rpc_url override: {e}")))?;
+
+        validated_entries.push(ValidatedManifestEntry {
+            index: idx,
+            line,
+            wasm_path,
+            function: entry.function,
+            id: entry.id,
+            args: entry.args,
+            network: effective_network,
+            rpc_url: effective_rpc_url,
+            endpoint,
+        });
+    }
+
+    Ok(ValidatedManifest {
+        manifest_path: path.to_path_buf(),
+        version,
+        default_network: top_network,
+        contracts: validated_entries,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -805,5 +1150,132 @@ mod tests {
                 "completion script for {shell:?} should reference {bin_name}"
             );
         }
+    }
+
+    #[test]
+    fn test_manifest_valid_toml_and_json_relative_paths() {
+        let dir = std::env::temp_dir().join(format!(
+            "soroban-manifest-test-valid-{}",
+            std::process::id()
+        ));
+        let sub = dir.join("contracts");
+        std::fs::create_dir_all(&sub).expect("create contracts dir");
+        let fixture_src =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/contract.wasm");
+        let rel_wasm = sub.join("counter.wasm");
+        std::fs::copy(&fixture_src, &rel_wasm).expect("copy fixture");
+
+        // TOML manifest with relative wasm path, function, args, id, and network override.
+        let toml_path = dir.join("batch.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+version = 1
+network = "testnet"
+
+[[contracts]]
+wasm = "contracts/counter.wasm"
+function = "increment"
+args = ["step=1"]
+id = "0000000000000000000000000000000000000000000000000000000000000001"
+network = "mainnet"
+"#,
+        )
+        .expect("write toml");
+
+        let validated =
+            load_and_validate_manifest(&toml_path, "testnet", None).expect("valid TOML manifest");
+        assert_eq!(validated.version, 1);
+        assert_eq!(validated.contracts.len(), 1);
+        assert_eq!(validated.contracts[0].wasm_path, rel_wasm);
+        assert_eq!(
+            validated.contracts[0].function.as_deref(),
+            Some("increment")
+        );
+        assert_eq!(validated.contracts[0].network, "mainnet");
+        assert_eq!(validated.contracts[0].line, 5);
+
+        // JSON manifest with relative wasm path.
+        let json_path = dir.join("batch.json");
+        std::fs::write(
+            &json_path,
+            r#"{
+  "version": 1,
+  "contracts": [
+    {
+      "wasm": "contracts/counter.wasm"
+    }
+  ]
+}"#,
+        )
+        .expect("write json");
+
+        let validated_json =
+            load_and_validate_manifest(&json_path, "testnet", None).expect("valid JSON manifest");
+        assert_eq!(validated_json.contracts.len(), 1);
+        assert_eq!(validated_json.contracts[0].wasm_path, rel_wasm);
+        assert_eq!(validated_json.contracts[0].line, 4);
+    }
+
+    #[test]
+    fn test_manifest_unknown_version_missing_fields_and_invalid_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "soroban-manifest-test-invalid-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        // Unknown version
+        let bad_ver = dir.join("bad_ver.toml");
+        std::fs::write(
+            &bad_ver,
+            "version = 99\n[[contracts]]\nwasm = \"counter.wasm\"\n",
+        )
+        .expect("write");
+        let err = load_and_validate_manifest(&bad_ver, "testnet", None)
+            .expect_err("unknown version must fail");
+        assert!(
+            err.to_string().contains("unsupported manifest version 99"),
+            "got: {err}"
+        );
+
+        // Missing version
+        let no_ver = dir.join("no_ver.json");
+        std::fs::write(&no_ver, r#"{"contracts": [{"wasm": "counter.wasm"}]}"#).expect("write");
+        let err = load_and_validate_manifest(&no_ver, "testnet", None)
+            .expect_err("missing version must fail");
+        assert!(
+            err.to_string().contains("missing required field 'version'"),
+            "got: {err}"
+        );
+
+        // Missing wasm field on second entry reports #contracts[1] and line number
+        let fixture_src =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/contract.wasm");
+        std::fs::copy(&fixture_src, dir.join("counter.wasm")).expect("copy");
+        let missing_wasm = dir.join("missing_wasm.toml");
+        std::fs::write(
+            &missing_wasm,
+            "version = 1\n\n[[contracts]]\nwasm = \"counter.wasm\"\n\n[[contracts]]\nfunction = \"increment\"\n",
+        )
+        .expect("write");
+        let err = load_and_validate_manifest(&missing_wasm, "testnet", None)
+            .expect_err("missing wasm field must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("#contracts[1] (line 6)"), "got: {msg}");
+        assert!(msg.contains("missing required field 'wasm'"), "got: {msg}");
+
+        // Non-existent wasm path reports entry index and line
+        let bad_path = dir.join("bad_path.json");
+        std::fs::write(
+            &bad_path,
+            "{\n  \"version\": 1,\n  \"contracts\": [\n    {\n      \"wasm\": \"does_not_exist.wasm\"\n    }\n  ]\n}",
+        )
+        .expect("write");
+        let err = load_and_validate_manifest(&bad_path, "testnet", None)
+            .expect_err("invalid wasm path must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("#contracts[0] (line 4)"), "got: {msg}");
+        assert!(msg.contains("does_not_exist.wasm"), "got: {msg}");
     }
 }
