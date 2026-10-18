@@ -4475,3 +4475,235 @@ fn test_config_snapshot_diff_makes_no_network_calls() {
         "offline diff must not resolve a network; got: {stderr}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// CI Fee and Resource Budget Gates (Issue #479)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_estimate_budget_gates_below_and_at_threshold_pass() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("budget-gates-pass");
+    let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+
+    // 1. Strictly below thresholds -> exit 0
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            contract_id,
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+            "--max-fee",
+            "15528",
+            "--max-cpu",
+            "532503",
+            "--max-memory",
+            "1024",
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 0,
+        "below-budget estimate should exit 0; stderr: {stderr}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(parsed["fee"]["total_stroops"], 15_527);
+    assert_eq!(parsed["cpu_instructions"], 532_502);
+
+    // 2. Exactly at thresholds -> exit 0
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            contract_id,
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+            "--max-fee",
+            "15527",
+            "--max-cpu",
+            "532502",
+            "--max-memory",
+            "0",
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 0,
+        "exact-budget estimate should exit 0; stderr: {stderr}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(parsed["fee"]["total_stroops"], 15_527);
+    assert_eq!(parsed["cpu_instructions"], 532_502);
+}
+
+#[test]
+fn test_estimate_budget_gates_above_threshold_fail_and_keep_stdout_parseable() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("budget-gates-fail");
+    let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            contract_id,
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+            "--max-fee",
+            "15526",
+            "--max-cpu",
+            "532501",
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 1,
+        "above-budget estimate should exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("total fee (15527 stroops) exceeds maximum budget (15526 stroops)"),
+        "stderr should report exceeded fee threshold; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("CPU instructions (532502) exceeds maximum budget (532501)"),
+        "stderr should report exceeded CPU threshold; got: {stderr}"
+    );
+
+    // Structured stdout remains parseable and measured values are unchanged.
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must remain valid JSON");
+    assert_eq!(parsed["fee"]["total_stroops"], 15_527);
+    assert_eq!(parsed["cpu_instructions"], 532_502);
+}
+
+#[test]
+fn test_estimate_memory_budget_gate_below_at_and_above_threshold() {
+    let home = temp_home("budget-gates-memory");
+    let wasm_bytes = std::fs::read("tests/fixtures/contract.wasm").expect("read fixture wasm");
+    let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_bytes));
+    let args_hash = hex::encode(sha2::Sha256::digest(b"1"));
+
+    let dir = home.join(".soroban-cost-estimator");
+    std::fs::create_dir_all(&dir).expect("create data dir");
+    let db = dir.join("cache.db");
+    let conn = rusqlite::Connection::open(&db).expect("open cache db");
+    cache::ensure_cache_schema(&conn).expect("ensure cache schema");
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT OR REPLACE INTO estimates \
+         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            cache::CACHE_SCHEMA_VERSION as i64,
+            wasm_hash,
+            "increment",
+            args_hash,
+            "testnet",
+            3_894_195i64,
+            15_427i64,
+            532_502i64,
+            2_048i64,
+            now,
+        ],
+    )
+    .expect("seed cache with memory_bytes=2048");
+    drop(conn);
+
+    // Below threshold (2049) -> exit 0
+    let (_, stderr, code) = run_cli_quiet(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--cache-ttl",
+            "1h",
+            "--max-memory",
+            "2049",
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 0,
+        "below memory budget should exit 0; stderr: {stderr}"
+    );
+
+    // At threshold (2048) -> exit 0
+    let (_, stderr, code) = run_cli_quiet(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--cache-ttl",
+            "1h",
+            "--max-memory",
+            "2048",
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 0,
+        "exact memory budget should exit 0; stderr: {stderr}"
+    );
+
+    // Above threshold (2047) -> exit 1
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--cache-ttl",
+            "1h",
+            "--max-memory",
+            "2047",
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 1,
+        "above memory budget should exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("memory bytes (2048) exceeds maximum budget (2047)"),
+        "stderr should report exceeded memory budget; got: {stderr}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must remain valid JSON");
+    assert_eq!(parsed["memory_bytes"], 2_048);
+}

@@ -286,6 +286,33 @@ pub enum Command {
         /// fee/CPU consistency across runs.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=100))]
         repeat: u32,
+
+        /// Maximum allowed total fee in integer stroops; fails with non-zero
+        /// status when the simulated fee exceeds this threshold.
+        #[arg(
+            long,
+            visible_aliases = ["max-fee-stroops", "fee-budget"],
+            value_name = "STROOPS"
+        )]
+        max_fee: Option<i64>,
+
+        /// Maximum allowed CPU instructions; fails with non-zero status when
+        /// the simulated CPU instruction count exceeds this threshold.
+        #[arg(
+            long,
+            visible_aliases = ["max-cpu-instructions", "cpu-budget"],
+            value_name = "INSTRUCTIONS"
+        )]
+        max_cpu: Option<u64>,
+
+        /// Maximum allowed memory usage in bytes; fails with non-zero status
+        /// when the simulated memory footprint exceeds this threshold.
+        #[arg(
+            long,
+            visible_aliases = ["max-memory-bytes", "max-mem", "memory-budget"],
+            value_name = "BYTES"
+        )]
+        max_memory: Option<u64>,
     },
 
     /// Enumerate all public contract functions and estimate each one.
@@ -331,6 +358,33 @@ pub enum Command {
         /// configuration has changed since the last snapshot.
         #[arg(long)]
         auto_snapshot: bool,
+
+        /// Maximum allowed total fee in integer stroops per function; fails
+        /// with non-zero status when any function exceeds this threshold.
+        #[arg(
+            long,
+            visible_aliases = ["max-fee-stroops", "fee-budget"],
+            value_name = "STROOPS"
+        )]
+        max_fee: Option<i64>,
+
+        /// Maximum allowed CPU instructions per function; fails with non-zero
+        /// status when any function exceeds this threshold.
+        #[arg(
+            long,
+            visible_aliases = ["max-cpu-instructions", "cpu-budget"],
+            value_name = "INSTRUCTIONS"
+        )]
+        max_cpu: Option<u64>,
+
+        /// Maximum allowed memory usage in bytes per function; fails with
+        /// non-zero status when any function exceeds this threshold.
+        #[arg(
+            long,
+            visible_aliases = ["max-memory-bytes", "max-mem", "memory-budget"],
+            value_name = "BYTES"
+        )]
+        max_memory: Option<u64>,
     },
     WasmInfo {
         #[arg(long, short)]

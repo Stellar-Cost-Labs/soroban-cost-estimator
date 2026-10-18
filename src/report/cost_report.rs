@@ -348,6 +348,137 @@ pub fn format_resource_warnings(warnings: &[ResourceWarning]) -> String {
     out
 }
 
+/// Optional CI budget thresholds for total fee (in stroops), CPU instructions,
+/// and memory bytes (issue #479).
+///
+/// Each threshold is evaluated independently: a measured metric that is less
+/// than or equal to its configured limit passes, while a metric strictly
+/// greater than its limit produces a [`BudgetViolation`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResourceBudget {
+    /// Maximum allowed total fee in integer stroops.
+    pub max_fee_stroops: Option<i64>,
+    /// Maximum allowed CPU instructions.
+    pub max_cpu_instructions: Option<u64>,
+    /// Maximum allowed memory usage in bytes.
+    pub max_memory_bytes: Option<u64>,
+}
+
+/// A single exceeded budget threshold identified after simulation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BudgetViolation {
+    /// Contract function (or upload target) that exceeded the budget.
+    pub function: String,
+    /// Machine-readable metric identifier (`"fee_stroops"`, `"cpu_instructions"`, `"memory_bytes"`).
+    pub metric: String,
+    /// Human-readable metric label (`"total fee"`, `"CPU instructions"`, `"memory bytes"`).
+    pub label: String,
+    /// Measured value from the simulation.
+    pub actual: i128,
+    /// Configured maximum allowed value.
+    pub limit: i128,
+    /// Unit suffix (`"stroops"`, `"instructions"`, `"bytes"`).
+    pub unit: String,
+    /// Human-readable diagnostic describing the exceeded threshold.
+    pub message: String,
+}
+
+impl ResourceBudget {
+    /// Returns `true` when at least one threshold is configured.
+    #[must_use]
+    pub const fn is_configured(&self) -> bool {
+        self.max_fee_stroops.is_some()
+            || self.max_cpu_instructions.is_some()
+            || self.max_memory_bytes.is_some()
+    }
+
+    /// Evaluate all configured thresholds against a [`CostReport`] without
+    /// mutating any measured values.
+    #[must_use]
+    pub fn check_report(&self, report: &CostReport) -> Vec<BudgetViolation> {
+        self.check_raw(
+            &report.function,
+            report.fee.total_stroops,
+            report.cpu_instructions,
+            report.memory_bytes,
+        )
+    }
+
+    /// Evaluate all configured thresholds against raw measured values in a
+    /// deterministic order (`fee_stroops`, `cpu_instructions`, `memory_bytes`).
+    #[must_use]
+    pub fn check_raw(
+        &self,
+        function: &str,
+        total_fee_stroops: i64,
+        cpu_instructions: u64,
+        memory_bytes: u64,
+    ) -> Vec<BudgetViolation> {
+        let mut violations = Vec::new();
+
+        if let Some(limit) = self.max_fee_stroops {
+            if total_fee_stroops > limit {
+                violations.push(BudgetViolation {
+                    function: function.to_string(),
+                    metric: "fee_stroops".to_string(),
+                    label: "total fee".to_string(),
+                    actual: i128::from(total_fee_stroops),
+                    limit: i128::from(limit),
+                    unit: "stroops".to_string(),
+                    message: format!(
+                        "total fee ({total_fee_stroops} stroops) exceeds maximum budget ({limit} stroops)"
+                    ),
+                });
+            }
+        }
+
+        if let Some(limit) = self.max_cpu_instructions {
+            if cpu_instructions > limit {
+                violations.push(BudgetViolation {
+                    function: function.to_string(),
+                    metric: "cpu_instructions".to_string(),
+                    label: "CPU instructions".to_string(),
+                    actual: i128::from(cpu_instructions),
+                    limit: i128::from(limit),
+                    unit: "instructions".to_string(),
+                    message: format!(
+                        "CPU instructions ({cpu_instructions}) exceeds maximum budget ({limit})"
+                    ),
+                });
+            }
+        }
+
+        if let Some(limit) = self.max_memory_bytes {
+            if memory_bytes > limit {
+                violations.push(BudgetViolation {
+                    function: function.to_string(),
+                    metric: "memory_bytes".to_string(),
+                    label: "memory bytes".to_string(),
+                    actual: i128::from(memory_bytes),
+                    limit: i128::from(limit),
+                    unit: "bytes".to_string(),
+                    message: format!(
+                        "memory bytes ({memory_bytes}) exceeds maximum budget ({limit})"
+                    ),
+                });
+            }
+        }
+
+        violations
+    }
+}
+
+/// Format a slice of [`BudgetViolation`]s into a single summary string suitable
+/// for [`crate::error::AppError::BudgetExceeded`].
+#[must_use]
+pub fn format_budget_violations(violations: &[BudgetViolation]) -> String {
+    violations
+        .iter()
+        .map(|v| format!("{}: {}", v.function, v.message))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Direction of a historical fee change relative to the current run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -2677,5 +2808,52 @@ mod tests {
             cpu_row.ends_with(','),
             "percent column should be empty; got: {cpu_row}"
         );
+    }
+
+    // ── CI Budget Gates (#479) ──────────────────────────────────────────
+
+    #[test]
+    fn test_resource_budget_below_and_at_threshold_passes() {
+        let mut report = report_with_rates(sample_rates());
+        report.memory_bytes = 2_048;
+
+        // Below threshold
+        let below = ResourceBudget {
+            max_fee_stroops: Some(report.fee.total_stroops + 1),
+            max_cpu_instructions: Some(report.cpu_instructions + 1),
+            max_memory_bytes: Some(report.memory_bytes + 1),
+        };
+        assert!(below.is_configured());
+        assert!(below.check_report(&report).is_empty());
+
+        // Exactly at threshold
+        let exact = ResourceBudget {
+            max_fee_stroops: Some(report.fee.total_stroops),
+            max_cpu_instructions: Some(report.cpu_instructions),
+            max_memory_bytes: Some(report.memory_bytes),
+        };
+        assert!(exact.check_report(&report).is_empty());
+    }
+
+    #[test]
+    fn test_resource_budget_above_threshold_identifies_every_exceeded_limit() {
+        let mut report = report_with_rates(sample_rates());
+        report.memory_bytes = 4_096;
+
+        let budget = ResourceBudget {
+            max_fee_stroops: Some(report.fee.total_stroops - 1),
+            max_cpu_instructions: Some(report.cpu_instructions - 1),
+            max_memory_bytes: Some(report.memory_bytes - 1),
+        };
+        let violations = budget.check_report(&report);
+        assert_eq!(violations.len(), 3);
+        assert_eq!(violations[0].metric, "fee_stroops");
+        assert_eq!(violations[1].metric, "cpu_instructions");
+        assert_eq!(violations[2].metric, "memory_bytes");
+
+        let summary = format_budget_violations(&violations);
+        assert!(summary.contains("total fee"));
+        assert!(summary.contains("CPU instructions"));
+        assert!(summary.contains("memory bytes"));
     }
 }

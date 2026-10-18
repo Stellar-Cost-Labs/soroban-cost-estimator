@@ -216,7 +216,9 @@ async fn main() {
     }
 
     if let Err(err) = run(args).await {
-        error!(error = %err, "command failed");
+        if !matches!(err, error::AppError::BudgetExceeded(_)) {
+            error!(error = %err, "command failed");
+        }
         eprintln!("Error: {err}");
         std::process::exit(1);
     }
@@ -282,7 +284,15 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             dry_run,
             project,
             repeat,
+            max_fee,
+            max_cpu,
+            max_memory,
         } => {
+            let budget = report::cost_report::ResourceBudget {
+                max_fee_stroops: max_fee,
+                max_cpu_instructions: max_cpu,
+                max_memory_bytes: max_memory,
+            };
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
             let format = match (args.format, json) {
@@ -348,6 +358,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     wasm_new.as_deref(),
                     dry_run,
                     project.as_deref(),
+                    budget,
                 )
                 .await
             }
@@ -362,7 +373,15 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             fn_names,
             json,
             auto_snapshot,
+            max_fee,
+            max_cpu,
+            max_memory,
         } => {
+            let budget = report::cost_report::ResourceBudget {
+                max_fee_stroops: max_fee,
+                max_cpu_instructions: max_cpu,
+                max_memory_bytes: max_memory,
+            };
             let format = match (args.format, json) {
                 (Some(fmt), _) => fmt,
                 (None, true) => cli::OutputFormat::Json,
@@ -412,6 +431,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     args.wasm_info,
                     args.verbose,
                     auto_snapshot,
+                    budget,
                 )
                 .await
             }
@@ -791,10 +811,29 @@ enum EstimateRun {
     },
     /// A still-fresh cached estimate was reused and already printed by
     /// [`estimate_once`]; nothing more to render.
-    Cached,
+    Cached(cache::CachedEstimate),
     /// `--dry-run` printed the planned simulation payload and skipped every
     /// network call; the caller must not render or snapshot anything.
     DryRun,
+}
+
+/// Emit diagnostics on stderr for every exceeded budget threshold and return
+/// [`error::AppError::BudgetExceeded`] when `violations` is non-empty.
+fn enforce_budget_violations(
+    violations: &[report::cost_report::BudgetViolation],
+) -> error::AppResult<()> {
+    if violations.is_empty() {
+        return Ok(());
+    }
+    for violation in violations {
+        eprintln!(
+            "Budget exceeded for '{}': {}",
+            violation.function, violation.message
+        );
+    }
+    Err(error::AppError::BudgetExceeded(
+        report::cost_report::format_budget_violations(violations),
+    ))
 }
 
 /// Emits the WASM structure summary (entry points, memory, host imports)
@@ -1024,6 +1063,7 @@ async fn simulate_report(
 /// With `--diff`, two WASM builds are simulated and rendered as a
 /// side-by-side comparison instead; see [`cmd_estimate_diff`].
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::fn_params_excessive_bools)]
 async fn cmd_estimate(
     wasm_path: &str,
@@ -1056,6 +1096,7 @@ async fn cmd_estimate(
     wasm_new: Option<&str>,
     dry_run: bool,
     project: Option<&str>,
+    budget: report::cost_report::ResourceBudget,
 ) -> error::AppResult<()> {
     // Parse the requested projection counts up front so an invalid list is
     // rejected before any RPC traffic, regardless of the output format.
@@ -1091,6 +1132,7 @@ async fn cmd_estimate(
             extra_headers,
             quiet,
             verbose,
+            budget,
         )
         .await;
     }
@@ -1146,6 +1188,7 @@ async fn cmd_estimate(
             verbose,
             auto_snapshot,
             dry_run,
+            budget,
         )
         .await;
     }
@@ -1184,6 +1227,19 @@ async fn cmd_estimate(
     if matches!(run, EstimateRun::DryRun) {
         return Ok(());
     }
+
+    // Evaluate budget thresholds immediately after simulation (or cache hit)
+    // and before formatting, without mutating measured values (#479).
+    let budget_violations = match &run {
+        EstimateRun::Simulated { report, .. } => budget.check_report(report),
+        EstimateRun::Cached(fresh) => budget.check_raw(
+            &fresh.function,
+            fresh.total_stroops,
+            fresh.cpu_instructions,
+            fresh.memory_bytes,
+        ),
+        EstimateRun::DryRun => Vec::new(),
+    };
 
     if let EstimateRun::Simulated {
         report, previous, ..
@@ -1278,6 +1334,8 @@ async fn cmd_estimate(
             eprintln!("Warning: auto-snapshot failed: {e}");
         }
     }
+
+    enforce_budget_violations(&budget_violations)?;
     Ok(())
 }
 
@@ -1324,6 +1382,7 @@ async fn cmd_estimate_repeat(
     verbose: bool,
     auto_snapshot: bool,
     dry_run: bool,
+    budget: report::cost_report::ResourceBudget,
 ) -> error::AppResult<()> {
     use tracing::{Instrument, info_span};
 
@@ -1389,7 +1448,14 @@ async fn cmd_estimate_repeat(
         if let Some(fresh) = fresh {
             let ttl_secs = ttl_secs.unwrap_or_default();
             info!(ttl_secs, function = %function_name, "cache hit — reusing fresh estimate");
+            let violations = budget.check_raw(
+                &fresh.function,
+                fresh.total_stroops,
+                fresh.cpu_instructions,
+                fresh.memory_bytes,
+            );
             print_cached_estimate(&fresh, ttl_secs, json_flag, precision, quiet);
+            enforce_budget_violations(&violations)?;
             return Ok(());
         }
 
@@ -1596,9 +1662,10 @@ async fn cmd_estimate_repeat(
             error::AppError::General("no simulation samples were collected".to_string())
         })?;
 
-        // Keep the first report alive for potential future use; the benchmark
-        // summary is the user-visible output in repeat mode.
-        let _ = first_report;
+        let violations = first_report
+            .as_ref()
+            .map(|r| budget.check_report(r))
+            .unwrap_or_default();
 
         print_repeat_summary(
             repeat,
@@ -1635,6 +1702,7 @@ async fn cmd_estimate_repeat(
             }
         }
 
+        enforce_budget_violations(&violations)?;
         Ok(())
     }
     .instrument(span)
@@ -1781,7 +1849,7 @@ async fn estimate_once(
             let ttl_secs = ttl_secs.unwrap_or_default();
             info!(ttl_secs, function = %function_name, "cache hit â€” reusing fresh estimate");
             print_cached_estimate(&fresh, ttl_secs, json_flag, precision, quiet);
-            return Ok(EstimateRun::Cached);
+            return Ok(EstimateRun::Cached(fresh));
         }
 
         // In dry-run mode, print the planned simulation payload and exit
@@ -2212,7 +2280,7 @@ async fn emit_watch_estimate(
             let formatter = formatter_by_name(format).unwrap_or_else(|| Box::new(TableFormatter));
             println!("{}", formatter.format(&report));
         }
-        Ok(EstimateRun::Cached | EstimateRun::DryRun) => {
+        Ok(EstimateRun::Cached(_) | EstimateRun::DryRun) => {
             // Unreachable in watch mode: the cache store is only consulted
             // when `--cache-ttl` is supplied, and `--dry-run` is suppressed,
             // which watch never does.
@@ -2648,6 +2716,7 @@ async fn cmd_estimate_diff(
     extra_headers: &[String],
     quiet: bool,
     verbose: bool,
+    budget: report::cost_report::ResourceBudget,
 ) -> error::AppResult<()> {
     use sha2::Digest;
 
@@ -2730,6 +2799,8 @@ async fn cmd_estimate_diff(
     })
     .await?;
 
+    let budget_violations = budget.check_report(&new_report);
+
     if format == "json" {
         let diff = report::diff::build_cost_report_diff(&old_report, &new_report);
         let output = serde_json::json!({
@@ -2745,6 +2816,7 @@ async fn cmd_estimate_diff(
         );
     }
 
+    enforce_budget_violations(&budget_violations)?;
     Ok(())
 }
 
@@ -2865,6 +2937,7 @@ fn csv_row(r: &EstimateAllResult) -> String {
 /// envelope is built against an undeployed contract, or identical fee-rate
 /// lookups â€” transmit each distinct `(method, params)` pair only once.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::fn_params_excessive_bools)]
 async fn cmd_estimate_all(
     wasm_path: &str,
@@ -2885,6 +2958,7 @@ async fn cmd_estimate_all(
     wasm_info_flag: bool,
     verbose: bool,
     auto_snapshot: bool,
+    budget: report::cost_report::ResourceBudget,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -3004,6 +3078,7 @@ async fn cmd_estimate_all(
 
         let mut json_results: Vec<EstimateAllResult> = Vec::new();
         let mut csv_rows: Vec<String> = Vec::new();
+        let mut budget_violations: Vec<report::cost_report::BudgetViolation> = Vec::new();
         let total = selected.len();
         debug!(total, "enumerated functions");
 
@@ -3026,6 +3101,16 @@ async fn cmd_estimate_all(
                 precision,
             )
             .await?;
+            if result.status == EstimateAllStatus::Ok {
+                if let Some(ref fee) = result.fee {
+                    budget_violations.extend(budget.check_raw(
+                        &result.function,
+                        fee.total_stroops,
+                        result.cpu_instructions.unwrap_or(0),
+                        result.memory_bytes.unwrap_or(0),
+                    ));
+                }
+            }
             if format == "csv" {
                 let row = csv_row(&result);
                 csv_rows.push(row);
@@ -3104,6 +3189,7 @@ async fn cmd_estimate_all(
             }
         }
 
+        enforce_budget_violations(&budget_violations)?;
         Ok(())
     }
     .instrument(span)
@@ -5088,6 +5174,7 @@ async fn cmd_cache_warm(
         false,
         verbose,
         false,
+        report::cost_report::ResourceBudget::default(),
     )
     .await
 }
