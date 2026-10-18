@@ -59,6 +59,13 @@ pub fn wasm_sha256_hex(bytes: &[u8]) -> String {
 ///
 /// # Network calls
 /// None — pure file I/O + parsing.
+/// Alias for [`load_wasm`] instrumented with `tracing`.
+#[tracing::instrument(level = "debug", skip_all, fields(path = %path.display()))]
+pub fn parse_wasm(path: &Path) -> AppResult<WasmInfo> {
+    load_wasm(path)
+}
+
+#[tracing::instrument(level = "debug", skip_all, fields(path = %path.display()))]
 pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
     debug!(path = %path.display(), "loading WASM file");
     let bytes = std::fs::read(path).map_err(|e| {

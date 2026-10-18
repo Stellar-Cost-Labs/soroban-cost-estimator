@@ -125,6 +125,7 @@ where
 ///
 /// # Network calls
 /// Makes one `simulateTransaction` RPC call to the Soroban RPC endpoint.
+#[tracing::instrument(level = "debug", skip_all, fields(tx_len = transaction_xdr.len()))]
 pub async fn simulate_transaction(
     client: &RpcClient,
     transaction_xdr: &str,
@@ -141,6 +142,7 @@ pub async fn simulate_transaction(
 ///
 /// # Network calls
 /// Makes one (retryable) `simulateTransaction` RPC call per invocation.
+#[tracing::instrument(level = "debug", skip_all, fields(tx_len = transaction_xdr.len()))]
 pub async fn simulate_transaction_uncached(
     client: &RpcClient,
     transaction_xdr: &str,

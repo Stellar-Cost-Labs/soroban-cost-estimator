@@ -118,6 +118,7 @@ pub struct ConfigSettingEntryRaw {
 ///
 /// # Network calls
 /// Makes one `getLedgerEntries` RPC call.
+#[tracing::instrument(level = "debug", skip(client))]
 pub async fn fetch_config_setting(
     client: &RpcClient,
     setting_id: ConfigSettingId,
@@ -159,6 +160,7 @@ pub async fn fetch_config_setting(
 ///
 /// # Network calls
 /// Makes 1 `getLedgerEntries` RPC call (all 6 keys batched).
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn fetch_all_config_settings(
     client: &RpcClient,
 ) -> AppResult<Vec<ConfigSettingEntryRaw>> {

@@ -205,11 +205,16 @@ async fn main() {
     } else {
         "info"
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level)),
-        )
-        .init();
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
+    if args.verbose {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 
     if !args.quiet {
         info!(command = ?args.command, verbose = args.verbose, quiet = args.quiet, "starting soroban-cost-estimator");
@@ -835,6 +840,7 @@ fn emit_wasm_structure(
 ///
 /// Only the settings that carry a limit are requested; entries that fail to
 /// decode leave the corresponding limits as `None` and are simply skipped.
+#[tracing::instrument(level = "debug", skip_all)]
 async fn fetch_network_config(
     client: &rpc::client::RpcClient,
 ) -> report::cost_report::NetworkConfig {

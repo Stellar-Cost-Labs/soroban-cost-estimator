@@ -316,6 +316,11 @@ pub struct SnapshotInfo {
 }
 
 /// Compares two config snapshots and returns a detailed diff.
+#[tracing::instrument(
+    level = "debug",
+    skip_all,
+    fields(network = %new.network, old_ledger = old.ledger, new_ledger = new.ledger)
+)]
 pub fn diff_snapshots(old: &ConfigSnapshot, new: &ConfigSnapshot) -> ConfigDiff {
     let mut changes = Vec::new();
 
