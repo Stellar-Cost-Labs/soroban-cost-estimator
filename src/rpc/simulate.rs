@@ -53,6 +53,9 @@ pub struct SimulateTransactionResponse {
     /// State changes produced by the simulation.
     #[serde(default)]
     pub state_changes: Option<Vec<Value>>,
+    /// Provenance metadata of the RPC endpoint that served this response.
+    #[serde(skip)]
+    pub endpoint: Option<crate::rpc::client::RpcEndpointMetadata>,
 }
 
 impl SimulateTransactionResponse {
@@ -162,11 +165,20 @@ async fn simulate_transaction_inner(
     };
     let params = serde_json::to_value(params)?;
 
-    let response: SimulateTransactionResponse = if dedup {
-        client.call("simulateTransaction", params).await?
+    let outcome = if dedup {
+        client
+            .call_with_outcome::<SimulateTransactionResponse>("simulateTransaction", params)
+            .await?
     } else {
-        client.call_uncached("simulateTransaction", params).await?
+        client
+            .call_uncached_with_outcome::<SimulateTransactionResponse>(
+                "simulateTransaction",
+                params,
+            )
+            .await?
     };
+    let mut response = outcome.value;
+    response.endpoint = Some(outcome.endpoint);
 
     if let Some(ref error) = response.error {
         debug!(error, "simulation returned error");

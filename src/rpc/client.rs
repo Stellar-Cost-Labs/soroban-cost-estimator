@@ -73,8 +73,106 @@ pub fn resolve_ws_endpoint(network: &str, custom_url: Option<&str>) -> AppResult
     Ok(ws_endpoint)
 }
 
+/// Role of the RPC endpoint that served a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EndpointRole {
+    /// The primary RPC endpoint (`--rpc-url` or default network endpoint).
+    Primary,
+    /// The fallback RPC endpoint (`--rpc-fallback-url`).
+    Fallback,
+}
+
+impl EndpointRole {
+    /// Lowercase string label (`"primary"` or `"fallback"`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
+impl std::fmt::Display for EndpointRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Sanitized provenance metadata identifying which RPC endpoint served a request.
+///
+/// Only the sanitized `host` (or `host:port`) and the endpoint role/failover
+/// flag are recorded — userinfo credentials (`user:pass@`), paths, and query
+/// strings (`?api_key=...`) are stripped so sensitive values never appear in
+/// human or structured reports.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RpcEndpointMetadata {
+    /// Whether the primary or fallback endpoint served the response.
+    pub role: EndpointRole,
+    /// Sanitized host (and optional port) of the endpoint that served the
+    /// response, with credentials, path, and query parameters removed.
+    pub host: String,
+    /// `true` when the primary endpoint failed and the request was served by
+    /// the fallback endpoint.
+    pub failed_over: bool,
+}
+
+/// Typed result pairing a deserialized JSON-RPC response with the
+/// [`RpcEndpointMetadata`] of the endpoint that served it.
+#[derive(Debug, Clone)]
+pub struct CallOutcome<T> {
+    /// Deserialized JSON-RPC `result` payload.
+    pub value: T,
+    /// Provenance metadata of the endpoint that served the response.
+    pub endpoint: RpcEndpointMetadata,
+}
+
+/// Sanitizes an endpoint URL down to its `host` (or `host:port`) identifier,
+/// stripping scheme, `user:pass@` credentials, path segments, query strings,
+/// and fragments.
+///
+/// Safe to include in human-readable and machine-readable reports.
+#[must_use]
+pub fn sanitize_endpoint_host(raw_url: &str) -> String {
+    let trimmed = raw_url.trim();
+    let without_scheme = match trimmed.find("://") {
+        Some(idx) => &trimmed[idx + 3..],
+        None => trimmed,
+    };
+    let authority_end = without_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(without_scheme.len());
+    let authority = &without_scheme[..authority_end];
+    let host_port = match authority.rfind('@') {
+        Some(idx) => &authority[idx + 1..],
+        None => authority,
+    };
+    if host_port.is_empty() {
+        "<redacted>".to_string()
+    } else {
+        host_port.to_string()
+    }
+}
+
+/// Redacts credentials (`user:pass@`), query strings (`?...`), and fragments
+/// (`#...`) from an endpoint URL while preserving its scheme and `host[:port]`.
+#[must_use]
+pub fn redact_endpoint_url(raw_url: &str) -> String {
+    let trimmed = raw_url.trim();
+    let scheme_prefix = match trimmed.find("://") {
+        Some(idx) => &trimmed[..idx + 3],
+        None => "",
+    };
+    let host = sanitize_endpoint_host(trimmed);
+    format!("{scheme_prefix}{host}")
+}
+
 /// Key identifying a deduplicable JSON-RPC request: `(method, serialized params)`.
 type RequestKey = (String, String);
+
+/// Raw JSON-RPC `result` value paired with the endpoint metadata that served it.
+type RawOutcome = (Value, RpcEndpointMetadata);
 
 /// A single-flight handle for one in-flight request.
 ///
@@ -98,7 +196,7 @@ struct SharedFuture {
 struct SharedFutureInner {
     /// Successful outcome published by the leader, if it completed. Written
     /// once by the leader and read by every follower.
-    outcome: Mutex<Option<Value>>,
+    outcome: Mutex<Option<RawOutcome>>,
     /// Set once the leader has finished — successfully or not.
     finished: AtomicBool,
     /// Wakes followers the moment `finished` flips to `true`.
@@ -107,12 +205,12 @@ struct SharedFutureInner {
 
 impl SharedFuture {
     /// Publishes the leader's successful result for its followers.
-    async fn publish(&self, value: Value) {
+    async fn publish(&self, value: RawOutcome) {
         *self.inner.outcome.lock().await = Some(value);
     }
 
     /// Returns the leader's published result, if it succeeded.
-    async fn outcome(&self) -> Option<Value> {
+    async fn outcome(&self) -> Option<RawOutcome> {
         self.inner.outcome.lock().await.clone()
     }
 
@@ -148,7 +246,7 @@ struct DedupState {
     /// Results of identical requests that already completed successfully,
     /// keyed by request. A cache hit skips the network entirely and also lets
     /// a request arriving *after* its twin finished share the result.
-    completed: HashMap<RequestKey, Value>,
+    completed: HashMap<RequestKey, RawOutcome>,
     /// One single-flight handle per key currently in flight. Concurrent
     /// identical callers attach to the existing handle rather than opening a
     /// second request.
@@ -523,13 +621,33 @@ impl RpcClient {
         method: &str,
         params: Value,
     ) -> AppResult<T> {
+        self.call_with_outcome(method, params)
+            .await
+            .map(|outcome| outcome.value)
+    }
+
+    /// Send a JSON-RPC request, deserialize the response, and return the
+    /// [`RpcEndpointMetadata`] identifying which endpoint served the result.
+    ///
+    /// Deduplication and single-flight coalescing behave identically to
+    /// [`Self::call`], preserving the endpoint metadata recorded by the
+    /// leader.
+    ///
+    /// # Errors
+    /// Returns [`AppError`] on transport, HTTP, or JSON-RPC failure.
+    pub async fn call_with_outcome<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> AppResult<CallOutcome<T>> {
         let key = (method.to_string(), params.to_string());
 
         loop {
             // Fast path: an identical request already completed successfully.
-            if let Some(cached) = self.cached_result(&key).await {
+            if let Some((cached, endpoint)) = self.cached_result(&key).await {
                 trace!(method, "deduplicated against completed request");
-                return deserialize_result::<T>(cached);
+                return deserialize_result::<T>(cached)
+                    .map(|value| CallOutcome { value, endpoint });
             }
 
             // Attach to the in-flight single-flight handle for this key, or
@@ -552,9 +670,10 @@ impl RpcClient {
                 // leader published its result for us; a failed one published
                 // nothing, so loop back and become the next leader (a retry).
                 shared.wait().await;
-                if let Some(value) = shared.outcome().await {
+                if let Some((value, endpoint)) = shared.outcome().await {
                     trace!(method, "deduplicated against in-flight request");
-                    return deserialize_result::<T>(value);
+                    return deserialize_result::<T>(value)
+                        .map(|value| CallOutcome { value, endpoint });
                 }
                 continue;
             }
@@ -563,18 +682,20 @@ impl RpcClient {
             // followers, then release the key so later callers can reuse the
             // completed result.
             let result = self.perform_call(method, params).await;
-            if let Ok(value) = &result {
-                shared.publish(value.clone()).await;
+            if let Ok(outcome) = &result {
+                shared.publish(outcome.clone()).await;
             }
             {
                 let mut state = self.dedup.lock().await;
-                if let Ok(value) = &result {
-                    state.completed.insert(key.clone(), value.clone());
+                if let Ok(outcome) = &result {
+                    state.completed.insert(key.clone(), outcome.clone());
                 }
                 state.in_flight.remove(&key);
             }
             shared.finish();
-            return result.and_then(deserialize_result::<T>);
+            return result.and_then(|(raw, endpoint)| {
+                deserialize_result::<T>(raw).map(|value| CallOutcome { value, endpoint })
+            });
         }
     }
 
@@ -591,19 +712,37 @@ impl RpcClient {
         method: &str,
         params: Value,
     ) -> AppResult<T> {
+        self.call_uncached_with_outcome(method, params)
+            .await
+            .map(|outcome| outcome.value)
+    }
+
+    /// Like [`Self::call_uncached`], but also returns the
+    /// [`RpcEndpointMetadata`] identifying which endpoint served the result.
+    ///
+    /// # Errors
+    /// Returns [`AppError`] on transport, HTTP, or JSON-RPC failure.
+    pub async fn call_uncached_with_outcome<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> AppResult<CallOutcome<T>> {
         self.perform_call(method, params)
             .await
-            .and_then(deserialize_result::<T>)
+            .and_then(|(raw, endpoint)| {
+                deserialize_result::<T>(raw).map(|value| CallOutcome { value, endpoint })
+            })
     }
 
     /// Returns the cached result for `key`, if a prior identical request
     /// completed successfully.
-    async fn cached_result(&self, key: &RequestKey) -> Option<Value> {
+    async fn cached_result(&self, key: &RequestKey) -> Option<RawOutcome> {
         let state = self.dedup.lock().await;
         state.completed.get(key).cloned()
     }
 
-    /// Performs the actual HTTP POST and extracts the raw `result` value.
+    /// Performs the actual HTTP POST and extracts the raw `result` value
+    /// together with the [`RpcEndpointMetadata`] of the serving endpoint.
     ///
     /// Tries the primary endpoint first. If the primary fails with a
     /// network-level error (connection refused, timeout, DNS failure, etc.)
@@ -616,7 +755,7 @@ impl RpcClient {
     /// # Network calls
     /// Makes an HTTP POST to the configured RPC endpoint (and optionally the
     /// fallback).
-    async fn perform_call(&self, method: &str, params: Value) -> AppResult<Value> {
+    async fn perform_call(&self, method: &str, params: Value) -> AppResult<RawOutcome> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -633,21 +772,43 @@ impl RpcClient {
             .post_and_parse(method, &body, &self.url, self.connect_timeout)
             .await
         {
-            Ok(result) => Ok(result),
+            Ok(result) => Ok((
+                result,
+                RpcEndpointMetadata {
+                    role: EndpointRole::Primary,
+                    host: sanitize_endpoint_host(&self.url),
+                    failed_over: false,
+                },
+            )),
             Err(e) if Self::is_failover_trigger(&e) => {
                 if let Some(ref fallback) = self.fallback_url {
+                    let sanitized_fallback = sanitize_endpoint_host(fallback);
+                    let display_fallback = redact_endpoint_url(fallback);
                     // The operator-facing notice goes to stderr so it never
                     // contaminates machine-readable stdout (json/csv/markdown).
-                    eprintln!("Primary RPC failed, failing over to fallback endpoint: {fallback}");
+                    // Redact credentials and query strings so sensitive tokens
+                    // in the fallback URL are never written to stderr.
+                    eprintln!(
+                        "Primary RPC failed, failing over to fallback endpoint: {display_fallback}"
+                    );
                     debug!(
                         method,
-                        primary = %self.url,
-                        fallback = %fallback,
+                        primary = %sanitize_endpoint_host(&self.url),
+                        fallback = %sanitized_fallback,
                         error = %e,
                         "primary RPC endpoint failed — failing over to fallback"
                     );
-                    self.post_and_parse(method, &body, fallback, self.connect_timeout)
-                        .await
+                    let result = self
+                        .post_and_parse(method, &body, fallback, self.connect_timeout)
+                        .await?;
+                    Ok((
+                        result,
+                        RpcEndpointMetadata {
+                            role: EndpointRole::Fallback,
+                            host: sanitized_fallback,
+                            failed_over: true,
+                        },
+                    ))
                 } else {
                     Err(e)
                 }
@@ -699,7 +860,11 @@ impl RpcClient {
         let request_body_str = serde_json::to_string(&request_body).unwrap_or_default();
         let payload_size = request_body_str.len();
         if self.verbose {
-            eprintln!("[RPC] POST {} ({} bytes)", url, payload_size);
+            eprintln!(
+                "[RPC] POST {} ({} bytes)",
+                redact_endpoint_url(&url),
+                payload_size
+            );
             eprintln!("[RPC] -> {}", request_body_str);
         }
 

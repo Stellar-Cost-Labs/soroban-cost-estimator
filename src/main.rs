@@ -1013,6 +1013,7 @@ async fn simulate_report(
         history: None,
         projections: None,
         contract_meta: req.contract_meta.clone(),
+        rpc_endpoint: response.endpoint.clone(),
     })
 }
 
@@ -1588,6 +1589,7 @@ async fn cmd_estimate_repeat(
                     history: None,
                     projections: None,
                     contract_meta: wasm_info.contract_meta.clone(),
+                    rpc_endpoint: response.endpoint.clone(),
                 });
             }
         }
@@ -5928,6 +5930,7 @@ mod tests {
             history: None,
             projections: None,
             contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
+            rpc_endpoint: None,
         }
     }
 

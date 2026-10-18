@@ -557,6 +557,10 @@ pub struct CostReport {
     /// decodable section; deserialized as empty from older payloads.
     #[serde(default)]
     pub contract_meta: ContractMeta,
+    /// Sanitized provenance metadata identifying which RPC endpoint served the
+    /// simulation (`primary` vs `fallback`, sanitized host, and failover outcome).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_endpoint: Option<crate::rpc::client::RpcEndpointMetadata>,
 }
 
 /// A cost projection for a specific batch invocation count.
@@ -2150,6 +2154,7 @@ mod tests {
             history: None,
             projections: None,
             contract_meta: ContractMeta::default(),
+            rpc_endpoint: None,
         }
     }
 
@@ -2271,6 +2276,7 @@ mod tests {
             history: None,
             projections: None,
             contract_meta: ContractMeta::default(),
+            rpc_endpoint: None,
         };
 
         let table_out = format_report_table(&report);

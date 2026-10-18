@@ -186,6 +186,17 @@ impl TableFormatter {
             "Simulated at ledger sequence: {}\n",
             crate::report::cost_report::format_ledger_sequence(report.ledger)
         ));
+        if let Some(ref endpoint) = report.rpc_endpoint {
+            let failover_suffix = if endpoint.failed_over {
+                ", failover"
+            } else {
+                ""
+            };
+            output.push_str(&format!(
+                "RPC endpoint: {} ({}{})\n",
+                endpoint.host, endpoint.role, failover_suffix
+            ));
+        }
         output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
         output.push_str(&format!("WASM hash: {}\n", report.wasm_hash));
         output.push_str(&format!("WASM size: {} bytes\n", report.wasm_size));
@@ -425,6 +436,17 @@ impl ReportFormatter for MarkdownFormatter {
         ));
         output.push_str(&format!("- **WASM hash:** `{}`\n", report.wasm_hash));
         output.push_str(&format!("- **WASM size:** {} bytes\n", report.wasm_size));
+        if let Some(ref endpoint) = report.rpc_endpoint {
+            let failover_suffix = if endpoint.failed_over {
+                ", failover"
+            } else {
+                ""
+            };
+            output.push_str(&format!(
+                "- **RPC endpoint:** `{}` ({}{})\n",
+                endpoint.host, endpoint.role, failover_suffix
+            ));
+        }
         output.push_str(&format!(
             "- **RPC round-trip:** {} ms\n\n",
             report.rpc_latency_ms
@@ -629,6 +651,7 @@ mod tests {
             history: None,
             projections: None,
             contract_meta: crate::wasm::parser::ContractMeta::default(),
+            rpc_endpoint: None,
         }
     }
 
@@ -664,6 +687,7 @@ mod tests {
             history: None,
             projections: None,
             contract_meta: crate::wasm::parser::ContractMeta::default(),
+            rpc_endpoint: None,
         }
     }
 
