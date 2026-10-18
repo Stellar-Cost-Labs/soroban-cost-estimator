@@ -127,3 +127,71 @@ fn test_last_changed_tracks_independent_fields_separately() {
     );
     assert_eq!(last[1].timestamp, "2026-01-02T00:00:00Z");
 }
+
+#[test]
+fn test_atomic_snapshot_write_preserves_previous_file_on_write_failure() {
+    use soroban_cost_estimator::config_snapshot::store::{
+        load_snapshot_from_path, save_snapshot, write_snapshot_atomically_with,
+    };
+    use std::io::Write;
+
+    let dir = std::env::temp_dir().join(format!("sce-atomic-write-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let dest = dir.join("testnet-snapshot.json");
+
+    let initial = make_snapshot("2026-01-01T00:00:00Z", 100, 100, 5);
+    save_snapshot(&initial, Some(&dest.to_string_lossy())).expect("save initial snapshot");
+
+    // Simulate a partial write followed by an I/O error before flush/rename
+    let err = write_snapshot_atomically_with(&dest, b"{\"truncated\":", |file| {
+        file.write_all(b"{\"truncated\":")?;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "simulated disk full mid-snapshot",
+        ))
+    });
+    assert!(err.is_err(), "simulated write error must fail");
+
+    // Previous snapshot must still be intact and readable
+    let preserved = load_snapshot_from_path(&dest.to_string_lossy())
+        .expect("previous snapshot must remain valid");
+    assert_eq!(preserved.ledger, 100);
+
+    // No temporary files should remain in the directory
+    let entries: Vec<_> = std::fs::read_dir(&dir)
+        .expect("read dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(entries, vec!["testnet-snapshot.json".to_string()]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_atomic_snapshot_write_cleans_up_temp_file_on_rename_failure() {
+    use soroban_cost_estimator::config_snapshot::store::write_snapshot_atomically;
+
+    let dir = std::env::temp_dir().join(format!("sce-atomic-rename-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+
+    // Create a directory at `dest` so renaming a regular file over `dest` fails
+    let dest_dir = dir.join("unrenamable-dir.json");
+    std::fs::create_dir_all(&dest_dir).expect("create conflicting directory");
+
+    let err = write_snapshot_atomically(&dest_dir, b"{}");
+    assert!(err.is_err(), "renaming over a directory must fail");
+
+    let leftover_temps: Vec<_> = std::fs::read_dir(&dir)
+        .expect("read dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect();
+    assert!(
+        leftover_temps.is_empty(),
+        "temporary files must be cleaned up after rename failure: {leftover_temps:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
