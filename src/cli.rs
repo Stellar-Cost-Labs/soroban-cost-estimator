@@ -373,6 +373,10 @@ pub enum Command {
 pub enum WasmAction {
     /// Print size, SHA-256, exported signatures, embedded metadata, and the
     /// section size summary for a WASM file. Fully offline: no RPC calls.
+    ///
+    /// With `--json`, machine-readable metadata includes `imports`, `host_imports`,
+    /// and `module.imports`, where each entry carries `module`, `name`, and `kind`
+    /// (`"function"`, `"memory"`, `"table"`, `"global"`, or `"tag"`) in deterministic order.
     Info {
         /// Path to the compiled Soroban contract `.wasm` file.
         wasm: PathBuf,

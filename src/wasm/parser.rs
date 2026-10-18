@@ -932,7 +932,10 @@ pub struct MemoryInfo {
 }
 
 /// Information about an import declared by a WASM module.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serialized in `wasm info --json` under `imports`, `host_imports`, and `module.imports`
+/// with fields `module`, `name`, and `kind` (`"function"`, `"memory"`, `"table"`, `"global"`, `"tag"`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct ImportInfo {
     /// Module name the import is pulled from.
     pub module: String,
@@ -1235,6 +1238,103 @@ impl WasmInfo {
         let rounded = (debug * 100 + bytes / 2) / bytes;
         u32::try_from(rounded.max(1)).unwrap_or(1)
     }
+
+    /// Returns all imports declared by the module (Soroban host functions as
+    /// well as non-function imports such as imported memories, tables, or
+    /// globals) in deterministic order.
+    #[must_use]
+    pub fn host_imports(&self) -> Vec<ImportInfo> {
+        self.imports.clone()
+    }
+}
+
+/// Builds the JSON representation of WASM metadata for `wasm info --json`.
+///
+/// Includes `imports` and `host_imports` (as well as `module.imports`) with
+/// `{ "module": ..., "name": ..., "kind": ... }` in deterministic order,
+/// preserving both function and non-function (`memory`, `table`, `global`, `tag`) imports.
+#[must_use]
+pub fn wasm_info_json(wasm_path: &str, wasm_info: &WasmInfo, hash: &str) -> serde_json::Value {
+    let breakdown = wasm_info.section_breakdown();
+    let imports = wasm_info.host_imports();
+    json!({
+        "path": wasm_path,
+        "size": wasm_info.bytes.len(),
+        "sha256": hash,
+        "has_spec": wasm_info.has_spec,
+        "sdk_version": wasm_info.contract_meta.sdk_version,
+        "has_debug_symbols": wasm_info.has_debug_symbols,
+        "debug_symbol_bytes": wasm_info.debug_symbol_bytes,
+        "estimated_size_reduction_percent": wasm_info.estimated_size_reduction_percent(),
+        "contract_meta": {
+            "name": wasm_info.contract_meta.name,
+            "version": wasm_info.contract_meta.version,
+            "description": wasm_info.contract_meta.description,
+            "author": wasm_info.contract_meta.author,
+            "sdk_version": wasm_info.contract_meta.sdk_version,
+            "entries": wasm_info.contract_meta.entries.iter().map(|(key, value)| {
+                json!({ "key": key, "value": value })
+            }).collect::<Vec<_>>(),
+        },
+        "functions": wasm_info.functions.iter().map(|f| {
+            json!({
+                "name": f.name,
+                "param_count": f.param_count,
+                "result_count": f.result_count,
+                "signature": format_function(f),
+                "params": f.params.iter().map(|p| {
+                    json!({
+                        "name": p.name,
+                        "type": p.type_name,
+                        "type_def": spec_type_json(&p.type_def),
+                    })
+                }).collect::<Vec<_>>(),
+                "returns": f.returns.iter().map(|r| {
+                    json!({
+                        "type": r.type_name,
+                        "type_def": spec_type_json(&r.type_def),
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        }).collect::<Vec<_>>(),
+        "spec_entries": wasm_info.spec_entries.iter()
+            .map(spec_entry_json)
+            .collect::<Vec<_>>(),
+        "imports": imports,
+        "host_imports": wasm_info.host_imports(),
+        "section_sizes": breakdown.size_map(),
+        "sections": breakdown.sections.iter().map(|s| {
+            json!({
+                "name": s.name,
+                "id": s.id,
+                "offset": s.offset,
+                "end": s.end,
+                "size": s.size,
+                "header_size": s.header_size,
+                "total_size": s.total_size,
+                "percent": s.percent,
+                "custom": s.id == Some(0),
+            })
+        }).collect::<Vec<_>>(),
+        "module": {
+            "start_function": wasm_info.start_function,
+            "memories": wasm_info.memories.iter().map(|m| {
+                json!({
+                    "initial_pages": m.initial_pages,
+                    "maximum_pages": m.maximum_pages,
+                    "memory64": m.memory64,
+                })
+            }).collect::<Vec<_>>(),
+            "imports": wasm_info.host_imports(),
+            "exports": wasm_info.exports.iter().map(|e| {
+                json!({
+                    "name": e.name,
+                    "kind": e.kind,
+                    "index": e.index,
+                })
+            }).collect::<Vec<_>>(),
+        },
+    })
 }
 
 /// True when a WASM custom section is a debug/optimization artifact: the

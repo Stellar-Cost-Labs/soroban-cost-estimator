@@ -1028,3 +1028,74 @@ fn test_load_wasm_detects_synthetic_debug_section() {
 
     let _ = std::fs::remove_file(&temp);
 }
+
+#[test]
+fn test_host_imports_json_includes_function_and_memory_imports_deterministically() {
+    use soroban_cost_estimator::wasm::parser::{load_wasm, wasm_info_json};
+
+    // Build a valid WASM binary that imports both a Soroban host function
+    // (`l::0` of kind `function`) and a linear memory (`env::memory` of kind
+    // `memory`), plus exports `run` (function index 1).
+    let mut wasm = Vec::new();
+    wasm.extend_from_slice(b"\0asm\x01\x00\x00\x00");
+    // Type section (id 1): 1 func type () -> ()
+    wasm.extend_from_slice(&[0x01, 0x04, 0x01, 0x60, 0x00, 0x00]);
+    // Import section (id 2): 2 imports:
+    //   1) module "l" (len 1), name "0" (len 1), kind Func (0x00), type idx 0
+    //   2) module "env" (len 3), name "memory" (len 6), kind Memory (0x02), flags 0x00, initial 1
+    let import_body = [
+        0x02, // 2 imports
+        0x01, b'l', 0x01, b'0', 0x00, 0x00, // l::0 (function, type 0)
+        0x03, b'e', b'n', b'v', 0x06, b'm', b'e', b'm', b'o', b'r', b'y', 0x02, 0x00,
+        0x01, // env::memory (memory, min 1 page)
+    ];
+    wasm.push(0x02);
+    wasm.push(import_body.len() as u8);
+    wasm.extend_from_slice(&import_body);
+    // Function section (id 3): 1 defined function of type 0
+    wasm.extend_from_slice(&[0x03, 0x02, 0x01, 0x00]);
+    // Export section (id 7): 1 export "run" -> func index 1 (since 0 is imported)
+    wasm.extend_from_slice(&[0x07, 0x07, 0x01, 0x03, b'r', b'u', b'n', 0x00, 0x01]);
+    // Code section (id 10): 1 body (0 locals, end)
+    wasm.extend_from_slice(&[0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b]);
+
+    let temp = std::env::temp_dir().join(format!("sce-host-imports-{}.wasm", std::process::id()));
+    std::fs::write(&temp, &wasm).expect("write fixture");
+
+    let info = load_wasm(&temp).expect("wasm with function and memory imports should load");
+    let json = wasm_info_json("/tmp/imports.wasm", &info, &info.wasm_hash);
+
+    let expected_imports = serde_json::json!([
+        {
+            "module": "l",
+            "name": "0",
+            "kind": "function"
+        },
+        {
+            "module": "env",
+            "name": "memory",
+            "kind": "memory"
+        }
+    ]);
+    assert_eq!(json["imports"], expected_imports);
+    assert_eq!(json["host_imports"], expected_imports);
+    assert_eq!(json["module"]["imports"], expected_imports);
+
+    // Real contract fixture also exposes its Soroban host imports deterministically.
+    let contract_info =
+        load_wasm(Path::new("tests/fixtures/contract.wasm")).expect("load contract.wasm");
+    let contract_json = wasm_info_json(
+        "tests/fixtures/contract.wasm",
+        &contract_info,
+        &contract_info.wasm_hash,
+    );
+    let contract_imports = contract_json["host_imports"]
+        .as_array()
+        .expect("host_imports array");
+    assert!(!contract_imports.is_empty());
+    assert!(contract_imports.iter().all(|imp| imp["module"].is_string()
+        && imp["name"].is_string()
+        && imp["kind"].is_string()));
+
+    let _ = std::fs::remove_file(&temp);
+}
