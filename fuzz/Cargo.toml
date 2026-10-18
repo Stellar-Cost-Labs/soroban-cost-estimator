@@ -1,0 +1,21 @@
+[package]
+name = "soroban-cost-estimator-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.soroban-cost-estimator]
+path = ".."
+
+[[bin]]
+name = "wasm_parser"
+path = "fuzz_targets/wasm_parser.rs"
+test = false
+doc = false
+bench = false

@@ -29,7 +29,11 @@ pub fn decode_config_entry_xdr(
         eprintln!("[XDR] -> Decoded to {} bytes", bytes.len());
     }
 
-    let entry_data = stellar_xdr::LedgerEntryData::from_xdr(&bytes, stellar_xdr::Limits::none())
+    let limits = stellar_xdr::Limits {
+        depth: crate::wasm::parser::MAX_XDR_DECODE_DEPTH,
+        len: bytes.len(),
+    };
+    let entry_data = stellar_xdr::LedgerEntryData::from_xdr(&bytes, limits)
         .map_err(|e| AppError::XdrDecode(format!("ledger entry data: {e}")))?;
 
     if verbose {
@@ -46,6 +50,17 @@ pub fn decode_config_entry_xdr(
             other.name()
         ))),
     }
+}
+
+/// Bounded fuzz/property-testing entry point for XDR config entry decoding.
+pub fn fuzz_xdr_config_decode_boundary(xdr_b64: &str) {
+    const MAX_FUZZ_B64_CHARS: usize = 64 * 1024;
+    let bounded = if xdr_b64.len() > MAX_FUZZ_B64_CHARS {
+        &xdr_b64[..MAX_FUZZ_B64_CHARS]
+    } else {
+        xdr_b64
+    };
+    let _ = decode_config_entry_xdr(bounded, false);
 }
 
 /// Initialize a snapshot with the network, timestamp, and ledger set; all

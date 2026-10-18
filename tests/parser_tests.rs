@@ -1028,3 +1028,108 @@ fn test_load_wasm_detects_synthetic_debug_section() {
 
     let _ = std::fs::remove_file(&temp);
 }
+
+#[test]
+fn fuzz_seed_corpus_valid_fixtures_and_mutations() {
+    use soroban_cost_estimator::wasm::parser::fuzz_wasm_parser_and_spec_boundaries;
+
+    for fixture in [
+        "tests/fixtures/minimal.wasm",
+        "tests/fixtures/zeroarg.wasm",
+        "tests/fixtures/contract.wasm",
+    ] {
+        let bytes = std::fs::read(fixture).expect("read seed fixture");
+        fuzz_wasm_parser_and_spec_boundaries(&bytes);
+
+        // Exercise truncated prefixes across section and XDR boundaries.
+        for split in (0..bytes.len()).step_by(7) {
+            fuzz_wasm_parser_and_spec_boundaries(&bytes[..split]);
+        }
+    }
+}
+
+#[test]
+fn fuzz_regression_non_function_composite_type_does_not_panic() {
+    use soroban_cost_estimator::wasm::parser::{
+        enumerate_module_metadata, fuzz_wasm_parser_and_spec_boundaries,
+    };
+
+    // Regression case: WASM Type section (id 1) containing a GC struct
+    // composite type (0x5f) instead of a function type (0x60). Previously
+    // `ty.unwrap_func()` panicked on non-function composite types when
+    // `enumerate_module_metadata` was invoked directly on untrusted bytes.
+    let gc_struct_type_wasm: [u8; 13] = [
+        0x00, 0x61, 0x73, 0x6d, // \0asm
+        0x01, 0x00, 0x00, 0x00, // version 1
+        0x01, 0x03, // Type section, 3 bytes
+        0x01, 0x5f, 0x00, // 1 type: struct (0x5f) with 0 fields
+    ];
+
+    fuzz_wasm_parser_and_spec_boundaries(&gc_struct_type_wasm);
+    let err = enumerate_module_metadata(&gc_struct_type_wasm)
+        .expect_err("non-function composite type must return Err, not panic");
+    assert!(err.to_string().contains("WASM"));
+}
+
+#[test]
+fn fuzz_regression_deeply_nested_contract_spec_type_is_bounded() {
+    use soroban_cost_estimator::wasm::parser::{
+        MAX_XDR_DECODE_DEPTH, fuzz_wasm_parser_and_spec_boundaries, parse_contract_spec_entries,
+    };
+
+    // Regression case: `contractspecv0` entry with `ScSpecTypeDef::Option`
+    // nested deeper than MAX_XDR_DECODE_DEPTH.
+    let mut spec_payload = Vec::new();
+    // ScSpecEntry::FunctionV0 discriminant (0)
+    spec_payload.extend_from_slice(&0u32.to_be_bytes());
+    // doc: ""
+    spec_payload.extend_from_slice(&xdr_string(""));
+    // name: "deep"
+    spec_payload.extend_from_slice(&xdr_string("deep"));
+    // inputs: 1 input
+    spec_payload.extend_from_slice(&1u32.to_be_bytes());
+    // input[0].doc: "", input[0].name: "x"
+    spec_payload.extend_from_slice(&xdr_string(""));
+    spec_payload.extend_from_slice(&xdr_string("x"));
+    // Nest ScSpecTypeDef::Option (discriminant 1000) 80 times (> MAX_XDR_DECODE_DEPTH = 64)
+    for _ in 0..(MAX_XDR_DECODE_DEPTH + 16) {
+        spec_payload.extend_from_slice(&1000u32.to_be_bytes());
+    }
+    // Leaf type U32 (discriminant 4)
+    spec_payload.extend_from_slice(&4u32.to_be_bytes());
+    // outputs: 0
+    spec_payload.extend_from_slice(&0u32.to_be_bytes());
+
+    let mut wasm = std::fs::read("tests/fixtures/minimal.wasm").expect("read minimal fixture");
+    wasm.extend_from_slice(&custom_section("contractspecv0", &spec_payload));
+
+    fuzz_wasm_parser_and_spec_boundaries(&wasm);
+    let err = parse_contract_spec_entries(&wasm)
+        .expect_err("deeply nested spec type exceeding XDR depth limit must be rejected");
+    assert!(err.to_string().contains("contractspecv0"));
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::test_runner::Config::with_cases(64))]
+
+    #[test]
+    fn fuzz_property_arbitrary_wasm_and_spec_bytes_never_panic(
+        raw in proptest::collection::vec(proptest::num::u8::ANY, 0..4096),
+        spec_tail in proptest::collection::vec(proptest::num::u8::ANY, 0..512),
+        meta_tail in proptest::collection::vec(proptest::num::u8::ANY, 0..512),
+    ) {
+        use soroban_cost_estimator::wasm::parser::fuzz_wasm_parser_and_spec_boundaries;
+        use soroban_cost_estimator::xdr_helper::fuzz_xdr_config_decode_boundary;
+
+        fuzz_wasm_parser_and_spec_boundaries(&raw);
+
+        let mut mutated = std::fs::read("tests/fixtures/minimal.wasm").expect("read minimal fixture");
+        mutated.extend_from_slice(&custom_section("contractspecv0", &spec_tail));
+        mutated.extend_from_slice(&custom_section("contractmetav0", &meta_tail));
+        fuzz_wasm_parser_and_spec_boundaries(&mutated);
+
+        if let Ok(s) = std::str::from_utf8(&raw) {
+            fuzz_xdr_config_decode_boundary(s);
+        }
+    }
+}

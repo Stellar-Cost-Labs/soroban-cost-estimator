@@ -310,7 +310,14 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
                 for rec_group in section {
                     let rec_group = rec_group.map_err(|e| AppError::WasmParse(e.to_string()))?;
                     for ty in rec_group.types() {
-                        let func_type = ty.unwrap_func();
+                        let wasmparser::CompositeInnerType::Func(func_type) =
+                            &ty.composite_type.inner
+                        else {
+                            return Err(AppError::WasmParse(
+                                "unsupported non-function composite type in WASM type section"
+                                    .to_string(),
+                            ));
+                        };
                         type_infos.push((
                             func_type.params().len() as u32,
                             func_type.results().len() as u32,
@@ -533,6 +540,12 @@ pub fn parse_contract_spec_functions(bytes: &[u8]) -> AppResult<(Vec<SpecFunctio
     Ok((spec_functions_from_entries(&entries), has_spec))
 }
 
+/// Maximum recursion depth allowed when decoding XDR payloads inside WASM custom sections.
+pub const MAX_XDR_DECODE_DEPTH: u32 = 64;
+
+/// Maximum input size (64 KiB) accepted by the fuzz/property harness for WASM parsing.
+pub const MAX_FUZZ_WASM_INPUT_BYTES: usize = 64 * 1024;
+
 /// Decodes every `ScSpecEntry` from the `contractspecv0` custom section.
 ///
 /// The section payload is **not** a count-prefixed `VecM<ScSpecEntry>`: it is
@@ -560,7 +573,12 @@ pub fn parse_contract_spec_entries(
         let data = section.data();
         let mut cursor = Cursor::new(data);
         while (cursor.position() as usize) < data.len() {
-            let mut limited = stellar_xdr::Limited::new(&mut cursor, stellar_xdr::Limits::none());
+            let remaining = data.len().saturating_sub(cursor.position() as usize);
+            let limits = stellar_xdr::Limits {
+                depth: MAX_XDR_DECODE_DEPTH,
+                len: remaining,
+            };
+            let mut limited = stellar_xdr::Limited::new(&mut cursor, limits);
             let entry = stellar_xdr::ScSpecEntry::read_xdr(&mut limited).map_err(|e| {
                 AppError::WasmParse(format!(
                     "failed to decode contractspecv0 entry {}: {e}",
@@ -705,8 +723,12 @@ pub fn parse_contract_meta(bytes: &[u8]) -> AppResult<ContractMeta> {
             let data = section.data();
             let mut cursor = Cursor::new(data);
             while (cursor.position() as usize) < data.len() {
-                let mut limited =
-                    stellar_xdr::Limited::new(&mut cursor, stellar_xdr::Limits::none());
+                let remaining = data.len().saturating_sub(cursor.position() as usize);
+                let limits = stellar_xdr::Limits {
+                    depth: MAX_XDR_DECODE_DEPTH,
+                    len: remaining,
+                };
+                let mut limited = stellar_xdr::Limited::new(&mut cursor, limits);
                 // Break (not `?`) on a decode error, matching
                 // `parse_contract_spec`: entries already decoded are kept and
                 // a malformed tail degrades gracefully to what we have.
@@ -732,6 +754,31 @@ pub fn parse_contract_meta(bytes: &[u8]) -> AppResult<ContractMeta> {
     }
 
     Ok(meta)
+}
+
+/// Bounded entry point for fuzzing and property testing of WASM validation,
+/// module metadata enumeration, and `contractspecv0` / `contractmeta` decoding.
+///
+/// Inputs larger than [`MAX_FUZZ_WASM_INPUT_BYTES`] are truncated so fuzzing
+/// stays bounded in memory and runtime.
+pub fn fuzz_wasm_parser_and_spec_boundaries(bytes: &[u8]) {
+    let bounded = if bytes.len() > MAX_FUZZ_WASM_INPUT_BYTES {
+        &bytes[..MAX_FUZZ_WASM_INPUT_BYTES]
+    } else {
+        bytes
+    };
+    let _ = validate_wasm(bounded);
+    let _ = validate_wasm_memory_limits(bounded);
+    let _ = enumerate_module_metadata(bounded);
+    if let Ok((entries, _)) = parse_contract_spec_entries(bounded) {
+        for entry in &entries {
+            let _ = spec_entry_json(entry);
+        }
+    }
+    let _ = parse_contract_spec(bounded);
+    let _ = parse_contract_spec_functions(bounded);
+    let _ = parse_contract_meta(bounded);
+    let _ = section_size_breakdown(bounded);
 }
 
 /// Formats the parsed contract metadata for display.

@@ -1,3 +1,6 @@
+[workspace]
+exclude = ["fuzz", "tests/fixtures/contract"]
+
 [package]
 name = "soroban-cost-estimator"
 version = "0.1.0"
