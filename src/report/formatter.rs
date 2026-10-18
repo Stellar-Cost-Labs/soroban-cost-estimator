@@ -582,6 +582,7 @@ fn csv_row(fields: &[&str]) -> String {
 ///
 /// Recognized names: `"table"`, `"json"`, `"csv"`, `"markdown"`.
 /// Returns `None` for unknown names.
+#[must_use]
 pub fn formatter_by_name(name: &str) -> Option<Box<dyn ReportFormatter>> {
     match name {
         "table" => Some(Box::new(TableFormatter)),

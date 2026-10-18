@@ -8,6 +8,7 @@ use crate::config_snapshot::model::{
 ///
 /// Each explanation describes what the setting controls and the unit of
 /// its value (stroops, bytes, instructions, etc.).
+#[must_use]
 pub fn setting_explanation(field_path: &str) -> Option<&'static str> {
     match field_path {
         "contract_compute.ledger_max_instructions" => {
@@ -111,6 +112,7 @@ pub fn setting_explanation(field_path: &str) -> Option<&'static str> {
 /// [`config_setting_id_for_prefix`]) so diff tables, diff headers, and
 /// `--json` payloads always agree. Unknown prefixes fall back to the raw
 /// field path.
+#[must_use]
 pub fn setting_display_name(field_path: &str) -> &str {
     let prefix = field_path.split('.').next().unwrap_or(field_path);
     match config_setting_id_for_prefix(prefix) {
@@ -122,6 +124,7 @@ pub fn setting_display_name(field_path: &str) -> &str {
 /// Converts a raw field name (snake_case) into a Title Case label.
 ///
 /// Example: `fee_rate_per_instructions_increment` → `Fee Rate Per Instructions Increment`
+#[must_use]
 pub fn humanize_field_name(field_path: &str) -> String {
     match field_path.find('.') {
         Some(pos) => {
@@ -157,6 +160,7 @@ pub fn humanize_field_name(field_path: &str) -> String {
 /// Combines the setting display name with the humanized field name:
 /// `contract_compute.fee_rate_per_instructions_increment`
 /// → `Contract Compute V0 > Fee Rate Per Instructions Increment`
+#[must_use]
 pub fn field_display_name(field_path: &str) -> String {
     let setting = setting_display_name(field_path);
     if field_path.contains('.') {
@@ -223,6 +227,7 @@ pub struct ConfigDiff {
 
 impl ConfigDiff {
     /// True when any config setting changed, pricing or not.
+    #[must_use]
     pub fn has_any_changes(&self) -> bool {
         !self.changes.is_empty()
     }
@@ -232,12 +237,14 @@ impl ConfigDiff {
     /// Provided as a method so callers (e.g. `cmd_config_diff` exit-code
     /// evaluation) can use `ConfigDiff::has_pricing_changes()` without
     /// touching the serialized `has_pricing_changes` field directly.
+    #[must_use]
     pub fn has_pricing_changes(&self) -> bool {
         self.has_pricing_changes
     }
 
     /// Returns true if any pricing change exceeds the given percentage threshold.
     /// Non-numeric changes are considered significant.
+    #[must_use]
     pub fn has_significant_pricing_changes(&self, threshold_percent: f64) -> bool {
         self.changes.iter().any(|change| {
             if !change.is_pricing_change {
@@ -257,6 +264,7 @@ impl ConfigDiff {
 }
 
 /// Returns a new `ConfigDiff` containing only the changes where `is_pricing_change` is true.
+#[must_use]
 pub fn pricing_only(diff: &ConfigDiff) -> ConfigDiff {
     let changes: Vec<FieldDiff> = diff
         .changes
@@ -289,6 +297,7 @@ pub fn pricing_only(diff: &ConfigDiff) -> ConfigDiff {
 ///   `0` otherwise.
 ///
 /// Returns `0` or `1`.
+#[must_use]
 pub fn resolve_exit_code(
     diff: &ConfigDiff,
     ignore_pricing_exit: bool,
@@ -316,6 +325,7 @@ pub struct SnapshotInfo {
 }
 
 /// Compares two config snapshots and returns a detailed diff.
+#[must_use]
 pub fn diff_snapshots(old: &ConfigSnapshot, new: &ConfigSnapshot) -> ConfigDiff {
     let mut changes = Vec::new();
 
@@ -753,6 +763,7 @@ fn check<T: PartialEq + std::fmt::Display>(
 /// the stored snapshot: `Network config up to date (ledger 1234)`. When any
 /// field drifted it reports how many of the changes were pricing vs.
 /// non-pricing: `Config drift detected: 2 pricing changes, 1 non-pricing changes`.
+#[must_use]
 pub fn format_diff_summary(diff: &ConfigDiff) -> String {
     if diff.changes.is_empty() {
         return format!(
@@ -780,6 +791,7 @@ const ANSI_RESET: &str = "\u{1b}[0m";
 ///
 /// Non-numeric transitions (e.g. a setting appearing or disappearing) cannot
 /// be quantified and are treated as major changes, colored red.
+#[must_use]
 pub fn pricing_change_color(old_value: &str, new_value: &str, colorize: bool) -> &'static str {
     if !colorize {
         return "";
@@ -805,6 +817,7 @@ pub fn pricing_change_color(old_value: &str, new_value: &str, colorize: bool) ->
 /// Pricing changes are colored red/yellow/green by the magnitude of the
 /// value change (see [`pricing_change_color`]); non-pricing changes are
 /// left uncolored.
+#[must_use]
 pub fn format_diff(
     diff: &ConfigDiff,
     colorize: bool,
@@ -923,6 +936,7 @@ fn csv_escape(value: &str) -> String {
 /// Emits a header row followed by one row per changed field, so the diff can
 /// be piped into a spreadsheet or `mlr`. The trade-off is deliberately
 /// machine-first: ANSI colors, icons, and explanations are omitted.
+#[must_use]
 pub fn format_diff_csv(diff: &ConfigDiff) -> String {
     let mut output = String::from("field,old_value,new_value,is_pricing_change\n");
     for change in &diff.changes {
@@ -940,6 +954,7 @@ pub fn format_diff_csv(diff: &ConfigDiff) -> String {
 /// Formats a `ConfigDiff` as a GitHub-flavored Markdown table.
 ///
 /// Suitable for pasting straight into a pull request or issue comment.
+#[must_use]
 pub fn format_diff_markdown(diff: &ConfigDiff) -> String {
     let mut output = String::new();
 

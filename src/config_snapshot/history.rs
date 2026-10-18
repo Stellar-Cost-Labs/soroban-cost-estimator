@@ -23,6 +23,7 @@ pub struct FieldHistoryEntry {
 /// snapshot in the pair — i.e. when the change was observed to have
 /// occurred. Fewer than two snapshots yields an empty log, since there is
 /// nothing to compare.
+#[must_use]
 pub fn build_change_log_from_snapshots(snapshots: &[ConfigSnapshot]) -> Vec<FieldHistoryEntry> {
     let mut sorted: Vec<&ConfigSnapshot> = snapshots.iter().collect();
     sorted.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
@@ -49,6 +50,7 @@ pub fn build_change_log_from_snapshots(snapshots: &[ConfigSnapshot]) -> Vec<Fiel
 ///
 /// The input need not be sorted; entries are compared by timestamp.
 /// Returned entries are sorted by field path for stable, readable output.
+#[must_use]
 pub fn last_changed_from_log(entries: &[FieldHistoryEntry]) -> Vec<FieldHistoryEntry> {
     use std::collections::HashMap;
 
@@ -84,6 +86,7 @@ pub fn load_change_log(network: &str) -> AppResult<Vec<FieldHistoryEntry>> {
 }
 
 /// Formats a change log as a human-readable, chronological listing.
+#[must_use]
 pub fn format_change_log(network: &str, log: &[FieldHistoryEntry]) -> String {
     let mut output = String::new();
     output.push_str(&format!("Config change log: {network}\n\n"));
@@ -117,6 +120,7 @@ pub fn format_change_log(network: &str, log: &[FieldHistoryEntry]) -> String {
 }
 
 /// Formats a "last changed" table: one line per field, most recent first.
+#[must_use]
 pub fn format_last_changed(network: &str, entries: &[FieldHistoryEntry]) -> String {
     let mut output = String::new();
     output.push_str(&format!("Last changed per setting: {network}\n\n"));

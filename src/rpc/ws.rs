@@ -82,6 +82,7 @@ pub struct EventFilter {
 
 impl EventFilter {
     /// Create a filter for the given event type.
+    #[must_use]
     pub fn new(r#type: EventFilterType) -> Self {
         Self {
             r#type,
@@ -121,6 +122,7 @@ pub struct EventsParams {
 
 impl EventsParams {
     /// Create an open-ended `events` subscription starting at `start_ledger`.
+    #[must_use]
     pub fn new(start_ledger: u32, filters: Vec<EventFilter>) -> Self {
         Self {
             start_ledger,

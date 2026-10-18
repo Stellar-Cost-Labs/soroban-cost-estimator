@@ -328,6 +328,7 @@ pub fn validate_all_snapshot_files() -> AppResult<Vec<SnapshotValidation>> {
 
 /// Validates a snapshot at an explicit path without requiring it to be stored
 /// in the snapshots directory.
+#[must_use]
 pub fn validate_snapshot_file(path: &std::path::Path) -> SnapshotValidation {
     match validate_snapshot_paths(vec![path.to_path_buf()])
         .into_iter()
@@ -823,6 +824,7 @@ pub fn list_all_snapshots() -> AppResult<Vec<PathBuf>> {
 ///
 /// Returns `None` for formats this tool does not recognize, so callers can
 /// skip a file rather than fail an entire purge on one odd snapshot.
+#[must_use]
 pub fn parse_snapshot_timestamp(timestamp: &str) -> Option<DateTime<Utc>> {
     let parsed = DateTime::parse_from_rfc3339(timestamp.trim());
     parsed.ok().map(|dt| dt.with_timezone(&Utc))
@@ -832,6 +834,7 @@ pub fn parse_snapshot_timestamp(timestamp: &str) -> Option<DateTime<Utc>> {
 ///
 /// A `days` value large enough to overflow the representable duration
 /// matches nothing, so an absurd request is a no-op instead of a panic.
+#[must_use]
 pub fn is_older_than(timestamp: DateTime<Utc>, days: u64, now: DateTime<Utc>) -> bool {
     let Ok(delta) = i64::try_from(days) else {
         return false;

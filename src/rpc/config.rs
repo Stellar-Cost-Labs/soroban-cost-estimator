@@ -20,6 +20,7 @@ pub enum ConfigSettingId {
 
 impl ConfigSettingId {
     /// Human-readable on-chain setting name, matching the Stellar XDR enum.
+    #[must_use]
     pub fn human_name(self) -> &'static str {
         match self {
             ConfigSettingId::ContractComputeV0 => "CONFIG_SETTING_CONTRACT_COMPUTE_V0",

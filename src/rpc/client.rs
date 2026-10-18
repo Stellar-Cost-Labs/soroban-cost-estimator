@@ -201,6 +201,7 @@ pub struct RpcClient {
 impl RpcClient {
     /// Create a new RPC client pointing at the given URL, without rate
     /// limiting and with the default request timeout.
+    #[must_use]
     pub fn new(url: &str) -> Self {
         Self::with_rate_limit(url, None, false)
     }
@@ -217,6 +218,7 @@ impl RpcClient {
     /// The underlying `reqwest::Client` is configured with connection pooling
     /// and TCP keep-alive so that HTTP connections are reused across multiple
     /// RPC calls within a single run, reducing handshake overhead.
+    #[must_use]
     pub fn with_rate_limit(url: &str, rps: Option<u64>, verbose: bool) -> Self {
         Self::with_options(url, rps, DEFAULT_TIMEOUT, DEFAULT_MAX_RETRIES, verbose)
     }
@@ -232,6 +234,7 @@ impl RpcClient {
     /// clamped. `timeout` applies to the whole request (connect through
     /// response body) and is passed straight to reqwest. A `max_retries` of
     /// `0` disables retries.
+    #[must_use]
     pub fn with_options(
         url: &str,
         rps: Option<u64>,
@@ -252,6 +255,7 @@ impl RpcClient {
     /// [`Self::with_options`]. `connect_timeout` bounds only the initial
     /// connect — a zero duration disables it (the total request timeout then
     /// applies to the connect phase too).
+    #[must_use]
     pub fn with_connect_timeout(
         url: &str,
         rps: Option<u64>,
@@ -287,6 +291,7 @@ impl RpcClient {
     ///
     /// The limiter, timeout, and retry behavior behave exactly as in
     /// [`Self::with_options`].
+    #[must_use]
     pub fn with_fallback(
         url: &str,
         fallback_url: Option<&str>,
@@ -449,6 +454,7 @@ impl RpcClient {
     /// These are the headers parsed from the `--header` values and attached to
     /// every outbound request; exposed for diagnostics and for tests that pin
     /// down header parsing/merging behavior.
+    #[must_use]
     pub fn custom_headers(&self) -> &HeaderMap {
         &self.headers
     }
@@ -457,6 +463,7 @@ impl RpcClient {
     /// sensitive values replaced by `<redacted>`.
     ///
     /// Safe to print at any log level: credentials never reach the log.
+    #[must_use]
     pub fn redacted_headers(&self) -> HeaderMap {
         redact_sensitive(&self.headers)
     }

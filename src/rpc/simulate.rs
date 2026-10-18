@@ -313,6 +313,7 @@ pub struct LatencyStats {
 /// arithmetic (`sum / count`) to avoid floating-point drift; the standard
 /// deviation is the population standard deviation
 /// (`sqrt(Σ(x - μ)² / n)`) computed in `f64` for display.
+#[must_use]
 pub fn summarize_latencies(samples: &[u64]) -> Option<LatencyStats> {
     if samples.is_empty() {
         return None;

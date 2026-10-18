@@ -935,6 +935,7 @@ const MIN_COLUMN_WIDTH: u16 = 6;
 /// * `reports` — the successfully estimated functions, in run order.
 /// * `summary` — pre-computed aggregates via [`summarize_estimate_all`];
 ///   `None` omits the footer row (e.g. when `--quiet` suppressed it).
+#[must_use]
 pub fn format_estimate_all_table(
     reports: &[CostReport],
     summary: Option<&EstimateAllSummary>,
@@ -1483,6 +1484,7 @@ pub fn format_report_table(report: &CostReport) -> String {
 }
 
 /// Formats a cost report as a JSON string.
+#[must_use]
 pub fn format_report_json(report: &CostReport) -> String {
     serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string())
 }

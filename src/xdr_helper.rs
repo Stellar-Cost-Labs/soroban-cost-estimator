@@ -50,7 +50,7 @@ pub fn decode_config_entry_xdr(
 
 /// Initialize a snapshot with the network, timestamp, and ledger set; all
 /// config entries start empty.
-#[must_use]
+#[must_use = "returns a newly initialized ConfigSnapshot"]
 pub fn begin_snapshot(network: &str, ledger: u32) -> ConfigSnapshot {
     use chrono::Utc;
     ConfigSnapshot {

@@ -241,6 +241,7 @@ impl CacheFilter {
     }
 
     /// Check whether a cached estimate satisfies all filter criteria.
+    #[must_use]
     pub fn matches(&self, entry: &CachedEstimate) -> bool {
         if let Some(f) = &self.function {
             if entry.function != *f {
@@ -1363,6 +1364,7 @@ pub fn load_estimate(
 ///
 /// # Network calls
 /// None — pure time comparison.
+#[must_use]
 pub fn is_cache_entry_fresh(entry: &CachedEstimate, ttl: std::time::Duration) -> bool {
     let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&entry.timestamp) else {
         return false;
@@ -1790,6 +1792,7 @@ pub fn cache_stats() -> AppResult<CacheStats> {
 /// Check which cached estimates are now stale (simulated at an earlier ledger).
 ///
 /// Returns a list of cached estimates that were made before `current_ledger`.
+#[must_use]
 pub fn find_stale_estimates(
     estimates: &[CachedEstimate],
     current_ledger: u32,

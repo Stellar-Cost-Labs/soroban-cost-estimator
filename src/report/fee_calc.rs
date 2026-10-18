@@ -82,7 +82,7 @@ pub struct FeeRates {
 ///
 /// # Network calls
 /// None — pure computation.
-#[must_use]
+#[must_use = "returns the computed fee breakdown without side effects"]
 pub fn compute_fee_breakdown(
     total_resource_fee: i64,
     cpu_insns: u64,
@@ -217,6 +217,7 @@ pub fn compute_fee_breakdown(
 /// Calculate `units * rate / divisor` without narrowing the unit count or
 /// overflowing intermediate arithmetic. The final fee is clamped to the
 /// representable stroop range.
+#[must_use]
 fn scaled_fee(units: u64, rate: i64, divisor: i128) -> i64 {
     let fee = i128::from(units).saturating_mul(i128::from(rate)) / divisor;
     match i64::try_from(fee) {
@@ -232,7 +233,7 @@ fn scaled_fee(units: u64, rate: i64, divisor: i128) -> i64 {
 /// [`DEFAULT_PRECISION`]); the fraction is rounded half-up to that many
 /// places. Returns a string to avoid floating-point precision issues.
 /// Example: `stroops_to_xlm(1_234_567, 7)` → "0.1234567".
-#[must_use]
+#[must_use = "returns the formatted XLM string without modifying the input"]
 pub fn stroops_to_xlm(stroops: i64, precision: u32) -> String {
     let negative = stroops < 0;
     let abs = stroops.unsigned_abs() as u128;

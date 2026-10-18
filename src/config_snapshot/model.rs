@@ -13,6 +13,7 @@ use crate::rpc::config::ConfigSettingId;
 /// - `ConfigSettingId::ContractComputeV0` → `Contract Compute V0`
 /// - `ConfigSettingId::ContractLedgerCostV0` → `Contract Ledger Cost V0`
 /// - `ConfigSettingId::StateArchival` → `State Archival`
+#[must_use]
 pub fn config_setting_human_name(id: &ConfigSettingId) -> &'static str {
     match id {
         ConfigSettingId::ContractComputeV0 => "Contract Compute V0",
@@ -30,6 +31,7 @@ pub fn config_setting_human_name(id: &ConfigSettingId) -> &'static str {
 /// This is the inverse bridge from stored snapshot paths (which carry no
 /// enum value) back to the id so [`config_setting_human_name`] can label
 /// them consistently.
+#[must_use]
 pub fn config_setting_id_for_prefix(prefix: &str) -> Option<ConfigSettingId> {
     match prefix {
         "contract_compute" => Some(ConfigSettingId::ContractComputeV0),
@@ -127,6 +129,7 @@ pub struct StateArchivalV0 {
     pub starting_eviction_scan_level: u32,
 }
 
+#[must_use]
 pub fn setting_unit_description(field_path: &str) -> Option<&'static str> {
     match field_path {
         "contract_compute.fee_rate_per_instructions_increment" => {
