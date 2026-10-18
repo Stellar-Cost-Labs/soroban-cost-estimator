@@ -1345,3 +1345,38 @@ fn test_format_diff_markdown_no_changes() {
     assert!(md.contains("✅ No changes detected."));
     assert!(!md.contains("| Setting |"));
 }
+
+// ── Snapshot store filtering & sorting tests (#365) ────────────────────────
+
+#[test]
+fn test_store_list_snapshots_filtering_and_sorting_in_temp_dir() {
+    use soroban_cost_estimator::config_snapshot::store::list_snapshots_in;
+
+    let temp = std::env::temp_dir().join(format!("sce-diff-store-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp);
+    std::fs::create_dir_all(&temp).expect("create temp dir");
+
+    assert!(
+        list_snapshots_in(&temp, "testnet")
+            .expect("empty dir")
+            .is_empty()
+    );
+
+    let f_late = temp.join("testnet-2026-03-02T00-00-00Z.json");
+    let f_early = temp.join("testnet-2026-03-01T00-00-00Z.json");
+    let f_main = temp.join("mainnet-2026-03-01T12-00-00Z.json");
+    let f_ignored = temp.join("testnet-notes.txt");
+
+    std::fs::write(&f_late, "{}").expect("write f_late");
+    std::fs::write(&f_early, "{}").expect("write f_early");
+    std::fs::write(&f_main, "{}").expect("write f_main");
+    std::fs::write(&f_ignored, "ignored").expect("write f_ignored");
+
+    let testnet_files = list_snapshots_in(&temp, "testnet").expect("list testnet");
+    assert_eq!(testnet_files, vec![f_early, f_late]);
+
+    let mainnet_files = list_snapshots_in(&temp, "mainnet").expect("list mainnet");
+    assert_eq!(mainnet_files, vec![f_main]);
+
+    let _ = std::fs::remove_dir_all(&temp);
+}

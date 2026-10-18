@@ -145,7 +145,7 @@ pub fn list_snapshots(network: &str) -> AppResult<Vec<PathBuf>> {
 /// Filenames are `{network}-{timestamp}.json` where the timestamp is an
 /// RFC 3339 UTC instant with `:` replaced by `-`, so a plain lexicographic
 /// sort of the paths is also a chronological one.
-fn list_snapshots_in(dir: &Path, network: &str) -> AppResult<Vec<PathBuf>> {
+pub fn list_snapshots_in(dir: &Path, network: &str) -> AppResult<Vec<PathBuf>> {
     let prefix = format!("{network}-");
     let mut snapshots = Vec::new();
     for entry in std::fs::read_dir(dir)? {
@@ -620,6 +620,57 @@ mod tests {
         assert!(matches!(err, AppError::SnapshotParse(_)), "got: {err}");
         assert!(corrupt.exists(), "a failed run deletes nothing");
         assert_eq!(count_snapshots(&dir, "testnet"), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_list_snapshots_empty_directory_returns_empty_vec() {
+        let dir = temp_dir("list-empty");
+        let list = list_snapshots_in(&dir, "testnet").expect("list empty dir");
+        assert!(list.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_list_snapshots_filters_by_network_and_ignores_foreign_files() {
+        let dir = temp_dir("list-filter-network");
+        let now = Utc::now();
+        let t1 = write_snapshot(&dir, "testnet", now - Duration::days(3), 10);
+        let t2 = write_snapshot(&dir, "testnet", now - Duration::days(1), 20);
+        let _m1 = write_snapshot(&dir, "mainnet", now - Duration::days(2), 30);
+        let _f1 = write_snapshot(&dir, "futurenet", now, 40);
+
+        // Foreign / non-JSON files that must be ignored
+        std::fs::write(dir.join("README.txt"), "notes").expect("write txt");
+        std::fs::write(dir.join("testnet-backup.bak"), "{}").expect("write bak");
+        std::fs::write(dir.join("random.json"), "{}").expect("write random json");
+
+        let testnet_list = list_snapshots_in(&dir, "testnet").expect("list testnet");
+        assert_eq!(testnet_list, vec![t1, t2]);
+
+        let mainnet_list = list_snapshots_in(&dir, "mainnet").expect("list mainnet");
+        assert_eq!(mainnet_list.len(), 1);
+
+        let unknown_list = list_snapshots_in(&dir, "customnet").expect("list customnet");
+        assert!(unknown_list.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_list_snapshots_chronological_sorting() {
+        let dir = temp_dir("list-chronological");
+        let base = DateTime::parse_from_rfc3339("2026-05-01T12:00:00Z")
+            .expect("valid timestamp")
+            .with_timezone(&Utc);
+
+        // Write out of chronological order
+        let newest = write_snapshot(&dir, "testnet", base + Duration::hours(10), 300);
+        let oldest = write_snapshot(&dir, "testnet", base - Duration::hours(10), 100);
+        let middle = write_snapshot(&dir, "testnet", base, 200);
+
+        let list = list_snapshots_in(&dir, "testnet").expect("list sorted");
+        assert_eq!(list, vec![oldest, middle, newest]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
