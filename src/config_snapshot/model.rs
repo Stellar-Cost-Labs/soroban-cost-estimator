@@ -42,8 +42,87 @@ pub fn config_setting_id_for_prefix(prefix: &str) -> Option<ConfigSettingId> {
     }
 }
 
+/// Documented initial and current schema version for persisted [`ConfigSnapshot`] files.
+///
+/// Unversioned legacy snapshot files are treated as version `1` on read without
+/// modifying the file on disk.
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+
+pub const fn default_snapshot_schema_version() -> u32 {
+    SNAPSHOT_SCHEMA_VERSION
+}
+
+/// Validates a snapshot schema version against [`SNAPSHOT_SCHEMA_VERSION`].
+pub fn validate_snapshot_schema_version(version: u32) -> Result<(), String> {
+    match version.cmp(&SNAPSHOT_SCHEMA_VERSION) {
+        std::cmp::Ordering::Equal => Ok(()),
+        std::cmp::Ordering::Greater => Err(format!(
+            "unsupported future snapshot schema_version {version} (supported: {SNAPSHOT_SCHEMA_VERSION}); recommended action: upgrade soroban-cost-estimator or re-capture the snapshot with `soroban-cost-estimator config snapshot`"
+        )),
+        std::cmp::Ordering::Less => Err(format!(
+            "invalid snapshot schema_version {version} (supported: {SNAPSHOT_SCHEMA_VERSION}); recommended action: re-capture the snapshot with `soroban-cost-estimator config snapshot`"
+        )),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WireConfigSnapshot {
+    #[serde(default = "default_snapshot_schema_version")]
+    schema_version: u32,
+    network: String,
+    timestamp: String,
+    ledger: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protocol_version: Option<u32>,
+    contract_compute: Option<ContractComputeV0>,
+    contract_ledger_cost: Option<ContractLedgerCostV0>,
+    contract_historical_data: Option<ContractHistoricalDataV0>,
+    contract_events: Option<ContractEventsV0>,
+    contract_bandwidth: Option<ContractBandwidthV0>,
+    state_archival: Option<StateArchivalV0>,
+}
+
+impl From<ConfigSnapshot> for WireConfigSnapshot {
+    fn from(snapshot: ConfigSnapshot) -> Self {
+        Self {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            network: snapshot.network,
+            timestamp: snapshot.timestamp,
+            ledger: snapshot.ledger,
+            protocol_version: snapshot.protocol_version,
+            contract_compute: snapshot.contract_compute,
+            contract_ledger_cost: snapshot.contract_ledger_cost,
+            contract_historical_data: snapshot.contract_historical_data,
+            contract_events: snapshot.contract_events,
+            contract_bandwidth: snapshot.contract_bandwidth,
+            state_archival: snapshot.state_archival,
+        }
+    }
+}
+
+impl TryFrom<WireConfigSnapshot> for ConfigSnapshot {
+    type Error = String;
+
+    fn try_from(wire: WireConfigSnapshot) -> Result<Self, Self::Error> {
+        validate_snapshot_schema_version(wire.schema_version)?;
+        Ok(Self {
+            network: wire.network,
+            timestamp: wire.timestamp,
+            ledger: wire.ledger,
+            protocol_version: wire.protocol_version,
+            contract_compute: wire.contract_compute,
+            contract_ledger_cost: wire.contract_ledger_cost,
+            contract_historical_data: wire.contract_historical_data,
+            contract_events: wire.contract_events,
+            contract_bandwidth: wire.contract_bandwidth,
+            state_archival: wire.state_archival,
+        })
+    }
+}
+
 /// A complete snapshot of the network's Soroban resource-pricing configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "WireConfigSnapshot", into = "WireConfigSnapshot")]
 pub struct ConfigSnapshot {
     pub network: String,
     pub timestamp: String,
@@ -52,7 +131,6 @@ pub struct ConfigSnapshot {
     /// snapshot was taken. `None` for snapshots saved before it was recorded
     /// or when the RPC call failed; omitted from JSON in that case so older
     /// files and outputs are unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_version: Option<u32>,
     pub contract_compute: Option<ContractComputeV0>,
     pub contract_ledger_cost: Option<ContractLedgerCostV0>,

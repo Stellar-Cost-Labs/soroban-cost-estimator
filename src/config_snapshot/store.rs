@@ -76,9 +76,10 @@ pub fn load_latest_snapshot(network: &str) -> AppResult<ConfigSnapshot> {
         .last()
         .ok_or_else(|| AppError::NoSnapshots(network.to_string()))?;
 
-    let content = std::fs::read_to_string(latest.path())?;
-    let snapshot: ConfigSnapshot =
-        serde_json::from_str(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))?;
+    let latest_path = latest.path();
+    let content = std::fs::read_to_string(&latest_path)?;
+    let snapshot: ConfigSnapshot = serde_json::from_str(&content)
+        .map_err(|e| AppError::SnapshotParse(format!("{}: {e}", latest_path.display())))?;
     trace!(network, ledger = snapshot.ledger, "latest snapshot loaded");
     Ok(snapshot)
 }
@@ -122,8 +123,8 @@ pub fn load_last_two_snapshots(network: &str) -> AppResult<(ConfigSnapshot, Conf
 pub fn load_snapshot_from_path(path: &str) -> AppResult<ConfigSnapshot> {
     debug!(path, "loading snapshot from path");
     let content = std::fs::read_to_string(path)?;
-    let snapshot: ConfigSnapshot =
-        serde_json::from_str(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))?;
+    let snapshot: ConfigSnapshot = serde_json::from_str(&content)
+        .map_err(|e| AppError::SnapshotParse(format!("{path}: {e}")))?;
     trace!(
         network = snapshot.network,
         ledger = snapshot.ledger,
@@ -696,6 +697,8 @@ pub struct SnapshotMetadata {
 /// materialised; serde skips them.
 #[derive(serde::Deserialize)]
 struct SnapshotHeader {
+    #[serde(default = "crate::config_snapshot::model::default_snapshot_schema_version")]
+    schema_version: u32,
     network: String,
     timestamp: String,
     ledger: u32,
@@ -744,6 +747,8 @@ pub fn list_snapshots_metadata(network: Option<&str>) -> AppResult<Vec<SnapshotM
         let text = std::fs::read_to_string(&path)
             .map_err(|e| AppError::SnapshotParse(format!("cannot read {}: {e}", path.display())))?;
         let header: SnapshotHeader = serde_json::from_str(&text)
+            .map_err(|e| AppError::SnapshotParse(format!("{}: {e}", path.display())))?;
+        crate::config_snapshot::model::validate_snapshot_schema_version(header.schema_version)
             .map_err(|e| AppError::SnapshotParse(format!("{}: {e}", path.display())))?;
         if network.is_some_and(|n| n != header.network) {
             continue;
