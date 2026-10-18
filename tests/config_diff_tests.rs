@@ -1345,3 +1345,193 @@ fn test_format_diff_markdown_no_changes() {
     assert!(md.contains("✅ No changes detected."));
     assert!(!md.contains("| Setting |"));
 }
+
+// ── Exhaustive 64x64 section presence/absence permutations (#362) ──────────
+
+#[test]
+fn test_exhaustive_64x64_section_presence_permutations() {
+    for old_mask in 0u32..64 {
+        let old = snapshot_with(
+            old_mask & 1 != 0,
+            old_mask & 2 != 0,
+            old_mask & 4 != 0,
+            old_mask & 8 != 0,
+            old_mask & 16 != 0,
+            old_mask & 32 != 0,
+        );
+        for new_mask in 0u32..64 {
+            let new = snapshot_with(
+                new_mask & 1 != 0,
+                new_mask & 2 != 0,
+                new_mask & 4 != 0,
+                new_mask & 8 != 0,
+                new_mask & 16 != 0,
+                new_mask & 32 != 0,
+            );
+            let d = diff::diff_snapshots(&old, &new);
+            let expected_changed_sections = (old_mask ^ new_mask).count_ones() as usize;
+            assert_eq!(
+                d.changes.len(),
+                expected_changed_sections,
+                "mask transition {old_mask:06b} -> {new_mask:06b}"
+            );
+            assert_eq!(d.has_any_changes(), expected_changed_sections > 0);
+            assert_eq!(d.has_pricing_changes(), expected_changed_sections > 0);
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn test_all_compared_fields_metadata_and_pricing_classification() {
+    let base = full_snapshot();
+
+    let mut all_changed = full_snapshot();
+    if let Some(c) = &mut all_changed.contract_compute {
+        c.ledger_max_instructions += 1;
+        c.tx_max_instructions += 1;
+        c.fee_rate_per_instructions_increment += 1;
+        c.tx_memory_limit += 1;
+    }
+    if let Some(lc) = &mut all_changed.contract_ledger_cost {
+        lc.ledger_max_disk_read_entries += 1;
+        lc.ledger_max_disk_read_bytes += 1;
+        lc.ledger_max_write_ledger_entries += 1;
+        lc.ledger_max_write_bytes += 1;
+        lc.fee_disk_read_ledger_entry += 1;
+        lc.fee_write_ledger_entry += 1;
+        lc.fee_disk_read1_kb += 1;
+        lc.soroban_state_target_size_bytes += 1;
+        lc.rent_fee1_kb_soroban_state_size_low += 1;
+        lc.rent_fee1_kb_soroban_state_size_high += 1;
+        lc.soroban_state_rent_fee_growth_factor += 1;
+    }
+    if let Some(h) = &mut all_changed.contract_historical_data {
+        h.fee_historical1_kb += 1;
+    }
+    if let Some(e) = &mut all_changed.contract_events {
+        e.tx_max_contract_events_size_bytes += 1;
+        e.fee_contract_events1_kb += 1;
+    }
+    if let Some(b) = &mut all_changed.contract_bandwidth {
+        b.ledger_max_txs_size_bytes += 1;
+        b.tx_max_size_bytes += 1;
+        b.fee_tx_size1_kb += 1;
+    }
+    if let Some(sa) = &mut all_changed.state_archival {
+        sa.max_entry_ttl += 1;
+        sa.min_temporary_ttl += 1;
+        sa.min_persistent_ttl += 1;
+        sa.persistent_rent_rate_denominator += 1;
+        sa.temp_rent_rate_denominator += 1;
+        sa.max_entries_to_archive += 1;
+        sa.live_soroban_state_size_window_sample_size += 1;
+        sa.live_soroban_state_size_window_sample_period += 1;
+        sa.eviction_scan_size += 1;
+        sa.starting_eviction_scan_level += 1;
+    }
+
+    let d = diff::diff_snapshots(&base, &all_changed);
+    assert_eq!(d.changes.len(), 31);
+    assert!(d.has_any_changes());
+    assert!(d.has_pricing_changes());
+
+    for change in &d.changes {
+        assert!(
+            change.setting_id.is_some(),
+            "missing setting_id for {}",
+            change.field_path
+        );
+        assert!(
+            !change.setting_name.is_empty(),
+            "empty setting_name for {}",
+            change.field_path
+        );
+        assert!(
+            change.explanation.is_some(),
+            "missing explanation for {}",
+            change.field_path
+        );
+    }
+
+    let pricing_only = diff::pricing_only(&d);
+    assert_eq!(pricing_only.changes.len(), 11);
+    assert!(pricing_only.has_pricing_changes());
+}
+
+#[test]
+fn test_significant_pricing_changes_and_exit_code_permutations() {
+    // +20% pricing increase (100 -> 120)
+    let old = make_snapshot(100, 5);
+    let new_up = make_snapshot(120, 5);
+    let diff_up = diff::diff_snapshots(&old, &new_up);
+
+    assert!(diff_up.has_significant_pricing_changes(0.0));
+    assert!(diff_up.has_significant_pricing_changes(10.0));
+    assert!(diff_up.has_significant_pricing_changes(20.0));
+    assert!(!diff_up.has_significant_pricing_changes(25.0));
+
+    // -20% pricing decrease (100 -> 80)
+    let new_down = make_snapshot(80, 5);
+    let diff_down = diff::diff_snapshots(&old, &new_down);
+    assert!(diff_down.has_significant_pricing_changes(15.0));
+    assert!(diff_down.has_significant_pricing_changes(20.0));
+    assert!(!diff_down.has_significant_pricing_changes(25.0));
+
+    // Non-numeric pricing change (missing -> present) always counts as significant
+    let added_diff = diff::diff_snapshots(&empty_snapshot(), &full_snapshot());
+    assert!(added_diff.has_significant_pricing_changes(999.0));
+
+    // Exit code permutations
+    assert_eq!(diff::resolve_exit_code(&diff_up, true, true, None), 0);
+    assert_eq!(
+        diff::resolve_exit_code(&diff_up, false, false, Some(25.0)),
+        0
+    );
+    assert_eq!(
+        diff::resolve_exit_code(&diff_up, false, false, Some(15.0)),
+        1
+    );
+    assert_eq!(
+        diff::resolve_exit_code(&diff_up, false, true, Some(99.0)),
+        1
+    );
+
+    let mut non_pricing_snap = old.clone();
+    non_pricing_snap
+        .contract_compute
+        .as_mut()
+        .unwrap()
+        .tx_max_instructions = 999_999;
+    let non_pricing_diff = diff::diff_snapshots(&old, &non_pricing_snap);
+    assert_eq!(
+        diff::resolve_exit_code(&non_pricing_diff, false, false, None),
+        0
+    );
+    assert_eq!(
+        diff::resolve_exit_code(&non_pricing_diff, false, true, None),
+        1
+    );
+    assert_eq!(
+        diff::resolve_exit_code(&non_pricing_diff, true, true, None),
+        0
+    );
+}
+
+#[test]
+fn test_pricing_change_color_thresholds() {
+    assert_eq!(diff::pricing_change_color("100", "200", false), "");
+    // < 10% -> green
+    assert_eq!(diff::pricing_change_color("100", "105", true), "\u{1b}[32m");
+    // 10%..50% -> yellow
+    assert_eq!(diff::pricing_change_color("100", "125", true), "\u{1b}[33m");
+    // >= 50% -> red
+    assert_eq!(diff::pricing_change_color("100", "160", true), "\u{1b}[31m");
+    // 0 -> non-zero -> red
+    assert_eq!(diff::pricing_change_color("0", "10", true), "\u{1b}[31m");
+    // non-numeric -> red
+    assert_eq!(
+        diff::pricing_change_color("(missing)", "(present)", true),
+        "\u{1b}[31m"
+    );
+}
