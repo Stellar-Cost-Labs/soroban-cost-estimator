@@ -24,6 +24,7 @@
 
 # Reference
 
+- [Networks & RPC Providers](networks.md)
 - [Architecture](architecture.md)
 - [Migrating from the Stellar CLI](migration.md)
 - [Verification](verification.md)
