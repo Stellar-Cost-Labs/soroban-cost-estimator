@@ -4921,8 +4921,125 @@ async fn handle_cache_action(
             json,
             quiet,
         ),
+        cli::CacheAction::Inspect {
+            network,
+            r#fn,
+            wasm_hash,
+            min_fee,
+            max_fee,
+            since,
+            to,
+            limit,
+            offset,
+            json,
+        } => cmd_cache_inspect(
+            network.as_deref(),
+            r#fn.as_deref(),
+            wasm_hash.as_deref(),
+            min_fee,
+            max_fee,
+            since.as_deref(),
+            to.as_deref(),
+            limit,
+            offset,
+            json,
+            quiet,
+        ),
         cli::CacheAction::Stats { json } => cmd_cache_stats(json, quiet),
     }
+}
+
+/// `cache inspect` command: read-only filtered inspection of cached estimates with bounded pagination.
+#[allow(clippy::too_many_arguments)]
+fn cmd_cache_inspect(
+    network: Option<&str>,
+    function: Option<&str>,
+    wasm_hash: Option<&str>,
+    min_fee: Option<i64>,
+    max_fee: Option<i64>,
+    since: Option<&str>,
+    to: Option<&str>,
+    limit: usize,
+    offset: usize,
+    json: bool,
+    quiet: bool,
+) -> error::AppResult<()> {
+    let since_dt = match since {
+        Some(s) => Some(cache::parse_since_timestamp(s)?),
+        None => None,
+    };
+    let to_dt = match to {
+        Some(s) => Some(cache::parse_to_timestamp(s)?),
+        None => None,
+    };
+
+    let filter = cache::CacheFilter {
+        function: function.map(str::to_string),
+        wasm_hash: wasm_hash.map(str::to_string),
+        network: network.map(str::to_string),
+        min_fee,
+        max_fee,
+        since: since_dt,
+        to: to_dt,
+    };
+
+    let page = cache::inspect_cache(&filter, Some(limit), Some(offset))?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&page)?);
+        return Ok(());
+    }
+
+    if page.entries.is_empty() {
+        if !quiet {
+            println!("No cached estimates match the filter.");
+        }
+        return Ok(());
+    }
+
+    if !quiet {
+        let mut table = Table::new();
+        if crate::cli::should_colorize() {
+            table.enforce_styling();
+        } else {
+            table.force_no_tty();
+        }
+        table.set_header(vec![
+            "Timestamp",
+            "Network",
+            "Function",
+            "WASM Hash",
+            "Ledger",
+            "CPU",
+            "Fee (stroops)",
+        ]);
+        for e in &page.entries {
+            table.add_row(vec![
+                Cell::new(e.timestamp.as_str()),
+                Cell::new(e.network.as_str()),
+                Cell::new(e.function.as_str()),
+                Cell::new(truncate_hash(&e.wasm_hash)),
+                Cell::new(e.ledger),
+                Cell::new(e.cpu_instructions),
+                Cell::new(e.total_stroops),
+            ]);
+        }
+        println!("{table}");
+        println!(
+            "Showing {} of {} matching cached estimate(s) (offset {}, limit {}{}).",
+            page.entries.len(),
+            page.total_matched,
+            page.offset,
+            page.limit,
+            if page.has_more {
+                ", more available"
+            } else {
+                ""
+            }
+        );
+    }
+
+    Ok(())
 }
 
 /// `cache query` / `config cache query` command: list cached estimates matching the given filters.
