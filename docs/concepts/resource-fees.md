@@ -92,4 +92,4 @@ fee is then visibly understated rather than silently wrong:
 Warning: fee rate source(s) ContractComputeV0 unavailable — affected rate(s) set to 0 (non-refundable fee understated)
 ```
 
-See the [FAQ](../faq.md) for what this means in practice.
+See the [FAQ](../faq.md) for what this means in practice, and [Fee Calculation Methodology](fee-calculation.md) for the complete mathematical equations and `stellar-xdr` config structure reference.
