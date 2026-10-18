@@ -85,3 +85,28 @@ Compare step 5's `instructions` and `resource_fee` / `min_resource_fee` with
 step 4's `cpu_instructions` and `fee.total_stroops`. They should land within
 ~20% (the margin `simulateTransaction` itself applies); this fixture
 reproduces ≤0.011%.
+
+## Reproducible Fixture Regeneration & Verification
+
+To regenerate the synthetic WASM fixtures (`minimal.wasm` and `zeroarg.wasm`):
+
+```bash
+cargo run --bin gen_test_wasm
+```
+
+To verify that all committed fixtures (`minimal.wasm`, `zeroarg.wasm`, and `contract.wasm`) match their expected deterministic contents without overwriting them:
+
+```bash
+cargo run --bin gen_test_wasm -- --check
+```
+
+To rebuild or verify `contract.wasm` from source with deterministic path remapping:
+
+```bash
+# Regenerate ../contract.wasm
+./tests/fixtures/contract/build.sh
+
+# Verify ../contract.wasm without overwriting it
+./tests/fixtures/contract/build.sh --check
+```
+

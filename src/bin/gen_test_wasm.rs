@@ -1,6 +1,7 @@
-/// Minimal valid WebAssembly module generator for testing.
+/// Minimal valid WebAssembly module generator and fixture verifier for testing
+/// and parser benchmarks.
 ///
-/// Writes two hand-crafted WASM fixtures into `tests/fixtures/`:
+/// Writes two deterministic, hand-crafted WASM fixtures into `tests/fixtures/`:
 ///
 /// * `minimal.wasm` — one exported function `add_one(i32) -> i32`.
 /// * `zeroarg.wasm` — two exported functions `ping()` and `pong()` that take
@@ -8,16 +9,34 @@
 ///   no way to invent arguments), so a multi-function batch summary can only
 ///   be exercised end-to-end against a contract whose exports are all
 ///   zero-argument.
+///
+/// Pass `--check` (or `--verify`) to verify that the committed fixtures on disk
+/// are byte-identical to the deterministic generator output (and that any
+/// sibling `contract.wasm` matches its pinned SHA-256) without modifying files.
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 /// File name of the zero-argument fixture, written next to `minimal.wasm`.
 const ZERO_ARG_FIXTURE_NAME: &str = "zeroarg.wasm";
 
+/// File name of the compiled Soroban contract fixture, stored alongside `minimal.wasm`.
+const CONTRACT_FIXTURE_NAME: &str = "contract.wasm";
+
+/// Pinned SHA-256 digest of `tests/fixtures/contract.wasm`.
+pub const EXPECTED_CONTRACT_WASM_SHA256: &str =
+    "ea14bca998e98f0ddb338e8e5cef6e19f07378a3b71e8b4f8868cedc857e4ecd";
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let out_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "tests/fixtures/minimal.wasm".to_string());
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (check_only, out_path) = parse_cli_args(&args);
+
+    if check_only {
+        verify_fixtures(Path::new(&out_path)).map_err(std::io::Error::other)?;
+        eprintln!("Verified WASM fixtures at {out_path} (all up to date)");
+        return Ok(());
+    }
 
     write_fixture(&out_path, &generate_minimal_wasm())?;
 
@@ -29,10 +48,79 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Parse CLI arguments into `(check_only, minimal_wasm_path)`.
+#[must_use]
+pub fn parse_cli_args(args: &[String]) -> (bool, String) {
+    let mut check_only = false;
+    let mut out_path = None;
+    for arg in args {
+        if arg == "--check" || arg == "--verify" {
+            check_only = true;
+        } else if out_path.is_none() {
+            out_path = Some(arg.clone());
+        }
+    }
+    (
+        check_only,
+        out_path.unwrap_or_else(|| "tests/fixtures/minimal.wasm".to_string()),
+    )
+}
+
+/// Verify that `minimal.wasm`, sibling `zeroarg.wasm`, and (if present)
+/// sibling `contract.wasm` match their deterministic expected contents without
+/// overwriting any files on disk.
+pub fn verify_fixtures(minimal_path: &Path) -> Result<(), String> {
+    verify_exact_bytes(minimal_path, &generate_minimal_wasm())?;
+
+    let zero_arg_path: PathBuf = minimal_path.with_file_name(ZERO_ARG_FIXTURE_NAME);
+    verify_exact_bytes(&zero_arg_path, &generate_zero_arg_wasm())?;
+
+    let contract_path: PathBuf = minimal_path.with_file_name(CONTRACT_FIXTURE_NAME);
+    if contract_path.exists() {
+        let bytes = std::fs::read(&contract_path)
+            .map_err(|e| format!("failed to read fixture '{}': {e}", contract_path.display()))?;
+        let actual_hash = sha256_hex(&bytes);
+        if actual_hash != EXPECTED_CONTRACT_WASM_SHA256 {
+            return Err(format!(
+                "stale fixture '{}': expected sha256 {EXPECTED_CONTRACT_WASM_SHA256}, got {actual_hash}",
+                contract_path.display()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn verify_exact_bytes(path: &Path, expected: &[u8]) -> Result<(), String> {
+    let actual = std::fs::read(path)
+        .map_err(|e| format!("failed to read fixture '{}': {e}", path.display()))?;
+    if actual != expected {
+        return Err(format!(
+            "stale fixture '{}': expected {} bytes (sha256 {}), got {} bytes (sha256 {})",
+            path.display(),
+            expected.len(),
+            sha256_hex(expected),
+            actual.len(),
+            sha256_hex(&actual)
+        ));
+    }
+    Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 /// Write `bytes` to `path` and report what was produced.
 fn write_fixture(path: &str, bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
     let mut f = std::fs::File::create(path)?;
-    f.write_all(&bytes)?;
+    f.write_all(bytes)?;
     eprintln!("Generated test WASM: {path} ({} bytes)", bytes.len());
     Ok(())
 }
@@ -44,7 +132,8 @@ fn write_fixture(path: &str, bytes: &[u8]) -> Result<(), Box<dyn std::error::Err
 /// - 1 function using type 0
 /// - 1 export: "add_one" → function 0
 /// - Function body: local.get 0, i32.const 1, i32.add, end
-fn generate_minimal_wasm() -> Vec<u8> {
+#[must_use]
+pub fn generate_minimal_wasm() -> Vec<u8> {
     let mut wasm = Vec::new();
 
     // ── WASM header ─────────────────────────────────────────────────
@@ -124,7 +213,8 @@ fn generate_minimal_wasm() -> Vec<u8> {
 /// - 2 functions, both using type 0
 /// - 2 exports: "ping" → function 0, "pong" → function 1
 /// - Two trivial bodies: `end`
-fn generate_zero_arg_wasm() -> Vec<u8> {
+#[must_use]
+pub fn generate_zero_arg_wasm() -> Vec<u8> {
     let mut wasm = Vec::new();
 
     // ── WASM header ─────────────────────────────────────────────────
@@ -193,5 +283,57 @@ fn write_leb_u32(buf: &mut Vec<u8>, mut value: u32) {
         if value == 0 {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generator_outputs_are_reproducible() {
+        assert_eq!(generate_minimal_wasm(), generate_minimal_wasm());
+        assert_eq!(generate_zero_arg_wasm(), generate_zero_arg_wasm());
+    }
+
+    #[test]
+    fn committed_fixtures_pass_verification() {
+        verify_fixtures(Path::new("tests/fixtures/minimal.wasm"))
+            .expect("committed fixtures should match deterministic generator output");
+    }
+
+    #[test]
+    fn verify_fixtures_detects_stale_files_without_overwriting() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sce-fixture-verify-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let minimal = temp_dir.join("minimal.wasm");
+        let zeroarg = temp_dir.join(ZERO_ARG_FIXTURE_NAME);
+
+        let stale_bytes = b"stale fixture bytes";
+        std::fs::write(&minimal, stale_bytes).expect("write stale minimal.wasm");
+        std::fs::write(&zeroarg, generate_zero_arg_wasm()).expect("write zeroarg.wasm");
+
+        let err = verify_fixtures(&minimal).expect_err("stale minimal.wasm must fail verification");
+        assert!(err.contains("stale fixture"));
+        assert_eq!(
+            std::fs::read(&minimal).expect("read minimal.wasm"),
+            stale_bytes,
+            "verification mode must not overwrite stale files"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn parse_cli_args_recognizes_check_and_verify_flags() {
+        let (check, path) = parse_cli_args(&["--check".to_string()]);
+        assert!(check);
+        assert_eq!(path, "tests/fixtures/minimal.wasm");
+
+        let (verify, custom_path) =
+            parse_cli_args(&["--verify".to_string(), "/tmp/minimal.wasm".to_string()]);
+        assert!(verify);
+        assert_eq!(custom_path, "/tmp/minimal.wasm");
     }
 }
