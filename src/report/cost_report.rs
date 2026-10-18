@@ -659,7 +659,59 @@ impl CostReport {
         });
         suggestions
     }
+
+    /// True when this report carries any resource-limit warnings that trigger
+    /// a non-zero exit under `--fail-on-warning` (#480).
+    #[must_use]
+    pub fn has_warnings(&self) -> bool {
+        !self.warnings.is_empty()
+    }
+
+    /// Return the distinct warning classes (`resource` identifiers) active on
+    /// this report (#480).
+    #[must_use]
+    pub fn warning_classes(&self) -> Vec<&str> {
+        self.warnings.iter().map(|w| w.resource.as_str()).collect()
+    }
+
+    /// Format a summary of active warnings for `--fail-on-warning` stderr
+    /// reporting (#480), or `None` when no warnings are present.
+    #[must_use]
+    pub fn fail_on_warning_summary(&self) -> Option<String> {
+        if self.warnings.is_empty() {
+            return None;
+        }
+        let details: Vec<String> = self
+            .warnings
+            .iter()
+            .map(|w| format!("[{}] {}", w.resource, w.message))
+            .collect();
+        Some(format!(
+            "Error: --fail-on-warning triggered by {} warning(s): {}",
+            self.warnings.len(),
+            details.join("; ")
+        ))
+    }
 }
+
+/// Documented warning classes that trigger a non-zero exit (`1`) when
+/// `--fail-on-warning` is passed (#480):
+/// - `"cpu_instructions"` — CPU instructions >= 80% of `tx_max_instructions`
+/// - `"read_entries"` — disk read entries >= 80% of `tx_max_read_entries`
+/// - `"write_entries"` — write ledger entries >= 80% of `tx_max_write_entries`
+/// - `"read_bytes"` — disk read bytes >= 80% of `tx_max_read_bytes`
+/// - `"write_bytes"` — write bytes >= 80% of `tx_max_write_bytes`
+/// - `"tx_size"` — transaction XDR size >= 80% of `tx_max_size`
+/// - `"repeat_non_determinism"` — CPU or fee varied across `--repeat` runs
+pub const FAIL_ON_WARNING_CLASSES: &[&str] = &[
+    "cpu_instructions",
+    "read_entries",
+    "write_entries",
+    "read_bytes",
+    "write_bytes",
+    "tx_size",
+    "repeat_non_determinism",
+];
 
 /// Render optimization suggestions as a human-readable block.
 ///
@@ -2677,5 +2729,35 @@ mod tests {
             cpu_row.ends_with(','),
             "percent column should be empty; got: {cpu_row}"
         );
+    }
+
+    #[test]
+    fn test_fail_on_warning_helpers_and_classes() {
+        assert!(FAIL_ON_WARNING_CLASSES.contains(&"cpu_instructions"));
+        assert!(FAIL_ON_WARNING_CLASSES.contains(&"read_entries"));
+        assert!(FAIL_ON_WARNING_CLASSES.contains(&"write_entries"));
+        assert!(FAIL_ON_WARNING_CLASSES.contains(&"read_bytes"));
+        assert!(FAIL_ON_WARNING_CLASSES.contains(&"write_bytes"));
+        assert!(FAIL_ON_WARNING_CLASSES.contains(&"tx_size"));
+        assert!(FAIL_ON_WARNING_CLASSES.contains(&"repeat_non_determinism"));
+
+        let mut report = report_with_rates(sample_rates());
+        assert!(!report.has_warnings());
+        assert!(report.warning_classes().is_empty());
+        assert!(report.fail_on_warning_summary().is_none());
+
+        report.warnings.push(ResourceWarning {
+            resource: "cpu_instructions".to_string(),
+            label: "CPU instructions".to_string(),
+            used: 90_000,
+            limit: 100_000,
+            percent: 90,
+            message: "CPU instructions at 90% of the network limit (90000 of 100000)".to_string(),
+        });
+        assert!(report.has_warnings());
+        assert_eq!(report.warning_classes(), vec!["cpu_instructions"]);
+        let summary = report.fail_on_warning_summary().expect("summary present");
+        assert!(summary.contains("--fail-on-warning triggered by 1 warning(s)"));
+        assert!(summary.contains("[cpu_instructions]"));
     }
 }

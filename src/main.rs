@@ -239,6 +239,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
     // `--quiet` is a single global flag; bind it once so every command in
     // `run()` reads the same value.
     let quiet = args.quiet;
+    cli::init_fail_on_warning(args.fail_on_warning);
     // Bound the on-disk estimate cache before any command can write to it.
     // A `--max-cache-size-mb` of 0 disables the byte quota; 0 entries
     // disables the entry quota.
@@ -1278,6 +1279,16 @@ async fn cmd_estimate(
             eprintln!("Warning: auto-snapshot failed: {e}");
         }
     }
+
+    if cli::fail_on_warning() {
+        if let EstimateRun::Simulated { report, .. } = &run {
+            if let Some(summary) = report.fail_on_warning_summary() {
+                eprintln!("{summary}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1633,6 +1644,13 @@ async fn cmd_estimate_repeat(
                 warn!(error = %e, "auto-snapshot failed");
                 eprintln!("Warning: auto-snapshot failed: {e}");
             }
+        }
+
+        if cli::fail_on_warning() && (!cpu_identical || !fee_identical) {
+            eprintln!(
+                "Error: --fail-on-warning triggered by [repeat_non_determinism]: fee or resource estimates varied across {repeat} runs"
+            );
+            std::process::exit(1);
         }
 
         Ok(())
@@ -2745,6 +2763,16 @@ async fn cmd_estimate_diff(
         );
     }
 
+    if cli::fail_on_warning() {
+        if let Some(summary) = new_report
+            .fail_on_warning_summary()
+            .or_else(|| old_report.fail_on_warning_summary())
+        {
+            eprintln!("{summary}");
+            std::process::exit(1);
+        }
+    }
+
     Ok(())
 }
 
@@ -3091,6 +3119,8 @@ async fn cmd_estimate_all(
         let fee_distribution = report::cost_report::FeeDistribution::from_samples(&fees, &cpu);
         emit_fee_distribution_summary(&fee_distribution, format == "json", precision);
 
+        let total_warnings: usize = json_results.iter().map(|r| r.warnings.len()).sum();
+
         if format == "json" {
             let report = EstimateAllJsonReport {
                 functions: json_results,
@@ -3102,6 +3132,13 @@ async fn cmd_estimate_all(
             for row in &csv_rows {
                 println!("{row}");
             }
+        }
+
+        if cli::fail_on_warning() && total_warnings > 0 {
+            eprintln!(
+                "Error: --fail-on-warning triggered by {total_warnings} resource-limit warning(s)"
+            );
+            std::process::exit(1);
         }
 
         Ok(())

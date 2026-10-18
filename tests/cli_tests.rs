@@ -4475,3 +4475,188 @@ fn test_config_snapshot_diff_makes_no_network_calls() {
         "offline diff must not resolve a network; got: {stderr}"
     );
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn test_fail_on_warning_exits_zero_without_warnings_and_nonzero_with_warnings() {
+    use base64::Engine;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use stellar_xdr::WriteXdr;
+
+    // Build a ContractComputeV0 config entry with tx_max_instructions = 5_000.
+    let compute_entry = stellar_xdr::LedgerEntryData::ConfigSetting(
+        stellar_xdr::ConfigSettingEntry::ContractComputeV0(
+            stellar_xdr::ConfigSettingContractComputeV0 {
+                ledger_max_instructions: 100_000,
+                tx_max_instructions: 5_000,
+                fee_rate_per_instructions_increment: 25,
+                tx_memory_limit: 41_943_040,
+            },
+        ),
+    );
+    let compute_b64 = base64::engine::general_purpose::STANDARD
+        .encode(compute_entry.to_xdr(stellar_xdr::Limits::none()).unwrap());
+
+    let spawn_server = |cpu_insns: u64| -> (String, std::sync::mpsc::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let addr = listener.local_addr().expect("local addr");
+        let (tx_stop, rx_stop) = std::sync::mpsc::channel::<()>();
+        let compute_b64 = compute_b64.clone();
+
+        std::thread::spawn(move || {
+            listener.set_nonblocking(true).expect("set nonblocking");
+            loop {
+                if rx_stop.try_recv().is_ok() {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buf = [0u8; 4096];
+                        let mut req_str = String::new();
+                        loop {
+                            match stream.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    req_str.push_str(&String::from_utf8_lossy(&buf[..n]));
+                                    if let Some(header_end) = req_str.find("\r\n\r\n") {
+                                        let body_start = header_end + 4;
+                                        let content_length = req_str[..header_end]
+                                            .lines()
+                                            .find_map(|line| {
+                                                let (name, value) = line.split_once(':')?;
+                                                if name
+                                                    .trim()
+                                                    .eq_ignore_ascii_case("content-length")
+                                                {
+                                                    value.trim().parse::<usize>().ok()
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                            .unwrap_or(0);
+                                        if req_str.len().saturating_sub(body_start)
+                                            >= content_length
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    std::thread::sleep(std::time::Duration::from_millis(5));
+                                }
+                                Err(_) => break,
+                            }
+                        }
+
+                        let resp_body = if req_str.contains("simulateTransaction") {
+                            format!(
+                                r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":500,"minResourceFee":"1500","cost":{{"cpuInsns":"{cpu_insns}","memBytes":"512"}}}}}}"#
+                            )
+                        } else if req_str.contains("getHealth") {
+                            r#"{"jsonrpc":"2.0","id":1,"result":{"status":"healthy","latestLedger":500}}"#
+                                .to_string()
+                        } else if req_str.contains("getLedgerEntries") {
+                            format!(
+                                r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":500,"entries":[{{"key":"AAAA","xdr":"{compute_b64}","lastModifiedLedgerSeq":499}}]}}}}"#
+                            )
+                        } else {
+                            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#
+                                .to_string()
+                        };
+
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            resp_body.len(),
+                            resp_body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        (format!("http://{addr}"), tx_stop)
+    };
+
+    let home = temp_home("fail-on-warning");
+
+    // 1. No-warning run (1_000 / 5_000 = 20% CPU) with --fail-on-warning -> exits 0
+    let (rpc_low, _stop_low) = spawn_server(1_000);
+    let (stdout_ok, stderr_ok, code_ok) = run_cli_quiet(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--rpc-url",
+            &rpc_low,
+            "--no-cache",
+            "--json",
+            "--fail-on-warning",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code_ok, 0,
+        "no-warning run with --fail-on-warning must exit 0; stderr: {stderr_ok}"
+    );
+    let parsed_ok: serde_json::Value =
+        serde_json::from_str(stdout_ok.trim()).expect("valid JSON on no-warning run");
+    assert_eq!(parsed_ok["warnings"].as_array().unwrap().len(), 0);
+
+    // 2. Warning run (4_500 / 5_000 = 90% CPU) WITHOUT --fail-on-warning -> exits 0
+    let (rpc_high_1, _stop_high_1) = spawn_server(4_500);
+    let (stdout_warn_ok, stderr_warn_ok, code_warn_ok) = run_cli_quiet(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--rpc-url",
+            &rpc_high_1,
+            "--no-cache",
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code_warn_ok, 0,
+        "warning run without --fail-on-warning must exit 0; stderr: {stderr_warn_ok}"
+    );
+    let parsed_warn_ok: serde_json::Value =
+        serde_json::from_str(stdout_warn_ok.trim()).expect("valid JSON on warning run");
+    assert_eq!(parsed_warn_ok["warnings"].as_array().unwrap().len(), 1);
+
+    // 3. Warning run (4_500 / 5_000 = 90% CPU) WITH --fail-on-warning -> preserves full report on stdout and exits 1
+    let (rpc_high_2, _stop_high_2) = spawn_server(4_500);
+    let (stdout_fail, stderr_fail, code_fail) = run_cli_quiet(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--rpc-url",
+            &rpc_high_2,
+            "--no-cache",
+            "--json",
+            "--fail-on-warning",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code_fail, 1,
+        "warning run with --fail-on-warning must exit 1; stderr: {stderr_fail}"
+    );
+    let parsed_fail: serde_json::Value = serde_json::from_str(stdout_fail.trim())
+        .expect("complete JSON report must be preserved on stdout before exiting non-zero");
+    assert_eq!(parsed_fail["warnings"].as_array().unwrap().len(), 1);
+    assert_eq!(parsed_fail["warnings"][0]["resource"], "cpu_instructions");
+    assert!(
+        stderr_fail.contains("--fail-on-warning triggered")
+            && stderr_fail.contains("[cpu_instructions]"),
+        "stderr must explain why --fail-on-warning failed; got: {stderr_fail}"
+    );
+}

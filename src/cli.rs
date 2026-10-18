@@ -176,6 +176,13 @@ pub struct Cli {
     )]
     pub precision: u32,
 
+    /// Exit with a non-zero status code (1) after emitting the full report if
+    /// any estimate warning is raised (resource usage >= 80% of network limits:
+    /// cpu_instructions, read_entries, write_entries, read_bytes, write_bytes,
+    /// tx_size, or non-deterministic repeat runs).
+    #[arg(long, global = true)]
+    pub fail_on_warning: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -698,6 +705,20 @@ pub fn init_quiet(quiet: bool) {
 #[must_use]
 pub fn is_quiet() -> bool {
     QUIET.load(Ordering::Relaxed)
+}
+
+/// Global `--fail-on-warning` state (#480), set once from the parsed CLI.
+static FAIL_ON_WARNING: AtomicBool = AtomicBool::new(false);
+
+/// Record whether `--fail-on-warning` was passed (#480).
+pub fn init_fail_on_warning(fail: bool) {
+    FAIL_ON_WARNING.store(fail, Ordering::Relaxed);
+}
+
+/// Whether `--fail-on-warning` is active (#480).
+#[must_use]
+pub fn fail_on_warning() -> bool {
+    FAIL_ON_WARNING.load(Ordering::Relaxed)
 }
 
 /// Terminal width to render the fee bar chart at, or `None` when the chart
