@@ -461,6 +461,25 @@ impl RpcClient {
         redact_sensitive(&self.headers)
     }
 
+    /// Formats the configured custom headers as a deterministic comma-separated
+    /// `name: value` string with sensitive values replaced by `<redacted>`.
+    #[must_use]
+    pub fn format_redacted_headers(&self) -> String {
+        if self.headers.is_empty() {
+            return "(none)".to_string();
+        }
+        let redacted = self.redacted_headers();
+        let mut pairs: Vec<String> = redacted
+            .iter()
+            .map(|(name, value)| {
+                let val = value.to_str().unwrap_or(REDACTED);
+                format!("{}: {val}", name.as_str())
+            })
+            .collect();
+        pairs.sort();
+        pairs.join(", ")
+    }
+
     /// Validate that the RPC endpoint is reachable and healthy before any
     /// simulation is run.
     ///
@@ -627,6 +646,7 @@ impl RpcClient {
         trace!(
             method,
             header_count = self.headers.len(),
+            headers = %self.format_redacted_headers(),
             "sending RPC request"
         );
         match self
@@ -700,6 +720,9 @@ impl RpcClient {
         let payload_size = request_body_str.len();
         if self.verbose {
             eprintln!("[RPC] POST {} ({} bytes)", url, payload_size);
+            if !self.headers.is_empty() {
+                eprintln!("[RPC] headers: {}", self.format_redacted_headers());
+            }
             eprintln!("[RPC] -> {}", request_body_str);
         }
 
