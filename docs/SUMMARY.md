@@ -24,6 +24,7 @@
 
 # Reference
 
+- [CI/CD Integration](ci-cd-integration.md)
 - [Architecture](architecture.md)
 - [Migrating from the Stellar CLI](migration.md)
 - [Verification](verification.md)
