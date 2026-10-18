@@ -3482,13 +3482,9 @@ fn wasm_info_json(
     })
 }
 
-/// Fetches the current network config settings and builds a snapshot.
-///
-/// Shared by `config snapshot`, `config diff`, and `watch`.
-///
-/// # Network calls
-/// Makes one batched `getLedgerEntries` RPC call.
-async fn fetch_config_snapshot(
+/// Build an [`rpc::client::RpcClient`] for `network` using standard CLI options.
+#[allow(clippy::too_many_arguments)]
+fn build_network_rpc_client(
     network: &str,
     rpc_fallback_url: Option<&str>,
     rps: Option<u64>,
@@ -3497,50 +3493,18 @@ async fn fetch_config_snapshot(
     max_retries: usize,
     extra_headers: &[String],
     verbose: bool,
-) -> error::AppResult<config_snapshot::model::ConfigSnapshot> {
-    use tracing::Instrument;
-    use tracing::{debug, info_span};
-
-    let span = info_span!("fetch_config_snapshot", network);
-    async {
-        let endpoint = rpc::client::resolve_endpoint(network, None)?;
-        let client = rpc::client::RpcClient::with_fallback_headers_connect_timeout(
-            &endpoint,
-            rpc_fallback_url,
-            rps,
-            std::time::Duration::from_secs(timeout),
-            std::time::Duration::from_secs(connect_timeout),
-            max_retries,
-            extra_headers,
-            verbose,
-        )?;
-        debug!("fetching all config settings");
-        let raw_entries = rpc::config::fetch_all_config_settings(&client).await?;
-        debug!(entries = raw_entries.len(), "received config entries");
-
-        let mut snapshot = xdr_helper::begin_snapshot(network, 0);
-        for raw in &raw_entries {
-            let config_entry = xdr_helper::decode_config_entry_xdr(&raw.config_xdr, verbose)?;
-            xdr_helper::apply_config_entry(&mut snapshot, config_entry);
-        }
-        if let Some(latest) = raw_entries.iter().map(|e| e.last_modified_ledger).max() {
-            snapshot.ledger = latest;
-        }
-        // The protocol version is informational (shown by `config snapshot
-        // list`), so a failure here must not lose the snapshot itself.
-        match rpc::config::fetch_protocol_version(&client).await {
-            Ok(version) => snapshot.protocol_version = Some(version),
-            Err(e) => warn!(error = %e, "could not fetch protocol version; recording none"),
-        }
-        debug!(
-            ledger = snapshot.ledger,
-            protocol_version = ?snapshot.protocol_version,
-            "config snapshot built"
-        );
-        Ok(snapshot)
-    }
-    .instrument(span)
-    .await
+) -> error::AppResult<rpc::client::RpcClient> {
+    let endpoint = rpc::client::resolve_endpoint(network, None)?;
+    rpc::client::RpcClient::with_fallback_headers_connect_timeout(
+        &endpoint,
+        rpc_fallback_url,
+        rps,
+        std::time::Duration::from_secs(timeout),
+        std::time::Duration::from_secs(connect_timeout),
+        max_retries,
+        extra_headers,
+        verbose,
+    )
 }
 
 /// Prints stale cached estimates for `network` relative to `ledger`, if any.
@@ -3556,7 +3520,7 @@ fn print_stale_estimates(network: &str, ledger: u32, quiet: bool) {
                     println!("  All cached estimates are current (ledger {ledger}).");
                 } else {
                     println!(
-                        "  {} cached estimate(s) from earlier ledger(s) â€” may be stale:",
+                        "  {} cached estimate(s) from earlier ledger(s) — may be stale:",
                         stale.len()
                     );
                     for est in &stale {
@@ -3670,7 +3634,7 @@ async fn cmd_config_snapshot(
     let span = info_span!("cmd_config_snapshot", network);
     async {
         info!("taking config snapshot");
-        let snapshot = fetch_config_snapshot(
+        let client = build_network_rpc_client(
             network,
             rpc_fallback_url,
             rps,
@@ -3679,8 +3643,8 @@ async fn cmd_config_snapshot(
             max_retries,
             extra_headers,
             verbose,
-        )
-        .await?;
+        )?;
+        let snapshot = config_snapshot::fetch_live_snapshot(&client, network).await?;
 
         let path = config_snapshot::store::save_snapshot(&snapshot, out_path)?;
         info!(path = %path.display(), ledger = snapshot.ledger, "snapshot saved");
@@ -3974,24 +3938,6 @@ fn upgrade_detected(diff: &config_snapshot::diff::ConfigDiff) -> bool {
     diff.has_pricing_changes
 }
 
-/// Cached estimates recorded before `ledger`, shaped for the
-/// `config diff --json` payload.
-///
-/// Both diff modes emit the same envelope, so a consumer sees one schema
-/// whether the newer side came from the network or from disk. An unreadable
-/// cache yields an empty list rather than failing the diff.
-fn stale_estimates_for(network: &str, ledger: u32) -> Vec<cache::CachedEstimate> {
-    cache::list_cached_estimates(network)
-        .map(|estimates| {
-            cache::find_stale_estimates(&estimates, ledger)
-                .into_iter()
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// `config diff` command: compare current config against a snapshot.
 /// `config diff` command: compare current config against a snapshot.
 ///
 /// Exit-code semantics (for CI drift detection):
@@ -4039,7 +3985,7 @@ async fn cmd_config_diff(
             }
         };
 
-        let new_snapshot = fetch_config_snapshot(
+        let client = build_network_rpc_client(
             network,
             rpc_fallback_url,
             rps,
@@ -4048,10 +3994,17 @@ async fn cmd_config_diff(
             max_retries,
             extra_headers,
             verbose,
-        )
-        .await?;
+        )?;
+        let live = config_snapshot::run_live_config_diff(&client, network).await?;
+        let new_snapshot = live.new_snapshot;
 
-        let mut diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
+        let mut diff = if against_path.is_some() {
+            config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot)
+        } else {
+            live.diff.unwrap_or_else(|| {
+                config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot)
+            })
+        };
         if pricing_only {
             diff = config_snapshot::diff::pricing_only(&diff);
         }
@@ -4063,7 +4016,7 @@ async fn cmd_config_diff(
         if json_flag {
             let json_output = serde_json::json!({
                 "diff": diff,
-                "stale_estimates": stale_estimates_for(network, new_snapshot.ledger),
+                "stale_estimates": live.stale_estimates,
             });
             println!("{}", serde_json::to_string_pretty(&json_output)?);
         } else if format == cli::OutputFormat::Csv {
@@ -4092,7 +4045,7 @@ async fn cmd_config_diff(
                     info!(path = %path.display(), "auto-saved post-upgrade snapshot");
                     if !machine && !summary {
                         println!(
-                            "  Protocol upgrade detected â€” new config auto-saved to {}",
+                            "  Protocol upgrade detected — new config auto-saved to {}",
                             path.display()
                         );
                     }
@@ -4137,7 +4090,7 @@ async fn cmd_config_diff(
 /// already the one on disk.
 ///
 /// # Network calls
-/// None â€” pure file I/O.
+/// None — pure file I/O.
 #[allow(clippy::fn_params_excessive_bools)]
 fn cmd_config_diff_against_previous(
     network: &str,
@@ -4164,7 +4117,7 @@ fn cmd_config_diff_against_previous(
     if json_flag {
         let json_output = serde_json::json!({
             "diff": diff,
-            "stale_estimates": stale_estimates_for(network, new_snapshot.ledger),
+            "stale_estimates": config_snapshot::stale_estimates_for(network, new_snapshot.ledger),
         });
         println!("{}", serde_json::to_string_pretty(&json_output)?);
     } else if summary {
@@ -4398,10 +4351,7 @@ async fn auto_snapshot_if_changed(
 ) -> error::AppResult<()> {
     use tracing::{debug, info};
 
-    // Try to load the latest snapshot; if none exists, save a new one.
-    let old_snapshot = config_snapshot::store::load_latest_snapshot(network).ok();
-
-    let new_snapshot = fetch_config_snapshot(
+    let client = build_network_rpc_client(
         network,
         rpc_fallback_url,
         rps,
@@ -4410,12 +4360,11 @@ async fn auto_snapshot_if_changed(
         max_retries,
         extra_headers,
         verbose,
-    )
-    .await?;
+    )?;
+    let live = config_snapshot::run_live_config_diff(&client, network).await?;
 
-    let has_changes = match &old_snapshot {
-        Some(old) => {
-            let diff = config_snapshot::diff::diff_snapshots(old, &new_snapshot);
+    let has_changes = match &live.diff {
+        Some(diff) => {
             debug!(
                 change_count = diff.changes.len(),
                 has_pricing = diff.has_pricing_changes,
@@ -4430,8 +4379,8 @@ async fn auto_snapshot_if_changed(
     };
 
     if has_changes {
-        let path = config_snapshot::store::save_snapshot(&new_snapshot, None)?;
-        info!(path = %path.display(), ledger = new_snapshot.ledger, "auto-snapshot saved");
+        let path = config_snapshot::store::save_snapshot(&live.new_snapshot, None)?;
+        info!(path = %path.display(), ledger = live.new_snapshot.ledger, "auto-snapshot saved");
         if !quiet {
             println!(
                 "Network configuration updated: saved snapshot {}",
@@ -4447,7 +4396,7 @@ async fn auto_snapshot_if_changed(
 /// long-running command can stop gracefully.
 ///
 /// # Network calls
-/// None â€” waits on OS signals.
+/// None — waits on OS signals.
 async fn shutdown_signal() -> error::AppResult<()> {
     #[cfg(unix)]
     {
@@ -4486,7 +4435,7 @@ async fn watch_poll_once(
 ) -> error::AppResult<()> {
     use tracing::{debug, warn};
 
-    let snapshot_result = fetch_config_snapshot(
+    let live_result = match build_network_rpc_client(
         network,
         rpc_fallback_url,
         rps,
@@ -4495,21 +4444,22 @@ async fn watch_poll_once(
         max_retries,
         extra_headers,
         verbose,
-    )
-    .await;
+    ) {
+        Ok(client) => config_snapshot::run_live_config_diff(&client, network).await,
+        Err(e) => Err(e),
+    };
 
-    match snapshot_result {
-        Ok(snapshot) => {
+    match live_result {
+        Ok(live) => {
             if !*first {
-                if let Ok(old_snapshot) = config_snapshot::store::load_latest_snapshot(network) {
-                    let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &snapshot);
+                if let Some(diff) = &live.diff {
                     if !diff.changes.is_empty() {
                         debug!(change_count = diff.changes.len(), "config changes detected");
                         if !quiet {
                             println!(
                                 "{}",
                                 config_snapshot::diff::format_diff(
-                                    &diff,
+                                    diff,
                                     cli::should_colorize(),
                                     false,
                                     threshold_percent
@@ -4518,11 +4468,11 @@ async fn watch_poll_once(
                         }
                     }
 
-                    print_stale_estimates(network, snapshot.ledger, quiet);
+                    print_stale_estimates(network, live.new_snapshot.ledger, quiet);
                 }
             }
 
-            let _ = config_snapshot::store::save_snapshot(&snapshot, None);
+            let _ = config_snapshot::store::save_snapshot(&live.new_snapshot, None);
             *first = false;
         }
         Err(e) => {
