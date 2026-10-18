@@ -1028,3 +1028,55 @@ fn test_load_wasm_detects_synthetic_debug_section() {
 
     let _ = std::fs::remove_file(&temp);
 }
+
+#[test]
+fn test_custom_sections_json_preserves_repeated_and_unknown_sections() {
+    use soroban_cost_estimator::wasm::parser::{format_sections, load_wasm, wasm_info_json};
+
+    let mut bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
+    bytes.extend_from_slice(&custom_section("producers", &[1, 2, 3, 4]));
+    bytes.extend_from_slice(&custom_section("vendor.custom.unknown", &[0xaa; 12]));
+    bytes.extend_from_slice(&custom_section("producers", &[5, 6, 7, 8, 9, 10]));
+
+    let temp =
+        std::env::temp_dir().join(format!("sce-custom-sections-{}.wasm", std::process::id()));
+    std::fs::write(&temp, &bytes).expect("write fixture");
+
+    let info = load_wasm(&temp).expect("wasm with repeated/unknown custom sections should load");
+    let custom = info.custom_sections();
+    assert_eq!(
+        custom.len(),
+        3,
+        "repeated custom sections must remain separate entries"
+    );
+    assert_eq!(custom[0].name, "producers");
+    assert_eq!(custom[1].name, "vendor.custom.unknown");
+    assert_eq!(custom[2].name, "producers");
+    assert!(custom[0].offset < custom[1].offset && custom[1].offset < custom[2].offset);
+    assert!(custom[2].size > custom[0].size);
+
+    let json = wasm_info_json("/tmp/custom.wasm", &info, &info.wasm_hash);
+    let json_custom = json["custom_sections"]
+        .as_array()
+        .expect("custom_sections array in JSON");
+    assert_eq!(json_custom.len(), 3);
+    assert_eq!(json_custom[0]["name"], "producers");
+    assert_eq!(json_custom[1]["name"], "vendor.custom.unknown");
+    assert_eq!(json_custom[2]["name"], "producers");
+    assert_eq!(
+        json["module"]["custom_sections"], json["custom_sections"],
+        "module.custom_sections should match top-level custom_sections"
+    );
+
+    // Deterministic ordering across repeated serializations.
+    let json_second = wasm_info_json("/tmp/custom.wasm", &info, &info.wasm_hash);
+    assert_eq!(json, json_second);
+
+    // Human-readable output remains intact.
+    let rendered = format_sections(&info);
+    assert!(rendered.contains("WASM sections:"));
+    assert!(rendered.contains("producers"));
+    assert!(rendered.contains("vendor.custom.unknown"));
+
+    let _ = std::fs::remove_file(&temp);
+}

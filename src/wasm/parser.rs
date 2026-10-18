@@ -974,6 +974,26 @@ pub struct SectionInfo {
     pub header_size: usize,
 }
 
+/// Name and byte size of a custom section in a WASM module.
+///
+/// Repeated custom sections with the same name are preserved as separate
+/// entries in deterministic binary-offset order.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CustomSectionInfo {
+    /// Custom section name (e.g. `contractspecv0`, `contractmetav0`, `name`, `.debug_info`).
+    pub name: String,
+    /// Size of the custom section contents, in bytes.
+    pub size: usize,
+    /// Bytes taken by the section header (id byte + LEB128 size prefix).
+    pub header_size: usize,
+    /// Full footprint in the binary (`header_size + size`), in bytes.
+    pub total_size: usize,
+    /// Byte offset of the section contents in the binary.
+    pub offset: usize,
+    /// Byte offset one past the end of the section contents.
+    pub end: usize,
+}
+
 /// Information about an exported function.
 #[derive(Debug, Clone)]
 pub struct FunctionInfo {
@@ -1216,6 +1236,26 @@ impl WasmInfo {
         SectionSizeBreakdown::from_sections(&self.sections, self.bytes.len())
     }
 
+    /// Custom sections present in the module, in deterministic binary-offset order.
+    ///
+    /// Repeated custom sections with the same name are preserved as separate entries.
+    #[must_use]
+    pub fn custom_sections(&self) -> Vec<CustomSectionInfo> {
+        let mut custom: Vec<&SectionInfo> = self.sections.iter().filter(|s| s.custom).collect();
+        custom.sort_by(|a, b| a.offset.cmp(&b.offset).then_with(|| a.name.cmp(&b.name)));
+        custom
+            .into_iter()
+            .map(|s| CustomSectionInfo {
+                name: s.name.clone(),
+                size: s.size,
+                header_size: s.header_size,
+                total_size: s.header_size + s.size,
+                offset: s.offset,
+                end: s.end,
+            })
+            .collect()
+    }
+
     /// Estimated percentage of the binary that can be reclaimed by stripping
     /// its `name` / `.debug*` custom sections, rounded to whole percent.
     ///
@@ -1235,6 +1275,100 @@ impl WasmInfo {
         let rounded = (debug * 100 + bytes / 2) / bytes;
         u32::try_from(rounded.max(1)).unwrap_or(1)
     }
+}
+
+/// Builds the JSON representation of WASM metadata for `wasm info --json`.
+///
+/// Includes `custom_sections` (preserving repeated custom sections in
+/// deterministic binary-offset order) alongside `section_sizes` and `sections`.
+#[must_use]
+pub fn wasm_info_json(wasm_path: &str, wasm_info: &WasmInfo, hash: &str) -> serde_json::Value {
+    let breakdown = wasm_info.section_breakdown();
+    let custom_sections = wasm_info.custom_sections();
+    json!({
+        "path": wasm_path,
+        "size": wasm_info.bytes.len(),
+        "sha256": hash,
+        "has_spec": wasm_info.has_spec,
+        "sdk_version": wasm_info.contract_meta.sdk_version,
+        "has_debug_symbols": wasm_info.has_debug_symbols,
+        "debug_symbol_bytes": wasm_info.debug_symbol_bytes,
+        "estimated_size_reduction_percent": wasm_info.estimated_size_reduction_percent(),
+        "contract_meta": {
+            "name": wasm_info.contract_meta.name,
+            "version": wasm_info.contract_meta.version,
+            "description": wasm_info.contract_meta.description,
+            "author": wasm_info.contract_meta.author,
+            "sdk_version": wasm_info.contract_meta.sdk_version,
+            "entries": wasm_info.contract_meta.entries.iter().map(|(key, value)| {
+                json!({ "key": key, "value": value })
+            }).collect::<Vec<_>>(),
+        },
+        "functions": wasm_info.functions.iter().map(|f| {
+            json!({
+                "name": f.name,
+                "param_count": f.param_count,
+                "result_count": f.result_count,
+                "signature": format_function(f),
+                "params": f.params.iter().map(|p| {
+                    json!({
+                        "name": p.name,
+                        "type": p.type_name,
+                        "type_def": spec_type_json(&p.type_def),
+                    })
+                }).collect::<Vec<_>>(),
+                "returns": f.returns.iter().map(|r| {
+                    json!({
+                        "type": r.type_name,
+                        "type_def": spec_type_json(&r.type_def),
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        }).collect::<Vec<_>>(),
+        "spec_entries": wasm_info.spec_entries.iter()
+            .map(spec_entry_json)
+            .collect::<Vec<_>>(),
+        "custom_sections": custom_sections,
+        "section_sizes": breakdown.size_map(),
+        "sections": breakdown.sections.iter().map(|s| {
+            json!({
+                "name": s.name,
+                "id": s.id,
+                "offset": s.offset,
+                "end": s.end,
+                "size": s.size,
+                "header_size": s.header_size,
+                "total_size": s.total_size,
+                "percent": s.percent,
+                "custom": s.id == Some(0),
+            })
+        }).collect::<Vec<_>>(),
+        "module": {
+            "start_function": wasm_info.start_function,
+            "memories": wasm_info.memories.iter().map(|m| {
+                json!({
+                    "initial_pages": m.initial_pages,
+                    "maximum_pages": m.maximum_pages,
+                    "memory64": m.memory64,
+                })
+            }).collect::<Vec<_>>(),
+            "imports": wasm_info.imports.iter().map(|i| {
+                json!({
+                    "module": i.module,
+                    "name": i.name,
+                    "kind": i.kind,
+                })
+            }).collect::<Vec<_>>(),
+            "exports": wasm_info.exports.iter().map(|e| {
+                json!({
+                    "name": e.name,
+                    "kind": e.kind,
+                    "index": e.index,
+                })
+            }).collect::<Vec<_>>(),
+            "custom_sections": wasm_info.custom_sections(),
+        },
+    })
 }
 
 /// True when a WASM custom section is a debug/optimization artifact: the
