@@ -364,7 +364,7 @@ pub struct CostResult {
 }
 
 /// Deserialize a u64 that may arrive as a JSON string or a JSON number.
-fn deserialize_u64_flexible<'de, D>(deserializer: D) -> Result<u64, D::Error>
+pub(crate) fn deserialize_u64_flexible<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -380,7 +380,7 @@ where
 
 /// Deserialize an optional u64 that may arrive as a JSON string, number, or
 /// null.
-fn deserialize_u64_flexible_opt<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+pub(crate) fn deserialize_u64_flexible_opt<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

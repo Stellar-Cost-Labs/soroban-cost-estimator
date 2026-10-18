@@ -1,0 +1,17 @@
+{
+  "transactionData": "AAAAAAAAAAEAAAAH6hS8qZjpjw3bM46OXO9uGfBzeKO3HotPiGjO3IV+Ts0AAAABAAAABgAAAAEmU1Fc+h02S4iEBnpjdCESXpKHG/bOUxC3DeRWUy9+mQAAABQAAAABAAggFgAAAAAAAACIAAAAAAAAPEM=",
+  "events": [],
+  "minResourceFee": "15427",
+  "results": [
+    {
+      "auth": [],
+      "xdr": "AAAAAwAAAAY="
+    }
+  ],
+  "restorePreamble": {
+    "minResourceFee": "0",
+    "transactionData": ""
+  },
+  "stateChanges": [],
+  "latestLedger": 3894195
+}

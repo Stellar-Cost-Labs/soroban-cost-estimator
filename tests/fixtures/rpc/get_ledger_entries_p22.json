@@ -1,0 +1,11 @@
+{
+  "entries": [
+    {
+      "key": "AAAACAAAAAE=",
+      "xdr": "AAAAAAAAAAEAAAAABfXhAAABkAAAAAAAJiWgAAAAAAAAJx8AAAPQkAAADWQAAAAGQAAAAAAADWQAAA==",
+      "lastModifiedLedgerSeq": 2539000,
+      "liveUntilLedgerSeq": 2600000
+    }
+  ],
+  "latestLedger": 2539605
+}
