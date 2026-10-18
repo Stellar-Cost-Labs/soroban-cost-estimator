@@ -4921,8 +4921,111 @@ async fn handle_cache_action(
             json,
             quiet,
         ),
+        cli::CacheAction::Delete {
+            network,
+            r#fn,
+            wasm_hash,
+            min_fee,
+            max_fee,
+            since,
+            to,
+            dry_run,
+            yes,
+            json,
+        } => cmd_cache_delete(
+            network.as_deref(),
+            r#fn.as_deref(),
+            wasm_hash.as_deref(),
+            min_fee,
+            max_fee,
+            since.as_deref(),
+            to.as_deref(),
+            dry_run,
+            yes,
+            json,
+            quiet,
+        ),
         cli::CacheAction::Stats { json } => cmd_cache_stats(json, quiet),
     }
+}
+
+/// `cache delete` command: delete cached estimates matching query filters with dry-run and confirmation.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::fn_params_excessive_bools)]
+fn cmd_cache_delete(
+    network: Option<&str>,
+    function: Option<&str>,
+    wasm_hash: Option<&str>,
+    min_fee: Option<i64>,
+    max_fee: Option<i64>,
+    since: Option<&str>,
+    to: Option<&str>,
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+    quiet: bool,
+) -> error::AppResult<()> {
+    let since_dt = match since {
+        Some(s) => Some(cache::parse_since_timestamp(s)?),
+        None => None,
+    };
+    let to_dt = match to {
+        Some(s) => Some(cache::parse_to_timestamp(s)?),
+        None => None,
+    };
+
+    let filter = cache::CacheFilter {
+        function: function.map(str::to_string),
+        wasm_hash: wasm_hash.map(str::to_string),
+        network: network.map(str::to_string),
+        min_fee,
+        max_fee,
+        since: since_dt,
+        to: to_dt,
+    };
+
+    if dry_run {
+        let preview = cache::delete_cached_estimates(&filter, true, false)?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&preview)?);
+        } else if !quiet {
+            println!(
+                "Would delete {} matching cached estimate(s). Dry run: no entries were deleted.",
+                preview.matched_count
+            );
+        }
+        return Ok(());
+    }
+
+    let preview = cache::delete_cached_estimates(&filter, true, false)?;
+    if preview.matched_count == 0 {
+        if json {
+            println!("{}", serde_json::to_string_pretty(&preview)?);
+        } else if !quiet {
+            println!("No cached estimates match the filter.");
+        }
+        return Ok(());
+    }
+
+    if !yes
+        && !confirm(&format!(
+            "Delete {} matching cached estimate(s)?",
+            preview.matched_count
+        ))
+    {
+        if !quiet {
+            println!("Aborted — no cached estimates deleted (pass --yes to skip the prompt).");
+        }
+        return Ok(());
+    }
+
+    let result = cache::delete_cached_estimates(&filter, false, true)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if !quiet {
+        println!("Deleted {} cached estimate(s).", result.deleted_count);
+    }
+    Ok(())
 }
 
 /// `cache query` / `config cache query` command: list cached estimates matching the given filters.
