@@ -287,6 +287,18 @@ impl CacheFilter {
         }
         true
     }
+
+    /// Return `true` when at least one filter criterion is set.
+    #[must_use]
+    pub fn has_any_criterion(&self) -> bool {
+        self.function.is_some()
+            || self.wasm_hash.is_some()
+            || self.network.is_some()
+            || self.min_fee.is_some()
+            || self.max_fee.is_some()
+            || self.since.is_some()
+            || self.to.is_some()
+    }
 }
 
 /// Optional filters for [`query_estimates`] (legacy filter type).
@@ -1552,6 +1564,108 @@ pub fn query_estimates(network: &str, filter: &QueryFilter) -> AppResult<Vec<Cac
     let mut cache_filter = CacheFilter::from(filter.clone());
     cache_filter.network = Some(network.to_string());
     query_cache(&cache_filter)
+}
+
+/// Outcome of a filtered cache deletion (or dry-run preview).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheDeleteResult {
+    /// Number of cache entries that matched the filter.
+    pub matched_count: usize,
+    /// Number of cache entries actually deleted (`0` when `dry_run` is `true`).
+    pub deleted_count: usize,
+    /// Whether the operation ran in dry-run preview mode.
+    pub dry_run: bool,
+}
+
+/// Count how many cached estimates match `filter` without modifying the cache.
+pub fn count_matching_cache_entries(filter: &CacheFilter) -> AppResult<usize> {
+    Ok(query_cache(filter)?.len())
+}
+
+/// Delete cached estimates matching `filter` transactionally.
+///
+/// Applies the exact same validation and matching semantics as [`query_cache`].
+/// Requires at least one filter criterion (to prevent accidental full-database
+/// deletion) and requires `confirmed = true` whenever `dry_run = false`.
+pub fn delete_cached_estimates(
+    filter: &CacheFilter,
+    dry_run: bool,
+    confirmed: bool,
+) -> AppResult<CacheDeleteResult> {
+    filter.validate()?;
+
+    if !filter.has_any_criterion() {
+        return Err(AppError::General(
+            "filtered cache deletion requires at least one filter (--network, --fn, --wasm-hash, --min-fee, --max-fee, --since, or --to)".to_string(),
+        ));
+    }
+
+    if !dry_run && !confirmed {
+        return Err(AppError::General(
+            "filtered cache deletion requires explicit confirmation (pass --yes or confirm interactively)".to_string(),
+        ));
+    }
+
+    let _guard = WRITE_LOCK
+        .lock()
+        .map_err(|e| AppError::General(format!("cache write lock poisoned: {e}")))?;
+    let mut conn = open_db()?;
+
+    execute_with_retry(|| {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let matched = {
+            let mut stmt = tx.prepare(
+                "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
+                 cpu_instructions, memory_bytes, timestamp, duration_ms, success, io_json \
+                 FROM estimates ORDER BY timestamp DESC",
+            )?;
+            let rows = stmt.query_map([], estimate_from_row)?;
+            let mut matched = Vec::new();
+            for row in rows {
+                let cached = row?;
+                if let Ok(cached) = migrate_to_latest(cached) {
+                    if filter.matches(&cached) {
+                        matched.push(cached);
+                    }
+                }
+            }
+            matched
+        };
+
+        let matched_count = matched.len();
+        if dry_run || matched_count == 0 {
+            tx.commit()?;
+            return Ok(CacheDeleteResult {
+                matched_count,
+                deleted_count: 0,
+                dry_run,
+            });
+        }
+
+        let mut deleted_count = 0usize;
+        for entry in &matched {
+            let removed = tx.execute(
+                "DELETE FROM estimates WHERE wasm_hash = ?1 AND function = ?2 AND args_hash = ?3",
+                rusqlite::params![entry.wasm_hash, entry.function, entry.args_hash],
+            )?;
+            deleted_count += removed;
+            let _ = tx.execute(
+                "DELETE FROM estimate_history WHERE wasm_hash = ?1 AND function = ?2 AND network = ?3 AND timestamp = ?4",
+                rusqlite::params![entry.wasm_hash, entry.function, entry.network, entry.timestamp],
+            )?;
+        }
+
+        tx.commit()?;
+        debug!(
+            matched_count,
+            deleted_count, "deleted filtered cached estimates"
+        );
+        Ok(CacheDeleteResult {
+            matched_count,
+            deleted_count,
+            dry_run: false,
+        })
+    })
 }
 
 /// Export every cached estimate as a deterministic, JSON-serializable list.

@@ -2784,3 +2784,94 @@ fn test_legacy_database_without_io_column_still_loads() {
         );
     });
 }
+
+#[test]
+fn test_delete_cached_estimates_dry_run_confirmation_and_selective_removal() {
+    with_temp_home(|tmp| {
+        seed_query_test_entry(
+            tmp,
+            "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000",
+            "transfer",
+            &[],
+            "testnet",
+            100_000,
+            10_000,
+            "2026-01-01T00:00:00Z",
+        );
+        seed_query_test_entry(
+            tmp,
+            "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000",
+            "approve",
+            &[],
+            "testnet",
+            200_000,
+            20_000,
+            "2026-01-02T00:00:00Z",
+        );
+        seed_query_test_entry(
+            tmp,
+            "bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000",
+            "transfer",
+            &[],
+            "mainnet",
+            300_000,
+            30_000,
+            "2026-01-03T00:00:00Z",
+        );
+
+        // 1. Empty filter (no criteria) is rejected to prevent deleting the entire cache accidentally.
+        let empty_filter = cache::CacheFilter::default();
+        assert!(cache::delete_cached_estimates(&empty_filter, false, true).is_err());
+
+        // 2. Invalid filter is rejected with the same validation rules as query_cache.
+        let bad_hash_filter = cache::CacheFilter {
+            wasm_hash: Some("not-hex!".to_string()),
+            ..Default::default()
+        };
+        assert!(cache::delete_cached_estimates(&bad_hash_filter, true, false).is_err());
+
+        // 3. Dry-run returns matching count without deleting anything.
+        let filter = cache::CacheFilter {
+            network: Some("testnet".to_string()),
+            function: Some("transfer".to_string()),
+            ..Default::default()
+        };
+        let preview = cache::delete_cached_estimates(&filter, true, false).expect("dry-run delete");
+        assert_eq!(preview.matched_count, 1);
+        assert_eq!(preview.deleted_count, 0);
+        assert!(preview.dry_run);
+        assert_eq!(
+            cache::query_cache(&cache::CacheFilter::default())
+                .expect("query all")
+                .len(),
+            3,
+            "dry-run must not remove any entries"
+        );
+
+        // 4. Non-dry-run without confirmation is rejected.
+        assert!(
+            cache::delete_cached_estimates(&filter, false, false).is_err(),
+            "deletion without confirmation must fail"
+        );
+
+        // 5. Confirmed deletion removes only matching entries and leaves nonmatching entries intact.
+        let deleted =
+            cache::delete_cached_estimates(&filter, false, true).expect("confirmed delete");
+        assert_eq!(deleted.matched_count, 1);
+        assert_eq!(deleted.deleted_count, 1);
+        assert!(!deleted.dry_run);
+
+        let remaining = cache::query_cache(&cache::CacheFilter::default()).expect("query all");
+        assert_eq!(remaining.len(), 2);
+        assert!(
+            remaining
+                .iter()
+                .any(|e| e.network == "testnet" && e.function == "approve")
+        );
+        assert!(
+            remaining
+                .iter()
+                .any(|e| e.network == "mainnet" && e.function == "transfer")
+        );
+    });
+}
