@@ -91,6 +91,11 @@ pub enum AppError {
     XdrEncode(String),
 
     // ── WASM ────────────────────────────────────────────────────────
+    #[error(
+        "failed to load WASM file {path}: size {size} bytes exceeds maximum allowed size of {limit} bytes"
+    )]
+    WasmFileTooLarge { path: String, size: u64, limit: u64 },
+
     #[error("failed to parse WASM: {0}")]
     WasmParse(String),
 
@@ -209,6 +214,11 @@ mod tests {
             AppError::UnknownNetwork("nope".to_string()),
             AppError::XdrDecode("invalid base64".to_string()),
             AppError::XdrEncode("ledger key".to_string()),
+            AppError::WasmFileTooLarge {
+                path: "a.wasm".to_string(),
+                size: 100,
+                limit: 50,
+            },
             AppError::WasmParse("no exported functions".to_string()),
             AppError::WasmValidation("invalid magic bytes".to_string()),
             AppError::TypeValidation("arg 'abc' cannot be used as 'i64'".to_string()),

@@ -187,8 +187,8 @@ pub enum Command {
     /// Repeat `--wasm` (or pass `--wasm-dir`) to evaluate several contracts
     /// in one batch run and print a multi-contract cost summary.
     Estimate {
-        /// Path to a compiled Soroban contract `.wasm` file. Repeat the flag
-        /// to evaluate multiple contracts in a single batch run.
+        /// Path to a compiled Soroban contract `.wasm` file (up to 16 MiB).
+        /// Repeat the flag to evaluate multiple contracts in a single batch run.
         #[arg(long, short, value_name = "PATH", required_unless_present = "wasm_dir")]
         wasm: Vec<PathBuf>,
 

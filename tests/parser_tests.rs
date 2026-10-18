@@ -1028,3 +1028,59 @@ fn test_load_wasm_detects_synthetic_debug_section() {
 
     let _ = std::fs::remove_file(&temp);
 }
+
+#[test]
+fn test_load_wasm_with_limit_accepts_exact_boundary_and_rejects_oversized_metadata() {
+    let path = Path::new("tests/fixtures/minimal.wasm");
+    let exact_len = std::fs::metadata(path).expect("metadata").len();
+
+    let ok = soroban_cost_estimator::wasm::parser::load_wasm_with_limit(path, exact_len)
+        .expect("exact size boundary should succeed");
+    assert_eq!(ok.bytes.len(), usize::try_from(exact_len).unwrap());
+
+    let err = soroban_cost_estimator::wasm::parser::load_wasm_with_limit(path, exact_len - 1)
+        .expect_err("file 1 byte above limit should be rejected before loading");
+    let rendered = err.to_string();
+    assert!(
+        matches!(
+            err,
+            soroban_cost_estimator::error::AppError::WasmFileTooLarge {
+                size,
+                limit,
+                ..
+            } if size == exact_len && limit == exact_len - 1
+        ),
+        "unexpected error variant: {err:?}"
+    );
+    assert!(rendered.contains("minimal.wasm"), "got: {rendered}");
+    assert!(
+        rendered.contains(&(exact_len - 1).to_string()),
+        "got: {rendered}"
+    );
+}
+
+#[test]
+fn test_read_wasm_bytes_bounded_rejects_stream_that_grows_past_metadata_limit() {
+    let stream_data = vec![0u8; 128];
+    let err = soroban_cost_estimator::wasm::parser::read_wasm_bytes_bounded_from_reader(
+        std::io::Cursor::new(stream_data),
+        32, // metadata reported 32 bytes (<= 64 limit)
+        64, // configured max_bytes is 64
+        "growing.wasm",
+    )
+    .expect_err("stream growing beyond max_bytes after metadata check must fail");
+
+    match err {
+        soroban_cost_estimator::error::AppError::WasmFileTooLarge {
+            ref path,
+            size,
+            limit,
+        } => {
+            assert_eq!(path, "growing.wasm");
+            // Stream read is capped at limit + 1 (65 bytes), preventing unbounded allocation.
+            assert_eq!(size, 65);
+            assert_eq!(limit, 64);
+        }
+        other => panic!("expected WasmFileTooLarge, got {other:?}"),
+    }
+}

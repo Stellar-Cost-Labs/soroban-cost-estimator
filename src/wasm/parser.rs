@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::Path;
 
 use serde_json::json;
@@ -7,6 +7,12 @@ use stellar_xdr::ReadXdr;
 use tracing::{debug, trace, warn};
 
 use crate::error::{AppError, AppResult};
+
+/// Maximum WASM file size allowed when loading from disk (16 MiB).
+///
+/// Prevents unbounded memory allocation when an accidental or malicious huge
+/// file path is passed to `--wasm`.
+pub const DEFAULT_MAX_WASM_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Maximum initial linear memory, in WASM pages, expected for Soroban
 /// contracts.
@@ -50,7 +56,56 @@ pub fn wasm_sha256_hex(bytes: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
-/// Loads a compiled Soroban contract `.wasm` file from disk.
+/// Reads a WASM stream up to `max_bytes`, rejecting oversized metadata before
+/// allocating and capping the read stream with [`Read::take`] so a file that
+/// grows between metadata inspection and reading cannot cause unbounded allocation.
+pub fn read_wasm_bytes_bounded_from_reader<R: Read>(
+    reader: R,
+    metadata_len: u64,
+    max_bytes: u64,
+    path_display: &str,
+) -> AppResult<Vec<u8>> {
+    if metadata_len > max_bytes {
+        return Err(AppError::WasmFileTooLarge {
+            path: path_display.to_string(),
+            size: metadata_len,
+            limit: max_bytes,
+        });
+    }
+
+    let initial_capacity = usize::try_from(metadata_len.min(max_bytes)).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    let read_cap = max_bytes.saturating_add(1);
+    reader.take(read_cap).read_to_end(&mut bytes)?;
+
+    if (bytes.len() as u64) > max_bytes {
+        return Err(AppError::WasmFileTooLarge {
+            path: path_display.to_string(),
+            size: bytes.len() as u64,
+            limit: max_bytes,
+        });
+    }
+
+    Ok(bytes)
+}
+
+/// Reads a `.wasm` file from disk while enforcing `max_bytes` both before
+/// buffer allocation (via file metadata) and during streaming reads.
+pub fn read_wasm_bytes_bounded(path: &Path, max_bytes: u64) -> AppResult<Vec<u8>> {
+    let path_display = path.display().to_string();
+    let file = std::fs::File::open(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            AppError::FileNotFound(path_display.clone())
+        } else {
+            AppError::Io(e)
+        }
+    })?;
+    let metadata_len = file.metadata()?.len();
+    read_wasm_bytes_bounded_from_reader(file, metadata_len, max_bytes, &path_display)
+}
+
+/// Loads a compiled Soroban contract `.wasm` file from disk using
+/// [`DEFAULT_MAX_WASM_FILE_BYTES`] (16 MiB) as the file-size cap.
 ///
 /// Reads the file bytes, performs basic structural validation via
 /// `wasmparser`, enumerates exported functions, and — when the WASM carries
@@ -60,14 +115,14 @@ pub fn wasm_sha256_hex(bytes: &[u8]) -> String {
 /// # Network calls
 /// None — pure file I/O + parsing.
 pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
-    debug!(path = %path.display(), "loading WASM file");
-    let bytes = std::fs::read(path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            AppError::FileNotFound(path.display().to_string())
-        } else {
-            AppError::Io(e)
-        }
-    })?;
+    load_wasm_with_limit(path, DEFAULT_MAX_WASM_FILE_BYTES)
+}
+
+/// Loads a compiled Soroban contract `.wasm` file from disk, rejecting files
+/// larger than `max_bytes` before loading them into memory.
+pub fn load_wasm_with_limit(path: &Path, max_bytes: u64) -> AppResult<WasmInfo> {
+    debug!(path = %path.display(), max_bytes, "loading WASM file");
+    let bytes = read_wasm_bytes_bounded(path, max_bytes)?;
     debug!(bytes = bytes.len(), "WASM bytes read");
 
     validate_wasm(&bytes)?;
