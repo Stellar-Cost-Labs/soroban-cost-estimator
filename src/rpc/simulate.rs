@@ -289,6 +289,54 @@ pub fn parse_resource_fee(min_resource_fee: &Option<String>) -> AppResult<Option
     }
 }
 
+/// Decode the simulation response's archival `restore_fee` in stroops (#524).
+///
+/// Preserves `None` as unknown (`Ok(None)`) when the field is absent rather
+/// than coercing absence to zero. Supports plain decimal stroop strings and
+/// 8-byte base64 XDR `int64` encodings, rejecting empty, malformed, or
+/// negative values.
+pub fn parse_restore_fee(restore_fee: &Option<String>) -> AppResult<Option<i64>> {
+    let Some(raw) = restore_fee else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::General(
+            "restore fee: empty string is not a valid stroop value".to_string(),
+        ));
+    }
+
+    if let Ok(stroops) = trimmed.parse::<i64>() {
+        if stroops < 0 {
+            return Err(AppError::General(format!(
+                "restore fee: negative stroops value ({stroops}) is invalid"
+            )));
+        }
+        return Ok(Some(stroops));
+    }
+
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, trimmed)
+        .map_err(|e| AppError::General(format!("restore fee: invalid encoding: {e}")))?;
+
+    if bytes.len() != 8 {
+        return Err(AppError::General(format!(
+            "restore fee: expected 8-byte XDR int64, got {} bytes",
+            bytes.len()
+        )));
+    }
+    let fee_bytes: [u8; 8] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| AppError::General("restore fee: invalid 8-byte slice".to_string()))?;
+    let stroops = i64::from_be_bytes(fee_bytes);
+    if stroops < 0 {
+        return Err(AppError::General(format!(
+            "restore fee: negative XDR stroops value ({stroops}) is invalid"
+        )));
+    }
+    Ok(Some(stroops))
+}
+
 /// Aggregate latency statistics over repeated simulation runs.
 ///
 /// Produced by [`summarize_latencies`] so the `estimate --repeat` summary is

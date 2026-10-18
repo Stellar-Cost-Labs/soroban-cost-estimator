@@ -105,3 +105,114 @@ async fn mock_rpc_fixture_surfaces_rpc_errors_from_the_server() {
 
     assert!(matches!(err, AppError::Rpc { status: -32602, .. }));
 }
+
+#[tokio::test]
+async fn mock_rpc_restore_fee_present_absent_zero_and_malformed() {
+    use soroban_cost_estimator::report::cost_report::{ArchivalRestoreFee, CostReport};
+    use soroban_cost_estimator::report::fee_calc::{DEFAULT_PRECISION, FeeBreakdown};
+    use soroban_cost_estimator::report::formatter::{JsonFormatter, ReportOptions, TableFormatter};
+    use soroban_cost_estimator::rpc::simulate::{parse_restore_fee, simulate_transaction};
+    use soroban_cost_estimator::wasm::parser::ContractMeta;
+
+    let server = common::start_mock_rpc_server().await;
+    common::stub_jsonrpc_success(
+        &server,
+        "simulateTransaction",
+        json!({
+            "latestLedger": 100,
+            "minResourceFee": "15427",
+            "restoreFee": "25000",
+            "cost": { "cpuInsns": "1000", "memBytes": "512" }
+        }),
+    )
+    .await;
+
+    let client = RpcClient::new(server.uri().as_str());
+    let resp = simulate_transaction(&client, "AAAA")
+        .await
+        .expect("simulateTransaction succeeds");
+
+    // 1. Present decimal restore fee
+    let present = parse_restore_fee(&resp.restore_fee).expect("valid restore fee");
+    assert_eq!(present, Some(25_000));
+
+    // 2. Present base64 XDR int64 restore fee
+    let xdr_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        50_000i64.to_be_bytes(),
+    );
+    assert_eq!(
+        parse_restore_fee(&Some(xdr_b64)).expect("valid XDR restore fee"),
+        Some(50_000)
+    );
+
+    // 3. Absent restore fee -> preserved as None (unknown), not Some(0)
+    assert_eq!(parse_restore_fee(&None).expect("absent is ok"), None);
+
+    // 4. Zero restore fee -> Some(0)
+    assert_eq!(
+        parse_restore_fee(&Some("0".to_string())).expect("zero is ok"),
+        Some(0)
+    );
+
+    // 5. Malformed / negative / empty restore fee -> Err
+    assert!(parse_restore_fee(&Some(String::new())).is_err());
+    assert!(parse_restore_fee(&Some("not-base64!".to_string())).is_err());
+    assert!(parse_restore_fee(&Some("-100".to_string())).is_err());
+
+    // 6. Table & JSON output expose restore fee without double-counting in total_stroops
+    let report = CostReport {
+        function: "increment".to_string(),
+        wasm_hash: "abc123".to_string(),
+        wasm_size: 0,
+        wasm_sections: Vec::new(),
+        cpu_instructions: 1_000,
+        memory_bytes: 512,
+        tx_size: 128,
+        read_entries: 1,
+        write_entries: 1,
+        read_bytes: 0,
+        write_bytes: 64,
+        fee: FeeBreakdown {
+            non_refundable_stroops: 4_496,
+            refundable_stroops: 10_931,
+            cpu_fee_stroops: 372,
+            storage_fee_stroops: 4_063,
+            bandwidth_fee_stroops: 61,
+            base_fee_stroops: 100,
+            total_stroops: 15_527,
+            total_xlm: "0.0015527".to_string(),
+            fee_percentages: std::collections::BTreeMap::new(),
+        },
+        ledger: 100,
+        network: "testnet".to_string(),
+        rpc_latency_ms: 12,
+        rates: None,
+        warnings: Vec::new(),
+        history: None,
+        projections: None,
+        contract_meta: ContractMeta::default(),
+    };
+
+    let restore_present = ArchivalRestoreFee::from_stroops(present, DEFAULT_PRECISION);
+    let table_out =
+        TableFormatter.format_with_restore_fee(&report, &restore_present, ReportOptions::default());
+    assert!(table_out.contains(
+        "Archival Restoration Fee (separate from execution total): 25000 stroops (0.0025000 XLM)"
+    ));
+    assert!(table_out.contains("15527 stroops (0.0015527)"));
+
+    let json_out =
+        JsonFormatter.format_with_restore_fee(&report, &restore_present, ReportOptions::default());
+    let parsed: serde_json::Value = serde_json::from_str(&json_out).expect("valid JSON");
+    assert_eq!(parsed["fee"]["total_stroops"], 15_527);
+    assert_eq!(parsed["archival_restore_fee"]["stroops"], 25_000);
+    assert_eq!(parsed["archival_restore_fee"]["status"], "present");
+
+    let restore_absent = ArchivalRestoreFee::from_stroops(None, DEFAULT_PRECISION);
+    let json_absent =
+        JsonFormatter.format_with_restore_fee(&report, &restore_absent, ReportOptions::default());
+    let parsed_absent: serde_json::Value = serde_json::from_str(&json_absent).expect("valid JSON");
+    assert!(parsed_absent["archival_restore_fee"]["stroops"].is_null());
+    assert_eq!(parsed_absent["archival_restore_fee"]["status"], "unknown");
+}
