@@ -2784,3 +2784,42 @@ fn test_legacy_database_without_io_column_still_loads() {
         );
     });
 }
+
+#[test]
+fn test_parse_duration_human_formats_and_defaults() {
+    use std::time::Duration;
+
+    assert_eq!(cache::DEFAULT_CACHE_TTL_SECS, 7 * 24 * 3600);
+    assert_eq!(cache::DEFAULT_CACHE_TTL, Duration::from_secs(7 * 24 * 3600));
+
+    assert_eq!(
+        cache::parse_duration("30s").expect("30s"),
+        Duration::from_secs(30)
+    );
+    assert_eq!(
+        cache::parse_duration("30m").expect("30m"),
+        Duration::from_secs(1_800)
+    );
+    assert_eq!(
+        cache::parse_duration("2h").expect("2h"),
+        Duration::from_secs(7_200)
+    );
+    assert_eq!(
+        cache::parse_duration("1d").expect("1d"),
+        Duration::from_secs(86_400)
+    );
+    assert_eq!(
+        cache::parse_duration("7d").expect("7d"),
+        Duration::from_secs(604_800)
+    );
+    assert_eq!(
+        cache::parse_duration("3600").expect("bare seconds"),
+        Duration::from_secs(3_600)
+    );
+
+    assert!(cache::parse_duration("").is_err());
+    assert!(cache::parse_duration("   ").is_err());
+    assert!(cache::parse_duration("m").is_err());
+    assert!(cache::parse_duration("abc").is_err());
+    assert!(cache::parse_duration("10w").is_err());
+}

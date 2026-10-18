@@ -1354,6 +1354,53 @@ pub fn load_estimate(
     Ok(cached)
 }
 
+/// Default cache time-to-live in seconds (7 days).
+pub const DEFAULT_CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Default cache time-to-live as a [`std::time::Duration`] (7 days).
+pub const DEFAULT_CACHE_TTL: std::time::Duration =
+    std::time::Duration::from_secs(DEFAULT_CACHE_TTL_SECS);
+
+/// Parse a human-readable duration string (e.g. `"30s"`, `"30m"`, `"2h"`,
+/// `"1d"`, `"7d"`, or bare seconds `"3600"`) into a [`std::time::Duration`].
+///
+/// # Errors
+/// Returns [`AppError::Config`] if `raw` is empty, has an unknown suffix, or
+/// has a non-numeric magnitude.
+pub fn parse_duration(raw: &str) -> AppResult<std::time::Duration> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Config(
+            "cache TTL duration cannot be empty".to_string(),
+        ));
+    }
+
+    let (num_str, multiplier): (&str, u64) = match trimmed.as_bytes().last().copied() {
+        Some(b's' | b'S') => (&trimmed[..trimmed.len() - 1], 1),
+        Some(b'm' | b'M') => (&trimmed[..trimmed.len() - 1], 60),
+        Some(b'h' | b'H') => (&trimmed[..trimmed.len() - 1], 3_600),
+        Some(b'd' | b'D') => (&trimmed[..trimmed.len() - 1], 86_400),
+        _ => (trimmed, 1),
+    };
+
+    let num_trimmed = num_str.trim();
+    if num_trimmed.is_empty() {
+        return Err(AppError::Config(format!(
+            "invalid cache TTL duration {raw:?}: missing numeric value"
+        )));
+    }
+
+    let units: u64 = num_trimmed.parse().map_err(|_| {
+        AppError::Config(format!(
+            "invalid cache TTL duration {raw:?}: expected e.g. '30m', '2h', '7d', or seconds"
+        ))
+    })?;
+
+    Ok(std::time::Duration::from_secs(
+        units.saturating_mul(multiplier),
+    ))
+}
+
 /// Whether a cached estimate is still fresh, i.e. its timestamp is within
 /// `ttl` of now.
 ///

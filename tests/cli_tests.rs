@@ -1256,6 +1256,61 @@ fn test_estimate_cache_expired_resimulates() {
     );
 }
 
+#[test]
+fn test_estimate_cache_ttl_from_config_toml_hit_and_miss() {
+    let home = temp_home("cache-ttl-config-toml");
+    let config_file = home.join("config.toml");
+    std::fs::write(&config_file, "cache_ttl = \"7d\"\n").expect("write config.toml");
+
+    // 1. Entry created 2 days ago is fresh under 7d config.toml TTL -> cache hit!
+    seed_cache_entry(
+        &home,
+        &(chrono::Utc::now() - chrono::TimeDelta::days(2)).to_rfc3339(),
+    );
+    let config_str = config_file.to_string_lossy().into_owned();
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "--config",
+            &config_str,
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--rpc-url",
+            DEAD_RPC,
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 0,
+        "2-day-old entry should hit under 7d config.toml cache_ttl; stderr: {stderr}"
+    );
+    assert!(stdout.contains("Cache hit"), "got: {stdout}");
+
+    // 2. Entry created 10 days ago is expired under 7d config.toml TTL -> cache miss!
+    let home_expired = temp_home("cache-ttl-config-toml-expired");
+    let config_expired = home_expired.join("config.toml");
+    std::fs::write(&config_expired, "cache_ttl = \"7d\"\n").expect("write config.toml");
+    seed_cache_entry(
+        &home_expired,
+        &(chrono::Utc::now() - chrono::TimeDelta::days(10)).to_rfc3339(),
+    );
+    let config_expired_str = config_expired.to_string_lossy().into_owned();
+    let (stdout, _stderr, code) = run_cli_in_home(
+        &[
+            "--config",
+            &config_expired_str,
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--rpc-url",
+            DEAD_RPC,
+        ],
+        Some(&home_expired),
+    );
+    assert_eq!(code, 1, "10-day-old entry must expire under 7d TTL");
+    assert!(!stdout.contains("Cache hit"), "got: {stdout}");
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // `estimate-all`
 // ─────────────────────────────────────────────────────────────────────────

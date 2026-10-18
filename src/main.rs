@@ -151,6 +151,7 @@ struct FileConfig {
     network: Option<String>,
     rpc_url: Option<String>,
     json: Option<bool>,
+    cache_ttl: Option<String>,
 }
 
 fn config_path(cli_path: Option<&str>) -> std::path::PathBuf {
@@ -215,7 +216,7 @@ async fn main() {
         info!(command = ?args.command, verbose = args.verbose, quiet = args.quiet, "starting soroban-cost-estimator");
     }
 
-    if let Err(err) = run(args).await {
+    if let Err(err) = Box::pin(run(args)).await {
         error!(error = %err, "command failed");
         eprintln!("Error: {err}");
         std::process::exit(1);
@@ -259,6 +260,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
     };
     let default_network = file.network.unwrap_or_else(|| "testnet".to_string());
     let default_rpc_url = file.rpc_url;
+    let default_cache_ttl = file.cache_ttl;
     match args.command {
         cli::Command::Estimate {
             wasm,
@@ -326,7 +328,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     r#fn.as_deref(),
                     &contract_args,
                     interactive_flag,
-                    cache_ttl.as_deref(),
+                    cache_ttl.as_deref().or(default_cache_ttl.as_deref()),
                     compare,
                     clear_cache,
                     no_cache,
