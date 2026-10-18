@@ -1028,3 +1028,79 @@ fn test_load_wasm_detects_synthetic_debug_section() {
 
     let _ = std::fs::remove_file(&temp);
 }
+
+fn spec_function_xdr_bytes(name: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    // ScSpecEntry::FunctionV0 discriminant (0)
+    out.extend_from_slice(&0u32.to_be_bytes());
+    // doc: ""
+    out.extend_from_slice(&xdr_string(""));
+    // name
+    out.extend_from_slice(&xdr_string(name));
+    // inputs: 0
+    out.extend_from_slice(&0u32.to_be_bytes());
+    // outputs: 0
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out
+}
+
+#[test]
+fn test_validate_spec_exports_accepts_valid_spec_and_bare_wasm() {
+    use soroban_cost_estimator::wasm::parser::load_wasm;
+
+    let contract =
+        load_wasm(Path::new("tests/fixtures/contract.wasm")).expect("load contract.wasm");
+    let contract_check = contract
+        .validate_spec_exports()
+        .expect("valid contract spec must match exports");
+    assert!(contract_check.has_spec);
+    assert!(contract_check.is_valid());
+    assert!(contract_check.missing_exports.is_empty());
+    assert!(contract_check.unindexed_exports.is_empty());
+
+    let minimal = load_wasm(Path::new("tests/fixtures/minimal.wasm")).expect("load minimal.wasm");
+    let minimal_check = minimal
+        .validate_spec_exports()
+        .expect("bare WASM without spec must remain valid");
+    assert!(!minimal_check.has_spec);
+    assert!(minimal_check.is_valid());
+}
+
+#[test]
+fn test_validate_spec_exports_detects_stale_spec_entry_and_missing_export_spec() {
+    use soroban_cost_estimator::error::AppError;
+    use soroban_cost_estimator::wasm::parser::{
+        format_module_metadata, load_wasm, validate_contract_spec_exports,
+    };
+
+    // `zeroarg.wasm` exports `ping` and `pong`. Append a `contractspecv0`
+    // section that declares `ping` (valid) and `stale_fn` (stale entry not
+    // exported by WASM), while omitting `pong` (export missing spec metadata).
+    let mut bytes = std::fs::read("tests/fixtures/zeroarg.wasm").expect("read zeroarg.wasm");
+    let mut spec_payload = Vec::new();
+    spec_payload.extend_from_slice(&spec_function_xdr_bytes("ping"));
+    spec_payload.extend_from_slice(&spec_function_xdr_bytes("stale_fn"));
+    bytes.extend_from_slice(&custom_section("contractspecv0", &spec_payload));
+
+    let temp = std::env::temp_dir().join(format!("sce-spec-mismatch-{}.wasm", std::process::id()));
+    std::fs::write(&temp, &bytes).expect("write fixture");
+
+    let info = load_wasm(&temp).expect("load_wasm should succeed and record diagnostics");
+    let check = info.spec_export_validation();
+    assert!(!check.is_valid());
+    assert_eq!(check.missing_exports, vec!["stale_fn".to_string()]);
+    assert_eq!(check.unindexed_exports, vec!["pong".to_string()]);
+
+    let err = validate_contract_spec_exports(&bytes)
+        .expect_err("mismatched spec/exports must return ContractSpecMismatch");
+    assert!(matches!(err, AppError::ContractSpecMismatch(_)));
+    let msg = err.to_string();
+    assert!(msg.contains("stale contractspecv0 entry 'stale_fn'"));
+    assert!(msg.contains("WASM export 'pong' has no matching contractspecv0 entry"));
+
+    let metadata_report = format_module_metadata(&info);
+    assert!(metadata_report.contains("stale_fn"));
+    assert!(metadata_report.contains("pong"));
+
+    let _ = std::fs::remove_file(&temp);
+}

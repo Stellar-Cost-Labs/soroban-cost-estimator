@@ -97,6 +97,9 @@ pub enum AppError {
     #[error("failed to validate WASM: {0}")]
     WasmValidation(String),
 
+    #[error("contract spec mismatch: {0}")]
+    ContractSpecMismatch(String),
+
     #[error("failed to validate argument type: {0}")]
     TypeValidation(String),
 
@@ -211,6 +214,9 @@ mod tests {
             AppError::XdrEncode("ledger key".to_string()),
             AppError::WasmParse("no exported functions".to_string()),
             AppError::WasmValidation("invalid magic bytes".to_string()),
+            AppError::ContractSpecMismatch(
+                "stale contractspecv0 entry 'old_fn' has no corresponding WASM export".to_string(),
+            ),
             AppError::TypeValidation("arg 'abc' cannot be used as 'i64'".to_string()),
             AppError::SnapshotNotFound("/tmp/s.json".to_string()),
             AppError::SnapshotParse("invalid bundle".to_string()),

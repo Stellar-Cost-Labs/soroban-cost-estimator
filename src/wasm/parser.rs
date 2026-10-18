@@ -104,6 +104,13 @@ pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
         }
     }
 
+    let spec_validation = check_contract_spec_exports(&exports, &spec_entries, has_spec);
+    if !spec_validation.is_valid() {
+        for diagnostic in &spec_validation.diagnostics {
+            warn!(diagnostic = %diagnostic, "contract spec / WASM export mismatch");
+        }
+    }
+
     // Soroban identifies a contract on-chain by the SHA-256 hash of its WASM
     // bytes (the executable hash). Compute it once, here, so every command
     // reports the same identity for the same file without re-hashing.
@@ -1235,6 +1242,124 @@ impl WasmInfo {
         let rounded = (debug * 100 + bytes / 2) / bytes;
         u32::try_from(rounded.max(1)).unwrap_or(1)
     }
+
+    /// Inspects `contractspecv0` function entries against WASM function exports,
+    /// returning structured mismatch diagnostics without failing on valid
+    /// contracts that omit a contract spec.
+    #[must_use]
+    pub fn spec_export_validation(&self) -> SpecExportValidation {
+        check_contract_spec_exports(&self.exports, &self.spec_entries, self.has_spec)
+    }
+
+    /// Validates `contractspecv0` function entries against WASM function exports,
+    /// returning [`AppError::ContractSpecMismatch`] when stale spec entries or
+    /// unindexed WASM function exports are present.
+    pub fn validate_spec_exports(&self) -> AppResult<SpecExportValidation> {
+        self.spec_export_validation().into_result()
+    }
+}
+
+/// Result of comparing `contractspecv0` function entries against WASM function exports.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SpecExportValidation {
+    /// Whether the module carries a `contractspecv0` custom section.
+    pub has_spec: bool,
+    /// Functions declared in `contractspecv0` that have no corresponding WASM function export.
+    pub missing_exports: Vec<String>,
+    /// WASM function exports that have no corresponding `contractspecv0` function entry.
+    pub unindexed_exports: Vec<String>,
+    /// Actionable human-readable diagnostics describing every detected mismatch.
+    pub diagnostics: Vec<String>,
+}
+
+impl SpecExportValidation {
+    /// True when the module has no spec (`has_spec == false`) or when every
+    /// `contractspecv0` function matches a WASM function export 1-to-1.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        !self.has_spec || (self.missing_exports.is_empty() && self.unindexed_exports.is_empty())
+    }
+
+    /// Converts this validation result into an [`AppResult`], returning
+    /// [`AppError::ContractSpecMismatch`] when any mismatch was detected.
+    pub fn into_result(self) -> AppResult<Self> {
+        if self.is_valid() {
+            Ok(self)
+        } else {
+            Err(AppError::ContractSpecMismatch(self.diagnostics.join("; ")))
+        }
+    }
+}
+
+/// Compares `contractspecv0` function entries against WASM function exports.
+///
+/// Valid contracts without a `contractspecv0` section (`has_spec == false`)
+/// produce an empty, valid [`SpecExportValidation`] so bare WASM modules
+/// remain supported.
+#[must_use]
+pub fn check_contract_spec_exports(
+    exports: &[ExportInfo],
+    spec_entries: &[stellar_xdr::ScSpecEntry],
+    has_spec: bool,
+) -> SpecExportValidation {
+    if !has_spec {
+        return SpecExportValidation {
+            has_spec: false,
+            missing_exports: Vec::new(),
+            unindexed_exports: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+    }
+
+    let exported_fns: Vec<String> = exports
+        .iter()
+        .filter(|e| e.kind == "function")
+        .map(|e| e.name.clone())
+        .collect();
+    let spec_fns: Vec<String> = spec_functions_from_entries(spec_entries)
+        .into_iter()
+        .map(|f| f.name)
+        .collect();
+
+    let mut missing_exports = Vec::new();
+    let mut unindexed_exports = Vec::new();
+    let mut diagnostics = Vec::new();
+
+    for spec_fn in &spec_fns {
+        if !exported_fns.iter().any(|exp| exp == spec_fn) {
+            missing_exports.push(spec_fn.clone());
+            diagnostics.push(format!(
+                "stale contractspecv0 entry '{spec_fn}': function is declared in contractspecv0 \
+                 but not exported by the WASM binary (rebuild the contract or regenerate its spec)"
+            ));
+        }
+    }
+
+    for exp_fn in &exported_fns {
+        if !spec_fns.iter().any(|spec_fn| spec_fn == exp_fn) {
+            unindexed_exports.push(exp_fn.clone());
+            diagnostics.push(format!(
+                "WASM export '{exp_fn}' has no matching contractspecv0 entry: exported function \
+                 is missing contract spec metadata (annotate with #[contractimpl] or regenerate spec)"
+            ));
+        }
+    }
+
+    SpecExportValidation {
+        has_spec: true,
+        missing_exports,
+        unindexed_exports,
+        diagnostics,
+    }
+}
+
+/// Validates `contractspecv0` function entries against WASM function exports
+/// directly from raw WASM bytes.
+pub fn validate_contract_spec_exports(bytes: &[u8]) -> AppResult<SpecExportValidation> {
+    validate_wasm(bytes)?;
+    let metadata = enumerate_module_metadata(bytes)?;
+    let (spec_entries, has_spec) = parse_contract_spec_entries(bytes)?;
+    check_contract_spec_exports(&metadata.exports, &spec_entries, has_spec).into_result()
 }
 
 /// True when a WASM custom section is a debug/optimization artifact: the
@@ -1312,6 +1437,10 @@ pub fn format_module_metadata(info: &WasmInfo) -> String {
         MAX_LISTED_ENTRIES,
         |ex| format!("{} ({}) index {}", ex.name, ex.kind, ex.index),
     );
+    let spec_validation = info.spec_export_validation();
+    for diagnostic in &spec_validation.diagnostics {
+        lines.push(format!("  WARNING: {diagnostic}"));
+    }
     lines.join("\n")
 }
 
