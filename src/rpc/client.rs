@@ -842,13 +842,13 @@ fn is_transient_status(status: reqwest::StatusCode) -> bool {
 
 /// Parses a `Retry-After` response header into a delay, if present.
 ///
-/// Only the delta-seconds form (e.g. `Retry-After: 5`) is supported; the
-/// HTTP-date form and unparseable values yield `None`, falling back to the
-/// retry loop's computed backoff.
+/// Supports both delta-seconds (`Retry-After: 5`) and HTTP-date (`Retry-After:
+/// Wed, 21 Oct 2015 07:28:00 GMT`) formats, capped at
+/// [`crate::rpc::retry::MAX_RETRY_AFTER_DELAY`]. Unparseable values yield
+/// `None`, falling back to the retry loop's computed backoff.
 fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
-    let seconds: u64 = value.trim().parse().ok()?;
-    Some(Duration::from_secs(seconds))
+    crate::rpc::retry::parse_retry_after_value(value)
 }
 
 /// Deserializes a raw JSON-RPC `result` value into the caller's type.

@@ -12,6 +12,11 @@ pub const DEFAULT_MAX_RETRIES: usize = 3;
 /// plus a random jitter offset drawn from the same range.
 const BASE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+/// Maximum duration the retry loop will wait when honoring a server-supplied
+/// `Retry-After` header (60 seconds). Prevents an excessive or misconfigured
+/// server header from stalling the client indefinitely.
+pub const MAX_RETRY_AFTER_DELAY: Duration = Duration::from_secs(60);
+
 /// HTTP statuses that indicate a transient failure worth retrying: rate
 /// limiting (429) and server-side errors (500/502/503/504). Deterministic
 /// client errors such as 400 are never retried.
@@ -30,7 +35,8 @@ const TRANSIENT_STATUSES: [u16; 5] = [429, 500, 502, 503, 504];
 /// Only retryable errors (see [`is_retryable`]) trigger a retry; permanent
 /// errors, including deterministic client errors and invalid XDR, are
 /// returned immediately. When the failing error carries a `Retry-After`
-/// hint (HTTP 429), that value is honored in place of the computed backoff.
+/// hint (HTTP 429), that value is honored (capped at
+/// [`MAX_RETRY_AFTER_DELAY`]) in place of the computed backoff.
 ///
 /// Retry attempts are logged to stderr when debug logging is enabled (i.e.
 /// when the CLI is run with `--verbose`).
@@ -61,6 +67,56 @@ where
     }
 }
 
+/// Parses an HTTP `Retry-After` header value in either delta-seconds form
+/// (`Retry-After: 5`) or HTTP-date form (`Retry-After: Wed, 21 Oct 2015 07:28:00 GMT`),
+/// capping the resulting duration at [`MAX_RETRY_AFTER_DELAY`].
+///
+/// Returns `None` for empty, negative, or malformed header values. An
+/// HTTP-date in the past clamps to `Duration::ZERO`.
+#[must_use]
+pub fn parse_retry_after_value(raw: &str) -> Option<Duration> {
+    parse_retry_after_value_at(raw, chrono::Utc::now())
+}
+
+/// Deterministic helper for [`parse_retry_after_value`] evaluated relative to `now`.
+#[must_use]
+pub fn parse_retry_after_value_at(
+    raw: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<Duration> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // 1. Delta-seconds (non-negative integer).
+    if trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        let seconds: u64 = trimmed.parse().ok()?;
+        return Some(Duration::from_secs(seconds).min(MAX_RETRY_AFTER_DELAY));
+    }
+
+    // 2. HTTP-date: IMF-fixdate (RFC 7231 / RFC 2822) or RFC 850 / asctime.
+    let parsed_utc = chrono::DateTime::parse_from_rfc2822(trimmed)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(trimmed, "%A, %d-%b-%y %H:%M:%S GMT")
+                .or_else(|_| {
+                    chrono::NaiveDateTime::parse_from_str(trimmed, "%a, %d %b %Y %H:%M:%S GMT")
+                })
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(trimmed, "%a %b %e %H:%M:%S %Y"))
+                .ok()
+                .map(|naive| naive.and_utc())
+        })?;
+
+    let delta = parsed_utc.signed_duration_since(now);
+    if delta.num_milliseconds() <= 0 {
+        return Some(Duration::ZERO);
+    }
+    let millis = u64::try_from(delta.num_milliseconds()).unwrap_or(u64::MAX);
+    Some(Duration::from_millis(millis).min(MAX_RETRY_AFTER_DELAY))
+}
+
 /// Returns `true` when `error` represents a transient failure worth retrying.
 ///
 /// Retryable transport failures are connection/timeout/request errors; an
@@ -80,16 +136,16 @@ fn is_retryable(error: &AppError) -> bool {
 
 /// Computes the delay before the retry following `attempt` (0-based).
 ///
-/// A `Retry-After` hint, when present, is authoritative. Otherwise the delay
-/// is the exponential backoff `500ms * 2^attempt` plus a random jitter offset
-/// of up to the same magnitude.
+/// A `Retry-After` hint, when present, is authoritative (capped at
+/// [`MAX_RETRY_AFTER_DELAY`]). Otherwise the delay is the exponential backoff
+/// `500ms * 2^attempt` plus a random jitter offset of up to the same magnitude.
 fn retry_delay(error: &AppError, attempt: usize) -> Duration {
     if let AppError::HttpStatus {
         retry_after: Some(delay),
         ..
     } = error
     {
-        return *delay;
+        return (*delay).min(MAX_RETRY_AFTER_DELAY);
     }
 
     let exponential = BASE_RETRY_DELAY.saturating_mul(1u32 << attempt.min(16));
@@ -283,15 +339,53 @@ mod tests {
         assert!(!is_retryable(&AppError::XdrDecode("bad".to_string())));
     }
 
-    /// `Retry-After` overrides the computed exponential backoff entirely.
+    /// `Retry-After` overrides the computed exponential backoff entirely and
+    /// caps excessive delays at `MAX_RETRY_AFTER_DELAY`.
     #[test]
     fn retry_after_hint_overrides_backoff() {
+        use crate::rpc::retry::{MAX_RETRY_AFTER_DELAY, parse_retry_after_value_at};
+        use chrono::TimeZone;
+
         let error = AppError::HttpStatus {
             status: 429,
             retry_after: Some(Duration::from_secs(7)),
             message: String::new(),
         };
         assert_eq!(retry_delay(&error, 2), Duration::from_secs(7));
+
+        let excessive = AppError::HttpStatus {
+            status: 429,
+            retry_after: Some(Duration::from_secs(3600)),
+            message: String::new(),
+        };
+        assert_eq!(retry_delay(&excessive, 0), MAX_RETRY_AFTER_DELAY);
+
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 10, 18, 12, 0, 0)
+            .unwrap();
+        assert_eq!(
+            parse_retry_after_value_at("12", now),
+            Some(Duration::from_secs(12))
+        );
+        assert_eq!(
+            parse_retry_after_value_at("999999", now),
+            Some(MAX_RETRY_AFTER_DELAY)
+        );
+        assert_eq!(
+            parse_retry_after_value_at("Sun, 18 Oct 2026 12:00:05 GMT", now),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            parse_retry_after_value_at("Sun, 18 Oct 2026 13:00:00 GMT", now),
+            Some(MAX_RETRY_AFTER_DELAY)
+        );
+        assert_eq!(
+            parse_retry_after_value_at("Sun, 18 Oct 2026 11:59:50 GMT", now),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(parse_retry_after_value_at("", now), None);
+        assert_eq!(parse_retry_after_value_at("-5", now), None);
+        assert_eq!(parse_retry_after_value_at("not-a-date", now), None);
     }
 
     /// Without a hint, the delay is `base * 2^attempt` plus jitter of up to
