@@ -557,6 +557,137 @@ pub struct CostReport {
     /// decodable section; deserialized as empty from older payloads.
     #[serde(default)]
     pub contract_meta: ContractMeta,
+    /// Provenance of the network fee-rate configuration used for this estimate
+    /// (#527). Kept distinct from [`Self::ledger`] (the simulation ledger) so
+    /// operators can tell whether rates came from the same or a different
+    /// ledger and whether any config setting was unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_rate_provenance: Option<FeeRateProvenance>,
+}
+
+/// Provenance of the network fee-rate configuration used to compute a [`CostReport`].
+///
+/// The simulation (`simulateTransaction`) and the rate lookup (`getLedgerEntries`)
+/// are separate RPC calls and do not form an atomic network snapshot, so the
+/// fee-rate source ledger is recorded separately from [`CostReport::ledger`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FeeRateProvenance {
+    /// Network ledger sequence reported by `getLedgerEntries` when all fetched
+    /// fee-rate config entries came from the same known ledger (`None` when
+    /// unavailable or when entries came from mixed ledgers).
+    pub source_ledger: Option<u32>,
+    /// Human-readable source ledger representation (`"unknown"` when unavailable).
+    pub source_ledger_display: String,
+    /// Completeness of the fee-rate configuration snapshot (`"complete"`,
+    /// `"partial"`, or `"unknown"`).
+    pub snapshot_status: String,
+    /// Config setting names that were fetched and decoded successfully.
+    pub available_settings: Vec<String>,
+    /// Config setting names that were unavailable or failed to decode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_settings: Vec<String>,
+}
+
+impl FeeRateProvenance {
+    /// Construct an explicit unknown provenance record when fee-rate source
+    /// metadata is unavailable.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self {
+            source_ledger: None,
+            source_ledger_display: "unknown".to_string(),
+            snapshot_status: "unknown".to_string(),
+            available_settings: Vec::new(),
+            missing_settings: Vec::new(),
+        }
+    }
+
+    /// Build provenance from the per-setting fetch results.
+    ///
+    /// `fetched` lists `(setting_name, source_ledger)` for each successfully
+    /// decoded config setting; `missing` lists setting names that failed to
+    /// fetch or decode.
+    #[must_use]
+    pub fn from_sources(fetched: &[(&str, Option<u32>)], missing: &[&str]) -> Self {
+        if fetched.is_empty() {
+            return Self {
+                source_ledger: None,
+                source_ledger_display: "unknown".to_string(),
+                snapshot_status: "unknown".to_string(),
+                available_settings: Vec::new(),
+                missing_settings: missing.iter().map(|s| (*s).to_string()).collect(),
+            };
+        }
+
+        let mut common_ledger: Option<u32> = None;
+        let mut ledger_consistent = true;
+        for &(_, ledger_opt) in fetched {
+            match (common_ledger, ledger_opt.filter(|&l| l > 0)) {
+                (_, None) => {
+                    ledger_consistent = false;
+                }
+                (None, Some(l)) => {
+                    common_ledger = Some(l);
+                }
+                (Some(prev), Some(l)) if prev != l => {
+                    ledger_consistent = false;
+                }
+                (Some(_), Some(_)) => {}
+            }
+        }
+
+        let source_ledger = if ledger_consistent {
+            common_ledger
+        } else {
+            None
+        };
+        let source_ledger_display = source_ledger
+            .map(format_ledger_sequence)
+            .unwrap_or_else(|| "unknown".to_string());
+        let snapshot_status = if missing.is_empty() {
+            "complete".to_string()
+        } else {
+            "partial".to_string()
+        };
+
+        Self {
+            source_ledger,
+            source_ledger_display,
+            snapshot_status,
+            available_settings: fetched
+                .iter()
+                .map(|(name, _)| (*name).to_string())
+                .collect(),
+            missing_settings: missing.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+}
+
+/// Format [`FeeRateProvenance`] as a concise human-readable line, explicitly
+/// showing `"unknown"` when provenance is unavailable.
+#[must_use]
+pub fn format_fee_rate_provenance(provenance: Option<&FeeRateProvenance>) -> String {
+    let default_unknown;
+    let p = match provenance {
+        Some(p) => p,
+        None => {
+            default_unknown = FeeRateProvenance::unknown();
+            &default_unknown
+        }
+    };
+    if p.missing_settings.is_empty() {
+        format!(
+            "Fee-rate source ledger: {} (config snapshot: {})",
+            p.source_ledger_display, p.snapshot_status
+        )
+    } else {
+        format!(
+            "Fee-rate source ledger: {} (config snapshot: {}, missing: {})",
+            p.source_ledger_display,
+            p.snapshot_status,
+            p.missing_settings.join(", ")
+        )
+    }
 }
 
 /// A cost projection for a specific batch invocation count.
@@ -1364,6 +1495,12 @@ pub fn format_report_table(report: &CostReport) -> String {
         "Simulated at ledger sequence: {}\n",
         format_ledger_sequence(report.ledger)
     ));
+    if report.fee_rate_provenance.is_some() {
+        output.push_str(&format!(
+            "{}\n",
+            format_fee_rate_provenance(report.fee_rate_provenance.as_ref())
+        ));
+    }
     output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
     if report.wasm_size > 0 {
         output.push_str(&format!("WASM size: {} bytes\n", report.wasm_size));
@@ -2150,6 +2287,7 @@ mod tests {
             history: None,
             projections: None,
             contract_meta: ContractMeta::default(),
+            fee_rate_provenance: None,
         }
     }
 
@@ -2271,6 +2409,7 @@ mod tests {
             history: None,
             projections: None,
             contract_meta: ContractMeta::default(),
+            fee_rate_provenance: None,
         };
 
         let table_out = format_report_table(&report);
