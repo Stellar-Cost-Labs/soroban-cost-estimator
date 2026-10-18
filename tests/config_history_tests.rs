@@ -127,3 +127,84 @@ fn test_last_changed_tracks_independent_fields_separately() {
     );
     assert_eq!(last[1].timestamp, "2026-01-02T00:00:00Z");
 }
+
+#[test]
+fn test_snapshot_schema_version_written_on_serialize_and_legacy_accepted() {
+    let snap = make_snapshot("2026-01-01T00:00:00Z", 100, 100, 5);
+    let json = serde_json::to_string_pretty(&snap).expect("serialize snapshot");
+    let raw: serde_json::Value = serde_json::from_str(&json).expect("parse json value");
+    assert_eq!(
+        raw.get("schema_version").and_then(|v| v.as_u64()),
+        Some(u64::from(SNAPSHOT_SCHEMA_VERSION))
+    );
+
+    // Legacy unversioned snapshot JSON loads cleanly without modifying disk files
+    let legacy_json = r#"{
+        "network": "testnet",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "ledger": 42,
+        "contract_compute": null,
+        "contract_ledger_cost": null,
+        "contract_historical_data": null,
+        "contract_events": null,
+        "contract_bandwidth": null,
+        "state_archival": null
+    }"#;
+    let dir = std::env::temp_dir().join(format!("sce-schema-legacy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let legacy_path = dir.join("legacy.json");
+    std::fs::write(&legacy_path, legacy_json).expect("write legacy snapshot");
+
+    let loaded = soroban_cost_estimator::config_snapshot::store::load_snapshot_from_path(
+        &legacy_path.to_string_lossy(),
+    )
+    .expect("load legacy snapshot");
+    assert_eq!(loaded.ledger, 42);
+    assert_eq!(
+        std::fs::read_to_string(&legacy_path).expect("read legacy file"),
+        legacy_json,
+        "reading a legacy snapshot must not rewrite it on disk"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_unsupported_future_snapshot_schema_version_rejected_with_file_and_guidance() {
+    let future_json = r#"{
+        "schema_version": 99,
+        "network": "testnet",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "ledger": 99,
+        "contract_compute": null,
+        "contract_ledger_cost": null,
+        "contract_historical_data": null,
+        "contract_events": null,
+        "contract_bandwidth": null,
+        "state_archival": null
+    }"#;
+    let dir = std::env::temp_dir().join(format!("sce-schema-future-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let future_path = dir.join("future-v99.json");
+    std::fs::write(&future_path, future_json).expect("write future snapshot");
+
+    let err = soroban_cost_estimator::config_snapshot::store::load_snapshot_from_path(
+        &future_path.to_string_lossy(),
+    )
+    .expect_err("future schema version must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("future-v99.json"),
+        "error should identify the file: {msg}"
+    );
+    assert!(
+        msg.contains("unsupported future snapshot schema_version 99"),
+        "error should report unsupported schema version: {msg}"
+    );
+    assert!(
+        msg.contains("recommended action"),
+        "error should include recommended action: {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
