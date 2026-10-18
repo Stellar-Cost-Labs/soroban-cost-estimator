@@ -87,6 +87,9 @@ pub struct CostReportDiff {
     pub identity: ReportIdentity,
     /// One row per compared resource, in report order.
     pub rows: Vec<DiffRow>,
+    /// Optional contract ABI comparison when both WASM builds are inspected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abi_diff: Option<crate::wasm::parser::ContractAbiDiff>,
 }
 
 /// Compute the percentage change from `old` to `new`.
@@ -168,6 +171,7 @@ pub fn build_cost_report_diff(old: &CostReport, new: &CostReport) -> CostReportD
             new_ledger: new.ledger,
         },
         rows,
+        abi_diff: None,
     }
 }
 
@@ -264,6 +268,35 @@ pub fn format_cost_report_diff_sized(
     output.push_str("\nLegend: red = increased cost, green = decreased cost.\n");
 
     output
+}
+
+/// Renders the human-readable ABI comparison section for `estimate --diff`.
+///
+/// Returns an empty string when either build lacks a contract spec so the
+/// cost comparison output remains unchanged.
+#[must_use]
+pub fn format_abi_diff_section(abi_diff: &crate::wasm::parser::ContractAbiDiff) -> String {
+    if !abi_diff.both_have_spec() {
+        return String::new();
+    }
+    let mut out = String::from("\nABI changes:\n");
+    if !abi_diff.has_changes() {
+        out.push_str("  none\n");
+        return out;
+    }
+    for added in &abi_diff.added_functions {
+        out.push_str(&format!("  + {added}\n"));
+    }
+    for removed in &abi_diff.removed_functions {
+        out.push_str(&format!("  - {removed}\n"));
+    }
+    for changed in &abi_diff.changed_functions {
+        out.push_str(&format!(
+            "  ~ {}: {} -> {}\n",
+            changed.name, changed.old_signature, changed.new_signature
+        ));
+    }
+    out
 }
 
 #[cfg(test)]

@@ -1028,3 +1028,101 @@ fn test_load_wasm_detects_synthetic_debug_section() {
 
     let _ = std::fs::remove_file(&temp);
 }
+
+#[test]
+fn test_compare_contract_abi_reports_added_removed_changed_and_missing_specs() {
+    use soroban_cost_estimator::report::diff::format_abi_diff_section;
+    use soroban_cost_estimator::wasm::parser::compare_wasm_abi_bytes;
+    use stellar_xdr::WriteXdr;
+
+    fn spec_fn_entry(
+        name: &str,
+        inputs: &[(&str, stellar_xdr::ScSpecTypeDef)],
+        outputs: &[stellar_xdr::ScSpecTypeDef],
+    ) -> Vec<u8> {
+        let input_entries: Vec<stellar_xdr::ScSpecFunctionInputV0> = inputs
+            .iter()
+            .map(|(n, ty)| stellar_xdr::ScSpecFunctionInputV0 {
+                doc: stellar_xdr::StringM::default(),
+                name: (*n).try_into().expect("valid input name"),
+                type_: ty.clone(),
+            })
+            .collect();
+        let entry = stellar_xdr::ScSpecEntry::FunctionV0(stellar_xdr::ScSpecFunctionV0 {
+            doc: stellar_xdr::StringM::default(),
+            name: name.try_into().expect("valid symbol"),
+            inputs: input_entries.try_into().expect("inputs vecm"),
+            outputs: outputs.to_vec().try_into().expect("outputs vecm"),
+        });
+        entry
+            .to_xdr(stellar_xdr::Limits::none())
+            .expect("encode ScSpecEntry")
+    }
+
+    let base_minimal = std::fs::read("tests/fixtures/minimal.wasm").expect("read minimal.wasm");
+
+    // 1) Missing spec on either build keeps ABI diff empty and format_abi_diff_section empty
+    let contract_bytes = std::fs::read("tests/fixtures/contract.wasm").expect("read contract.wasm");
+    let missing_old =
+        compare_wasm_abi_bytes(&base_minimal, &contract_bytes).expect("compare missing old spec");
+    assert!(!missing_old.both_have_spec());
+    assert!(!missing_old.has_changes());
+    assert!(format_abi_diff_section(&missing_old).is_empty());
+
+    // 2) Old build has `add_one(x: i64) -> i64` and `legacy(flag: bool)`
+    //    New build has `add_one(x: u64) -> u64` (type change), removes `legacy`, and adds `reset() -> void`
+    let mut old_spec_payload = Vec::new();
+    old_spec_payload.extend_from_slice(&spec_fn_entry(
+        "add_one",
+        &[("x", stellar_xdr::ScSpecTypeDef::I64)],
+        &[stellar_xdr::ScSpecTypeDef::I64],
+    ));
+    old_spec_payload.extend_from_slice(&spec_fn_entry(
+        "legacy",
+        &[("flag", stellar_xdr::ScSpecTypeDef::Bool)],
+        &[],
+    ));
+    let mut old_wasm = base_minimal.clone();
+    old_wasm.extend_from_slice(&custom_section("contractspecv0", &old_spec_payload));
+
+    let mut new_spec_payload = Vec::new();
+    new_spec_payload.extend_from_slice(&spec_fn_entry(
+        "add_one",
+        &[("x", stellar_xdr::ScSpecTypeDef::U64)],
+        &[stellar_xdr::ScSpecTypeDef::U64],
+    ));
+    new_spec_payload.extend_from_slice(&spec_fn_entry(
+        "reset",
+        &[],
+        &[stellar_xdr::ScSpecTypeDef::Void],
+    ));
+    let mut new_wasm = base_minimal;
+    new_wasm.extend_from_slice(&custom_section("contractspecv0", &new_spec_payload));
+
+    let diff = compare_wasm_abi_bytes(&old_wasm, &new_wasm).expect("compare ABI diff");
+    assert!(diff.both_have_spec());
+    assert!(diff.has_changes());
+    assert_eq!(diff.added_functions, vec!["reset() -> void".to_string()]);
+    assert_eq!(
+        diff.removed_functions,
+        vec!["legacy(flag: bool)".to_string()]
+    );
+    assert_eq!(diff.changed_functions.len(), 1);
+    assert_eq!(diff.changed_functions[0].name, "add_one");
+    assert_eq!(
+        diff.changed_functions[0].old_signature,
+        "add_one(x: i64) -> i64"
+    );
+    assert_eq!(
+        diff.changed_functions[0].new_signature,
+        "add_one(x: u64) -> u64"
+    );
+
+    let section = format_abi_diff_section(&diff);
+    assert!(section.contains("+ reset() -> void"), "got: {section}");
+    assert!(section.contains("- legacy(flag: bool)"), "got: {section}");
+    assert!(
+        section.contains("~ add_one: add_one(x: i64) -> i64 -> add_one(x: u64) -> u64"),
+        "got: {section}"
+    );
+}

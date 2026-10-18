@@ -1621,3 +1621,160 @@ impl WasmInfo {
         Ok(())
     }
 }
+
+/// Summary of a function signature change between two contract builds.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AbiFunctionTypeChange {
+    /// Exported function name present in both builds.
+    pub name: String,
+    /// Formatted signature in the old build (e.g. `increment(step: i64) -> i64`).
+    pub old_signature: String,
+    /// Formatted signature in the new build (e.g. `increment(step: u64) -> u64`).
+    pub new_signature: String,
+    /// Parameter list in the old build (`name: type`).
+    pub old_params: Vec<String>,
+    /// Parameter list in the new build (`name: type`).
+    pub new_params: Vec<String>,
+    /// Return types in the old build.
+    pub old_returns: Vec<String>,
+    /// Return types in the new build.
+    pub new_returns: Vec<String>,
+}
+
+/// Contract ABI comparison between two WASM builds (`old` vs `new`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ContractAbiDiff {
+    /// Whether the baseline ("old") build carries a `contractspecv0` section.
+    pub old_has_spec: bool,
+    /// Whether the comparison ("new") build carries a `contractspecv0` section.
+    pub new_has_spec: bool,
+    /// Functions present in `new` but absent from `old` (formatted signatures).
+    pub added_functions: Vec<String>,
+    /// Functions present in `old` but absent from `new` (formatted signatures).
+    pub removed_functions: Vec<String>,
+    /// Functions present in both builds whose parameter or return types changed.
+    pub changed_functions: Vec<AbiFunctionTypeChange>,
+}
+
+impl ContractAbiDiff {
+    /// Returns `true` when both builds carry a `contractspecv0` contract spec.
+    #[must_use]
+    pub const fn both_have_spec(&self) -> bool {
+        self.old_has_spec && self.new_has_spec
+    }
+
+    /// Returns `true` when any function was added, removed, or changed in type.
+    #[must_use]
+    pub fn has_changes(&self) -> bool {
+        !self.added_functions.is_empty()
+            || !self.removed_functions.is_empty()
+            || !self.changed_functions.is_empty()
+    }
+}
+
+/// Compares the contract ABI (exported function signatures from `contractspecv0`)
+/// between two loaded WASM builds.
+///
+/// When either build lacks a contract spec, `added_functions`, `removed_functions`,
+/// and `changed_functions` are left empty and `both_have_spec()` is `false` so
+/// cost diffing continues unaffected.
+#[must_use]
+pub fn compare_contract_abi(old: &WasmInfo, new: &WasmInfo) -> ContractAbiDiff {
+    compare_spec_functions(&old.functions, old.has_spec, &new.functions, new.has_spec)
+}
+
+/// Decodes and compares the contract ABI directly from two raw WASM byte slices.
+pub fn compare_wasm_abi_bytes(old_bytes: &[u8], new_bytes: &[u8]) -> AppResult<ContractAbiDiff> {
+    let (old_specs, old_has_spec) = parse_contract_spec_functions(old_bytes)?;
+    let (new_specs, new_has_spec) = parse_contract_spec_functions(new_bytes)?;
+
+    let to_fn_infos = |specs: Vec<SpecFunctionInfo>| -> Vec<FunctionInfo> {
+        specs
+            .into_iter()
+            .map(|f| FunctionInfo {
+                name: f.name,
+                param_count: f.inputs.len() as u32,
+                result_count: f.outputs.len() as u32,
+                params: f.inputs,
+                returns: f.outputs,
+            })
+            .collect()
+    };
+
+    Ok(compare_spec_functions(
+        &to_fn_infos(old_specs),
+        old_has_spec,
+        &to_fn_infos(new_specs),
+        new_has_spec,
+    ))
+}
+
+fn compare_spec_functions(
+    old_functions: &[FunctionInfo],
+    old_has_spec: bool,
+    new_functions: &[FunctionInfo],
+    new_has_spec: bool,
+) -> ContractAbiDiff {
+    if !old_has_spec || !new_has_spec {
+        return ContractAbiDiff {
+            old_has_spec,
+            new_has_spec,
+            added_functions: Vec::new(),
+            removed_functions: Vec::new(),
+            changed_functions: Vec::new(),
+        };
+    }
+
+    let old_map: std::collections::BTreeMap<&str, &FunctionInfo> =
+        old_functions.iter().map(|f| (f.name.as_str(), f)).collect();
+    let new_map: std::collections::BTreeMap<&str, &FunctionInfo> =
+        new_functions.iter().map(|f| (f.name.as_str(), f)).collect();
+
+    let mut added_functions = Vec::new();
+    for (name, new_fn) in &new_map {
+        if !old_map.contains_key(name) {
+            added_functions.push(format_function(new_fn));
+        }
+    }
+
+    let mut removed_functions = Vec::new();
+    let mut changed_functions = Vec::new();
+    for (name, old_fn) in &old_map {
+        match new_map.get(name) {
+            None => removed_functions.push(format_function(old_fn)),
+            Some(new_fn) => {
+                if old_fn.params != new_fn.params || old_fn.returns != new_fn.returns {
+                    let old_params = old_fn
+                        .params
+                        .iter()
+                        .map(|p| format!("{}: {}", p.name, p.type_name))
+                        .collect();
+                    let new_params = new_fn
+                        .params
+                        .iter()
+                        .map(|p| format!("{}: {}", p.name, p.type_name))
+                        .collect();
+                    let old_returns = old_fn.returns.iter().map(|r| r.type_name.clone()).collect();
+                    let new_returns = new_fn.returns.iter().map(|r| r.type_name.clone()).collect();
+                    changed_functions.push(AbiFunctionTypeChange {
+                        name: (*name).to_string(),
+                        old_signature: format_function(old_fn),
+                        new_signature: format_function(new_fn),
+                        old_params,
+                        new_params,
+                        old_returns,
+                        new_returns,
+                    });
+                }
+            }
+        }
+    }
+
+    ContractAbiDiff {
+        old_has_spec,
+        new_has_spec,
+        added_functions,
+        removed_functions,
+        changed_functions,
+    }
+}

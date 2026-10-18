@@ -2730,19 +2730,24 @@ async fn cmd_estimate_diff(
     })
     .await?;
 
+    let abi_diff = wasm::parser::compare_contract_abi(&old_info, &new_info);
+
     if format == "json" {
-        let diff = report::diff::build_cost_report_diff(&old_report, &new_report);
+        let mut diff = report::diff::build_cost_report_diff(&old_report, &new_report);
+        if abi_diff.both_have_spec() {
+            diff.abi_diff = Some(abi_diff.clone());
+        }
         let output = serde_json::json!({
             "wasm_a": old_report,
             "wasm_b": new_report,
             "diff": diff,
+            "abi_diff": abi_diff,
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        println!(
-            "{}",
-            report::diff::format_cost_report_diff(&old_report, &new_report)
-        );
+        let mut rendered = report::diff::format_cost_report_diff(&old_report, &new_report);
+        rendered.push_str(&report::diff::format_abi_diff_section(&abi_diff));
+        println!("{rendered}");
     }
 
     Ok(())
