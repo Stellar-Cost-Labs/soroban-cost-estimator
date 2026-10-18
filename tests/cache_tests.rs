@@ -2784,3 +2784,128 @@ fn test_legacy_database_without_io_column_still_loads() {
         );
     });
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Cache decision diagnostics (#522)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_cache_decision_hit_miss_expired_network_mismatch_and_bypass() {
+    with_temp_home(|tmp| {
+        let secret_arg = "SECRET_CREDENTIAL_TOKEN_DO_NOT_LOG".to_string();
+
+        // 1. Miss on empty cache
+        let miss = cache::evaluate_cache_decision(
+            "hash_diag",
+            "transfer",
+            std::slice::from_ref(&secret_arg),
+            Some("testnet"),
+            Some(std::time::Duration::from_secs(3600)),
+            false,
+        )
+        .expect("miss decision");
+        assert_eq!(miss.reason, cache::CacheDecisionReason::Miss);
+        assert_eq!(miss.reason.as_code(), "miss");
+        assert!(miss.estimate.is_none());
+        let miss_summary = miss.diagnostic_summary("transfer", "testnet");
+        assert!(!miss_summary.contains(&secret_arg));
+
+        // 2. Save entry and verify Hit
+        cache::save_estimate(
+            "hash_diag",
+            "transfer",
+            std::slice::from_ref(&secret_arg),
+            "testnet",
+            42,
+            1_000,
+            500,
+            100,
+            None,
+            true,
+        )
+        .expect("save entry");
+
+        let hit = cache::evaluate_cache_decision(
+            "hash_diag",
+            "transfer",
+            std::slice::from_ref(&secret_arg),
+            Some("testnet"),
+            Some(std::time::Duration::from_secs(3600)),
+            false,
+        )
+        .expect("hit decision");
+        assert_eq!(hit.reason, cache::CacheDecisionReason::Hit);
+        assert_eq!(hit.reason.as_code(), "hit");
+        assert!(hit.estimate.is_some());
+        let hit_summary = hit.diagnostic_summary("transfer", "testnet");
+        assert!(hit_summary.contains("decision=hit"));
+        assert!(!hit_summary.contains(&secret_arg));
+
+        // 3. Network mismatch
+        let mismatch = cache::evaluate_cache_decision(
+            "hash_diag",
+            "transfer",
+            std::slice::from_ref(&secret_arg),
+            Some("mainnet"),
+            Some(std::time::Duration::from_secs(3600)),
+            false,
+        )
+        .expect("network mismatch decision");
+        assert_eq!(mismatch.reason, cache::CacheDecisionReason::NetworkMismatch);
+        assert_eq!(mismatch.reason.as_code(), "network_mismatch");
+        assert!(mismatch.estimate.is_none());
+
+        // 4. Bypass via --no-cache or absent TTL
+        let bypassed_flag = cache::evaluate_cache_decision(
+            "hash_diag",
+            "transfer",
+            std::slice::from_ref(&secret_arg),
+            Some("testnet"),
+            Some(std::time::Duration::from_secs(3600)),
+            true,
+        )
+        .expect("bypassed flag");
+        assert_eq!(bypassed_flag.reason, cache::CacheDecisionReason::Bypassed);
+        assert_eq!(bypassed_flag.reason.as_code(), "bypassed");
+
+        let bypassed_no_ttl = cache::evaluate_cache_decision(
+            "hash_diag",
+            "transfer",
+            std::slice::from_ref(&secret_arg),
+            Some("testnet"),
+            None,
+            false,
+        )
+        .expect("bypassed no ttl");
+        assert_eq!(bypassed_no_ttl.reason, cache::CacheDecisionReason::Bypassed);
+
+        // 5. Expired entry
+        insert_raw_row(
+            tmp,
+            cache::CACHE_SCHEMA_VERSION,
+            "hash_expired",
+            "old_fn",
+            &[secret_arg.as_str()],
+            "testnet",
+            10,
+            "2020-01-01T00:00:00Z",
+        );
+        let expired = cache::evaluate_cache_decision(
+            "hash_expired",
+            "old_fn",
+            std::slice::from_ref(&secret_arg),
+            Some("testnet"),
+            Some(std::time::Duration::from_secs(60)),
+            false,
+        )
+        .expect("expired decision");
+        assert_eq!(expired.reason, cache::CacheDecisionReason::Expired);
+        assert_eq!(expired.reason.as_code(), "expired");
+        assert!(expired.estimate.is_none());
+        assert!(
+            !expired
+                .diagnostic_summary("old_fn", "testnet")
+                .contains(&secret_arg)
+        );
+    });
+}
