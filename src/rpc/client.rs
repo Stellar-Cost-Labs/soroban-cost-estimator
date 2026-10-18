@@ -660,10 +660,11 @@ impl RpcClient {
     /// configured fallback endpoint.
     ///
     /// This covers transport-level failures (connection refused, timeout,
-    /// DNS failure, ...) and transient gateway statuses (HTTP 502/503/504).
-    /// RPC-level errors returned inside a successful HTTP response — bad
-    /// method, invalid params — are **not** failover triggers: they would
-    /// fail identically on the fallback.
+    /// DNS failure, ...), transient gateway statuses (HTTP 502/503/504), and
+    /// transient server-class JSON-RPC errors (`AppError::JsonRpcError { retryable: true, .. }`).
+    /// Deterministic JSON-RPC errors (bad method, invalid params, application
+    /// errors) are **not** failover triggers: they would fail identically on
+    /// the fallback.
     fn is_failover_trigger(error: &AppError) -> bool {
         match error {
             AppError::Http(e) => {
@@ -672,6 +673,7 @@ impl RpcClient {
                 e.is_connect() || e.is_timeout() || e.is_request()
             }
             AppError::ConnectTimeout { .. } | AppError::RpcUnavailable { .. } => true,
+            AppError::JsonRpcError { retryable, .. } => *retryable,
             // Transient gateway statuses surfaced as HttpStatus (502/503/504)
             // are also failover triggers; other HttpStatus values (429/500 or
             // deterministic 4xx) are not — 429/500 are retried but not failed
@@ -703,7 +705,7 @@ impl RpcClient {
             eprintln!("[RPC] -> {}", request_body_str);
         }
 
-        let response = with_retry(self.max_retries, || {
+        let (status, response_body) = with_retry(self.max_retries, || {
             let client = client.clone();
             let url = url.clone();
             let request_body = request_body.clone();
@@ -734,43 +736,33 @@ impl RpcClient {
                         message: format!("RPC endpoint returned transient HTTP status {status}"),
                     });
                 }
-                Ok::<reqwest::Response, AppError>(response)
+
+                // A 502/503/504 means the endpoint is briefly unavailable rather than
+                // misconfigured. Surface it as a dedicated error *before* parsing the
+                // body — gateways commonly return an HTML error page, and both the
+                // retry loop and the failover logic key off this variant.
+                let status_code = status.as_u16();
+                if matches!(status_code, 502..=504) {
+                    debug!(
+                        method,
+                        status = status_code,
+                        "transient gateway error from RPC endpoint"
+                    );
+                    return Err(AppError::RpcUnavailable {
+                        status: status_code,
+                    });
+                }
+
+                let response_body: Value = response.json().await?;
+
+                if let Some(error) = response_body.get("error") {
+                    return Err(parse_json_rpc_error(method, error));
+                }
+
+                Ok::<(reqwest::StatusCode, Value), AppError>((status, response_body))
             }
         })
         .await?;
-        let status = response.status();
-
-        // A 502/503/504 means the endpoint is briefly unavailable rather than
-        // misconfigured. Surface it as a dedicated error *before* parsing the
-        // body — gateways commonly return an HTML error page, and both the
-        // retry loop and the failover logic key off this variant.
-        let status_code = status.as_u16();
-        if matches!(status_code, 502..=504) {
-            debug!(
-                method,
-                status = status_code,
-                "transient gateway error from RPC endpoint"
-            );
-            return Err(AppError::RpcUnavailable {
-                status: status_code,
-            });
-        }
-
-        let response_body: Value = response.json().await?;
-
-        if let Some(error) = response_body.get("error") {
-            let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-            let message = error
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown error")
-                .to_string();
-            debug!(method, code, message, "RPC error response");
-            return Err(AppError::Rpc {
-                status: code,
-                message,
-            });
-        }
 
         let result = response_body.get("result").ok_or_else(|| AppError::Rpc {
             status: status.as_u16() as i64,
@@ -792,6 +784,42 @@ impl RpcClient {
         );
         trace!(method, "RPC call succeeded");
         Ok(result.clone())
+    }
+}
+
+/// Parses a JSON-RPC `error` object into [`AppError::JsonRpcError`] (when
+/// structured `data` or a classified retryable server error is present) or
+/// [`AppError::Rpc`].
+fn parse_json_rpc_error(method: &str, error: &Value) -> AppError {
+    let code = error.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown error")
+        .to_string();
+    let data = error.get("data").cloned().filter(|v| !v.is_null());
+    let class = crate::rpc::retry::classify_json_rpc_error(code, data.as_ref());
+    let retryable = class.is_retryable();
+    debug!(
+        method,
+        code,
+        message,
+        ?class,
+        retryable,
+        "RPC error response"
+    );
+    if data.is_some() || retryable {
+        AppError::JsonRpcError {
+            code,
+            message,
+            data,
+            retryable,
+        }
+    } else {
+        AppError::Rpc {
+            status: code,
+            message,
+        }
     }
 }
 

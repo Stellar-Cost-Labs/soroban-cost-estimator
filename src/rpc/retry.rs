@@ -61,19 +61,85 @@ where
     }
 }
 
+/// Classification of a JSON-RPC error object by numeric code and structured `data`.
+///
+/// Classification relies strictly on the numeric JSON-RPC `code` and optional
+/// structured `data` object (such as `{"retryable": true}` or `{"transient": true}`),
+/// never on free-form `message` text. Unknown codes default to [`Self::Application`]
+/// (non-retryable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonRpcErrorClass {
+    /// Transient server/provider error (e.g. `-32002`..=`-32005` or structured
+    /// `data.retryable == true`): eligible for retry and failover.
+    TransientServer,
+    /// Invalid JSON-RPC request (`-32700`, `-32600`, `-32601`, `-32602`):
+    /// deterministic client error, never retried or failed over.
+    InvalidRequest,
+    /// Permanent server or application error (`-32603`, `-32000`, unknown codes):
+    /// never retried or failed over unless structured `data` explicitly marks it
+    /// retryable.
+    Application,
+}
+
+impl JsonRpcErrorClass {
+    /// Returns `true` when errors in this class should be retried and can
+    /// trigger failover to a configured fallback RPC endpoint.
+    #[must_use]
+    pub const fn is_retryable(self) -> bool {
+        matches!(self, Self::TransientServer)
+    }
+}
+
+/// Classify a JSON-RPC error using its numeric `code` and optional structured
+/// `data` field.
+///
+/// * If `data` is an object with `"retryable": bool` or `"transient": bool`,
+///   that explicit structured signal takes precedence.
+/// * Standard invalid-request codes (`-32700`, `-32600`, `-32601`, `-32602`)
+///   are [`JsonRpcErrorClass::InvalidRequest`].
+/// * Provider transient server codes (`-32002`..=`-32005`: server busy,
+///   overloaded, timeout, rate-limited/unavailable) are
+///   [`JsonRpcErrorClass::TransientServer`].
+/// * All other codes (including `-32000`, `-32603`, and unknown codes) default
+///   to [`JsonRpcErrorClass::Application`] (non-retryable).
+#[must_use]
+pub fn classify_json_rpc_error(code: i64, data: Option<&serde_json::Value>) -> JsonRpcErrorClass {
+    if let Some(obj) = data.and_then(serde_json::Value::as_object) {
+        if let Some(flag) = obj
+            .get("retryable")
+            .or_else(|| obj.get("transient"))
+            .and_then(serde_json::Value::as_bool)
+        {
+            return if flag {
+                JsonRpcErrorClass::TransientServer
+            } else {
+                JsonRpcErrorClass::Application
+            };
+        }
+    }
+
+    match code {
+        -32700 | -32600 | -32601 | -32602 => JsonRpcErrorClass::InvalidRequest,
+        -32005..=-32002 => JsonRpcErrorClass::TransientServer,
+        _ => JsonRpcErrorClass::Application,
+    }
+}
+
 /// Returns `true` when `error` represents a transient failure worth retrying.
 ///
 /// Retryable transport failures are connection/timeout/request errors; an
 /// HTTP status error is retryable only for the statuses in
 /// [`TRANSIENT_STATUSES`]; transient gateway statuses
-/// ([`AppError::RpcUnavailable`]) and connect timeouts are also retryable.
-/// Everything else — RPC-level errors, XDR decode failures, deterministic
-/// 4xx client errors — is deterministic and returned as-is.
-fn is_retryable(error: &AppError) -> bool {
+/// ([`AppError::RpcUnavailable`]), connect timeouts, and transient
+/// [`AppError::JsonRpcError`] responses (`retryable: true`) are also retryable.
+/// Everything else — non-retryable RPC errors, XDR decode failures,
+/// deterministic 4xx client errors — is deterministic and returned as-is.
+pub fn is_retryable(error: &AppError) -> bool {
     match error {
         AppError::Http(e) => e.is_connect() || e.is_timeout() || e.is_request(),
         AppError::HttpStatus { status, .. } => TRANSIENT_STATUSES.contains(status),
         AppError::RpcUnavailable { .. } | AppError::ConnectTimeout { .. } => true,
+        AppError::JsonRpcError { retryable, .. } => *retryable,
         _ => false,
     }
 }

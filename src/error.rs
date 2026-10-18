@@ -35,6 +35,17 @@ pub enum AppError {
     #[error("failed to execute RPC: status {status} - {message}")]
     Rpc { status: i64, message: String },
 
+    /// A structured JSON-RPC error object returned by an RPC endpoint,
+    /// preserving the numeric `code`, `message`, and optional structured `data`
+    /// payload alongside whether the error is transient/retryable.
+    #[error("failed to execute RPC: status {code} - {message}")]
+    JsonRpcError {
+        code: i64,
+        message: String,
+        data: Option<serde_json::Value>,
+        retryable: bool,
+    },
+
     /// The endpoint answered with a transient gateway status (502/503/504),
     /// meaning it is briefly unavailable rather than misconfigured. Treated
     /// as retryable and as a trigger for failover to `--rpc-fallback-url`.
@@ -201,6 +212,12 @@ mod tests {
             AppError::Rpc {
                 status: -32000,
                 message: "boom".to_string(),
+            },
+            AppError::JsonRpcError {
+                code: -32003,
+                message: "server overloaded".to_string(),
+                data: Some(serde_json::json!({ "retryable": true })),
+                retryable: true,
             },
             AppError::InvalidHeader("missing '=' separator".to_string()),
             AppError::WsConnect("wss://host/ws: refused".to_string()),
