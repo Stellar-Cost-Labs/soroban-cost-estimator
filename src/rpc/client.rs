@@ -136,6 +136,15 @@ impl SharedFuture {
     }
 }
 
+/// Default maximum number of completed JSON-RPC request results retained in an
+/// [`RpcClient`]'s deduplication cache before the least-recently-used entry is
+/// evicted.
+///
+/// Bounding `completed` prevents unbounded memory growth when a long-running
+/// process issues many unique RPC calls over the lifetime of a client, while
+/// keeping `in_flight` single-flight entries separate and unaffected.
+pub const DEFAULT_MAX_COMPLETED_DEDUP_ENTRIES: usize = 256;
+
 /// Private, shared deduplication state for a `RpcClient`.
 ///
 /// Deduplication collapses identical JSON-RPC requests — the same method with
@@ -143,16 +152,87 @@ impl SharedFuture {
 /// operations such as `estimate-all`, where several functions share the same
 /// WASM upload path and would otherwise transmit the identical upload request
 /// over and over.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct DedupState {
     /// Results of identical requests that already completed successfully,
-    /// keyed by request. A cache hit skips the network entirely and also lets
-    /// a request arriving *after* its twin finished share the result.
+    /// keyed by request and bounded by `max_completed_entries` with LRU
+    /// eviction.
     completed: HashMap<RequestKey, Value>,
+    /// Access order for `completed` entries (front = least-recently-used,
+    /// back = most-recently-used).
+    completed_order: std::collections::VecDeque<RequestKey>,
+    /// Maximum number of completed entries retained (`0` disables retaining
+    /// completed results while preserving in-flight deduplication).
+    max_completed_entries: usize,
     /// One single-flight handle per key currently in flight. Concurrent
     /// identical callers attach to the existing handle rather than opening a
-    /// second request.
+    /// second request. Kept separate from evictable `completed` entries.
     in_flight: HashMap<RequestKey, SharedFuture>,
+}
+
+impl Default for DedupState {
+    fn default() -> Self {
+        Self::with_capacity_bound(DEFAULT_MAX_COMPLETED_DEDUP_ENTRIES)
+    }
+}
+
+impl DedupState {
+    fn with_capacity_bound(max_completed_entries: usize) -> Self {
+        Self {
+            completed: HashMap::new(),
+            completed_order: std::collections::VecDeque::new(),
+            max_completed_entries,
+            in_flight: HashMap::new(),
+        }
+    }
+
+    fn get_completed(&mut self, key: &RequestKey) -> Option<Value> {
+        let value = self.completed.get(key).cloned()?;
+        if let Some(pos) = self.completed_order.iter().position(|k| k == key) {
+            self.completed_order.remove(pos);
+        }
+        self.completed_order.push_back(key.clone());
+        Some(value)
+    }
+
+    fn insert_completed(&mut self, key: RequestKey, value: Value) {
+        if self.max_completed_entries == 0 {
+            self.completed.clear();
+            self.completed_order.clear();
+            return;
+        }
+
+        if let Some(pos) = self.completed_order.iter().position(|k| k == &key) {
+            self.completed_order.remove(pos);
+        } else {
+            while self.completed.len() >= self.max_completed_entries {
+                if let Some(oldest) = self.completed_order.pop_front() {
+                    self.completed.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        self.completed.insert(key.clone(), value);
+        self.completed_order.push_back(key);
+    }
+
+    fn set_max_completed_entries(&mut self, max_completed_entries: usize) {
+        self.max_completed_entries = max_completed_entries;
+        if max_completed_entries == 0 {
+            self.completed.clear();
+            self.completed_order.clear();
+            return;
+        }
+        while self.completed.len() > self.max_completed_entries {
+            if let Some(oldest) = self.completed_order.pop_front() {
+                self.completed.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 /// Response envelope for the `getHealth` JSON-RPC method.
@@ -444,6 +524,23 @@ impl RpcClient {
         }
     }
 
+    /// Configures the maximum number of completed request entries retained in
+    /// the client's deduplication cache before deterministic LRU eviction
+    /// occurs. In-flight single-flight deduplication is unaffected.
+    #[must_use]
+    pub fn with_max_completed_dedup_entries(self, max_entries: usize) -> Self {
+        if let Ok(mut state) = self.dedup.try_lock() {
+            state.set_max_completed_entries(max_entries);
+        }
+        self
+    }
+
+    /// Returns the number of completed request entries currently retained in
+    /// the deduplication cache.
+    pub async fn completed_dedup_len(&self) -> usize {
+        self.dedup.lock().await.completed.len()
+    }
+
     /// Returns the custom HTTP headers configured for this client.
     ///
     /// These are the headers parsed from the `--header` values and attached to
@@ -569,7 +666,7 @@ impl RpcClient {
             {
                 let mut state = self.dedup.lock().await;
                 if let Ok(value) = &result {
-                    state.completed.insert(key.clone(), value.clone());
+                    state.insert_completed(key.clone(), value.clone());
                 }
                 state.in_flight.remove(&key);
             }
@@ -599,8 +696,8 @@ impl RpcClient {
     /// Returns the cached result for `key`, if a prior identical request
     /// completed successfully.
     async fn cached_result(&self, key: &RequestKey) -> Option<Value> {
-        let state = self.dedup.lock().await;
-        state.completed.get(key).cloned()
+        let mut state = self.dedup.lock().await;
+        state.get_completed(key)
     }
 
     /// Performs the actual HTTP POST and extracts the raw `result` value.
