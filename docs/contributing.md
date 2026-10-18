@@ -6,40 +6,60 @@ first contributions.
 ## Start with the issue backlog
 
 The fastest path to useful work is the issue tracker — every open issue
-carries a Summary, Acceptance Criteria, and Tech Stack, sized for a focused
-sprint:
+carries a Summary, Acceptance Criteria, and Implementation Hints, sized for a
+focused sprint:
 
-- Issue backlog: <https://github.com/aigbagbobila/soroban-cost-estimator/issues>
+- Issue backlog: <https://github.com/Stellar-Cost-Labs/soroban-cost-estimator/issues>
 - List open issues from the CLI:
   ```bash
-  gh issue list -R aigbagbobila/soroban-cost-estimator --state open
+  gh issue list -R Stellar-Cost-Labs/soroban-cost-estimator --state open
   ```
 
-Recent scoped work has included exponential RPC backoff, cache pruning and a
-cache stats command, spec-typed `--arg` validation, parallelized
-`estimate-all`, footprint reporting, and graceful watch shutdown. If you are
-arriving from a Drips Wave contributor sprint, issues labeled `Stellar Wave`
-are the ones with acceptance criteria ready for pickup.
+If you are arriving from a Drips Wave contributor sprint, issues labeled
+`Stellar Wave` include detailed acceptance criteria ready for pickup.
+
+## Prerequisites
+
+- **Rust**: `1.85+` (Edition 2024) via [`rustup`](https://rustup.rs/)
+- **Components**: `rustfmt` and `clippy` (`rustup component add rustfmt clippy`)
+- **Git**: `2.30+`
 
 ## Development setup and standards
 
 The full contributing guide — coding standards, the PR process, and the
-project structure — lives in [`CONTRIBUTING.md`](https://github.com/aigbagbobila/soroban-cost-estimator/blob/main/CONTRIBUTING.md).
+project structure — lives in [`CONTRIBUTING.md`](https://github.com/Stellar-Cost-Labs/soroban-cost-estimator/blob/main/CONTRIBUTING.md).
 In short:
 
 - One commit per logical unit, conventional commit format
   (`feat(rpc): …`, `fix(fee-calc): …`).
-- No `unwrap()` or `expect()` outside `tests/`; all fallible operations
-  return `Result` through the `AppError` enum.
-- No floats near fee math, and no hardcoded stroops-per-unit constants —
-  every fee-relevant constant must come from a fetched `ConfigSetting*`
-  entry or from `simulateTransaction`'s own output.
-- `clippy::all` + `clippy::pedantic` clean, enforced in CI.
+- No `unwrap()` or `expect()` outside `#[cfg(test)]` / `tests/`; all fallible
+  operations return `Result` through the `AppError` enum.
+- Integer-only stroop math (`i64` / `i128`) for fee calculations, and no
+  hardcoded stroops-per-unit constants — every fee-relevant constant must come
+  from a fetched `ConfigSetting*` entry or from `simulateTransaction`'s own
+  output.
+- `rustfmt` and `clippy` clean, enforced in CI.
 
 ```bash
-cargo build
-cargo test
-cargo clippy --all-targets
+# Format check
+cargo fmt --all -- --check
+
+# Lint all targets
+cargo clippy --workspace --all-targets -- -D warnings
+
+# Run unit and integration tests
+cargo test --workspace
+
+# Run Criterion benchmarks
+cargo bench --bench wasm_benchmark
 ```
 
-`main` is protected: the CI `build` check must be green for changes to merge.
+## PR Submission Checklist
+
+- [ ] `cargo fmt --all -- --check` passes
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes
+- [ ] `cargo test --workspace` passes
+- [ ] No `unwrap()` / `expect()` in `src/` outside test modules
+- [ ] PR description references the issue (`Closes #<number>`)
+
+`main` is protected: the CI checks must be green for changes to merge.
