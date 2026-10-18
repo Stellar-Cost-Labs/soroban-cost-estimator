@@ -121,3 +121,194 @@ fn cli_announces_failover_on_stderr() {
         "the fallback endpoint must have been contacted"
     );
 }
+
+/// Spawns a programmable stub whose response HTTP status and JSON body can be
+/// switched dynamically via an atomic flag.
+fn spawn_programmable_stub(
+    healthy: Arc<std::sync::atomic::AtomicBool>,
+) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind stub server");
+    let addr = listener.local_addr().expect("no local address");
+    let counter = Arc::new(AtomicUsize::new(0));
+    let server_counter = Arc::clone(&counter);
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let counter = Arc::clone(&server_counter);
+            let healthy = Arc::clone(&healthy);
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                counter.fetch_add(1, Ordering::SeqCst);
+                let (status_line, body) = if healthy.load(Ordering::SeqCst) {
+                    (
+                        "HTTP/1.1 200 OK",
+                        r#"{"jsonrpc":"2.0","id":1,"result":{"status":"healthy"}}"#,
+                    )
+                } else {
+                    (
+                        "HTTP/1.1 503 Service Unavailable",
+                        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"down"}}"#,
+                    )
+                };
+                let response = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            });
+        }
+    });
+
+    (format!("http://{addr}"), counter)
+}
+
+#[tokio::test]
+async fn circuit_breaker_opens_primary_independently_and_recovers_after_cooldown() {
+    use soroban_cost_estimator::rpc::retry::{CircuitBreakerConfig, CircuitState};
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+
+    let primary_healthy = Arc::new(AtomicBool::new(false));
+    let (primary_url, primary_hits) = spawn_programmable_stub(Arc::clone(&primary_healthy));
+    let (fallback_url, fallback_hits) = spawn_rpc_stub();
+
+    let base = Instant::now();
+    let clock_offset = Arc::new(Mutex::new(Duration::ZERO));
+    let clock_reader = Arc::clone(&clock_offset);
+
+    let client = RpcClient::with_fallback(
+        &primary_url,
+        Some(&fallback_url),
+        None,
+        Duration::from_secs(5),
+        0,
+        false,
+    )
+    .with_circuit_breaker_clock(
+        CircuitBreakerConfig::new(2, Duration::from_secs(60)),
+        move || base + *clock_reader.lock().expect("clock lock"),
+    );
+
+    assert_eq!(
+        client.primary_circuit_state().await,
+        Some(CircuitState::Closed)
+    );
+    assert_eq!(
+        client.fallback_circuit_state().await,
+        Some(CircuitState::Closed)
+    );
+
+    // Call 1: primary fails (1/2), fails over to fallback.
+    let _: Value = client
+        .call_uncached("getHealth", serde_json::json!({}))
+        .await
+        .expect("call 1 succeeds via fallback");
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        client.primary_circuit_state().await,
+        Some(CircuitState::Closed)
+    );
+
+    // Call 2: primary fails (2/2) -> primary circuit trips Open; fallback stays Closed.
+    let _: Value = client
+        .call_uncached("getHealth", serde_json::json!({}))
+        .await
+        .expect("call 2 succeeds via fallback");
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(fallback_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        client.primary_circuit_state().await,
+        Some(CircuitState::Open)
+    );
+    assert_eq!(
+        client.fallback_circuit_state().await,
+        Some(CircuitState::Closed)
+    );
+
+    // Call 3 while primary circuit is Open: primary is skipped completely (0 new hits),
+    // request goes straight to fallback!
+    let _: Value = client
+        .call_uncached("getHealth", serde_json::json!({}))
+        .await
+        .expect("call 3 succeeds via fallback without touching open primary");
+    assert_eq!(
+        primary_hits.load(Ordering::SeqCst),
+        2,
+        "open primary circuit must prevent outbound requests to primary"
+    );
+    assert_eq!(fallback_hits.load(Ordering::SeqCst), 3);
+
+    // Restore primary health and advance injected clock past cooldown (61s).
+    primary_healthy.store(true, Ordering::SeqCst);
+    *clock_offset.lock().expect("clock lock") = Duration::from_secs(61);
+    assert_eq!(
+        client.primary_circuit_state().await,
+        Some(CircuitState::HalfOpen)
+    );
+
+    // Call 4: half-open recovery probe hits primary, succeeds, and closes primary circuit.
+    let _: Value = client
+        .call_uncached("getHealth", serde_json::json!({}))
+        .await
+        .expect("call 4 succeeds on recovered primary");
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        fallback_hits.load(Ordering::SeqCst),
+        3,
+        "fallback should not be used when primary recovery probe succeeds"
+    );
+    assert_eq!(
+        client.primary_circuit_state().await,
+        Some(CircuitState::Closed)
+    );
+}
+
+#[tokio::test]
+async fn circuit_breaker_never_opens_for_application_level_rpc_errors() {
+    use soroban_cost_estimator::rpc::retry::{CircuitBreakerConfig, CircuitState};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+    let addr = listener.local_addr().expect("local addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid params"}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            });
+        }
+    });
+
+    let client = RpcClient::with_options(
+        &format!("http://{addr}"),
+        None,
+        Duration::from_secs(5),
+        0,
+        false,
+    )
+    .with_circuit_breaker(CircuitBreakerConfig::new(1, Duration::from_secs(60)));
+
+    for _ in 0..3 {
+        let res: AppResult<Value> = client
+            .call_uncached("simulateTransaction", serde_json::json!({}))
+            .await;
+        assert!(res.is_err());
+        assert_eq!(
+            client.primary_circuit_state().await,
+            Some(CircuitState::Closed),
+            "application-level JSON-RPC errors must never open the circuit breaker"
+        );
+    }
+}

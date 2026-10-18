@@ -1,7 +1,190 @@
 use std::future::Future;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::error::{AppError, AppResult};
+
+/// State of an endpoint's circuit breaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitState {
+    /// Normal operation: requests flow to the endpoint.
+    Closed,
+    /// Tripped after repeated transport/gateway failures: requests fail fast
+    /// with [`AppError::CircuitOpen`] until the cooldown elapses.
+    Open,
+    /// Cooldown has elapsed: a single recovery probe request is permitted.
+    HalfOpen,
+}
+
+/// Configuration for optional endpoint circuit breaking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CircuitBreakerConfig {
+    /// Number of consecutive transport/gateway failures required to trip the
+    /// circuit open. Values of `0` are treated as `1`.
+    pub failure_threshold: u32,
+    /// Cooldown duration an open circuit waits before allowing a half-open
+    /// recovery probe.
+    pub cooldown: Duration,
+}
+
+impl CircuitBreakerConfig {
+    /// Creates a new circuit breaker configuration.
+    #[must_use]
+    pub const fn new(failure_threshold: u32, cooldown: Duration) -> Self {
+        Self {
+            failure_threshold,
+            cooldown,
+        }
+    }
+}
+
+/// Per-endpoint circuit breaker tracking consecutive transport failures and
+/// recovery probes.
+pub struct CircuitBreaker {
+    config: CircuitBreakerConfig,
+    consecutive_failures: u32,
+    opened_at: Option<Instant>,
+    half_open_probe_in_flight: bool,
+    clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+}
+
+impl std::fmt::Debug for CircuitBreaker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CircuitBreaker")
+            .field("config", &self.config)
+            .field("consecutive_failures", &self.consecutive_failures)
+            .field("opened_at", &self.opened_at)
+            .field("half_open_probe_in_flight", &self.half_open_probe_in_flight)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CircuitBreaker {
+    /// Creates a circuit breaker using [`Instant::now`] as the clock source.
+    #[must_use]
+    pub fn new(config: CircuitBreakerConfig) -> Self {
+        Self::with_clock(config, Instant::now)
+    }
+
+    /// Creates a circuit breaker with a custom monotonic clock (used by unit
+    /// tests to advance time deterministically).
+    pub fn with_clock<C>(config: CircuitBreakerConfig, clock: C) -> Self
+    where
+        C: Fn() -> Instant + Send + Sync + 'static,
+    {
+        Self {
+            config,
+            consecutive_failures: 0,
+            opened_at: None,
+            half_open_probe_in_flight: false,
+            clock: Arc::new(clock),
+        }
+    }
+
+    /// Returns the current circuit state without mutating probe state.
+    #[must_use]
+    pub fn state(&self) -> CircuitState {
+        match self.opened_at {
+            None => CircuitState::Closed,
+            Some(opened) => {
+                if self.half_open_probe_in_flight
+                    || (self.clock)().saturating_duration_since(opened) >= self.config.cooldown
+                {
+                    CircuitState::HalfOpen
+                } else {
+                    CircuitState::Open
+                }
+            }
+        }
+    }
+
+    /// Checks whether a request to `endpoint` may proceed.
+    ///
+    /// Transitions from `Open` to `HalfOpen` once the cooldown has elapsed and
+    /// admits a single probe request. Concurrent requests while a probe is in
+    /// flight (or before the cooldown expires) fail fast with
+    /// [`AppError::CircuitOpen`].
+    pub fn allow_request(&mut self, endpoint: &str) -> AppResult<CircuitState> {
+        let Some(opened) = self.opened_at else {
+            return Ok(CircuitState::Closed);
+        };
+
+        let elapsed = (self.clock)().saturating_duration_since(opened);
+        if elapsed >= self.config.cooldown && !self.half_open_probe_in_flight {
+            self.half_open_probe_in_flight = true;
+            tracing::debug!(
+                endpoint,
+                state = ?CircuitState::HalfOpen,
+                "RPC circuit breaker entering half-open recovery probe"
+            );
+            return Ok(CircuitState::HalfOpen);
+        }
+
+        tracing::debug!(
+            endpoint,
+            state = ?CircuitState::Open,
+            "RPC circuit breaker is open; skipping endpoint"
+        );
+        Err(AppError::CircuitOpen {
+            endpoint: endpoint.to_string(),
+        })
+    }
+
+    /// Records a successful response from `endpoint`, closing the circuit and
+    /// resetting failure counters.
+    pub fn record_success(&mut self, endpoint: &str) {
+        let was_unhealthy = self.opened_at.is_some() || self.consecutive_failures > 0;
+        self.consecutive_failures = 0;
+        self.opened_at = None;
+        self.half_open_probe_in_flight = false;
+        if was_unhealthy {
+            tracing::debug!(
+                endpoint,
+                state = ?CircuitState::Closed,
+                "RPC circuit breaker closed after healthy response"
+            );
+        }
+    }
+
+    /// Records an error from `endpoint`.
+    ///
+    /// Only transport and gateway failures count toward opening the circuit;
+    /// application-level RPC or simulation errors never trip the circuit, and
+    /// if a half-open probe receives a valid HTTP JSON-RPC error response, the
+    /// transport is considered recovered and the circuit closes.
+    pub fn record_error(&mut self, endpoint: &str, error: &AppError) {
+        if is_circuit_failure(error) {
+            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            let was_probe = self.half_open_probe_in_flight;
+            self.half_open_probe_in_flight = false;
+            let threshold = self.config.failure_threshold.max(1);
+            if was_probe || self.consecutive_failures >= threshold {
+                self.opened_at = Some((self.clock)());
+                tracing::debug!(
+                    endpoint,
+                    state = ?CircuitState::Open,
+                    consecutive_failures = self.consecutive_failures,
+                    "RPC circuit breaker opened"
+                );
+            }
+        } else if self.half_open_probe_in_flight {
+            // An application-level JSON-RPC response proves the endpoint's
+            // transport recovered.
+            self.record_success(endpoint);
+        }
+    }
+}
+
+/// Returns `true` when `error` represents an endpoint transport or gateway
+/// failure that should count toward tripping the circuit breaker.
+fn is_circuit_failure(error: &AppError) -> bool {
+    match error {
+        AppError::Http(e) => e.is_connect() || e.is_timeout() || e.is_request(),
+        AppError::ConnectTimeout { .. } | AppError::RpcUnavailable { .. } => true,
+        AppError::HttpStatus { status, .. } => matches!(status, 500 | 502 | 503 | 504),
+        _ => false,
+    }
+}
 
 /// Default number of retries performed on transient RPC failures when the
 /// caller does not specify a value.
@@ -315,5 +498,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn circuit_breaker_transitions_closed_open_half_open_closed_with_injected_clock() {
+        use super::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
+        use std::sync::{Arc, Mutex};
+        use std::time::Instant;
+
+        let base = Instant::now();
+        let offset = Arc::new(Mutex::new(Duration::ZERO));
+        let clock_offset = Arc::clone(&offset);
+        let mut breaker = CircuitBreaker::with_clock(
+            CircuitBreakerConfig::new(2, Duration::from_secs(30)),
+            move || base + *clock_offset.lock().expect("clock lock"),
+        );
+
+        let endpoint = "http://primary.local:8080";
+        assert_eq!(breaker.state(), CircuitState::Closed);
+        assert_eq!(
+            breaker.allow_request(endpoint).expect("closed admits"),
+            CircuitState::Closed
+        );
+
+        // First gateway failure keeps circuit closed (threshold = 2).
+        breaker.record_error(endpoint, &AppError::RpcUnavailable { status: 503 });
+        assert_eq!(breaker.state(), CircuitState::Closed);
+
+        // Application-level RPC errors never count toward opening the circuit.
+        breaker.record_error(
+            endpoint,
+            &AppError::Rpc {
+                status: -32602,
+                message: "invalid params".to_string(),
+            },
+        );
+        assert_eq!(breaker.state(), CircuitState::Closed);
+
+        // Second gateway failure reaches threshold and opens the circuit.
+        breaker.record_error(endpoint, &AppError::RpcUnavailable { status: 502 });
+        assert_eq!(breaker.state(), CircuitState::Open);
+        assert!(matches!(
+            breaker.allow_request(endpoint),
+            Err(AppError::CircuitOpen { .. })
+        ));
+
+        // Before cooldown expires (29s < 30s), requests still fail fast.
+        *offset.lock().expect("clock lock") = Duration::from_secs(29);
+        assert_eq!(breaker.state(), CircuitState::Open);
+        assert!(matches!(
+            breaker.allow_request(endpoint),
+            Err(AppError::CircuitOpen { .. })
+        ));
+
+        // Once cooldown elapses (30s), circuit reports HalfOpen and admits one probe.
+        *offset.lock().expect("clock lock") = Duration::from_secs(30);
+        assert_eq!(breaker.state(), CircuitState::HalfOpen);
+        assert_eq!(
+            breaker
+                .allow_request(endpoint)
+                .expect("half-open admits probe"),
+            CircuitState::HalfOpen
+        );
+        // While probe is in flight, a second concurrent caller is rejected.
+        assert!(matches!(
+            breaker.allow_request(endpoint),
+            Err(AppError::CircuitOpen { .. })
+        ));
+
+        // If the half-open probe fails with a gateway error, circuit re-opens immediately.
+        breaker.record_error(endpoint, &AppError::RpcUnavailable { status: 504 });
+        assert_eq!(breaker.state(), CircuitState::Open);
+        assert!(matches!(
+            breaker.allow_request(endpoint),
+            Err(AppError::CircuitOpen { .. })
+        ));
+
+        // Advance another 30s cooldown, admit probe, and record success to close circuit.
+        *offset.lock().expect("clock lock") = Duration::from_secs(60);
+        assert_eq!(
+            breaker
+                .allow_request(endpoint)
+                .expect("second probe admitted"),
+            CircuitState::HalfOpen
+        );
+        breaker.record_success(endpoint);
+        assert_eq!(breaker.state(), CircuitState::Closed);
+        assert_eq!(
+            breaker.allow_request(endpoint).expect("closed admits"),
+            CircuitState::Closed
+        );
     }
 }

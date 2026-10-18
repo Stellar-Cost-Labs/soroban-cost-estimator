@@ -41,6 +41,14 @@ pub enum AppError {
     #[error("RPC endpoint temporarily unavailable (HTTP {status})")]
     RpcUnavailable { status: u16 },
 
+    /// The endpoint's circuit breaker is open due to repeated transport or
+    /// gateway failures. Treated as a failover trigger when a fallback URL is
+    /// configured.
+    #[error(
+        "RPC circuit breaker is open for endpoint {endpoint}: temporarily skipping unhealthy host"
+    )]
+    CircuitOpen { endpoint: String },
+
     #[error("failed to send HTTP request: {0}")]
     Http(#[from] reqwest::Error),
 
@@ -201,6 +209,9 @@ mod tests {
             AppError::Rpc {
                 status: -32000,
                 message: "boom".to_string(),
+            },
+            AppError::CircuitOpen {
+                endpoint: "http://127.0.0.1:8080".to_string(),
             },
             AppError::InvalidHeader("missing '=' separator".to_string()),
             AppError::WsConnect("wss://host/ws: refused".to_string()),

@@ -12,7 +12,9 @@ use tokio::sync::{Mutex, Notify};
 use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
-use crate::rpc::retry::{DEFAULT_MAX_RETRIES, with_retry};
+use crate::rpc::retry::{
+    CircuitBreaker, CircuitBreakerConfig, CircuitState, DEFAULT_MAX_RETRIES, with_retry,
+};
 
 /// Default per-request HTTP timeout applied to every RPC call. Matches the
 /// CLI's `--timeout` default (30 seconds).
@@ -196,6 +198,10 @@ pub struct RpcClient {
     pub headers: HeaderMap,
     /// Whether to print verbose RPC request/response diagnostics to stderr.
     pub verbose: bool,
+    /// Optional circuit breaker tracking health of the primary endpoint.
+    primary_circuit: Option<Arc<Mutex<CircuitBreaker>>>,
+    /// Optional circuit breaker tracking health of the fallback endpoint independently.
+    fallback_circuit: Option<Arc<Mutex<CircuitBreaker>>>,
 }
 
 impl RpcClient {
@@ -441,7 +447,53 @@ impl RpcClient {
             connect_timeout,
             headers,
             verbose,
+            primary_circuit: None,
+            fallback_circuit: None,
         }
+    }
+
+    /// Enables optional circuit breaking with `config` for the primary and
+    /// (when configured) fallback endpoints independently.
+    #[must_use]
+    pub fn with_circuit_breaker(mut self, config: CircuitBreakerConfig) -> Self {
+        self.primary_circuit = Some(Arc::new(Mutex::new(CircuitBreaker::new(config))));
+        self.fallback_circuit = self
+            .fallback_url
+            .as_ref()
+            .map(|_| Arc::new(Mutex::new(CircuitBreaker::new(config))));
+        self
+    }
+
+    /// Enables optional circuit breaking with `config` and an injected
+    /// monotonic `clock` for deterministic testing.
+    #[must_use]
+    pub fn with_circuit_breaker_clock<C>(mut self, config: CircuitBreakerConfig, clock: C) -> Self
+    where
+        C: Fn() -> std::time::Instant + Send + Sync + Clone + 'static,
+    {
+        self.primary_circuit = Some(Arc::new(Mutex::new(CircuitBreaker::with_clock(
+            config,
+            clock.clone(),
+        ))));
+        self.fallback_circuit = self
+            .fallback_url
+            .as_ref()
+            .map(|_| Arc::new(Mutex::new(CircuitBreaker::with_clock(config, clock))));
+        self
+    }
+
+    /// Returns the current circuit state of the primary endpoint, if circuit
+    /// breaking is enabled.
+    pub async fn primary_circuit_state(&self) -> Option<CircuitState> {
+        let circuit = self.primary_circuit.as_ref()?;
+        Some(circuit.lock().await.state())
+    }
+
+    /// Returns the current circuit state of the fallback endpoint, if both a
+    /// fallback URL and circuit breaking are enabled.
+    pub async fn fallback_circuit_state(&self) -> Option<CircuitState> {
+        let circuit = self.fallback_circuit.as_ref()?;
+        Some(circuit.lock().await.state())
     }
 
     /// Returns the custom HTTP headers configured for this client.
@@ -630,7 +682,13 @@ impl RpcClient {
             "sending RPC request"
         );
         match self
-            .post_and_parse(method, &body, &self.url, self.connect_timeout)
+            .post_and_parse(
+                method,
+                &body,
+                &self.url,
+                self.connect_timeout,
+                self.primary_circuit.as_ref(),
+            )
             .await
         {
             Ok(result) => Ok(result),
@@ -646,8 +704,14 @@ impl RpcClient {
                         error = %e,
                         "primary RPC endpoint failed — failing over to fallback"
                     );
-                    self.post_and_parse(method, &body, fallback, self.connect_timeout)
-                        .await
+                    self.post_and_parse(
+                        method,
+                        &body,
+                        fallback,
+                        self.connect_timeout,
+                        self.fallback_circuit.as_ref(),
+                    )
+                    .await
                 } else {
                     Err(e)
                 }
@@ -660,10 +724,10 @@ impl RpcClient {
     /// configured fallback endpoint.
     ///
     /// This covers transport-level failures (connection refused, timeout,
-    /// DNS failure, ...) and transient gateway statuses (HTTP 502/503/504).
-    /// RPC-level errors returned inside a successful HTTP response — bad
-    /// method, invalid params — are **not** failover triggers: they would
-    /// fail identically on the fallback.
+    /// DNS failure, ...), an open primary circuit breaker, and transient
+    /// gateway statuses (HTTP 502/503/504). RPC-level errors returned inside
+    /// a successful HTTP response — bad method, invalid params — are **not**
+    /// failover triggers: they would fail identically on the fallback.
     fn is_failover_trigger(error: &AppError) -> bool {
         match error {
             AppError::Http(e) => {
@@ -671,7 +735,9 @@ impl RpcClient {
                 // are the cases where a fallback endpoint might succeed.
                 e.is_connect() || e.is_timeout() || e.is_request()
             }
-            AppError::ConnectTimeout { .. } | AppError::RpcUnavailable { .. } => true,
+            AppError::ConnectTimeout { .. }
+            | AppError::RpcUnavailable { .. }
+            | AppError::CircuitOpen { .. } => true,
             // Transient gateway statuses surfaced as HttpStatus (502/503/504)
             // are also failover triggers; other HttpStatus values (429/500 or
             // deterministic 4xx) are not — 429/500 are retried but not failed
@@ -681,9 +747,37 @@ impl RpcClient {
         }
     }
 
-    /// POST `body` to `url` (with retries), parse the JSON-RPC response, and
-    /// extract the raw `result` value.
+    /// POST `body` to `url` (with retries and optional circuit breaking), parse
+    /// the JSON-RPC response, and extract the raw `result` value.
     async fn post_and_parse(
+        &self,
+        method: &str,
+        body: &Value,
+        url: &str,
+        connect_timeout: Duration,
+        circuit: Option<&Arc<Mutex<CircuitBreaker>>>,
+    ) -> AppResult<Value> {
+        if let Some(breaker) = circuit {
+            breaker.lock().await.allow_request(url)?;
+        }
+
+        let outcome = self
+            .post_and_parse_inner(method, body, url, connect_timeout)
+            .await;
+
+        if let Some(breaker) = circuit {
+            let mut guard = breaker.lock().await;
+            match &outcome {
+                Ok(_) => guard.record_success(url),
+                Err(err) => guard.record_error(url, err),
+            }
+        }
+
+        outcome
+    }
+
+    /// Performs the HTTP POST and response parsing for [`Self::post_and_parse`].
+    async fn post_and_parse_inner(
         &self,
         method: &str,
         body: &Value,
