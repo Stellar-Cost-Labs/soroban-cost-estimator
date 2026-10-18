@@ -61,6 +61,33 @@ where
     }
 }
 
+/// Generic retry helper with configurable `max_retries` and exponential
+/// `base_delay` (`base_delay * 2^attempt`) over any error type `E`.
+pub async fn with_retry_backoff<F, Fut, T, E>(
+    max_retries: u32,
+    base_delay: Duration,
+    mut op: F,
+) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    let mut attempt = 0u32;
+    loop {
+        match op().await {
+            Ok(val) => return Ok(val),
+            Err(err) => {
+                if attempt >= max_retries {
+                    return Err(err);
+                }
+                let delay = base_delay.saturating_mul(1u32 << attempt.min(16));
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
 /// Returns `true` when `error` represents a transient failure worth retrying.
 ///
 /// Retryable transport failures are connection/timeout/request errors; an
@@ -315,5 +342,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn generic_with_retry_backoff_retries_and_succeeds() {
+        use super::with_retry_backoff;
+
+        let calls = AtomicUsize::new(0);
+        let res: Result<u32, &'static str> =
+            with_retry_backoff(3, Duration::from_millis(1), || {
+                let calls = &calls;
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                        Err("transient")
+                    } else {
+                        Ok(42)
+                    }
+                }
+            })
+            .await;
+        assert_eq!(res, Ok(42));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 }
