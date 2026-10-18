@@ -4475,3 +4475,95 @@ fn test_config_snapshot_diff_makes_no_network_calls() {
         "offline diff must not resolve a network; got: {stderr}"
     );
 }
+
+#[test]
+fn test_watch_graceful_shutdown_on_sigint() {
+    use std::io::{BufRead, BufReader};
+
+    let home = temp_home("watch-sigint-shutdown");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "--timeout",
+            "1",
+            "--connect-timeout",
+            "1",
+            "--max-retries",
+            "0",
+            "watch",
+            "--network",
+            "testnet",
+            "--interval",
+            "1h",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn watch subprocess");
+
+    let stdout = child.stdout.take().expect("capture child stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut first_line = String::new();
+    reader
+        .read_line(&mut first_line)
+        .expect("read initial watch banner line");
+    assert!(
+        first_line.contains("Watching testnet for config changes"),
+        "expected initial watch poll banner, got: {first_line}"
+    );
+
+    #[cfg(unix)]
+    {
+        let pid = child.id().to_string();
+        let kill_status = Command::new("kill")
+            .args(["-s", "INT", &pid])
+            .status()
+            .expect("send SIGINT to watch process");
+        assert!(kill_status.success(), "kill -s INT must succeed");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut exit_status = None;
+        while std::time::Instant::now() < deadline {
+            if let Some(status) = child.try_wait().expect("poll watch child status") {
+                exit_status = Some(status);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let status = exit_status.unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("watch process did not terminate within 2 seconds after SIGINT");
+        });
+        assert!(
+            status.success(),
+            "watch must exit cleanly with status 0 on SIGINT, got: {status:?}"
+        );
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    // Verify no corrupted or partial snapshot files remain on disk.
+    let snapshots_dir = home.join(".soroban-cost-estimator").join("snapshots");
+    if snapshots_dir.exists() {
+        for entry in std::fs::read_dir(&snapshots_dir).expect("read snapshots dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                let validation =
+                    soroban_cost_estimator::config_snapshot::store::validate_snapshot_file(&path);
+                assert!(
+                    validation.valid,
+                    "snapshot file {} should not be corrupted after watch shutdown: {:?}",
+                    path.display(),
+                    validation.error
+                );
+            }
+        }
+    }
+}
