@@ -4922,6 +4922,23 @@ async fn handle_cache_action(
             quiet,
         ),
         cli::CacheAction::Stats { json } => cmd_cache_stats(json, quiet),
+        cli::CacheAction::Backup { out } => {
+            let count = cache::backup_cache_db(&out)?;
+            if !quiet {
+                println!("Backed up {count} cached estimate(s) to {}.", out.display());
+            }
+            Ok(())
+        }
+        cli::CacheAction::Restore { path } => {
+            let count = cache::restore_cache_db(&path)?;
+            if !quiet {
+                println!(
+                    "Restored {count} cached estimate(s) from {}.",
+                    path.display()
+                );
+            }
+            Ok(())
+        }
     }
 }
 

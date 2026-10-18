@@ -483,6 +483,20 @@ pub enum CacheAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Create a transactionally consistent online SQLite backup of the estimate cache.
+    Backup {
+        /// Destination file path for the SQLite backup.
+        #[arg(long, short, value_name = "PATH")]
+        out: PathBuf,
+    },
+
+    /// Validate and transactionally restore a SQLite backup into the active estimate cache.
+    Restore {
+        /// Source SQLite backup file path to restore from.
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+    },
 }
 
 /// Sub-actions under `config snapshot` that operate on snapshots already on
