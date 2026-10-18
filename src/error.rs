@@ -70,6 +70,11 @@ pub enum AppError {
         source: reqwest::Error,
     },
 
+    /// An RPC operation exceeded its overall deadline across retries, backoff,
+    /// and fallback endpoints.
+    #[error("RPC operation timed out: exceeded overall deadline of {timeout_ms} ms")]
+    TotalTimeout { timeout_ms: u64 },
+
     // ── WebSocket ────────────────────────────────────────────────
     #[error("failed to open WebSocket connection: {0}")]
     WsConnect(String),
@@ -224,6 +229,7 @@ mod tests {
                 status: -32000,
                 message: "boom".to_string(),
             },
+            AppError::TotalTimeout { timeout_ms: 1500 },
             AppError::InvalidHeader("missing '=' separator".to_string()),
             AppError::WsConnect("wss://host/ws: refused".to_string()),
             AppError::WsProtocol("malformed RPC message".to_string()),
