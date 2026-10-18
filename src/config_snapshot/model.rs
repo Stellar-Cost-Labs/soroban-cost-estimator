@@ -62,6 +62,22 @@ pub struct ConfigSnapshot {
     pub state_archival: Option<StateArchivalV0>,
 }
 
+impl ConfigSnapshot {
+    /// Returns `true` when `self` and `other` belong to the same network and
+    /// have identical normalized configuration values and protocol metadata,
+    /// ignoring capture `timestamp` and `ledger` sequence.
+    pub fn has_same_normalized_config(&self, other: &Self) -> bool {
+        self.network == other.network
+            && self.protocol_version == other.protocol_version
+            && self.contract_compute == other.contract_compute
+            && self.contract_ledger_cost == other.contract_ledger_cost
+            && self.contract_historical_data == other.contract_historical_data
+            && self.contract_events == other.contract_events
+            && self.contract_bandwidth == other.contract_bandwidth
+            && self.state_archival == other.state_archival
+    }
+}
+
 /// ConfigSettingContractComputeV0
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContractComputeV0 {

@@ -441,6 +441,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 out,
                 json,
                 retain,
+                skip_unchanged,
             } => match action {
                 // A subcommand manages snapshots already on disk, so it cannot
                 // be combined with this command's fetching flags (enforced by
@@ -491,6 +492,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                         out.as_deref(),
                         format,
                         retain,
+                        skip_unchanged,
                         rps,
                         timeout,
                         connect_timeout,
@@ -3650,12 +3652,16 @@ fn prune_output<'a>(
 /// With `--retain <N>`, a retention pass runs *after* the new snapshot is
 /// safely on disk, so a failed fetch or write never costs the user the older
 /// snapshots it would have pruned.
+/// Exit status: `0` whether the snapshot was written to disk or skipped as
+/// unchanged via `--skip-unchanged`.
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 async fn cmd_config_snapshot(
     network: &str,
     rpc_fallback_url: Option<&str>,
     out_path: Option<&str>,
     format: cli::OutputFormat,
     retain: Option<usize>,
+    skip_unchanged: bool,
     rps: Option<u64>,
     timeout: u64,
     connect_timeout: u64,
@@ -3682,44 +3688,80 @@ async fn cmd_config_snapshot(
         )
         .await?;
 
-        let path = config_snapshot::store::save_snapshot(&snapshot, out_path)?;
-        info!(path = %path.display(), ledger = snapshot.ledger, "snapshot saved");
+        let outcome =
+            config_snapshot::store::save_snapshot_if_changed(&snapshot, out_path, skip_unchanged)?;
+        let path = outcome.path();
+        if outcome.is_saved() {
+            info!(path = %path.display(), ledger = snapshot.ledger, "snapshot saved");
+        } else {
+            info!(
+                latest = %path.display(),
+                ledger = snapshot.ledger,
+                "snapshot skipped: configuration unchanged since latest snapshot"
+            );
+        }
 
         // Retention runs *after* the save, so a failed fetch or write never
         // costs the older snapshots it would have pruned. It manages the
         // snapshots directory, so a snapshot redirected with `--out` lives
         // elsewhere and is neither counted nor deleted here.
-        let pruned = match retain {
-            Some(count) => config_snapshot::store::prune_snapshots(network, Some(count), None)?,
-            None => Vec::new(),
+        let pruned = match (retain, outcome.is_saved()) {
+            (Some(count), true) => {
+                config_snapshot::store::prune_snapshots(network, Some(count), None)?
+            }
+            _ => Vec::new(),
         };
 
         if format == cli::OutputFormat::Json {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
             return Ok(());
         }
-        if !quiet {
-            println!("Config snapshot saved to: {}", path.display());
-            println!("Network: {}", snapshot.network);
-            println!("Ledger:  {}", snapshot.ledger);
-            println!("Time:    {}", snapshot.timestamp);
-        }
         if format == cli::OutputFormat::Csv {
-            println!("network,ledger,timestamp,path");
-            println!("{},{},{},{}", snapshot.network, snapshot.ledger, snapshot.timestamp, path.display());
+            println!("network,ledger,timestamp,path,saved");
+            println!(
+                "{},{},{},{},{}",
+                snapshot.network,
+                snapshot.ledger,
+                snapshot.timestamp,
+                path.display(),
+                outcome.is_saved()
+            );
             return Ok(());
         }
         if format == cli::OutputFormat::Markdown {
-            println!("# Config Snapshot\n\n| Field | Value |\n| --- | --- |\n| Network | {} |\n| Ledger | {} |\n| Timestamp | {} |\n| Path | `{}` |", snapshot.network, snapshot.ledger, snapshot.timestamp, path.display());
+            println!(
+                "# Config Snapshot\n\n| Field | Value |\n| --- | --- |\n| Network | {} |\n| Ledger | {} |\n| Timestamp | {} |\n| Saved | {} |\n| Path | `{}` |",
+                snapshot.network,
+                snapshot.ledger,
+                snapshot.timestamp,
+                outcome.is_saved(),
+                path.display()
+            );
             return Ok(());
         }
-        println!("Config snapshot saved to: {}", path.display());
-        println!("Network: {}", snapshot.network);
-        println!("Ledger:  {}", snapshot.ledger);
-        println!("Time:    {}", snapshot.timestamp);
-        if retain.is_some() {
-            println!("{}", retention_summary(network, retain, None, &pruned));
-            print_pruned_paths(&pruned);
+        if !quiet {
+            match &outcome {
+                config_snapshot::store::SnapshotSaveOutcome::Saved { path } => {
+                    println!("Config snapshot saved to: {}", path.display());
+                }
+                config_snapshot::store::SnapshotSaveOutcome::SkippedUnchanged {
+                    latest_path,
+                    latest_timestamp,
+                    latest_ledger,
+                } => {
+                    println!(
+                        "Config unchanged since {latest_timestamp} (ledger {latest_ledger}); skipped writing new snapshot (retained {}).",
+                        latest_path.display()
+                    );
+                }
+            }
+            println!("Network: {}", snapshot.network);
+            println!("Ledger:  {}", snapshot.ledger);
+            println!("Time:    {}", snapshot.timestamp);
+            if retain.is_some() && outcome.is_saved() {
+                println!("{}", retention_summary(network, retain, None, &pruned));
+                print_pruned_paths(&pruned);
+            }
         }
         Ok(())
     }

@@ -595,6 +595,12 @@ pub enum ConfigAction {
         /// older ones once the new snapshot is safely on disk.
         #[arg(long, value_name = "COUNT")]
         retain: Option<usize>,
+
+        /// Skip writing a new snapshot file when normalized config values and
+        /// protocol metadata are identical to the latest stored snapshot.
+        /// Exits with status 0 whether saved or skipped as unchanged.
+        #[arg(long)]
+        skip_unchanged: bool,
     },
     /// List all saved config snapshots with their timestamp and ledger.
     List {

@@ -23,7 +23,7 @@ fn snapshots_dir() -> AppResult<PathBuf> {
     Ok(dir)
 }
 
-/// Saves a config snapshot to disk as a JSON file.
+///Saves a config snapshot to disk as a JSON file.
 ///
 /// The filename is `{network}-{timestamp}.json` within the snapshots directory,
 /// unless an explicit `--out` path is provided.
@@ -31,10 +31,20 @@ fn snapshots_dir() -> AppResult<PathBuf> {
 /// # Network calls
 /// None — pure file I/O.
 pub fn save_snapshot(snapshot: &ConfigSnapshot, out_path: Option<&str>) -> AppResult<PathBuf> {
+    let dir = snapshots_dir()?;
+    save_snapshot_in(&dir, snapshot, out_path)
+}
+
+/// Saves a config snapshot into `dir` (or to `out_path` when supplied).
+pub fn save_snapshot_in(
+    dir: &Path,
+    snapshot: &ConfigSnapshot,
+    out_path: Option<&str>,
+) -> AppResult<PathBuf> {
     let path = match out_path {
         Some(p) => PathBuf::from(p),
         None => {
-            let dir = snapshots_dir()?;
+            std::fs::create_dir_all(dir)?;
             let filename = format!(
                 "{}-{}.json",
                 snapshot.network,
@@ -48,6 +58,87 @@ pub fn save_snapshot(snapshot: &ConfigSnapshot, out_path: Option<&str>) -> AppRe
     std::fs::write(&path, json)?;
     debug!(path = %path.display(), network = snapshot.network, ledger = snapshot.ledger, "snapshot saved");
     Ok(path)
+}
+
+/// Exit code (`0`) returned by `config snapshot` whether a new file was written
+/// or skipped via `--skip-unchanged`, so scheduled jobs do not treat an
+/// unchanged network configuration as a failure.
+pub const SNAPSHOT_EXIT_CODE_OK: i32 = 0;
+
+/// Result of attempting to save a snapshot when `--skip-unchanged` may be active.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SnapshotSaveOutcome {
+    /// A new snapshot file was written to disk.
+    Saved { path: PathBuf },
+    /// The snapshot's normalized configuration and protocol metadata matched the
+    /// latest snapshot on disk, so writing a duplicate file was skipped.
+    SkippedUnchanged {
+        latest_path: PathBuf,
+        latest_timestamp: String,
+        latest_ledger: u32,
+    },
+}
+
+impl SnapshotSaveOutcome {
+    pub fn is_saved(&self) -> bool {
+        matches!(self, Self::Saved { .. })
+    }
+
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Saved { path } => path,
+            Self::SkippedUnchanged { latest_path, .. } => latest_path,
+        }
+    }
+
+    pub fn exit_code(&self) -> i32 {
+        SNAPSHOT_EXIT_CODE_OK
+    }
+}
+
+/// Saves `snapshot` to the default snapshots directory unless `skip_unchanged`
+/// is `true` and its normalized configuration matches the latest stored snapshot.
+pub fn save_snapshot_if_changed(
+    snapshot: &ConfigSnapshot,
+    out_path: Option<&str>,
+    skip_unchanged: bool,
+) -> AppResult<SnapshotSaveOutcome> {
+    let dir = snapshots_dir()?;
+    save_snapshot_if_changed_in(&dir, snapshot, out_path, skip_unchanged)
+}
+
+/// Saves `snapshot` into `dir` unless `skip_unchanged` is `true` and its
+/// normalized configuration and protocol metadata match the latest stored
+/// snapshot for `snapshot.network` in `dir`.
+pub fn save_snapshot_if_changed_in(
+    dir: &Path,
+    snapshot: &ConfigSnapshot,
+    out_path: Option<&str>,
+    skip_unchanged: bool,
+) -> AppResult<SnapshotSaveOutcome> {
+    if skip_unchanged && out_path.is_none() && dir.exists() {
+        let existing_paths = list_snapshots_in(dir, &snapshot.network)?;
+        if let Some(latest_path) = existing_paths.into_iter().last() {
+            let latest = load_snapshot_from_path(&latest_path.to_string_lossy())?;
+            if snapshot.has_same_normalized_config(&latest) {
+                debug!(
+                    network = snapshot.network,
+                    latest_path = %latest_path.display(),
+                    latest_ledger = latest.ledger,
+                    "skipping unchanged snapshot"
+                );
+                return Ok(SnapshotSaveOutcome::SkippedUnchanged {
+                    latest_path,
+                    latest_timestamp: latest.timestamp,
+                    latest_ledger: latest.ledger,
+                });
+            }
+        }
+    }
+
+    let path = save_snapshot_in(dir, snapshot, out_path)?;
+    Ok(SnapshotSaveOutcome::Saved { path })
 }
 
 /// Loads the most recent snapshot for a given network.
