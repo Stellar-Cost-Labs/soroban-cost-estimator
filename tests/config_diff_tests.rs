@@ -1345,3 +1345,62 @@ fn test_format_diff_markdown_no_changes() {
     assert!(md.contains("✅ No changes detected."));
     assert!(!md.contains("| Setting |"));
 }
+
+#[test]
+fn test_json_diff_includes_units_and_pricing_classification_for_representative_settings() {
+    let old = full_snapshot();
+    let mut new = full_snapshot();
+
+    if let Some(compute) = &mut new.contract_compute {
+        compute.fee_rate_per_instructions_increment += 25;
+        compute.tx_max_instructions += 50_000;
+    }
+    if let Some(archival) = &mut new.state_archival {
+        archival.persistent_rent_rate_denominator += 100;
+        archival.max_entry_ttl += 1_000;
+    }
+
+    let diff_res = diff::diff_snapshots(&old, &new);
+    let json = serde_json::to_value(&diff_res).expect("serialize diff to JSON");
+    let changes = json["changes"].as_array().expect("changes array");
+    assert_eq!(changes.len(), 4);
+
+    let find_change = |path: &str| -> &serde_json::Value {
+        changes
+            .iter()
+            .find(|c| c["field_path"] == path)
+            .expect("change present")
+    };
+
+    let fee_rate = find_change("contract_compute.fee_rate_per_instructions_increment");
+    assert_eq!(fee_rate["unit"], "stroops per 10,000 CPU instructions");
+    assert_eq!(fee_rate["pricing_classification"], "pricing");
+    assert_eq!(fee_rate["is_pricing_change"], true);
+
+    let limit = find_change("contract_compute.tx_max_instructions");
+    assert_eq!(limit["unit"], "instructions");
+    assert_eq!(limit["pricing_classification"], "non_pricing");
+    assert_eq!(limit["is_pricing_change"], false);
+
+    let archival_rent = find_change("state_archival.persistent_rent_rate_denominator");
+    assert_eq!(archival_rent["unit"], "fractional fee scaling");
+    assert_eq!(archival_rent["pricing_classification"], "pricing");
+    assert_eq!(archival_rent["is_pricing_change"], true);
+
+    let archival_ttl = find_change("state_archival.max_entry_ttl");
+    assert_eq!(archival_ttl["unit"], "ledgers");
+    assert_eq!(archival_ttl["pricing_classification"], "non_pricing");
+    assert_eq!(archival_ttl["is_pricing_change"], false);
+
+    // Unknown and section-level metadata use null unit and explicit unknown classification
+    let unknown_change = diff::FieldDiff::new(
+        "future_section.experimental_field",
+        "1".to_string(),
+        "2".to_string(),
+        false,
+        None,
+    );
+    let unknown_json = serde_json::to_value(&unknown_change).expect("serialize unknown change");
+    assert!(unknown_json["unit"].is_null());
+    assert_eq!(unknown_json["pricing_classification"], "unknown");
+}

@@ -1,7 +1,8 @@
 use crate::config_snapshot::model::{
     ConfigSnapshot, ContractBandwidthV0, ContractComputeV0, ContractEventsV0,
-    ContractHistoricalDataV0, ContractLedgerCostV0, StateArchivalV0, config_setting_human_name,
-    config_setting_id_for_prefix,
+    ContractHistoricalDataV0, ContractLedgerCostV0, PricingClassification, StateArchivalV0,
+    config_setting_human_name, config_setting_id_for_prefix, setting_pricing_classification,
+    setting_unit_description,
 };
 
 /// Returns a human-readable explanation for a given config setting field path.
@@ -168,7 +169,7 @@ pub fn field_display_name(field_path: &str) -> String {
 }
 
 /// A single changed field between two snapshots.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FieldDiff {
     pub field_path: String,
     /// Raw `ConfigSettingId` number (e.g. `0` for contract compute), or
@@ -182,11 +183,42 @@ pub struct FieldDiff {
     pub explanation: Option<&'static str>,
 }
 
+impl serde::Serialize for FieldDiff {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("FieldDiff", 9)?;
+        s.serialize_field("field_path", &self.field_path)?;
+        s.serialize_field("setting_id", &self.setting_id)?;
+        s.serialize_field("setting_name", &self.setting_name)?;
+        s.serialize_field("old_value", &self.old_value)?;
+        s.serialize_field("new_value", &self.new_value)?;
+        s.serialize_field("is_pricing_change", &self.is_pricing_change)?;
+        s.serialize_field("pricing_classification", &self.pricing_classification())?;
+        s.serialize_field("unit", &self.unit())?;
+        s.serialize_field("explanation", &self.explanation)?;
+        s.end()
+    }
+}
+
 impl FieldDiff {
-    /// Builds one change entry, deriving the raw setting id and the
-    /// friendly setting name from `field_path` so `--json` output carries
-    /// both alongside the machine path and always matches the table text.
-    fn new(
+    /// Returns the measurement unit for this setting path, or `None` when unknown.
+    pub fn unit(&self) -> Option<&'static str> {
+        setting_unit_description(&self.field_path)
+    }
+
+    /// Returns the centralized pricing classification (`pricing`, `non_pricing`, or `unknown`).
+    pub fn pricing_classification(&self) -> PricingClassification {
+        setting_pricing_classification(&self.field_path)
+    }
+
+    /// Builds one change entry, deriving the raw setting id, friendly setting
+    /// name, unit, and pricing classification from `field_path` so `--json`
+    /// output carries all metadata alongside the machine path and always
+    /// matches the table text.
+    pub fn new(
         field_path: &str,
         old_value: String,
         new_value: String,
@@ -199,6 +231,12 @@ impl FieldDiff {
         let setting_name = match id {
             Some(id) => config_setting_human_name(&id).to_string(),
             None => field_path.to_string(),
+        };
+        let pricing_classification = setting_pricing_classification(field_path);
+        let is_pricing_change = match pricing_classification {
+            PricingClassification::Pricing => true,
+            PricingClassification::NonPricing => false,
+            PricingClassification::Unknown => is_pricing_change,
         };
         Self {
             field_path: field_path.to_string(),

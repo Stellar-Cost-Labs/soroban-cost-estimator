@@ -127,11 +127,103 @@ pub struct StateArchivalV0 {
     pub starting_eviction_scan_level: u32,
 }
 
+/// Classification of whether a configuration setting directly affects Soroban pricing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PricingClassification {
+    /// Directly determines transaction or state-rent fees.
+    Pricing,
+    /// Resource limit or operational archival parameter that does not directly set fees.
+    NonPricing,
+    /// Unrecognized setting path whose pricing semantics are unknown.
+    Unknown,
+}
+
+impl PricingClassification {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pricing => "pricing",
+            Self::NonPricing => "non_pricing",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn is_pricing(&self) -> bool {
+        matches!(self, Self::Pricing)
+    }
+}
+
+/// Centralized pricing classification for a snapshot setting field path.
+pub fn setting_pricing_classification(field_path: &str) -> PricingClassification {
+    match field_path {
+        "contract_compute"
+        | "contract_ledger_cost"
+        | "contract_historical_data"
+        | "contract_events"
+        | "contract_bandwidth"
+        | "state_archival"
+        | "contract_compute.fee_rate_per_instructions_increment"
+        | "contract_ledger_cost.fee_disk_read_ledger_entry"
+        | "contract_ledger_cost.fee_write_ledger_entry"
+        | "contract_ledger_cost.fee_disk_read1_kb"
+        | "contract_ledger_cost.rent_fee1_kb_soroban_state_size_low"
+        | "contract_ledger_cost.rent_fee1_kb_soroban_state_size_high"
+        | "contract_historical_data.fee_historical1_kb"
+        | "contract_events.fee_contract_events1_kb"
+        | "contract_bandwidth.fee_tx_size1_kb"
+        | "state_archival.persistent_rent_rate_denominator"
+        | "state_archival.temp_rent_rate_denominator" => PricingClassification::Pricing,
+        "contract_compute.ledger_max_instructions"
+        | "contract_compute.tx_max_instructions"
+        | "contract_compute.tx_memory_limit"
+        | "contract_ledger_cost.ledger_max_disk_read_entries"
+        | "contract_ledger_cost.ledger_max_disk_read_bytes"
+        | "contract_ledger_cost.ledger_max_write_ledger_entries"
+        | "contract_ledger_cost.ledger_max_write_bytes"
+        | "contract_ledger_cost.tx_max_disk_read_entries"
+        | "contract_ledger_cost.tx_max_disk_read_bytes"
+        | "contract_ledger_cost.tx_max_write_ledger_entries"
+        | "contract_ledger_cost.tx_max_write_bytes"
+        | "contract_ledger_cost.soroban_state_target_size_bytes"
+        | "contract_ledger_cost.soroban_state_rent_fee_growth_factor"
+        | "contract_events.tx_max_contract_events_size_bytes"
+        | "contract_bandwidth.ledger_max_txs_size_bytes"
+        | "contract_bandwidth.tx_max_size_bytes"
+        | "state_archival.max_entry_ttl"
+        | "state_archival.min_temporary_ttl"
+        | "state_archival.min_persistent_ttl"
+        | "state_archival.max_entries_to_archive"
+        | "state_archival.live_soroban_state_size_window_sample_size"
+        | "state_archival.live_soroban_state_size_window_sample_period"
+        | "state_archival.eviction_scan_size"
+        | "state_archival.starting_eviction_scan_level" => PricingClassification::NonPricing,
+        _ => PricingClassification::Unknown,
+    }
+}
+
 pub fn setting_unit_description(field_path: &str) -> Option<&'static str> {
     match field_path {
         "contract_compute.fee_rate_per_instructions_increment" => {
             Some("stroops per 10,000 CPU instructions")
         }
+        "contract_compute.ledger_max_instructions" | "contract_compute.tx_max_instructions" => {
+            Some("instructions")
+        }
+        "contract_compute.tx_memory_limit"
+        | "contract_ledger_cost.ledger_max_disk_read_bytes"
+        | "contract_ledger_cost.ledger_max_write_bytes"
+        | "contract_ledger_cost.tx_max_disk_read_bytes"
+        | "contract_ledger_cost.tx_max_write_bytes"
+        | "contract_ledger_cost.soroban_state_target_size_bytes"
+        | "contract_events.tx_max_contract_events_size_bytes"
+        | "contract_bandwidth.ledger_max_txs_size_bytes"
+        | "contract_bandwidth.tx_max_size_bytes" => Some("bytes"),
+        "contract_ledger_cost.ledger_max_disk_read_entries"
+        | "contract_ledger_cost.ledger_max_write_ledger_entries"
+        | "contract_ledger_cost.tx_max_disk_read_entries"
+        | "contract_ledger_cost.tx_max_write_ledger_entries"
+        | "state_archival.max_entries_to_archive"
+        | "state_archival.eviction_scan_size" => Some("entries"),
         "contract_ledger_cost.fee_disk_read_ledger_entry"
         | "contract_ledger_cost.fee_write_ledger_entry" => Some("stroops per entry"),
         "contract_ledger_cost.fee_disk_read1_kb"
@@ -140,8 +232,15 @@ pub fn setting_unit_description(field_path: &str) -> Option<&'static str> {
         | "contract_historical_data.fee_historical1_kb"
         | "contract_events.fee_contract_events1_kb"
         | "contract_bandwidth.fee_tx_size1_kb" => Some("stroops per 1KB"),
+        "contract_ledger_cost.soroban_state_rent_fee_growth_factor" => Some("factor"),
         "state_archival.persistent_rent_rate_denominator"
         | "state_archival.temp_rent_rate_denominator" => Some("fractional fee scaling"),
+        "state_archival.max_entry_ttl"
+        | "state_archival.min_temporary_ttl"
+        | "state_archival.min_persistent_ttl"
+        | "state_archival.live_soroban_state_size_window_sample_period" => Some("ledgers"),
+        "state_archival.live_soroban_state_size_window_sample_size" => Some("samples"),
+        "state_archival.starting_eviction_scan_level" => Some("level"),
         _ => None,
     }
 }
