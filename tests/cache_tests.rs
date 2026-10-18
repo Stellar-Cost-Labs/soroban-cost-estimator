@@ -2784,3 +2784,201 @@ fn test_legacy_database_without_io_column_still_loads() {
         );
     });
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Transactional schema migrations (#521)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_schema_migrations_across_all_supported_versions_preserve_estimates_and_indexes() {
+    with_temp_home(|home| {
+        let dir = home.join(".soroban-cost-estimator");
+        std::fs::create_dir_all(&dir).expect("create data dir");
+        let db = dir.join("cache.db");
+
+        // Build a pre-v3 schema database (lacking `last_accessed`, `io_json`,
+        // `estimate_history`, and newer indexes) containing v1, v2, and v3 rows.
+        {
+            let conn = rusqlite::Connection::open(&db).expect("open db");
+            conn.execute_batch(
+                "CREATE TABLE estimates (
+                    version          INTEGER NOT NULL,
+                    wasm_hash        TEXT NOT NULL,
+                    function         TEXT NOT NULL,
+                    args_hash        TEXT NOT NULL,
+                    network          TEXT NOT NULL,
+                    ledger           INTEGER NOT NULL,
+                    total_stroops    INTEGER NOT NULL,
+                    cpu_instructions INTEGER NOT NULL,
+                    memory_bytes     INTEGER NOT NULL,
+                    timestamp        TEXT NOT NULL,
+                    duration_ms      INTEGER,
+                    success          INTEGER NOT NULL DEFAULT 1,
+                    PRIMARY KEY (wasm_hash, function, args_hash)
+                );",
+            )
+            .expect("create legacy v1/v2 table");
+
+            for (ver, fn_name, ledger, stroops, dur) in [
+                (
+                    cache::INITIAL_SCHEMA_VERSION,
+                    "fn_v1",
+                    10u32,
+                    1_000i64,
+                    None::<i64>,
+                ),
+                (
+                    cache::DURATION_SCHEMA_VERSION,
+                    "fn_v2",
+                    20u32,
+                    2_000i64,
+                    Some(45i64),
+                ),
+                (
+                    cache::ACCESS_TRACKING_SCHEMA_VERSION,
+                    "fn_v3",
+                    30u32,
+                    3_000i64,
+                    Some(90i64),
+                ),
+            ] {
+                conn.execute(
+                    "INSERT INTO estimates \
+                     (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, duration_ms, success) \
+                     VALUES (?1, 'hash_mig', ?2, ?3, 'testnet', ?4, ?5, 500, 128, '2026-01-01T00:00:00Z', ?6, 1)",
+                    rusqlite::params![
+                        ver as i64,
+                        fn_name,
+                        args_hash_of(&[]),
+                        ledger as i64,
+                        stroops,
+                        dur,
+                    ],
+                )
+                .expect("insert versioned row");
+            }
+        }
+
+        // Trigger migration by loading each estimate through the production API
+        let e1 = cache::load_estimate("hash_mig", "fn_v1", &[])
+            .expect("load v1")
+            .expect("v1 exists");
+        assert_eq!(e1.version, cache::CACHE_SCHEMA_VERSION);
+        assert_eq!(e1.ledger, 10);
+        assert_eq!(e1.total_stroops, 1_000);
+        assert_eq!(e1.duration_ms, None);
+        assert!(e1.success);
+
+        let e2 = cache::load_estimate("hash_mig", "fn_v2", &[])
+            .expect("load v2")
+            .expect("v2 exists");
+        assert_eq!(e2.version, cache::CACHE_SCHEMA_VERSION);
+        assert_eq!(e2.ledger, 20);
+        assert_eq!(e2.total_stroops, 2_000);
+        assert_eq!(e2.duration_ms, Some(45));
+
+        let e3 = cache::load_estimate("hash_mig", "fn_v3", &[])
+            .expect("load v3")
+            .expect("v3 exists");
+        assert_eq!(e3.version, cache::CACHE_SCHEMA_VERSION);
+        assert_eq!(e3.ledger, 30);
+        assert_eq!(e3.total_stroops, 3_000);
+        assert_eq!(e3.duration_ms, Some(90));
+
+        // Verify all expected indexes exist after migration
+        let conn = rusqlite::Connection::open(&db).expect("reopen db");
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
+            .expect("prepare index query");
+        let index_names: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .expect("query indexes")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect indexes");
+        for expected_idx in [
+            "idx_estimates_lookup",
+            "idx_estimates_network_created",
+            "idx_estimates_key_net_created",
+            "idx_estimates_last_accessed",
+            "idx_estimate_history_lookup",
+        ] {
+            assert!(
+                index_names.iter().any(|n| n == expected_idx),
+                "missing expected index {expected_idx} in {index_names:?}"
+            );
+        }
+    });
+}
+
+#[test]
+fn test_schema_migration_rolls_back_transactionally_on_mid_migration_failure() {
+    with_temp_home(|home| {
+        let dir = home.join(".soroban-cost-estimator");
+        std::fs::create_dir_all(&dir).expect("create data dir");
+        let db = dir.join("cache.db");
+
+        let conn = rusqlite::Connection::open(&db).expect("open db");
+        // Create a v2 schema lacking `last_accessed` and `io_json`, and plant a
+        // conflicting table named `idx_estimates_last_accessed` so the migration
+        // fails partway through (after `ensure_column` adds `last_accessed` and
+        // `io_json`, when `CREATE INDEX idx_estimates_last_accessed` runs).
+        conn.execute_batch(
+            "CREATE TABLE estimates (
+                version          INTEGER NOT NULL,
+                wasm_hash        TEXT NOT NULL,
+                function         TEXT NOT NULL,
+                args_hash        TEXT NOT NULL,
+                network          TEXT NOT NULL,
+                ledger           INTEGER NOT NULL,
+                total_stroops    INTEGER NOT NULL,
+                cpu_instructions INTEGER NOT NULL,
+                memory_bytes     INTEGER NOT NULL,
+                timestamp        TEXT NOT NULL,
+                duration_ms      INTEGER,
+                success          INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (wasm_hash, function, args_hash)
+            );
+            INSERT INTO estimates VALUES (2, 'h_rb', 'fn_rb', 'a_rb', 'testnet', 77, 5000, 100, 50, '2026-01-01T00:00:00Z', 12, 1);
+            CREATE TABLE idx_estimates_last_accessed (blocker INTEGER);",
+        )
+        .expect("setup pre-migration state with blocker");
+
+        // Attempt migration — must fail because `idx_estimates_last_accessed` conflicts
+        let err = cache::ensure_cache_schema(&conn);
+        assert!(
+            err.is_err(),
+            "migration should fail on conflicting index name"
+        );
+
+        // Verify transactional rollback: `last_accessed` and `io_json` columns
+        // must NOT have been left behind on `estimates`, and original data must
+        // remain intact.
+        let mut col_stmt = conn
+            .prepare("PRAGMA table_info(estimates)")
+            .expect("table_info");
+        let cols: Vec<String> = col_stmt
+            .query_map([], |r| r.get(1))
+            .expect("query cols")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect cols");
+        assert!(
+            !cols.iter().any(|c| c == "last_accessed" || c == "io_json"),
+            "partial ALTER TABLE columns must be rolled back on migration failure, got {cols:?}"
+        );
+
+        let (ledger, stroops): (i64, i64) = conn
+            .query_row(
+                "SELECT ledger, total_stroops FROM estimates WHERE wasm_hash = 'h_rb'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("original row must still be readable");
+        assert_eq!(ledger, 77);
+        assert_eq!(stroops, 5000);
+
+        // Once the blocker is removed, migration succeeds and the row loads cleanly
+        conn.execute_batch("DROP TABLE idx_estimates_last_accessed;")
+            .expect("remove blocker");
+        cache::ensure_cache_schema(&conn).expect("migration succeeds after recovery");
+    });
+}
