@@ -4475,3 +4475,62 @@ fn test_config_snapshot_diff_makes_no_network_calls() {
         "offline diff must not resolve a network; got: {stderr}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Clap `debug_assert`, help completeness, and short flag uniqueness (#364)
+// ─────────────────────────────────────────────────────────────────────────
+
+fn assert_command_help_and_short_flags(cmd: &clap::Command, parent_globals: &[char]) {
+    use std::collections::HashSet;
+
+    if cmd.get_name() != "soroban-cost-estimator" {
+        assert!(
+            cmd.get_about().is_some(),
+            "subcommand '{}' is missing an about/help description",
+            cmd.get_name()
+        );
+    }
+
+    let mut seen_shorts: HashSet<char> = parent_globals.iter().copied().collect();
+    let mut next_globals: Vec<char> = parent_globals.to_vec();
+
+    for arg in cmd.get_arguments() {
+        let id = arg.get_id().as_str();
+        if id == "help" || id == "version" {
+            continue;
+        }
+        assert!(
+            arg.get_help().is_some() || arg.get_long_help().is_some(),
+            "argument '{}' in command '{}' must have a non-empty help description",
+            id,
+            cmd.get_name()
+        );
+        if let Some(short) = arg.get_short() {
+            assert!(
+                seen_shorts.insert(short),
+                "duplicate short flag '-{short}' detected in command '{}' (arg '{id}')",
+                cmd.get_name()
+            );
+            if arg.is_global_set() {
+                next_globals.push(short);
+            }
+        }
+    }
+
+    for sub in cmd.get_subcommands() {
+        if sub.get_name() == "help" {
+            continue;
+        }
+        assert_command_help_and_short_flags(sub, &next_globals);
+    }
+}
+
+#[test]
+fn verify_cli_debug_assert_and_help_descriptions() {
+    use clap::CommandFactory;
+    use soroban_cost_estimator::cli::Cli;
+
+    let cmd = Cli::command();
+    cmd.clone().debug_assert();
+    assert_command_help_and_short_flags(&cmd, &[]);
+}

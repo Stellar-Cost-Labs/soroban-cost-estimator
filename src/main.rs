@@ -215,7 +215,7 @@ async fn main() {
         info!(command = ?args.command, verbose = args.verbose, quiet = args.quiet, "starting soroban-cost-estimator");
     }
 
-    if let Err(err) = run(args).await {
+    if let Err(err) = Box::pin(run(args)).await {
         error!(error = %err, "command failed");
         eprintln!("Error: {err}");
         std::process::exit(1);
