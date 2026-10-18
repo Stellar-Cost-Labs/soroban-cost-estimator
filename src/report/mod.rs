@@ -3,3 +3,4 @@ pub mod cost_report;
 pub mod diff;
 pub mod fee_calc;
 pub mod formatter;
+pub mod formatters;

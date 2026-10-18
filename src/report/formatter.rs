@@ -42,11 +42,23 @@ impl ReportOptions {
     }
 }
 
-/// Formats a [`CostReport`] into a specific output representation.
+/// Formats a [`CostReport`], a batch of reports, or a [`crate::config_snapshot::diff::ConfigDiff`]
+/// into a specific output representation.
 ///
 /// All implementations are deterministic and produce stable output for the
 /// same input, making them safe for snapshot testing and piping into scripts.
 pub trait ReportFormatter {
+    /// Format a single cost estimate report into the target representation.
+    fn format_estimate(&self, report: &CostReport) -> String {
+        self.format(report)
+    }
+
+    /// Format a batch of cost estimate reports into the target representation.
+    fn format_estimate_all(&self, reports: &[CostReport]) -> String;
+
+    /// Format a configuration snapshot diff into the target representation.
+    fn format_diff(&self, diff: &crate::config_snapshot::diff::ConfigDiff) -> String;
+
     /// Format the report into the target representation.
     ///
     /// Equivalent to calling [`Self::format_with`] with the default
@@ -259,6 +271,18 @@ impl TableFormatter {
 }
 
 impl ReportFormatter for TableFormatter {
+    fn format_estimate_all(&self, reports: &[CostReport]) -> String {
+        let summary = crate::report::cost_report::summarize_estimate_all(
+            reports,
+            crate::report::fee_calc::DEFAULT_PRECISION,
+        );
+        crate::report::cost_report::format_estimate_all_table(reports, summary.as_ref())
+    }
+
+    fn format_diff(&self, diff: &crate::config_snapshot::diff::ConfigDiff) -> String {
+        crate::config_snapshot::diff::format_diff(diff, crate::cli::should_colorize(), false, None)
+    }
+
     fn format_with(&self, report: &CostReport, options: ReportOptions) -> String {
         self.format_with_options(
             report,
@@ -283,6 +307,14 @@ impl fmt::Display for TableFormatter {
 pub struct JsonFormatter;
 
 impl ReportFormatter for JsonFormatter {
+    fn format_estimate_all(&self, reports: &[CostReport]) -> String {
+        serde_json::to_string_pretty(reports).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    fn format_diff(&self, diff: &crate::config_snapshot::diff::ConfigDiff) -> String {
+        serde_json::to_string_pretty(diff).unwrap_or_else(|_| "{}".to_string())
+    }
+
     /// Emits the report plus two derived keys:
     ///
     /// * `suggestions` — contextual, human-readable tips from
@@ -359,6 +391,58 @@ impl fmt::Display for JsonFormatter {
 pub struct CsvFormatter;
 
 impl ReportFormatter for CsvFormatter {
+    fn format_estimate_all(&self, reports: &[CostReport]) -> String {
+        let mut output = String::from(
+            "function,network,ledger,wasm_hash,wasm_size,cpu_instructions,memory_bytes,\
+             read_entries,write_entries,read_bytes,write_bytes,tx_size,\
+             non_refundable_stroops,refundable_stroops,total_stroops,total_xlm,\
+             rpc_latency_ms\n",
+        );
+
+        for report in reports {
+            let row = csv_row(&[
+                &report.function,
+                &report.network,
+                &report.ledger.to_string(),
+                &report.wasm_hash,
+                &report.wasm_size.to_string(),
+                &report.cpu_instructions.to_string(),
+                &report.memory_bytes.to_string(),
+                &report.read_entries.to_string(),
+                &report.write_entries.to_string(),
+                &report.read_bytes.to_string(),
+                &report.write_bytes.to_string(),
+                &report.tx_size.to_string(),
+                &report.fee.non_refundable_stroops.to_string(),
+                &report.fee.refundable_stroops.to_string(),
+                &report.fee.total_stroops.to_string(),
+                &report.fee.total_xlm,
+                &report.rpc_latency_ms.to_string(),
+            ]);
+            output.push_str(&row);
+            output.push('\n');
+        }
+
+        output
+    }
+
+    fn format_diff(&self, diff: &crate::config_snapshot::diff::ConfigDiff) -> String {
+        let mut output =
+            String::from("field_path,setting_name,old_value,new_value,is_pricing_change\n");
+        for change in &diff.changes {
+            let row = csv_row(&[
+                &change.field_path,
+                &change.setting_name,
+                &change.old_value,
+                &change.new_value,
+                &change.is_pricing_change.to_string(),
+            ]);
+            output.push_str(&row);
+            output.push('\n');
+        }
+        output
+    }
+
     fn format_with(&self, report: &CostReport, _options: ReportOptions) -> String {
         let mut output = String::from(
             "function,network,ledger,wasm_hash,wasm_size,cpu_instructions,memory_bytes,\
@@ -410,6 +494,47 @@ impl fmt::Display for CsvFormatter {
 pub struct MarkdownFormatter;
 
 impl ReportFormatter for MarkdownFormatter {
+    fn format_estimate_all(&self, reports: &[CostReport]) -> String {
+        let mut sections: Vec<String> = reports.iter().map(|r| self.format(r)).collect();
+        if let Some(summary) = crate::report::cost_report::summarize_estimate_all(
+            reports,
+            crate::report::fee_calc::DEFAULT_PRECISION,
+        ) {
+            sections
+                .push(crate::report::cost_report::format_estimate_all_summary_markdown(&summary));
+        }
+        sections.join("\n---\n\n")
+    }
+
+    fn format_diff(&self, diff: &crate::config_snapshot::diff::ConfigDiff) -> String {
+        let mut output = String::new();
+        output.push_str(&format!(
+            "## Config Diff: `{}` (ledger {} → {})\n\n",
+            diff.new_snapshot.network, diff.old_snapshot.ledger, diff.new_snapshot.ledger
+        ));
+        if diff.changes.is_empty() {
+            output.push_str("No configuration changes detected.\n");
+            return output;
+        }
+        output.push_str("| Setting | Field | Old | New | Pricing |\n");
+        output.push_str("| --- | --- | --- | --- | --- |\n");
+        for change in &diff.changes {
+            output.push_str(&format!(
+                "| {} | `{}` | `{}` | `{}` | {} |\n",
+                change.setting_name,
+                change.field_path,
+                change.old_value,
+                change.new_value,
+                if change.is_pricing_change {
+                    "yes"
+                } else {
+                    "no"
+                }
+            ));
+        }
+        output
+    }
+
     #[allow(clippy::too_many_lines)]
     fn format_with(&self, report: &CostReport, options: ReportOptions) -> String {
         let mut output = String::new();
@@ -1302,5 +1427,52 @@ mod tests {
         let md_out = MarkdownFormatter.format(&report);
         assert!(md_out.contains("### Cost Projections"));
         assert!(md_out.contains("| 100 | 1,552,700 | 0.1552700 | $0.18 |"));
+    }
+
+    #[test]
+    fn test_trait_format_estimate_all_and_diff_across_all_formatters() {
+        use crate::config_snapshot::diff::{ConfigDiff, FieldDiff, SnapshotInfo};
+
+        let report1 = sample_report();
+        let mut report2 = sample_report();
+        report2.function = "transfer".to_string();
+        let batch = vec![report1.clone(), report2];
+
+        let diff = ConfigDiff {
+            old_snapshot: SnapshotInfo {
+                network: "testnet".to_string(),
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                ledger: 100,
+            },
+            new_snapshot: SnapshotInfo {
+                network: "testnet".to_string(),
+                timestamp: "2026-01-02T00:00:00Z".to_string(),
+                ledger: 200,
+            },
+            changes: vec![FieldDiff {
+                field_path: "contract_compute.fee_rate_per_instructions_increment".to_string(),
+                setting_id: Some(0),
+                setting_name: "Contract Compute V0".to_string(),
+                old_value: "25".to_string(),
+                new_value: "50".to_string(),
+                is_pricing_change: true,
+                explanation: Some("Stroops charged per 10,000 CPU instructions"),
+            }],
+            has_pricing_changes: true,
+        };
+
+        for name in ["table", "json", "csv", "markdown"] {
+            let fmt = formatter_by_name(name).expect("valid formatter");
+            let single = fmt.format_estimate(&report1);
+            assert_eq!(single, fmt.format(&report1));
+
+            let batch_out = fmt.format_estimate_all(&batch);
+            assert!(batch_out.contains("increment"), "{name} batch: {batch_out}");
+            assert!(batch_out.contains("transfer"), "{name} batch: {batch_out}");
+
+            let diff_out = fmt.format_diff(&diff);
+            assert!(diff_out.contains("25"), "{name} diff: {diff_out}");
+            assert!(diff_out.contains("50"), "{name} diff: {diff_out}");
+        }
     }
 }

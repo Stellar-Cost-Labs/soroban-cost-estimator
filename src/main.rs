@@ -1239,7 +1239,7 @@ async fn cmd_estimate(
             }
         } else {
             match formatter_by_name(format) {
-                Some(formatter) => println!("{}", formatter.format(report)),
+                Some(formatter) => println!("{}", formatter.format_estimate(report)),
                 None => {
                     println!(
                         "{}",
