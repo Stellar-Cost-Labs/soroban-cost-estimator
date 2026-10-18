@@ -256,6 +256,24 @@ impl TableFormatter {
 
         output
     }
+
+    /// Format a report with an optional opt-in simulation events and
+    /// state-changes diagnostic summary (#525).
+    #[must_use]
+    pub fn format_with_diagnostics(
+        &self,
+        report: &CostReport,
+        diagnostics: Option<&crate::rpc::simulate::SimulationDiagnosticsSummary>,
+        options: ReportOptions,
+    ) -> String {
+        let mut output = self.format_with(report, options);
+        if let Some(summary) = diagnostics {
+            output.push_str(&crate::report::cost_report::format_simulation_diagnostics(
+                summary,
+            ));
+        }
+        output
+    }
 }
 
 impl ReportFormatter for TableFormatter {
@@ -320,6 +338,32 @@ impl ReportFormatter for JsonFormatter {
 
     fn name(&self) -> &'static str {
         "json"
+    }
+}
+
+impl JsonFormatter {
+    /// Format a report as pretty-printed JSON, optionally attaching an opt-in
+    /// `simulation_diagnostics` object (#525).
+    #[must_use]
+    pub fn format_with_diagnostics(
+        &self,
+        report: &CostReport,
+        diagnostics: Option<&crate::rpc::simulate::SimulationDiagnosticsSummary>,
+        options: ReportOptions,
+    ) -> String {
+        let base = self.format_with(report, options);
+        let Some(summary) = diagnostics else {
+            return base;
+        };
+        let mut value: serde_json::Value =
+            serde_json::from_str(&base).unwrap_or(serde_json::Value::Null);
+        if let serde_json::Value::Object(ref mut map) = value {
+            map.insert(
+                "simulation_diagnostics".to_string(),
+                serde_json::to_value(summary).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        serde_json::to_string_pretty(&value).unwrap_or(base)
     }
 }
 
@@ -1302,5 +1346,93 @@ mod tests {
         let md_out = MarkdownFormatter.format(&report);
         assert!(md_out.contains("### Cost Projections"));
         assert!(md_out.contains("| 100 | 1,552,700 | 0.1552700 | $0.18 |"));
+    }
+
+    #[test]
+    fn test_simulation_diagnostics_empty_populated_and_malformed() {
+        use crate::rpc::simulate::{SimulateTransactionResponse, summarize_simulation_diagnostics};
+
+        let report = sample_report();
+
+        // 1. Empty payload
+        let empty_resp: SimulateTransactionResponse =
+            serde_json::from_str(r#"{ "events": [], "stateChanges": [] }"#)
+                .expect("valid response");
+        let empty_summary = summarize_simulation_diagnostics(&empty_resp, false);
+        assert_eq!(empty_summary.event_count, 0);
+        assert_eq!(empty_summary.state_change_count, 0);
+        assert!(empty_summary.events.is_empty());
+        assert!(empty_summary.state_changes.is_empty());
+
+        let text_empty = TableFormatter.format_with_diagnostics(
+            &report,
+            Some(&empty_summary),
+            ReportOptions::default(),
+        );
+        assert!(text_empty.contains("Events: 0 (malformed: 0)"));
+        assert!(text_empty.contains("State changes: 0 (malformed: 0)"));
+
+        // 2. Populated + malformed payload with opt-in details
+        let populated_resp: SimulateTransactionResponse = serde_json::from_str(
+            r#"{
+                "events": ["AAAA", "!!!not_base64!!!"],
+                "stateChanges": [
+                    {
+                        "type": "updated",
+                        "key": "AAAA_KEY_123",
+                        "before": "SENSITIVE_BEFORE_BLOB",
+                        "after": "SENSITIVE_AFTER_BLOB"
+                    },
+                    "not-an-object"
+                ]
+            }"#,
+        )
+        .expect("valid response");
+
+        let counts_only = summarize_simulation_diagnostics(&populated_resp, false);
+        assert_eq!(counts_only.event_count, 2);
+        assert_eq!(counts_only.malformed_event_count, 1);
+        assert_eq!(counts_only.state_change_count, 2);
+        assert_eq!(counts_only.malformed_state_change_count, 1);
+        assert!(counts_only.events.is_empty());
+        assert!(counts_only.state_changes.is_empty());
+
+        let detailed = summarize_simulation_diagnostics(&populated_resp, true);
+        assert_eq!(detailed.events.len(), 2);
+        assert!(detailed.events[0].valid);
+        assert_eq!(detailed.events[0].decoded_bytes, Some(3));
+        assert!(!detailed.events[1].valid);
+        assert_eq!(detailed.state_changes.len(), 2);
+        assert_eq!(detailed.state_changes[0].change_type, "updated");
+        assert!(detailed.state_changes[0].has_before);
+        assert!(detailed.state_changes[0].has_after);
+        assert_eq!(detailed.state_changes[1].change_type, "malformed");
+
+        let text_out = TableFormatter.format_with_diagnostics(
+            &report,
+            Some(&detailed),
+            ReportOptions::default(),
+        );
+        assert!(text_out.contains("Events: 2 (malformed: 1)"));
+        assert!(text_out.contains("event #0: 3 XDR bytes (payload redacted)"));
+        assert!(text_out.contains("event #1: malformed base64"));
+        assert!(text_out.contains("State changes: 2 (malformed: 1)"));
+        assert!(!text_out.contains("SENSITIVE_BEFORE_BLOB"));
+        assert!(!text_out.contains("SENSITIVE_AFTER_BLOB"));
+
+        let json_out = JsonFormatter.format_with_diagnostics(
+            &report,
+            Some(&detailed),
+            ReportOptions::default(),
+        );
+        assert!(!json_out.contains("SENSITIVE_BEFORE_BLOB"));
+        let parsed: serde_json::Value = serde_json::from_str(&json_out).expect("valid JSON");
+        assert_eq!(parsed["simulation_diagnostics"]["event_count"], 2);
+        assert_eq!(parsed["simulation_diagnostics"]["malformed_event_count"], 1);
+        assert_eq!(parsed["simulation_diagnostics"]["state_change_count"], 2);
+        assert_eq!(
+            parsed["simulation_diagnostics"]["malformed_state_change_count"],
+            1
+        );
     }
 }

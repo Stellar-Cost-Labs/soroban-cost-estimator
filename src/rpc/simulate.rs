@@ -339,6 +339,203 @@ pub fn summarize_latencies(samples: &[u64]) -> Option<LatencyStats> {
     })
 }
 
+/// Maximum number of individual event or state-change summaries included when
+/// detailed diagnostics are requested (#525).
+pub const MAX_DIAGNOSTIC_SUMMARIES: usize = 10;
+
+/// Maximum character length for a key preview in a diagnostic summary.
+pub const MAX_DIAGNOSTIC_KEY_CHARS: usize = 48;
+
+/// Safe, bounded summary of a single simulation event (#525).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimulationEventSummary {
+    /// Zero-based index of the event in the response array.
+    pub index: usize,
+    /// Length of the encoded base64 string.
+    pub encoded_len: usize,
+    /// Decoded byte length when the event is valid base64 (`None` if malformed).
+    pub decoded_bytes: Option<usize>,
+    /// Whether the event payload decoded as valid base64.
+    pub valid: bool,
+    /// Safe summary string (raw event payload is omitted by default).
+    pub summary: String,
+}
+
+/// Safe, bounded summary of a single ledger state change (#525).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateChangeSummary {
+    /// Zero-based index of the state change in the response array.
+    pub index: usize,
+    /// Change classification (`"created"`, `"updated"`, `"deleted"`, `"unknown"`, or `"malformed"`).
+    pub change_type: String,
+    /// Bounded preview of the ledger key (`"[redacted/omitted]"` when absent).
+    pub key_preview: String,
+    /// Whether a `before` state snapshot was present (payload omitted for safety/size).
+    pub has_before: bool,
+    /// Whether an `after` state snapshot was present (payload omitted for safety/size).
+    pub has_after: bool,
+}
+
+/// Bounded summary of simulation events and state changes (#525).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimulationDiagnosticsSummary {
+    /// Total number of events returned by `simulateTransaction`.
+    pub event_count: usize,
+    /// Number of events whose base64 payload was empty or malformed.
+    pub malformed_event_count: usize,
+    /// Total number of state changes returned by `simulateTransaction`.
+    pub state_change_count: usize,
+    /// Number of state change entries that were not well-formed JSON objects.
+    pub malformed_state_change_count: usize,
+    /// Number of events omitted beyond [`MAX_DIAGNOSTIC_SUMMARIES`].
+    pub truncated_events: usize,
+    /// Number of state changes omitted beyond [`MAX_DIAGNOSTIC_SUMMARIES`].
+    pub truncated_state_changes: usize,
+    /// Bounded per-event summaries (populated only when `include_details` is `true`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<SimulationEventSummary>,
+    /// Bounded per-state-change summaries (populated only when `include_details` is `true`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state_changes: Vec<StateChangeSummary>,
+}
+
+fn truncate_preview(input: &str, max_chars: usize) -> String {
+    let clean: String = input
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(max_chars + 1)
+        .collect();
+    if clean.chars().count() > max_chars {
+        let head: String = clean.chars().take(max_chars).collect();
+        format!("{head}...")
+    } else {
+        clean
+    }
+}
+
+/// Build a bounded, safe summary of `events` and `state_changes` from a
+/// [`SimulateTransactionResponse`] (#525).
+///
+/// Raw `before`/`after` state XDR blobs and raw event payloads are never
+/// echoed into the summary; when `include_details` is `false`, only the
+/// aggregate counts are populated.
+#[must_use]
+pub fn summarize_simulation_diagnostics(
+    response: &SimulateTransactionResponse,
+    include_details: bool,
+) -> SimulationDiagnosticsSummary {
+    let raw_events = response.events.as_deref().unwrap_or(&[]);
+    let raw_changes = response.state_changes.as_deref().unwrap_or(&[]);
+
+    let mut malformed_event_count = 0usize;
+    let mut events = Vec::new();
+
+    for (index, ev) in raw_events.iter().enumerate() {
+        let trimmed = ev.trim();
+        let decoded = if trimmed.is_empty() {
+            None
+        } else {
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, trimmed).ok()
+        };
+        let valid = decoded.is_some();
+        if !valid {
+            malformed_event_count += 1;
+        }
+        if include_details && events.len() < MAX_DIAGNOSTIC_SUMMARIES {
+            let decoded_bytes = decoded.as_ref().map(Vec::len);
+            let summary = match decoded_bytes {
+                Some(n) => format!("event #{index}: {n} XDR bytes (payload redacted)"),
+                None => format!(
+                    "event #{index}: malformed base64 ({} chars)",
+                    trimmed.chars().count()
+                ),
+            };
+            events.push(SimulationEventSummary {
+                index,
+                encoded_len: trimmed.len(),
+                decoded_bytes,
+                valid,
+                summary,
+            });
+        }
+    }
+
+    let mut malformed_state_change_count = 0usize;
+    let mut state_changes = Vec::new();
+
+    for (index, item) in raw_changes.iter().enumerate() {
+        let Some(obj) = item.as_object() else {
+            malformed_state_change_count += 1;
+            if include_details && state_changes.len() < MAX_DIAGNOSTIC_SUMMARIES {
+                state_changes.push(StateChangeSummary {
+                    index,
+                    change_type: "malformed".to_string(),
+                    key_preview: "[malformed entry]".to_string(),
+                    has_before: false,
+                    has_after: false,
+                });
+            }
+            continue;
+        };
+
+        let change_type = obj
+            .get("type")
+            .and_then(|v| {
+                v.as_str().map(str::to_string).or_else(|| {
+                    v.as_u64().map(|n| match n {
+                        1 => "created".to_string(),
+                        2 => "updated".to_string(),
+                        3 => "deleted".to_string(),
+                        _ => format!("type_{n}"),
+                    })
+                })
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let key_preview = obj
+            .get("key")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| truncate_preview(s.trim(), MAX_DIAGNOSTIC_KEY_CHARS))
+            .unwrap_or_else(|| "[omitted]".to_string());
+
+        let has_before = obj.get("before").is_some_and(|v| !v.is_null());
+        let has_after = obj.get("after").is_some_and(|v| !v.is_null());
+
+        if include_details && state_changes.len() < MAX_DIAGNOSTIC_SUMMARIES {
+            state_changes.push(StateChangeSummary {
+                index,
+                change_type,
+                key_preview,
+                has_before,
+                has_after,
+            });
+        }
+    }
+
+    let truncated_events = if include_details {
+        raw_events.len().saturating_sub(MAX_DIAGNOSTIC_SUMMARIES)
+    } else {
+        0
+    };
+    let truncated_state_changes = if include_details {
+        raw_changes.len().saturating_sub(MAX_DIAGNOSTIC_SUMMARIES)
+    } else {
+        0
+    };
+
+    SimulationDiagnosticsSummary {
+        event_count: raw_events.len(),
+        malformed_event_count,
+        state_change_count: raw_changes.len(),
+        malformed_state_change_count,
+        truncated_events,
+        truncated_state_changes,
+        events,
+        state_changes,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
