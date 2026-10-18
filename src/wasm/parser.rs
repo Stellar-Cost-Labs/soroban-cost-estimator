@@ -148,25 +148,41 @@ pub fn validate_wasm(bytes: &[u8]) -> AppResult<()> {
 
 /// Validates WASM memory limits against Soroban network constraints.
 ///
-/// Returns a warning message if the WASM memory section exceeds Soroban limits,
-/// or `Ok(None)` if the memory is within limits.
+/// Inspects both imported (`ImportSection` with `TypeRef::Memory`) and defined
+/// (`MemorySection`) memory declarations. Returns a warning message if any
+/// declared memory exceeds Soroban limits, or `None` if all memories are within
+/// limits (or absent). Malformed sections are ignored without panicking.
 ///
 /// Soroban enforces a per-transaction memory limit of 40 MB (approximately 610 WASM pages).
 /// If the WASM declares a memory that exceeds this limit, the contract will likely
 /// fail during simulation or execution.
 #[must_use]
 pub fn validate_wasm_memory_limits(bytes: &[u8]) -> Option<String> {
-    let mut memories = Vec::new();
+    let mut memories: Vec<(Option<(String, String)>, MemoryInfo)> = Vec::new();
 
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
-        if let Ok(wasmparser::Payload::MemorySection(section)) = payload {
-            for memory in section.into_iter().flatten() {
-                memories.push(MemoryInfo {
-                    initial_pages: memory.initial,
-                    maximum_pages: memory.maximum,
-                    memory64: memory.memory64,
-                });
+        let Ok(payload) = payload else {
+            continue;
+        };
+        match payload {
+            wasmparser::Payload::ImportSection(section) => {
+                for group in section.into_iter().flatten() {
+                    collect_imported_memories_from_group(group, &mut memories);
+                }
             }
+            wasmparser::Payload::MemorySection(section) => {
+                for memory in section.into_iter().flatten() {
+                    memories.push((
+                        None,
+                        MemoryInfo {
+                            initial_pages: memory.initial,
+                            maximum_pages: memory.maximum,
+                            memory64: memory.memory64,
+                        },
+                    ));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -176,16 +192,18 @@ pub fn validate_wasm_memory_limits(bytes: &[u8]) -> Option<String> {
 
     let mut warnings = Vec::new();
 
-    for (idx, memory) in memories.iter().enumerate() {
-        let memory_label = if memories.len() == 1 {
+    for (idx, (import_source, memory)) in memories.iter().enumerate() {
+        let memory_label = if let Some((module, name)) = import_source {
+            format!("Imported Memory[{idx}] ({module}::{name})")
+        } else if memories.len() == 1 {
             "Memory".to_string()
         } else {
-            format!("Memory[{}]", idx)
+            format!("Memory[{idx}]")
         };
 
         // Check initial pages
         if memory.initial_pages > SOROBAN_MAX_WASM_PAGES {
-            let initial_bytes = memory.initial_pages * WASM_PAGE_SIZE_BYTES;
+            let initial_bytes = memory.initial_pages.saturating_mul(WASM_PAGE_SIZE_BYTES);
             warnings.push(format!(
                 "{}: initial size {} pages ({} bytes) exceeds Soroban limit of {} pages ({} bytes)",
                 memory_label,
@@ -199,7 +217,7 @@ pub fn validate_wasm_memory_limits(bytes: &[u8]) -> Option<String> {
         // Check maximum pages if specified
         if let Some(max_pages) = memory.maximum_pages {
             if max_pages > SOROBAN_MAX_WASM_PAGES {
-                let max_bytes = max_pages * WASM_PAGE_SIZE_BYTES;
+                let max_bytes = max_pages.saturating_mul(WASM_PAGE_SIZE_BYTES);
                 warnings.push(format!(
                     "{}: maximum size {} pages ({} bytes) exceeds Soroban limit of {} pages ({} bytes)",
                     memory_label,
@@ -216,6 +234,57 @@ pub fn validate_wasm_memory_limits(bytes: &[u8]) -> Option<String> {
         None
     } else {
         Some(warnings.join("; "))
+    }
+}
+
+fn collect_imported_memories_from_group(
+    group: wasmparser::Imports<'_>,
+    memories: &mut Vec<(Option<(String, String)>, MemoryInfo)>,
+) {
+    match group {
+        wasmparser::Imports::Single(_, imported) => {
+            if let wasmparser::TypeRef::Memory(memory) = imported.ty {
+                memories.push((
+                    Some((imported.module.to_string(), imported.name.to_string())),
+                    MemoryInfo {
+                        initial_pages: memory.initial,
+                        maximum_pages: memory.maximum,
+                        memory64: memory.memory64,
+                    },
+                ));
+            }
+        }
+        wasmparser::Imports::Compact1 { module, items } => {
+            for item in items.into_iter().flatten() {
+                if let wasmparser::TypeRef::Memory(memory) = item.ty {
+                    memories.push((
+                        Some((module.to_string(), item.name.to_string())),
+                        MemoryInfo {
+                            initial_pages: memory.initial,
+                            maximum_pages: memory.maximum,
+                            memory64: memory.memory64,
+                        },
+                    ));
+                }
+            }
+        }
+        wasmparser::Imports::Compact2 {
+            module,
+            ty: wasmparser::TypeRef::Memory(memory),
+            names,
+        } => {
+            for name in names.into_iter().flatten() {
+                memories.push((
+                    Some((module.to_string(), name.to_string())),
+                    MemoryInfo {
+                        initial_pages: memory.initial,
+                        maximum_pages: memory.maximum,
+                        memory64: memory.memory64,
+                    },
+                ));
+            }
+        }
+        wasmparser::Imports::Compact2 { .. } => {}
     }
 }
 
@@ -376,6 +445,13 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
                         wasmparser::Imports::Single(_, imported) => {
                             imported_function_count +=
                                 usize::from(is_function_type_ref(&imported.ty));
+                            if let wasmparser::TypeRef::Memory(memory) = imported.ty {
+                                memories.push(MemoryInfo {
+                                    initial_pages: memory.initial,
+                                    maximum_pages: memory.maximum,
+                                    memory64: memory.memory64,
+                                });
+                            }
                             imports.push(ImportInfo {
                                 module: imported.module.to_string(),
                                 name: imported.name.to_string(),
@@ -387,6 +463,13 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
                                 let item = item.map_err(|e| AppError::WasmParse(e.to_string()))?;
                                 imported_function_count +=
                                     usize::from(is_function_type_ref(&item.ty));
+                                if let wasmparser::TypeRef::Memory(memory) = item.ty {
+                                    memories.push(MemoryInfo {
+                                        initial_pages: memory.initial,
+                                        maximum_pages: memory.maximum,
+                                        memory64: memory.memory64,
+                                    });
+                                }
                                 imports.push(ImportInfo {
                                     module: module.to_string(),
                                     name: item.name.to_string(),
@@ -399,6 +482,13 @@ pub fn enumerate_module_metadata(bytes: &[u8]) -> AppResult<ModuleMetadata> {
                                 names.count() as usize * usize::from(is_function_type_ref(&ty));
                             for name in names {
                                 let name = name.map_err(|e| AppError::WasmParse(e.to_string()))?;
+                                if let wasmparser::TypeRef::Memory(memory) = ty {
+                                    memories.push(MemoryInfo {
+                                        initial_pages: memory.initial,
+                                        maximum_pages: memory.maximum,
+                                        memory64: memory.memory64,
+                                    });
+                                }
                                 imports.push(ImportInfo {
                                     module: module.to_string(),
                                     name: name.to_string(),

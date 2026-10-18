@@ -1028,3 +1028,71 @@ fn test_load_wasm_detects_synthetic_debug_section() {
 
     let _ = std::fs::remove_file(&temp);
 }
+
+#[test]
+fn test_validate_wasm_memory_limits_imported_defined_absent_and_malformed() {
+    use soroban_cost_estimator::wasm::parser::{
+        enumerate_module_metadata, validate_wasm_memory_limits,
+    };
+
+    // 1) Absent memory (`minimal.wasm` has no memory declarations)
+    let minimal = std::fs::read("tests/fixtures/minimal.wasm").expect("read minimal.wasm");
+    assert_eq!(validate_wasm_memory_limits(&minimal), None);
+
+    // 2) Defined memory within limits (`contract.wasm`)
+    let contract = std::fs::read("tests/fixtures/contract.wasm").expect("read contract.wasm");
+    assert_eq!(validate_wasm_memory_limits(&contract), None);
+
+    // 3) Defined memory exceeding Soroban limit (> 610 pages; 700 = 0xBC 0x05 LEB128)
+    let defined_over_limit = [
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // header
+        0x05, 0x04, 0x01, 0x00, 0xbc, 0x05, // Memory section: 1 memory, initial 700 pages
+    ];
+    let defined_warn =
+        validate_wasm_memory_limits(&defined_over_limit).expect("defined memory > 610 should warn");
+    assert!(
+        defined_warn.contains("Memory: initial size 700 pages"),
+        "got: {defined_warn}"
+    );
+
+    // 4) Imported memory exceeding Soroban initial and maximum limits (initial 700, max 800)
+    //    700 = 0xBC 0x05, 800 = 0xA0 0x06
+    let imported_over_limit = [
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // header
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // Type section: () -> ()
+        0x02, 0x12, // Import section (18 bytes)
+        0x01, // 1 import
+        0x03, b'e', b'n', b'v', // module "env"
+        0x06, b'm', b'e', b'm', b'o', b'r', b'y', // name "memory"
+        0x02, // kind: Memory
+        0x01, // flags: has maximum
+        0xbc, 0x05, // initial: 700 pages
+        0xa0, 0x06, // maximum: 800 pages
+        0x03, 0x02, 0x01, 0x00, // Function section: 1 func
+        0x07, 0x07, 0x01, 0x03, b'r', b'u', b'n', 0x00, 0x00, // Export "run"
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b, // Code section
+    ];
+    let imported_warn = validate_wasm_memory_limits(&imported_over_limit)
+        .expect("imported memory > 610 pages should warn");
+    assert!(
+        imported_warn.contains("Imported Memory[0] (env::memory): initial size 700 pages"),
+        "got: {imported_warn}"
+    );
+    assert!(
+        imported_warn.contains("Imported Memory[0] (env::memory): maximum size 800 pages"),
+        "got: {imported_warn}"
+    );
+
+    let meta = enumerate_module_metadata(&imported_over_limit)
+        .expect("module with imported memory should parse metadata");
+    assert_eq!(meta.memories.len(), 1);
+    assert_eq!(meta.memories[0].initial_pages, 700);
+    assert_eq!(meta.memories[0].maximum_pages, Some(800));
+
+    // 5) Malformed import section must not panic
+    let malformed_import = [
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // header
+        0x02, 0x05, 0x02, 0x03, b'e', b'n', // truncated import section
+    ];
+    assert_eq!(validate_wasm_memory_limits(&malformed_import), None);
+}
