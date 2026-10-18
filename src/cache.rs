@@ -409,10 +409,10 @@ pub fn cache_limits() -> CacheLimits {
 }
 
 /// Returns the base data directory path: `~/.soroban-cost-estimator`,
-/// creating it if needed.
+/// creating it with user-only permissions if needed.
 fn data_dir() -> AppResult<PathBuf> {
     let dir = crate::paths::data_dir()?;
-    std::fs::create_dir_all(&dir)?;
+    crate::paths::ensure_private_dir(&dir)?;
     Ok(dir)
 }
 
@@ -560,8 +560,17 @@ fn enable_wal_if_possible(conn: &Connection) {
 /// import any pre-SQLite JSON cache files left behind by older releases.
 fn open_db() -> AppResult<Connection> {
     let path = db_path()?;
+    let sidecars: Vec<(PathBuf, bool)> = crate::paths::sqlite_sidecar_paths(&path)
+        .into_iter()
+        .map(|p| {
+            let existed = p.exists();
+            (p, existed)
+        })
+        .collect();
+    crate::paths::create_private_file_if_missing(&path)?;
     let conn = Connection::open(&path)?;
     ensure_cache_schema(&conn)?;
+    crate::paths::restrict_new_sidecar_permissions(&sidecars);
     // Transparent, one-time upgrade from the old per-entry JSON cache.
     // The directory is removed once every file is imported, so subsequent
     // opens short-circuit on `!dir.is_dir()`.
