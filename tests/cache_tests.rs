@@ -2784,3 +2784,85 @@ fn test_legacy_database_without_io_column_still_loads() {
         );
     });
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// SQLITE_BUSY bounded backoff (#523)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_sqlite_busy_multi_connection_bounded_waiting_and_eventual_success() {
+    with_temp_home(|home| {
+        cache::save_estimate(
+            "busy_hash",
+            "fn_init",
+            &[],
+            "testnet",
+            1,
+            100,
+            10,
+            5,
+            None,
+            true,
+        )
+        .expect("initial save");
+
+        let db = home.join(".soroban-cost-estimator").join("cache.db");
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+
+        let db_for_holder = db.clone();
+        let holder = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&db_for_holder).expect("open holder");
+            conn.execute_batch("PRAGMA busy_timeout=0; BEGIN EXCLUSIVE;")
+                .expect("acquire exclusive lock");
+            locked_tx.send(()).expect("signal locked");
+            std::thread::sleep(std::time::Duration::from_millis(45));
+            conn.execute_batch("COMMIT;")
+                .expect("release exclusive lock");
+        });
+
+        locked_rx.recv().expect("wait for holder lock");
+
+        let conn_contender = rusqlite::Connection::open(&db).expect("open contender");
+        conn_contender
+            .execute_batch("PRAGMA busy_timeout=0;")
+            .expect("set zero timeout");
+
+        let mut attempts = 0u32;
+        let updated: usize = cache::execute_with_busy_retry(|| {
+            attempts += 1;
+            conn_contender.execute(
+                "UPDATE estimates SET ledger = ledger + 1 WHERE wasm_hash = 'busy_hash'",
+                [],
+            )
+        })
+        .expect("contender should succeed after bounded backoff wait");
+
+        holder.join().expect("holder thread finished");
+        assert_eq!(updated, 1);
+        assert!(
+            attempts >= 2,
+            "contender should have retried on SQLITE_BUSY at least once (attempts={attempts})"
+        );
+    });
+}
+
+#[test]
+fn test_sqlite_busy_does_not_retry_corruption_permission_or_io_errors() {
+    for code in [
+        rusqlite::ErrorCode::DatabaseCorrupt,
+        rusqlite::ErrorCode::PermissionDenied,
+        rusqlite::ErrorCode::SystemIoFailure,
+        rusqlite::ErrorCode::ReadOnly,
+    ] {
+        let mut attempts = 0u32;
+        let res: Result<(), _> = cache::execute_with_busy_retry(|| {
+            attempts += 1;
+            Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code as i32),
+                Some("fatal non-busy error".to_string()),
+            ))
+        });
+        assert!(res.is_err(), "non-busy error {code:?} must fail");
+        assert_eq!(attempts, 1, "non-busy error {code:?} must not be retried");
+    }
+}
