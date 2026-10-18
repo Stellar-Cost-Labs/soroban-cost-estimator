@@ -239,6 +239,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
     // `--quiet` is a single global flag; bind it once so every command in
     // `run()` reads the same value.
     let quiet = args.quiet;
+    let keep_going = args.keep_going;
     // Bound the on-disk estimate cache before any command can write to it.
     // A `--max-cache-size-mb` of 0 disables the byte quota; 0 entries
     // disables the entry quota.
@@ -309,6 +310,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     max_retries,
                     verbose,
                     &headers,
+                    keep_going,
                 )
                 .await
             } else {
@@ -385,6 +387,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     max_retries,
                     verbose,
                     &headers,
+                    keep_going,
                 )
                 .await
             } else {
@@ -5325,9 +5328,10 @@ async fn batch_contract_summary(
 /// `estimate`/`estimate-all` batch mode: evaluate every resolved WASM file and
 /// print one aggregated multi-contract cost summary.
 ///
-/// Contract failures never abort the run; each is captured in its summary row
-/// and the process still exits non-zero when any contract failed, so scripts
-/// notice partial failures without losing the report.
+/// By default, batch mode fails fast on the first contract that fails to load
+/// or simulate. When `keep_going` (`--keep-going`) is enabled, file-scoped
+/// failures are recorded in each contract's summary row and the process exits
+/// non-zero after printing the complete batch report.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn cmd_batch(
     wasm_paths: &[std::path::PathBuf],
@@ -5344,12 +5348,13 @@ async fn cmd_batch(
     max_retries: usize,
     verbose: bool,
     extra_headers: &[String],
+    keep_going: bool,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
 
     let total = wasm_paths.len();
-    let span = info_span!("cmd_batch", contracts = total, network);
+    let span = info_span!("cmd_batch", contracts = total, network, keep_going);
     async move {
         let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
         let client = rpc::client::RpcClient::with_fallback_headers_connect_timeout(
@@ -5376,6 +5381,10 @@ async fn cmd_batch(
         let mut contracts: Vec<report::cost_report::ContractCostSummary> =
             Vec::with_capacity(total);
         for (i, path) in wasm_paths.iter().enumerate() {
+            if !keep_going {
+                let info = wasm::parser::load_wasm(path)?;
+                xdr_helper::validate_args_against_spec(fn_name, args, &info.functions)?;
+            }
             if text_mode {
                 println!("[{}/{}] {}", i + 1, total, path.display());
             }
@@ -5389,6 +5398,14 @@ async fn cmd_batch(
                 args,
             )
             .await;
+            if !keep_going {
+                if let Some(ref err) = summary.error {
+                    return Err(error::AppError::General(format!(
+                        "{}: {err}",
+                        path.display()
+                    )));
+                }
+            }
             if text_mode {
                 match &summary.error {
                     Some(err) => println!("  error: {err}"),
@@ -5405,15 +5422,11 @@ async fn cmd_batch(
         }
 
         let batch = report::cost_report::BatchCostReport::new(network.to_string(), contracts);
-
-        match format {
-            "json" => println!("{}", report::cost_report::format_batch_report_json(&batch)),
-            "csv" => print!("{}", report::cost_report::format_batch_report_csv(&batch)),
-            "markdown" => println!(
-                "{}",
-                report::cost_report::format_batch_report_markdown(&batch)
-            ),
-            _ => println!("{}", report::cost_report::format_batch_report_table(&batch)),
+        let formatted = report::formatter::format_batch_report(&batch, format);
+        if format == "csv" {
+            print!("{formatted}");
+        } else {
+            println!("{formatted}");
         }
 
         // Surface partial failures to scripts; the summary above is already

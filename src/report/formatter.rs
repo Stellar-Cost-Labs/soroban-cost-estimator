@@ -592,6 +592,23 @@ pub fn formatter_by_name(name: &str) -> Option<Box<dyn ReportFormatter>> {
     }
 }
 
+/// Formats a [`crate::report::cost_report::BatchCostReport`] in the requested
+/// output format (`table`, `json`, `csv`, or `markdown`), preserving each
+/// contract's `path` and `error` fields when `--keep-going` records partial
+/// failures.
+#[must_use]
+pub fn format_batch_report(
+    report: &crate::report::cost_report::BatchCostReport,
+    format: &str,
+) -> String {
+    match format {
+        "json" => crate::report::cost_report::format_batch_report_json(report),
+        "csv" => crate::report::cost_report::format_batch_report_csv(report),
+        "markdown" => crate::report::cost_report::format_batch_report_markdown(report),
+        _ => crate::report::cost_report::format_batch_report_table(report),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1302,5 +1319,52 @@ mod tests {
         let md_out = MarkdownFormatter.format(&report);
         assert!(md_out.contains("### Cost Projections"));
         assert!(md_out.contains("| 100 | 1,552,700 | 0.1552700 | $0.18 |"));
+    }
+
+    #[test]
+    fn test_format_batch_report_includes_path_and_error_across_formats() {
+        use crate::report::cost_report::{BatchCostReport, ContractCostSummary};
+
+        let valid = ContractCostSummary {
+            path: "valid.wasm".to_string(),
+            wasm_hash: Some("deadbeef".to_string()),
+            function_count: Some(1),
+            upload_cost_stroops: Some(1_200),
+            min_invocation_fee_stroops: Some(800),
+            max_invocation_fee_stroops: Some(800),
+            functions_simulated: Some(1),
+            error: None,
+        };
+        let invalid =
+            ContractCostSummary::unloadable("broken.wasm", "failed to load WASM: invalid magic");
+        let batch = BatchCostReport::new("testnet", vec![valid, invalid]);
+
+        let json_str = format_batch_report(&batch, "json");
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("valid batch JSON");
+        assert_eq!(parsed["succeeded"], 1);
+        assert_eq!(parsed["failed"], 1);
+        assert_eq!(parsed["contracts"][0]["path"], "valid.wasm");
+        assert_eq!(parsed["contracts"][1]["path"], "broken.wasm");
+        assert!(
+            parsed["contracts"][1]["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("invalid magic")
+        );
+
+        let csv_str = format_batch_report(&batch, "csv");
+        assert!(csv_str.contains("valid.wasm"));
+        assert!(csv_str.contains("broken.wasm"));
+        assert!(csv_str.contains("invalid magic"));
+
+        let md_str = format_batch_report(&batch, "markdown");
+        assert!(md_str.contains("valid.wasm"));
+        assert!(md_str.contains("broken.wasm"));
+        assert!(md_str.contains("invalid magic"));
+
+        let table_str = format_batch_report(&batch, "table");
+        assert!(table_str.contains("valid.wasm"));
+        assert!(table_str.contains("broken.wasm"));
+        assert!(table_str.contains("invalid magic"));
     }
 }

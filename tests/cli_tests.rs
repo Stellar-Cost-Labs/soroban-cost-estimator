@@ -4475,3 +4475,116 @@ fn test_config_snapshot_diff_makes_no_network_calls() {
         "offline diff must not resolve a network; got: {stderr}"
     );
 }
+
+#[test]
+fn test_batch_default_fails_fast_on_invalid_fixture() {
+    let home = temp_home("batch-fail-fast");
+    let invalid_wasm = home.join("a_invalid.wasm");
+    std::fs::write(&invalid_wasm, b"not a valid wasm binary").expect("write invalid wasm");
+
+    let (rpc_url, stop) = start_mock_rpc_server("", "1000", 100);
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "estimate",
+            "--wasm",
+            invalid_wasm.to_str().unwrap(),
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--rpc-url",
+            &rpc_url,
+            "--json",
+        ],
+        Some(&home),
+    );
+    let _ = stop.send(());
+
+    assert_eq!(
+        code, 1,
+        "default batch must fail fast on invalid fixture; stderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("total_contracts"),
+        "default fail-fast batch must not emit aggregated report after aborting; got: {stdout}"
+    );
+    assert!(
+        stderr.contains("failed to parse WASM") || stderr.contains("failed to validate WASM"),
+        "stderr must report the failing WASM; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_batch_keep_going_continues_after_invalid_fixture_and_exits_nonzero() {
+    let home = temp_home("batch-keep-going");
+    let batch_dir = home.join("contracts");
+    std::fs::create_dir_all(&batch_dir).expect("create contracts dir");
+
+    let invalid_wasm = batch_dir.join("01_invalid.wasm");
+    std::fs::write(&invalid_wasm, b"not a valid wasm binary").expect("write invalid wasm");
+    let valid_wasm = batch_dir.join("02_valid.wasm");
+    std::fs::copy("tests/fixtures/minimal.wasm", &valid_wasm).expect("copy valid wasm");
+
+    let (rpc_url, stop) = start_mock_rpc_server("", "1000", 100);
+
+    // 1. Multi-file (`--wasm` repeated) with `--keep-going`
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "estimate",
+            "--keep-going",
+            "--wasm",
+            invalid_wasm.to_str().unwrap(),
+            "--wasm",
+            valid_wasm.to_str().unwrap(),
+            "--rpc-url",
+            &rpc_url,
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 1,
+        "--keep-going batch must exit non-zero when any item failed; stderr: {stderr}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("must emit valid JSON batch report");
+    assert_eq!(parsed["total_contracts"], 2);
+    assert_eq!(parsed["succeeded"], 1);
+    assert_eq!(parsed["failed"], 1);
+    assert_eq!(
+        parsed["contracts"][0]["path"],
+        invalid_wasm.to_str().unwrap()
+    );
+    assert!(
+        parsed["contracts"][0]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("failed to load WASM")
+    );
+    assert_eq!(parsed["contracts"][1]["path"], valid_wasm.to_str().unwrap());
+    assert_eq!(parsed["contracts"][1]["upload_cost_stroops"], 1000);
+    assert!(parsed["contracts"][1]["error"].is_null());
+
+    // 2. Directory (`--wasm-dir`) with `--keep-going`
+    let (dir_stdout, dir_stderr, dir_code) = run_cli_quiet(
+        &[
+            "estimate",
+            "--keep-going",
+            "--wasm-dir",
+            batch_dir.to_str().unwrap(),
+            "--rpc-url",
+            &rpc_url,
+            "--json",
+        ],
+        Some(&home),
+    );
+    let _ = stop.send(());
+
+    assert_eq!(
+        dir_code, 1,
+        "--wasm-dir --keep-going must exit non-zero when any item failed; stderr: {dir_stderr}"
+    );
+    let dir_parsed: serde_json::Value =
+        serde_json::from_str(dir_stdout.trim()).expect("must emit valid JSON batch report");
+    assert_eq!(dir_parsed["total_contracts"], 2);
+    assert_eq!(dir_parsed["succeeded"], 1);
+    assert_eq!(dir_parsed["failed"], 1);
+}

@@ -176,6 +176,11 @@ pub struct Cli {
     )]
     pub precision: u32,
 
+    /// Continue evaluating remaining WASM files in a multi-contract batch after
+    /// individual file or simulation failures, exiting non-zero at the end.
+    #[arg(long, global = true)]
+    pub keep_going: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
