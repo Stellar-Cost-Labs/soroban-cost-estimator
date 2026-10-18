@@ -37,7 +37,7 @@ pub struct FeeBreakdown {
 /// (`fee_rate_per_instructions_increment`), per ledger entry
 /// (`fee_disk_read_ledger_entry` / `fee_write_ledger_entry`), and per 1KB
 /// (`fee_disk_read1_kb` / `fee_tx_size1_kb`).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeeRates {
     /// Stroops per 10,000 CPU instructions.
     pub fee_per_10k_insns: i64,
@@ -49,6 +49,162 @@ pub struct FeeRates {
     pub fee_per_read_1kb: i64,
     /// Stroops per 1KB of transaction size.
     pub fee_per_1kb: i64,
+}
+
+/// Explanation of a single locally derived fee component (`(units * rate) / scale`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeeComponentExplanation {
+    /// Component identifier (`"cpu_instructions"`, `"read_entries"`,
+    /// `"write_entries"`, `"read_bytes"`, `"transaction_size"`).
+    pub component: String,
+    /// Human-readable display label (e.g. `"CPU Instructions"`, `"Read Entries"`).
+    pub label: String,
+    /// Measured resource units consumed.
+    pub units: u64,
+    /// Human-readable unit label (`"instructions"`, `"entries"`, `"bytes"`).
+    pub unit_label: String,
+    /// Network config rate in stroops per `scale` units.
+    pub rate_stroops: i64,
+    /// Human-readable rate unit label (e.g. `"stroops / 10,000 instructions"`).
+    pub rate_label: String,
+    /// Integer divisor (`scale`) applied in `(units * rate_stroops) / scale`.
+    pub scale: u64,
+    /// Resulting integer-rounded fee in stroops.
+    pub fee_stroops: i64,
+    /// Human-readable integer formula reconciling units, rate, scale, and result.
+    pub formula: String,
+}
+
+/// Complete explanation of how locally derived non-refundable fee components
+/// were computed from measured units and network config rates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeeCalculationExplanation {
+    /// Effective network fee rates used in the calculation.
+    pub rates: FeeRates,
+    /// Per-subcomponent calculations (`cpu_instructions`, `read_entries`,
+    /// `write_entries`, `read_bytes`, `transaction_size`).
+    pub components: Vec<FeeComponentExplanation>,
+    /// Reconciled CPU fee in stroops.
+    pub cpu_fee_stroops: i64,
+    /// Reconciled combined storage I/O fee (`read_entries + write_entries + read_bytes`) in stroops.
+    pub storage_fee_stroops: i64,
+    /// Reconciled transaction bandwidth fee in stroops.
+    pub bandwidth_fee_stroops: i64,
+    /// Reconciled total non-refundable fee in stroops (`cpu + storage + bandwidth`).
+    pub non_refundable_stroops: i64,
+}
+
+fn build_component_explanation(
+    component: &str,
+    label: &str,
+    units: u64,
+    unit_label: &str,
+    rate_stroops: i64,
+    rate_label: &str,
+    scale: u64,
+) -> FeeComponentExplanation {
+    let fee_stroops = scaled_fee(units, rate_stroops, i128::from(scale));
+    let formula = if scale == 1 {
+        format!("{units} {unit_label} * {rate_stroops} {rate_label} = {fee_stroops} stroops")
+    } else {
+        format!(
+            "({units} {unit_label} * {rate_stroops} {rate_label}) / {scale} = {fee_stroops} stroops"
+        )
+    };
+    FeeComponentExplanation {
+        component: component.to_string(),
+        label: label.to_string(),
+        units,
+        unit_label: unit_label.to_string(),
+        rate_stroops,
+        rate_label: rate_label.to_string(),
+        scale,
+        fee_stroops,
+        formula,
+    }
+}
+
+/// Computes the structured explanation for every locally derived fee component
+/// using integer-only stroop arithmetic.
+#[must_use]
+pub fn explain_fee_calculation(
+    cpu_insns: u64,
+    read_entries: u32,
+    write_entries: u32,
+    read_bytes: u32,
+    tx_size: u32,
+    rates: FeeRates,
+) -> FeeCalculationExplanation {
+    let cpu_comp = build_component_explanation(
+        "cpu_instructions",
+        "CPU Instructions",
+        cpu_insns,
+        "instructions",
+        rates.fee_per_10k_insns,
+        "stroops / 10,000 instructions",
+        10_000,
+    );
+    let read_entry_comp = build_component_explanation(
+        "read_entries",
+        "Read Entries",
+        u64::from(read_entries),
+        "entries",
+        rates.fee_per_read_entry,
+        "stroops / entry",
+        1,
+    );
+    let write_entry_comp = build_component_explanation(
+        "write_entries",
+        "Write Entries",
+        u64::from(write_entries),
+        "entries",
+        rates.fee_per_write_entry,
+        "stroops / entry",
+        1,
+    );
+    let read_bytes_comp = build_component_explanation(
+        "read_bytes",
+        "Read Bytes",
+        u64::from(read_bytes),
+        "bytes",
+        rates.fee_per_read_1kb,
+        "stroops / 1,024 bytes",
+        1024,
+    );
+    let bandwidth_comp = build_component_explanation(
+        "transaction_size",
+        "Transaction Size",
+        u64::from(tx_size),
+        "bytes",
+        rates.fee_per_1kb,
+        "stroops / 1,024 bytes",
+        1024,
+    );
+
+    let cpu_fee_stroops = cpu_comp.fee_stroops;
+    let storage_fee_stroops = read_entry_comp
+        .fee_stroops
+        .saturating_add(write_entry_comp.fee_stroops)
+        .saturating_add(read_bytes_comp.fee_stroops);
+    let bandwidth_fee_stroops = bandwidth_comp.fee_stroops;
+    let non_refundable_stroops = cpu_fee_stroops
+        .saturating_add(storage_fee_stroops)
+        .saturating_add(bandwidth_fee_stroops);
+
+    FeeCalculationExplanation {
+        rates,
+        components: vec![
+            cpu_comp,
+            read_entry_comp,
+            write_entry_comp,
+            read_bytes_comp,
+            bandwidth_comp,
+        ],
+        cpu_fee_stroops,
+        storage_fee_stroops,
+        bandwidth_fee_stroops,
+        non_refundable_stroops,
+    }
 }
 
 /// Compute the fee breakdown from a simulation result.
@@ -93,28 +249,18 @@ pub fn compute_fee_breakdown(
     rates: FeeRates,
     precision: u32,
 ) -> FeeBreakdown {
-    // CPU fee: stroops per 10K instructions → (cpu_insns * rate) / 10000
-    let cpu_fee = scaled_fee(cpu_insns, rates.fee_per_10k_insns, 10_000);
-
-    // Storage I/O fees (non-refundable): per-entry read/write fees and a
-    // per-KB fee on disk bytes read.
-    let read_entry_fee = scaled_fee(u64::from(read_entries), rates.fee_per_read_entry, 1);
-    let write_entry_fee = scaled_fee(u64::from(write_entries), rates.fee_per_write_entry, 1);
-    let read_bytes_fee = scaled_fee(u64::from(read_bytes), rates.fee_per_read_1kb, 1024);
-
-    // Bandwidth fee: stroops per 1KB → (tx_size * rate) / 1024
-    let bandwidth_fee = scaled_fee(u64::from(tx_size), rates.fee_per_1kb, 1024);
-
-    // Non-refundable: CPU + storage I/O + bandwidth fees, computed
-    // independently from the config-sourced rates. This is NOT clamped to
-    // the total: capping it here would silently hide errors in the rest of
-    // the chain (wrong tx size, wrong rate lookup) by reporting a smaller
-    // fee than the rates imply.
-    let non_refundable = cpu_fee
-        .saturating_add(read_entry_fee)
-        .saturating_add(write_entry_fee)
-        .saturating_add(read_bytes_fee)
-        .saturating_add(bandwidth_fee);
+    let explanation = explain_fee_calculation(
+        cpu_insns,
+        read_entries,
+        write_entries,
+        read_bytes,
+        tx_size,
+        rates,
+    );
+    let cpu_fee = explanation.cpu_fee_stroops;
+    let storage_fee = explanation.storage_fee_stroops;
+    let bandwidth_fee = explanation.bandwidth_fee_stroops;
+    let non_refundable = explanation.non_refundable_stroops;
 
     // Refundable: the remainder of the authoritative total after the
     // non-refundable costs (events, ledger rent bumps). `.max(0)` floors
@@ -131,11 +277,6 @@ pub fn compute_fee_breakdown(
     let base_fee_stroops = if total_resource_fee > 0 { 100 } else { 0 };
     let total_stroops = total_resource_fee.saturating_add(base_fee_stroops);
     let total_xlm = stroops_to_xlm(total_stroops, precision);
-
-    // Combined storage I/O fee for the report breakdown.
-    let storage_fee = read_entry_fee
-        .saturating_add(write_entry_fee)
-        .saturating_add(read_bytes_fee);
 
     // Compute exact percentages summing to 100.0%
     let parts = [

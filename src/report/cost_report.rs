@@ -659,6 +659,56 @@ impl CostReport {
         });
         suggestions
     }
+
+    /// Returns the structured fee-calculation explanation when network fee
+    /// rates are available on this report.
+    #[must_use]
+    pub fn explain_fee_calculation(
+        &self,
+    ) -> Option<crate::report::fee_calc::FeeCalculationExplanation> {
+        let rates = self.rates?;
+        Some(crate::report::fee_calc::explain_fee_calculation(
+            self.cpu_instructions,
+            self.read_entries,
+            self.write_entries,
+            self.read_bytes,
+            self.tx_size,
+            rates,
+        ))
+    }
+}
+
+/// Renders a human-readable table explaining how each locally derived fee
+/// component was calculated from measured units, network config rates, and integer scale.
+#[must_use]
+pub fn format_fee_explanation(
+    explanation: &crate::report::fee_calc::FeeCalculationExplanation,
+) -> String {
+    let mut table = Table::new();
+    table.force_no_tty();
+    table.set_header(vec![
+        "Component",
+        "Measured Units",
+        "Rate",
+        "Scale",
+        "Fee (stroops)",
+    ]);
+    for comp in &explanation.components {
+        table.add_row(vec![
+            Cell::new(&comp.label),
+            Cell::new(format!("{} {}", comp.units, comp.unit_label)),
+            Cell::new(format!("{} {}", comp.rate_stroops, comp.rate_label)),
+            Cell::new(comp.scale),
+            Cell::new(format!("{} stroops", comp.fee_stroops)),
+        ]);
+    }
+    format!(
+        "\nFee Calculation Explanation:\n\n{table}\nNon-refundable Subtotal: {} stroops (CPU: {} stroops, Storage I/O: {} stroops, Bandwidth: {} stroops)\n",
+        explanation.non_refundable_stroops,
+        explanation.cpu_fee_stroops,
+        explanation.storage_fee_stroops,
+        explanation.bandwidth_fee_stroops,
+    )
 }
 
 /// Render optimization suggestions as a human-readable block.

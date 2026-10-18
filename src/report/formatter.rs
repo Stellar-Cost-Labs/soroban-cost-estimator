@@ -26,19 +26,34 @@ use crate::report::cost_report::CostReport;
 pub struct ReportOptions {
     /// Suppress advisory output (optimization tips and savings breakdown).
     pub quiet: bool,
+    /// Include the detailed fee-calculation explanation (rates, units, scale, and stroop results).
+    pub explain_fee: bool,
 }
 
 impl ReportOptions {
     /// Options with advisory output enabled — the default.
     #[must_use]
     pub fn verbose_advisory() -> Self {
-        Self { quiet: false }
+        Self {
+            quiet: false,
+            explain_fee: false,
+        }
     }
 
     /// Options with advisory output suppressed, as `--quiet` requests.
     #[must_use]
     pub fn quiet() -> Self {
-        Self { quiet: true }
+        Self {
+            quiet: true,
+            explain_fee: false,
+        }
+    }
+
+    /// Enables or disables the opt-in fee calculation explanation.
+    #[must_use]
+    pub const fn with_explain_fee(mut self, explain_fee: bool) -> Self {
+        self.explain_fee = explain_fee;
+        self
     }
 }
 
@@ -213,6 +228,14 @@ impl TableFormatter {
         output.push_str(&fee_table(report));
         output.push('\n');
 
+        if options.explain_fee {
+            if let Some(explanation) = report.explain_fee_calculation() {
+                output.push_str(&crate::report::cost_report::format_fee_explanation(
+                    &explanation,
+                ));
+            }
+        }
+
         // The fee bar chart is a human-only visual; the CLI omits it for
         // `--quiet` and non-TTY output by passing `show_chart = false`.
         // `render_fee_bar_chart` returns an empty string when there is nothing
@@ -310,6 +333,13 @@ impl ReportFormatter for JsonFormatter {
                     .unwrap_or(serde_json::Value::Null);
                 map.insert("suggestions".to_string(), tips);
                 map.insert("optimization_suggestions".to_string(), structured);
+            }
+            if options.explain_fee {
+                if let Some(explanation) = report.explain_fee_calculation() {
+                    if let Ok(explained_json) = serde_json::to_value(explanation) {
+                        map.insert("fee_explanation".to_string(), explained_json);
+                    }
+                }
             }
             if !report.wasm_sections.is_empty() {
                 map.insert("section_sizes".to_string(), section_size_map(report));

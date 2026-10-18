@@ -1218,7 +1218,8 @@ async fn cmd_estimate(
                             true,
                             width,
                             ReportOptions {
-                                quiet: cli::is_quiet()
+                                quiet: cli::is_quiet(),
+                                explain_fee: false,
                             },
                         )
                     );
@@ -1231,7 +1232,8 @@ async fn cmd_estimate(
                             false,
                             report::cost_report::DEFAULT_CHART_WIDTH,
                             ReportOptions {
-                                quiet: cli::is_quiet()
+                                quiet: cli::is_quiet(),
+                                explain_fee: false,
                             },
                         )
                     );
@@ -1248,7 +1250,8 @@ async fn cmd_estimate(
                             false,
                             report::cost_report::DEFAULT_CHART_WIDTH,
                             ReportOptions {
-                                quiet: cli::is_quiet()
+                                quiet: cli::is_quiet(),
+                                explain_fee: false,
                             },
                         )
                     );

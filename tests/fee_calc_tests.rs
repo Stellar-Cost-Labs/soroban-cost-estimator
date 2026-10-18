@@ -103,3 +103,128 @@ fn test_extra_fraction_digits_are_truncated() {
     assert_eq!(xlm_to_stroops("0.12345678").unwrap(), 1_234_567);
     assert_eq!(xlm_to_stroops("1.00000009").unwrap(), 10_000_000);
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn test_explain_fee_calculation_reconciles_with_compute_fee_breakdown_and_integer_rounding() {
+    use soroban_cost_estimator::report::cost_report::CostReport;
+    use soroban_cost_estimator::report::fee_calc::{
+        DEFAULT_PRECISION, FeeRates, compute_fee_breakdown, explain_fee_calculation,
+    };
+    use soroban_cost_estimator::report::formatter::{
+        JsonFormatter, ReportFormatter, ReportOptions, TableFormatter,
+    };
+    use soroban_cost_estimator::wasm::parser::ContractMeta;
+
+    let rates = FeeRates {
+        fee_per_10k_insns: 25,
+        fee_per_read_entry: 6_250,
+        fee_per_write_entry: 10_000,
+        fee_per_read_1kb: 1_786,
+        fee_per_1kb: 1_624,
+    };
+    // Choose unit counts that exercise integer truncation/rounding across 10,000 and 1,024 scales:
+    // CPU: (14_999 * 25) / 10_000 = 374_975 / 10_000 = 37 stroops
+    // Read entries: 2 * 6_250 = 12_500 stroops
+    // Write entries: 1 * 10_000 = 10_000 stroops
+    // Read bytes: (1_500 * 1_786) / 1024 = 2_679_000 / 1024 = 2_616 stroops
+    // Tx size: (511 * 1_624) / 1024 = 829_864 / 1024 = 810 stroops
+    let cpu_insns = 14_999;
+    let read_entries = 2;
+    let write_entries = 1;
+    let read_bytes = 1_500;
+    let tx_size = 511;
+    let total_resource_fee = 50_000;
+
+    let breakdown = compute_fee_breakdown(
+        total_resource_fee,
+        cpu_insns,
+        read_entries,
+        write_entries,
+        read_bytes,
+        tx_size,
+        rates,
+        DEFAULT_PRECISION,
+    );
+    let explanation = explain_fee_calculation(
+        cpu_insns,
+        read_entries,
+        write_entries,
+        read_bytes,
+        tx_size,
+        rates,
+    );
+
+    assert_eq!(explanation.cpu_fee_stroops, 37);
+    assert_eq!(explanation.storage_fee_stroops, 12_500 + 10_000 + 2_616);
+    assert_eq!(explanation.bandwidth_fee_stroops, 810);
+    assert_eq!(explanation.cpu_fee_stroops, breakdown.cpu_fee_stroops);
+    assert_eq!(
+        explanation.storage_fee_stroops,
+        breakdown.storage_fee_stroops
+    );
+    assert_eq!(
+        explanation.bandwidth_fee_stroops,
+        breakdown.bandwidth_fee_stroops
+    );
+    assert_eq!(
+        explanation.non_refundable_stroops,
+        breakdown.non_refundable_stroops
+    );
+
+    let report = CostReport {
+        function: "increment".to_string(),
+        wasm_hash: "deadbeef".to_string(),
+        wasm_size: 1024,
+        wasm_sections: Vec::new(),
+        cpu_instructions: cpu_insns,
+        memory_bytes: 2048,
+        tx_size,
+        read_entries,
+        write_entries,
+        read_bytes,
+        write_bytes: 128,
+        fee: breakdown,
+        ledger: 42,
+        network: "testnet".to_string(),
+        rpc_latency_ms: 10,
+        rates: Some(rates),
+        warnings: Vec::new(),
+        history: None,
+        projections: None,
+        contract_meta: ContractMeta::default(),
+    };
+
+    let opts = ReportOptions::default().with_explain_fee(true);
+    let table_out = TableFormatter.format_with(&report, opts);
+    assert!(
+        table_out.contains("Fee Calculation Explanation:"),
+        "got: {table_out}"
+    );
+    assert!(
+        table_out.contains("14999 instructions"),
+        "table must label CPU units: {table_out}"
+    );
+    assert!(
+        table_out.contains("25 stroops / 10,000 instructions"),
+        "table must label CPU rate: {table_out}"
+    );
+    assert!(
+        table_out.contains("511 bytes"),
+        "table must label bandwidth units: {table_out}"
+    );
+
+    let json_out = JsonFormatter.format_with(&report, opts);
+    let parsed: serde_json::Value = serde_json::from_str(&json_out).expect("valid JSON");
+    assert_eq!(parsed["fee_explanation"]["cpu_fee_stroops"], 37);
+    assert_eq!(
+        parsed["fee_explanation"]["storage_fee_stroops"],
+        12_500 + 10_000 + 2_616
+    );
+    assert_eq!(parsed["fee_explanation"]["bandwidth_fee_stroops"], 810);
+    assert_eq!(
+        parsed["fee_explanation"]["components"][0]["unit_label"],
+        "instructions"
+    );
+    assert_eq!(parsed["fee_explanation"]["components"][0]["scale"], 10_000);
+}
