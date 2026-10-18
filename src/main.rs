@@ -474,8 +474,9 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 Some(cli::SnapshotAction::Diff {
                     file_a,
                     file_b,
+                    cross_network,
                     json,
-                }) => cmd_config_snapshot_diff(&file_a, &file_b, json),
+                }) => cmd_config_snapshot_diff(&file_a, &file_b, cross_network, json),
                 Some(cli::SnapshotAction::Validate { path, all }) => {
                     cmd_config_snapshot_validate(path.as_deref(), all)
                 }
@@ -507,6 +508,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 network,
                 against,
                 against_previous,
+                cross_network,
                 pricing_only,
                 threshold_percent,
                 summary,
@@ -538,6 +540,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                         &env_string(network, &default_network, "SOROBAN_NETWORK"),
                         fallback,
                         against.as_deref(),
+                        cross_network,
                         pricing_only,
                         threshold_percent,
                         summary,
@@ -3937,6 +3940,19 @@ fn delete_snapshots_older_than(
     Ok(())
 }
 
+fn load_snapshot_path_or_identifier(
+    path_or_id: &Path,
+) -> error::AppResult<config_snapshot::model::ConfigSnapshot> {
+    if path_or_id.is_file() {
+        return config_snapshot::store::load_snapshot_checked(path_or_id);
+    }
+    let id_str = path_or_id.to_string_lossy();
+    if let Ok(resolved) = config_snapshot::store::resolve_snapshot_path(&id_str) {
+        return config_snapshot::store::load_snapshot_checked(&resolved);
+    }
+    config_snapshot::store::load_snapshot_checked(path_or_id)
+}
+
 /// `config snapshot diff <a> <b>` command: compare two saved snapshots
 /// offline.
 ///
@@ -3945,9 +3961,42 @@ fn delete_snapshots_older_than(
 ///
 /// # Network calls
 /// None — both snapshots are read from disk.
-fn cmd_config_snapshot_diff(file_a: &Path, file_b: &Path, json: bool) -> error::AppResult<()> {
-    let old_snapshot = config_snapshot::store::load_snapshot_checked(file_a)?;
-    let new_snapshot = config_snapshot::store::load_snapshot_checked(file_b)?;
+fn cmd_config_snapshot_diff(
+    file_a: &Path,
+    file_b: &Path,
+    cross_network: bool,
+    json: bool,
+) -> error::AppResult<()> {
+    let old_snapshot = load_snapshot_path_or_identifier(file_a)?;
+    let new_snapshot = load_snapshot_path_or_identifier(file_b)?;
+
+    if old_snapshot.network != new_snapshot.network && !cross_network {
+        return Err(error::AppError::General(format!(
+            "snapshot network mismatch ('{}' vs '{}'): pass --cross-network to compare snapshots across networks",
+            old_snapshot.network, new_snapshot.network
+        )));
+    }
+
+    if cross_network || old_snapshot.network != new_snapshot.network {
+        let cross_diff =
+            config_snapshot::diff::diff_snapshots_across_networks(&old_snapshot, &new_snapshot);
+        if json {
+            println!("{}", serde_json::to_string_pretty(&cross_diff)?);
+        } else {
+            println!(
+                "{}",
+                config_snapshot::diff::format_cross_network_diff(
+                    &cross_diff,
+                    cli::should_colorize()
+                )
+            );
+        }
+        if cross_diff.has_pricing_changes {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
 
     if json {
@@ -3968,8 +4017,8 @@ fn cmd_config_snapshot_diff(file_a: &Path, file_b: &Path, json: bool) -> error::
 /// True when a config diff signals a network protocol/config upgrade.
 ///
 /// Pricing changes are the tool's proxy for "the network changed its
-/// resource-pricing configuration under us" â€” e.g. what a protocol vote
-/// produces â€” so they trigger the automatic post-upgrade snapshot.
+/// resource-pricing configuration under us" — e.g. what a protocol vote
+/// produces — so they trigger the automatic post-upgrade snapshot.
 fn upgrade_detected(diff: &config_snapshot::diff::ConfigDiff) -> bool {
     diff.has_pricing_changes
 }
@@ -3992,17 +4041,17 @@ fn stale_estimates_for(network: &str, ledger: u32) -> Vec<cache::CachedEstimate>
 }
 
 /// `config diff` command: compare current config against a snapshot.
-/// `config diff` command: compare current config against a snapshot.
 ///
 /// Exit-code semantics (for CI drift detection):
 /// - default: `0` when no pricing changes, `1` when pricing changes detected.
 /// - `--ignore-pricing-exit`: always `0`, even when pricing changed.
 /// - `--fail-on-any-change`: `1` when any setting changed, even non-pricing.
-#[allow(clippy::fn_params_excessive_bools)]
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 async fn cmd_config_diff(
     network: &str,
     rpc_fallback_url: Option<&str>,
     against_path: Option<&str>,
+    cross_network: bool,
     pricing_only: bool,
     threshold_percent: Option<f64>,
     summary: bool,
@@ -4031,13 +4080,20 @@ async fn cmd_config_diff(
         let old_snapshot = match against_path {
             Some(path) => {
                 debug!(path, "loading snapshot from path");
-                config_snapshot::store::load_snapshot_from_path(path)?
+                load_snapshot_path_or_identifier(Path::new(path))?
             }
             None => {
                 debug!("loading latest snapshot");
                 config_snapshot::store::load_latest_snapshot(network)?
             }
         };
+
+        if old_snapshot.network != network && !cross_network {
+            return Err(error::AppError::General(format!(
+                "snapshot network mismatch ('{}' vs '{}'): pass --cross-network to compare snapshots across networks",
+                old_snapshot.network, network
+            )));
+        }
 
         let new_snapshot = fetch_config_snapshot(
             network,

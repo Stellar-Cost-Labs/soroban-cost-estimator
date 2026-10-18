@@ -1345,3 +1345,68 @@ fn test_format_diff_markdown_no_changes() {
     assert!(md.contains("✅ No changes detected."));
     assert!(!md.contains("| Setting |"));
 }
+
+#[test]
+fn test_cross_network_diff_same_settings_changed_settings_and_absent_section() {
+    let mut testnet = full_snapshot();
+    testnet.network = "testnet".to_string();
+    testnet.ledger = 1000;
+
+    let mut mainnet = full_snapshot();
+    mainnet.network = "mainnet".to_string();
+    mainnet.ledger = 9000;
+
+    // 1. Rejects silent network mixing when allow_cross_network is false
+    let err = diff::compare_snapshots_checked(&testnet, &mainnet, false)
+        .expect_err("must reject cross-network comparison without explicit mode");
+    assert!(err.contains("snapshot network mismatch ('testnet' vs 'mainnet')"));
+    assert!(diff::compare_snapshots_checked(&testnet, &mainnet, true).is_ok());
+
+    // 2. Same settings across networks
+    let same_cross = diff::diff_snapshots_across_networks(&testnet, &mainnet);
+    assert!(same_cross.is_cross_network);
+    assert!(same_cross.changes.is_empty());
+    assert!(!same_cross.has_pricing_changes);
+    let rendered_same = diff::format_cross_network_diff(&same_cross, false);
+    assert!(rendered_same.contains("Networks: testnet vs mainnet"));
+    assert!(rendered_same.contains("No configuration differences detected between networks"));
+
+    // 3. Changed pricing & limit settings + a section absent on one side
+    if let Some(compute) = &mut mainnet.contract_compute {
+        compute.fee_rate_per_instructions_increment += 50; // pricing difference
+        compute.tx_max_instructions += 250_000; // limit difference
+    }
+    mainnet.state_archival = None; // absent on mainnet (present only on testnet)
+
+    let cross = diff::diff_snapshots_across_networks(&testnet, &mainnet);
+    assert!(cross.is_cross_network);
+    assert!(cross.has_pricing_changes);
+    assert_eq!(cross.pricing_difference_count, 1);
+    assert_eq!(cross.limit_difference_count, 1);
+    assert_eq!(cross.network_only_count, 1);
+
+    let archival_diff = cross
+        .changes
+        .iter()
+        .find(|c| c.field_path == "state_archival")
+        .expect("state_archival entry");
+    assert_eq!(
+        archival_diff.kind,
+        diff::CrossNetworkChangeKind::NetworkOnlyLeft
+    );
+    assert_eq!(archival_diff.left_value, "(present)");
+    assert_eq!(archival_diff.right_value, "(missing)");
+
+    let rendered = diff::format_cross_network_diff(&cross, false);
+    assert!(rendered.contains("Networks: testnet vs mainnet"));
+    assert!(rendered.contains(
+        "Summary: 1 pricing difference(s), 1 limit difference(s), 1 network-only setting(s)"
+    ));
+    assert!(
+        rendered.contains("[PRICING] Contract Compute V0 > Fee Rate Per Instructions Increment")
+    );
+    assert!(rendered.contains("[LIMIT] Contract Compute V0 > Tx Max Instructions"));
+    assert!(rendered.contains("[NETWORK-ONLY: testnet] State Archival"));
+    assert!(rendered.contains("testnet: (present)"));
+    assert!(rendered.contains("mainnet: (missing)"));
+}

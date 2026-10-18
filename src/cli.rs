@@ -548,13 +548,18 @@ pub enum SnapshotAction {
 
     /// Compare two saved snapshot files offline, without any network calls.
     Diff {
-        /// First (older) snapshot file to compare.
+        /// First (older or left) snapshot file or identifier to compare.
         #[arg(value_name = "SNAPSHOT_A")]
         file_a: PathBuf,
 
-        /// Second (newer) snapshot file to compare.
+        /// Second (newer or right) snapshot file or identifier to compare.
         #[arg(value_name = "SNAPSHOT_B")]
         file_b: PathBuf,
+
+        /// Allow comparing snapshots captured from different networks and
+        /// label network-only vs pricing differences separately.
+        #[arg(long)]
+        cross_network: bool,
 
         /// Output as JSON instead of a human-readable diff.
         #[arg(long)]
@@ -614,6 +619,12 @@ pub enum ConfigAction {
         /// instead of the live network. Never contacts the RPC endpoint.
         #[arg(long, conflicts_with = "against")]
         against_previous: bool,
+
+        /// Allow comparing a live network against a snapshot from a different
+        /// network (`--against`), labeling network-only and pricing differences.
+        #[arg(long)]
+        cross_network: bool,
+
         /// Hide non-pricing changes and display only fee-rate adjustments.
         #[arg(long)]
         pricing_only: bool,

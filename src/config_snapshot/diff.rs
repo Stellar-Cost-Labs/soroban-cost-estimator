@@ -821,7 +821,14 @@ pub fn format_diff(
         diff.new_snapshot.timestamp,
         diff.new_snapshot.ledger,
     ));
-    output.push_str(&format!("Network: {}\n\n", diff.new_snapshot.network));
+    if diff.old_snapshot.network == diff.new_snapshot.network {
+        output.push_str(&format!("Network: {}\n\n", diff.new_snapshot.network));
+    } else {
+        output.push_str(&format!(
+            "Network: {} → {}\n\n",
+            diff.old_snapshot.network, diff.new_snapshot.network
+        ));
+    }
 
     let mut omitted_count = 0;
     let mut visible_changes: Vec<&FieldDiff> = Vec::new();
@@ -978,6 +985,182 @@ pub fn format_diff_markdown(diff: &ConfigDiff) -> String {
             } else {
                 "no"
             },
+        ));
+    }
+
+    output
+}
+
+/// Classification of a setting difference in a cross-network comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrossNetworkChangeKind {
+    /// Both networks define the setting, and its pricing value differs.
+    PricingDifference,
+    /// Both networks define the setting, and its non-pricing limit/operational value differs.
+    LimitDifference,
+    /// Setting or section is present only on the left (first) network and absent on the right.
+    NetworkOnlyLeft,
+    /// Setting or section is present only on the right (second) network and absent on the left.
+    NetworkOnlyRight,
+}
+
+/// A single difference between two snapshots in cross-network comparison mode.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct CrossNetworkFieldDiff {
+    pub field_path: String,
+    pub setting_id: Option<u32>,
+    pub setting_name: String,
+    pub left_network: String,
+    pub right_network: String,
+    pub left_value: String,
+    pub right_value: String,
+    pub is_pricing_change: bool,
+    pub kind: CrossNetworkChangeKind,
+    pub explanation: Option<&'static str>,
+}
+
+/// Result of comparing two snapshots across networks.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CrossNetworkConfigDiff {
+    pub left_snapshot: SnapshotInfo,
+    pub right_snapshot: SnapshotInfo,
+    pub is_cross_network: bool,
+    pub changes: Vec<CrossNetworkFieldDiff>,
+    pub pricing_difference_count: usize,
+    pub limit_difference_count: usize,
+    pub network_only_count: usize,
+    pub has_pricing_changes: bool,
+}
+
+/// Compares two snapshots while enforcing that cross-network comparisons must be
+/// explicitly opted into via `allow_cross_network`.
+pub fn compare_snapshots_checked(
+    old: &ConfigSnapshot,
+    new: &ConfigSnapshot,
+    allow_cross_network: bool,
+) -> Result<ConfigDiff, String> {
+    if old.network != new.network && !allow_cross_network {
+        return Err(format!(
+            "snapshot network mismatch ('{}' vs '{}'): pass --cross-network to compare snapshots across networks",
+            old.network, new.network
+        ));
+    }
+    Ok(diff_snapshots(old, new))
+}
+
+/// Compares two snapshots (typically from different networks), labeling
+/// network-only (absent on one side) and pricing differences separately.
+pub fn diff_snapshots_across_networks(
+    left: &ConfigSnapshot,
+    right: &ConfigSnapshot,
+) -> CrossNetworkConfigDiff {
+    let base = diff_snapshots(left, right);
+    let mut pricing_difference_count = 0usize;
+    let mut limit_difference_count = 0usize;
+    let mut network_only_count = 0usize;
+
+    let changes: Vec<CrossNetworkFieldDiff> = base
+        .changes
+        .into_iter()
+        .map(|change| {
+            let kind = if change.old_value == "(present)" && change.new_value == "(missing)" {
+                network_only_count += 1;
+                CrossNetworkChangeKind::NetworkOnlyLeft
+            } else if change.old_value == "(missing)" && change.new_value == "(present)" {
+                network_only_count += 1;
+                CrossNetworkChangeKind::NetworkOnlyRight
+            } else if change.is_pricing_change {
+                pricing_difference_count += 1;
+                CrossNetworkChangeKind::PricingDifference
+            } else {
+                limit_difference_count += 1;
+                CrossNetworkChangeKind::LimitDifference
+            };
+
+            CrossNetworkFieldDiff {
+                field_path: change.field_path,
+                setting_id: change.setting_id,
+                setting_name: change.setting_name,
+                left_network: left.network.clone(),
+                right_network: right.network.clone(),
+                left_value: change.old_value,
+                right_value: change.new_value,
+                is_pricing_change: change.is_pricing_change,
+                kind,
+                explanation: change.explanation,
+            }
+        })
+        .collect();
+
+    CrossNetworkConfigDiff {
+        left_snapshot: base.old_snapshot,
+        right_snapshot: base.new_snapshot,
+        is_cross_network: left.network != right.network,
+        changes,
+        pricing_difference_count,
+        limit_difference_count,
+        network_only_count,
+        has_pricing_changes: base.has_pricing_changes,
+    }
+}
+
+/// Formats a [`CrossNetworkConfigDiff`] as a human-readable operator report.
+pub fn format_cross_network_diff(diff: &CrossNetworkConfigDiff, colorize: bool) -> String {
+    let reset_code = if colorize { ANSI_RESET } else { "" };
+    let mut output = String::new();
+
+    output.push_str(&format!(
+        "Cross-network config comparison: {} (ledger {}, {}) ↔ {} (ledger {}, {})\n",
+        diff.left_snapshot.network,
+        diff.left_snapshot.ledger,
+        diff.left_snapshot.timestamp,
+        diff.right_snapshot.network,
+        diff.right_snapshot.ledger,
+        diff.right_snapshot.timestamp,
+    ));
+    output.push_str(&format!(
+        "Networks: {} vs {}\n",
+        diff.left_snapshot.network, diff.right_snapshot.network
+    ));
+    output.push_str(&format!(
+        "Summary: {} pricing difference(s), {} limit difference(s), {} network-only setting(s)\n\n",
+        diff.pricing_difference_count, diff.limit_difference_count, diff.network_only_count
+    ));
+
+    if diff.changes.is_empty() {
+        output.push_str("✅ No configuration differences detected between networks.\n");
+        return output;
+    }
+
+    for change in &diff.changes {
+        let label = match change.kind {
+            CrossNetworkChangeKind::PricingDifference => "[PRICING]".to_string(),
+            CrossNetworkChangeKind::LimitDifference => "[LIMIT]".to_string(),
+            CrossNetworkChangeKind::NetworkOnlyLeft => {
+                format!("[NETWORK-ONLY: {}]", change.left_network)
+            }
+            CrossNetworkChangeKind::NetworkOnlyRight => {
+                format!("[NETWORK-ONLY: {}]", change.right_network)
+            }
+        };
+        let display = field_display_name(&change.field_path);
+        let color = if change.is_pricing_change {
+            pricing_change_color(&change.left_value, &change.right_value, colorize)
+        } else {
+            ""
+        };
+        output.push_str(&format!("  {color}{label} {display}{reset_code}\n"));
+        if let Some(explanation) = change.explanation {
+            output.push_str(&format!("      ℹ️  {explanation}\n"));
+        }
+        output.push_str(&format!(
+            "      {}: {}\n",
+            change.left_network, change.left_value
+        ));
+        output.push_str(&format!(
+            "      {}: {color}{}{reset_code}\n",
+            change.right_network, change.right_value
         ));
     }
 
