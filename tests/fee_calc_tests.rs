@@ -103,3 +103,52 @@ fn test_extra_fraction_digits_are_truncated() {
     assert_eq!(xlm_to_stroops("0.12345678").unwrap(), 1_234_567);
     assert_eq!(xlm_to_stroops("1.00000009").unwrap(), 10_000_000);
 }
+
+#[test]
+fn test_refundable_component_semantics_and_labels() {
+    use soroban_cost_estimator::report::cost_report::format_fee_component_notes;
+    use soroban_cost_estimator::report::fee_calc::{
+        DEFAULT_PRECISION, FeeComponentOrigin, FeeRates, compute_fee_breakdown,
+    };
+
+    let rates = FeeRates {
+        fee_per_10k_insns: 7,
+        fee_per_read_entry: 1_563,
+        fee_per_write_entry: 2_500,
+        fee_per_read_1kb: 447,
+        fee_per_1kb: 406,
+    };
+    let breakdown = compute_fee_breakdown(15_427, 532_502, 1, 1, 0, 156, rates, DEFAULT_PRECISION);
+
+    assert_eq!(breakdown.non_refundable_stroops, 4_496);
+    assert_eq!(breakdown.refundable_stroops, 10_931);
+    assert_eq!(breakdown.base_fee_stroops, 100);
+    assert_eq!(breakdown.total_stroops, 15_527);
+
+    let components = breakdown.component_semantics();
+    assert_eq!(components.len(), 5);
+
+    // Sum of all 5 displayed components equals the authoritative total_stroops.
+    let sum_stroops: i64 = components.iter().map(|c| c.stroops).sum();
+    assert_eq!(sum_stroops, breakdown.total_stroops);
+
+    let refundable = components
+        .iter()
+        .find(|c| c.key == "refundable_resource_fee")
+        .expect("refundable component present");
+    assert_eq!(refundable.label, "Refundable Fee (rent + events remainder)");
+    assert_eq!(refundable.stroops, 10_931);
+    assert_eq!(
+        refundable.origin,
+        FeeComponentOrigin::InferredRefundableRemainder
+    );
+    assert!(
+        refundable
+            .limitation
+            .contains("does not itemize rent separately")
+    );
+
+    let note = format_fee_component_notes(&breakdown);
+    assert!(note.contains("inferred as the remainder"));
+    assert!(note.contains("ledger rent bumps and contract events"));
+}
