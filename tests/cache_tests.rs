@@ -2784,3 +2784,92 @@ fn test_legacy_database_without_io_column_still_loads() {
         );
     });
 }
+
+#[test]
+fn test_inspect_cache_combined_filters_pagination_and_validation() {
+    with_temp_home(|tmp| {
+        seed_query_test_entry(
+            tmp,
+            "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000",
+            "transfer",
+            &["secret_arg=super_secret_token"],
+            "testnet",
+            100_000,
+            10_000,
+            "2026-01-01T00:00:00Z",
+        );
+        seed_query_test_entry(
+            tmp,
+            "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000",
+            "transfer",
+            &["secret_arg=another_secret"],
+            "testnet",
+            150_000,
+            15_000,
+            "2026-01-02T00:00:00Z",
+        );
+        seed_query_test_entry(
+            tmp,
+            "bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000",
+            "approve",
+            &[],
+            "mainnet",
+            200_000,
+            20_000,
+            "2026-01-03T00:00:00Z",
+        );
+
+        // 1. Combined filters + bounded pagination
+        let filter = cache::CacheFilter {
+            network: Some("testnet".to_string()),
+            wasm_hash: Some("aaaa0000".to_string()),
+            function: Some("transfer".to_string()),
+            since: Some(cache::parse_since_timestamp("2026-01-01").expect("parse since")),
+            to: Some(cache::parse_to_timestamp("2026-01-02T23:59:59Z").expect("parse to")),
+            ..Default::default()
+        };
+        let page1 = cache::inspect_cache(&filter, Some(1), Some(0)).expect("inspect page 1");
+        assert_eq!(page1.total_matched, 2);
+        assert_eq!(page1.offset, 0);
+        assert_eq!(page1.limit, 1);
+        assert!(page1.has_more);
+        assert_eq!(page1.entries.len(), 1);
+        assert_eq!(page1.entries[0].total_stroops, 150_000);
+
+        // Verify JSON contract has stable field names and never leaks raw argument values/secrets.
+        let json = serde_json::to_string(&page1).expect("serialize inspect page");
+        assert!(json.contains("\"total_matched\":2"));
+        assert!(json.contains("\"args_hash\""));
+        assert!(!json.contains("super_secret_token"));
+        assert!(!json.contains("another_secret"));
+
+        let page2 = cache::inspect_cache(&filter, Some(1), Some(1)).expect("inspect page 2");
+        assert_eq!(page2.total_matched, 2);
+        assert!(!page2.has_more);
+        assert_eq!(page2.entries.len(), 1);
+        assert_eq!(page2.entries[0].total_stroops, 100_000);
+
+        // 2. Empty results
+        let empty_filter = cache::CacheFilter {
+            function: Some("nonexistent_fn".to_string()),
+            ..Default::default()
+        };
+        let empty_page =
+            cache::inspect_cache(&empty_filter, None, None).expect("inspect empty result");
+        assert_eq!(empty_page.total_matched, 0);
+        assert!(empty_page.entries.is_empty());
+        assert!(!empty_page.has_more);
+
+        // 3. Invalid limit, hash, and date inputs
+        assert!(cache::inspect_cache(&filter, Some(0), None).is_err());
+        assert!(
+            cache::inspect_cache(&filter, Some(cache::MAX_CACHE_INSPECT_LIMIT + 1), None).is_err()
+        );
+        let invalid_hash = cache::CacheFilter {
+            wasm_hash: Some("invalid_hex_hash!".to_string()),
+            ..Default::default()
+        };
+        assert!(cache::inspect_cache(&invalid_hash, None, None).is_err());
+        assert!(cache::parse_since_timestamp("not-a-valid-date").is_err());
+    });
+}
