@@ -2864,7 +2864,9 @@ fn start_mock_rpc_server(
                     }
 
                     let resp_body = if req_str.contains("simulateTransaction") {
-                        if live_tx_data.is_empty() {
+                        if live_tx_data.is_empty() && min_fee.is_empty() && ledger == 0 {
+                            r#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_string()
+                        } else if live_tx_data.is_empty() {
                             format!(
                                 r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":"{ledger}","minResourceFee":"{min_fee}"}}}}"#
                             )
@@ -4474,4 +4476,160 @@ fn test_config_snapshot_diff_makes_no_network_calls() {
         !stderr.contains("failed to locate RPC endpoint"),
         "offline diff must not resolve a network; got: {stderr}"
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn test_stable_exit_codes_for_automation() {
+    use soroban_cost_estimator::error::{EXIT_FAILURE, EXIT_SUCCESS, EXIT_USAGE};
+
+    let home = temp_home("stable-exit-codes");
+
+    // 1. Success (0): normal report on stdout, no `Error:` on stderr.
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "wasm-info",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, EXIT_SUCCESS,
+        "successful command must exit 0; stderr: {stderr}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must contain pure JSON report");
+    assert_eq!(parsed["size"], 44);
+    assert!(
+        !stderr.contains("Error:"),
+        "stderr must not contain Error on success"
+    );
+
+    // 2. CLI usage error (2): missing required `--wasm` flag.
+    let (stdout, stderr, code) = run_cli_in_home(&["estimate"], Some(&home));
+    assert_eq!(
+        code, EXIT_USAGE,
+        "clap usage error must exit 2; stderr: {stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "stdout must be empty on usage error; got: {stdout}"
+    );
+    assert!(
+        stderr.contains("Usage"),
+        "stderr must contain usage help; got: {stderr}"
+    );
+
+    // 3. Invalid invocation arguments (1): `--fn` without `--id`.
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--fn",
+            "increment",
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, EXIT_FAILURE,
+        "invalid arguments must exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "stdout must be empty on argument error; got: {stdout}"
+    );
+    assert!(
+        stderr.contains("Error:"),
+        "stderr must contain Error prefix; got: {stderr}"
+    );
+
+    // 4. RPC failure (1): unreachable loopback endpoint.
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "--max-retries",
+            "0",
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--rpc-url",
+            DEAD_RPC,
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, EXIT_FAILURE,
+        "RPC failure must exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "stdout must be empty on RPC error; got: {stdout}"
+    );
+    assert!(
+        stderr.contains("Error:"),
+        "stderr must contain Error prefix; got: {stderr}"
+    );
+
+    // 5. Simulation failure (1): mock RPC returns empty simulation payload (no cost data).
+    let (mock_url, stop) = start_mock_rpc_server("", "", 0);
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "--max-retries",
+            "0",
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--rpc-url",
+            &mock_url,
+            "--json",
+        ],
+        Some(&home),
+    );
+    let _ = stop.send(());
+    assert_eq!(
+        code, EXIT_FAILURE,
+        "simulation failure must exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "stdout must be empty on simulation failure; got: {stdout}"
+    );
+    assert!(
+        stderr.contains("Error: failed to simulate transaction"),
+        "stderr must report simulation failure; got: {stderr}"
+    );
+
+    // 6. Diff regression (1): snapshot diff with pricing change.
+    let snap_a = write_snapshot_file(
+        &home,
+        "snap-a.json",
+        &snapshot_json_fee("testnet", 100, 100),
+    );
+    let snap_b = write_snapshot_file(
+        &home,
+        "snap-b.json",
+        &snapshot_json_fee("testnet", 101, 250),
+    );
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "snapshot",
+            "diff",
+            snap_a.to_str().unwrap(),
+            snap_b.to_str().unwrap(),
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, EXIT_FAILURE,
+        "diff regression must exit 1; stderr: {stderr}"
+    );
+    let diff_json: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("diff report must be written to stdout");
+    assert_eq!(diff_json["has_pricing_changes"], true);
 }

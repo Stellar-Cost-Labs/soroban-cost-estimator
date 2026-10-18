@@ -159,3 +159,19 @@ renders the same value with thousands separators as
 
 Use `--format json`, `--format csv`, or `--format markdown` when feeding the result into CI, spreadsheets, or documentation. `--json` remains a backward-compatible alias for `--format json`. The
 result is also written to the estimate cache(see [Caching](../concepts/caching.md)).
+
+## Exit codes and output streams
+
+Automation and CI pipelines can rely on stable process exit codes and strict stream separation:
+
+| Exit code | Constant | Triggering conditions |
+| :--- | :--- | :--- |
+| `0` | `EXIT_SUCCESS` | Command completed successfully (`--help`, `estimate`, `estimate-all`, `wasm-info`, `cache`, or `config diff` with no pricing changes). |
+| `1` | `EXIT_FAILURE` | Runtime or domain failure: invalid contract/function arguments (`--fn` without `--id`, unknown function name, type mismatch against contract spec), WASM/file validation failure, simulation failure (`simulateTransaction` error or empty cost data), RPC/network failure (unreachable host, HTTP/JSON-RPC error, unknown network), batch run with failed items, or diff regression (`config diff` / `config snapshot diff` detecting pricing changes). |
+| `2` | `EXIT_USAGE` | CLI command-line syntax or flag usage error reported by `clap` (missing required `--wasm`, unknown flag, conflicting flags such as `--diff` without `--wasm-new`, or invalid flag value type). |
+
+### Stream separation
+
+- **`stdout`**: Reserved exclusively for the requested command output (table, JSON, CSV, Markdown, or shell completions). When a command fails before producing a report, `stdout` is empty.
+- **`stderr`**: Receives all `Error: …` messages, `clap` usage diagnostics, failover notices, and `tracing` logs.
+

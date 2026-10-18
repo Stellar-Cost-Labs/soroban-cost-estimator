@@ -159,12 +159,64 @@ pub enum AppError {
     General(String),
 }
 
+/// Stable process exit code for a successful command or diff without regressions.
+pub const EXIT_SUCCESS: i32 = 0;
+
+/// Stable process exit code for runtime, validation, simulation, RPC, or diff failures.
+pub const EXIT_FAILURE: i32 = 1;
+
+/// Stable process exit code for CLI flag/argument syntax errors reported by `clap`.
+pub const EXIT_USAGE: i32 = 2;
+
+impl AppError {
+    /// Stable process exit code for this error class.
+    ///
+    /// Runtime, validation, simulation, RPC, and diff failures return
+    /// [`EXIT_FAILURE`] (`1`), while command-line parser usage errors handled
+    /// by `clap` return [`EXIT_USAGE`] (`2`).
+    #[must_use]
+    pub const fn exit_code(&self) -> i32 {
+        EXIT_FAILURE
+    }
+
+    /// Machine-readable category name for diagnostics and automation.
+    #[must_use]
+    pub const fn error_category(&self) -> &'static str {
+        match self {
+            Self::Io(_) | Self::FileNotFound(_) => "io",
+            Self::Rpc { .. }
+            | Self::RpcUnavailable { .. }
+            | Self::Http(_)
+            | Self::InvalidHeader(_)
+            | Self::HttpStatus { .. }
+            | Self::ConnectTimeout { .. }
+            | Self::WsConnect(_)
+            | Self::WsProtocol(_)
+            | Self::WsClosed
+            | Self::UnknownNetwork(_) => "rpc",
+            Self::XdrDecode(_) | Self::XdrEncode(_) => "xdr",
+            Self::WasmParse(_) | Self::WasmValidation(_) => "wasm",
+            Self::TypeValidation(_) => "invalid_arguments",
+            Self::SnapshotNotFound(_)
+            | Self::SnapshotParse(_)
+            | Self::NoSnapshots(_)
+            | Self::NotEnoughSnapshots { .. } => "snapshot",
+            Self::SimulationFailed(_) | Self::TxConstruction(_) => "simulation",
+            Self::FeeCalc(_) => "report",
+            Self::Config(_) | Self::ConfigFetch(_) | Self::ConfigSettingNotFound(_) => "config",
+            Self::Json(_) => "serialization",
+            Self::Sqlite(_) => "cache",
+            Self::General(_) => "general",
+        }
+    }
+}
+
 /// Convenience alias for `Result<T, AppError>`.
 pub type AppResult<T> = Result<T, AppError>;
 
 #[cfg(test)]
 mod tests {
-    use super::AppError;
+    use super::{AppError, EXIT_FAILURE, EXIT_SUCCESS, EXIT_USAGE};
 
     /// First word of `message`, lower-cased, for case checks.
     fn first_word(message: &str) -> String {
@@ -260,5 +312,24 @@ mod tests {
                 "error message must separate cause with a colon: {rendered:?}"
             );
         }
+    }
+
+    #[test]
+    fn stable_exit_codes_and_categories() {
+        assert_eq!(EXIT_SUCCESS, 0);
+        assert_eq!(EXIT_FAILURE, 1);
+        assert_eq!(EXIT_USAGE, 2);
+
+        let rpc_err = AppError::UnknownNetwork("nope".to_string());
+        assert_eq!(rpc_err.exit_code(), EXIT_FAILURE);
+        assert_eq!(rpc_err.error_category(), "rpc");
+
+        let sim_err = AppError::SimulationFailed("trap".to_string());
+        assert_eq!(sim_err.exit_code(), EXIT_FAILURE);
+        assert_eq!(sim_err.error_category(), "simulation");
+
+        let arg_err = AppError::TypeValidation("bad arg".to_string());
+        assert_eq!(arg_err.exit_code(), EXIT_FAILURE);
+        assert_eq!(arg_err.error_category(), "invalid_arguments");
     }
 }

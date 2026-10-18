@@ -206,6 +206,7 @@ async fn main() {
         "info"
     };
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level)),
         )
@@ -216,9 +217,9 @@ async fn main() {
     }
 
     if let Err(err) = run(args).await {
-        error!(error = %err, "command failed");
+        error!(error = %err, category = err.error_category(), "command failed");
         eprintln!("Error: {err}");
-        std::process::exit(1);
+        std::process::exit(err.exit_code());
     }
 }
 
