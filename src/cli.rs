@@ -162,6 +162,11 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "N", default_value_t = 10_000)]
     pub max_cache_entries: usize,
 
+    /// Quarantine a corrupt SQLite cache database to a timestamped backup
+    /// (`cache.db.corrupt.<timestamp>`) and initialize a fresh empty cache.
+    #[arg(long, global = true)]
+    pub recover_corrupt_cache: bool,
+
     /// Number of decimal places shown for XLM fee values (0..=7, default 7).
     ///
     /// Stellar amounts are denominated in stroops (1 XLM = 10,000,000
@@ -689,6 +694,10 @@ pub static COLOR_CHOICE: AtomicU8 = AtomicU8::new(0);
 /// without threading a flag through every call site.
 static QUIET: AtomicBool = AtomicBool::new(false);
 
+/// Global `--recover-corrupt-cache` state. Set once from the parsed CLI or
+/// toggled in tests when explicit corrupt-cache recovery is permitted.
+static RECOVER_CORRUPT_CACHE: AtomicBool = AtomicBool::new(false);
+
 /// Record whether `--quiet` was passed.
 pub fn init_quiet(quiet: bool) {
     QUIET.store(quiet, Ordering::Relaxed);
@@ -698,6 +707,17 @@ pub fn init_quiet(quiet: bool) {
 #[must_use]
 pub fn is_quiet() -> bool {
     QUIET.load(Ordering::Relaxed)
+}
+
+/// Record whether `--recover-corrupt-cache` was passed.
+pub fn init_recover_corrupt_cache(recover: bool) {
+    RECOVER_CORRUPT_CACHE.store(recover, Ordering::Relaxed);
+}
+
+/// Whether explicit recovery of a corrupt SQLite cache is permitted.
+#[must_use]
+pub fn should_recover_corrupt_cache() -> bool {
+    RECOVER_CORRUPT_CACHE.load(Ordering::Relaxed)
 }
 
 /// Terminal width to render the fee bar chart at, or `None` when the chart

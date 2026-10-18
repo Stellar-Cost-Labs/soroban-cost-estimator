@@ -2784,3 +2784,156 @@ fn test_legacy_database_without_io_column_still_loads() {
         );
     });
 }
+
+#[test]
+fn test_classify_sqlite_error_distinguishes_corruption_from_other_errors() {
+    use rusqlite::ffi;
+
+    let make_err = |code: ffi::ErrorCode| {
+        rusqlite::Error::SqliteFailure(
+            ffi::Error {
+                code,
+                extended_code: code as i32,
+            },
+            Some("test error".to_string()),
+        )
+    };
+
+    assert_eq!(
+        cache::classify_sqlite_error(&make_err(ffi::ErrorCode::DatabaseCorrupt)),
+        cache::CacheDbFailureKind::Corrupt
+    );
+    assert_eq!(
+        cache::classify_sqlite_error(&make_err(ffi::ErrorCode::NotADatabase)),
+        cache::CacheDbFailureKind::Corrupt
+    );
+    assert_eq!(
+        cache::classify_sqlite_error(&make_err(ffi::ErrorCode::PermissionDenied)),
+        cache::CacheDbFailureKind::PermissionDenied
+    );
+    assert_eq!(
+        cache::classify_sqlite_error(&make_err(ffi::ErrorCode::ReadOnly)),
+        cache::CacheDbFailureKind::PermissionDenied
+    );
+    assert_eq!(
+        cache::classify_sqlite_error(&make_err(ffi::ErrorCode::CannotOpen)),
+        cache::CacheDbFailureKind::PermissionDenied
+    );
+    assert_eq!(
+        cache::classify_sqlite_error(&make_err(ffi::ErrorCode::DiskFull)),
+        cache::CacheDbFailureKind::DiskFull
+    );
+    assert_eq!(
+        cache::classify_sqlite_error(&make_err(ffi::ErrorCode::DatabaseBusy)),
+        cache::CacheDbFailureKind::Locked
+    );
+    assert_eq!(
+        cache::classify_sqlite_error(&make_err(ffi::ErrorCode::DatabaseLocked)),
+        cache::CacheDbFailureKind::Locked
+    );
+    assert_eq!(
+        cache::classify_sqlite_error(&rusqlite::Error::QueryReturnedNoRows),
+        cache::CacheDbFailureKind::Other
+    );
+}
+
+#[test]
+fn test_corrupt_sqlite_database_recovery_and_failed_init_preservation() {
+    with_temp_home(|home| {
+        cache::set_cache_recovery_mode(false);
+        soroban_cost_estimator::cli::init_recover_corrupt_cache(false);
+
+        let dir = home.join(".soroban-cost-estimator");
+        std::fs::create_dir_all(&dir).expect("create data dir");
+        let db = dir.join("cache.db");
+        let corrupt_payload = b"NOT A VALID SQLITE DATABASE HEADER - CORRUPTED BYTES";
+        std::fs::write(&db, corrupt_payload).expect("write corrupt db");
+
+        // 1. Without recovery mode, opening fails with CacheCorrupt and does NOT overwrite or delete the file.
+        let err = cache::load_estimate("hash1", "fn1", &[]).expect_err("should fail on corrupt db");
+        match err {
+            soroban_cost_estimator::error::AppError::CacheCorrupt { ref path, .. } => {
+                assert!(path.contains("cache.db"));
+            }
+            other => panic!("expected AppError::CacheCorrupt, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&db).expect("corrupt db still exists"),
+            corrupt_payload,
+            "corrupt database must never be overwritten or deleted automatically"
+        );
+
+        // 2. If initialization fails after quarantine, the original corrupt database remains available in the backup.
+        let init_err = cache::recover_corrupt_cache_with_initializer(&db, |_target| {
+            Err(soroban_cost_estimator::error::AppError::General(
+                "simulated initialization failure".to_string(),
+            ))
+        })
+        .expect_err("initializer failure should propagate");
+        assert!(
+            init_err
+                .to_string()
+                .contains("simulated initialization failure")
+        );
+
+        let backups_after_failed_init: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("cache.db.corrupt."))
+            })
+            .collect();
+        assert_eq!(
+            backups_after_failed_init.len(),
+            1,
+            "original corrupt db must be preserved in timestamped backup after failed init"
+        );
+        assert_eq!(
+            std::fs::read(&backups_after_failed_init[0]).expect("read quarantined backup"),
+            corrupt_payload
+        );
+
+        // Restore corrupt payload at `db` to test successful explicit recovery.
+        std::fs::write(&db, corrupt_payload).expect("rewrite corrupt db");
+
+        // 3. Explicit recovery renames the corrupt file to a timestamped backup and initializes a fresh database.
+        let report = cache::recover_corrupt_cache_at(&db).expect("recover corrupt cache");
+        assert_eq!(report.database_path, db);
+        assert!(report.quarantined_path.exists());
+        assert_eq!(
+            std::fs::read(&report.quarantined_path).expect("read quarantined file"),
+            corrupt_payload
+        );
+        assert!(
+            report.notice.contains("no longer in active use"),
+            "recovery notice should explain cached estimates loss from active use"
+        );
+
+        // New database is now healthy and usable.
+        cache::save_estimate(
+            "hash_ok",
+            "fn_ok",
+            &[],
+            "testnet",
+            10,
+            500,
+            100,
+            50,
+            None,
+            true,
+        )
+        .expect("save to recovered db");
+        let loaded = cache::load_estimate("hash_ok", "fn_ok", &[])
+            .expect("load from recovered db")
+            .expect("entry exists");
+        assert_eq!(loaded.total_stroops, 500);
+
+        // 4. Attempting recovery on a healthy database is refused.
+        let healthy_err = cache::recover_corrupt_cache_at(&db)
+            .expect_err("healthy database should not be quarantined");
+        assert!(healthy_err.to_string().contains("healthy"));
+    });
+}

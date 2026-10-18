@@ -145,6 +145,13 @@ pub enum AppError {
     #[error("failed to access cache database: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    #[error(
+        "cache database at {path} is corrupt: {reason} \
+         (pass `--recover-corrupt-cache` to quarantine the original file and initialize an empty cache; \
+         cached estimates in the broken database will no longer be in active use)"
+    )]
+    CacheCorrupt { path: String, reason: String },
+
     // ── General ─────────────────────────────────────────────────────
     #[error("operation failed: {0}")]
     General(String),
@@ -221,6 +228,10 @@ mod tests {
             AppError::ConfigFetch("boom".to_string()),
             AppError::ConfigSettingNotFound("CONFIG_SETTING_CONTRACT_COMPUTE_V0".to_string()),
             AppError::Json(serde_json::from_str::<u8>("nope").unwrap_err()),
+            AppError::CacheCorrupt {
+                path: "/tmp/cache.db".to_string(),
+                reason: "file is not a database".to_string(),
+            },
             AppError::General("could not determine home directory".to_string()),
         ];
 
@@ -238,6 +249,10 @@ mod tests {
             AppError::XdrDecode("invalid base64".to_string()),
             AppError::FileNotFound("a.wasm".to_string()),
             AppError::InvalidHeader("missing '=' separator".to_string()),
+            AppError::CacheCorrupt {
+                path: "/tmp/cache.db".to_string(),
+                reason: "file is not a database".to_string(),
+            },
         ];
         for sample in samples {
             let rendered = sample.to_string();
