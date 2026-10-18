@@ -1028,3 +1028,217 @@ fn test_load_wasm_detects_synthetic_debug_section() {
 
     let _ = std::fs::remove_file(&temp);
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Typed JSON invocation arguments (--args-file, issue #486)
+// ─────────────────────────────────────────────────────────────────────────
+
+fn complex_spec_function() -> soroban_cost_estimator::wasm::parser::FunctionInfo {
+    use soroban_cost_estimator::wasm::parser::{FunctionInfo, ParamInfo};
+    use stellar_xdr::{ScSpecTypeDef, ScSpecTypeMap, ScSpecTypeVec};
+
+    FunctionInfo {
+        name: "configure".to_string(),
+        param_count: 5,
+        result_count: 1,
+        params: vec![
+            ParamInfo {
+                name: "enabled".to_string(),
+                type_name: "bool".to_string(),
+                type_def: ScSpecTypeDef::Bool,
+            },
+            ParamInfo {
+                name: "step".to_string(),
+                type_name: "i64".to_string(),
+                type_def: ScSpecTypeDef::I64,
+            },
+            ParamInfo {
+                name: "note".to_string(),
+                type_name: "string".to_string(),
+                type_def: ScSpecTypeDef::String,
+            },
+            ParamInfo {
+                name: "tags".to_string(),
+                type_name: "vec".to_string(),
+                type_def: ScSpecTypeDef::Vec(Box::new(ScSpecTypeVec {
+                    element_type: Box::new(ScSpecTypeDef::Symbol),
+                })),
+            },
+            ParamInfo {
+                name: "limits".to_string(),
+                type_name: "map".to_string(),
+                type_def: ScSpecTypeDef::Map(Box::new(ScSpecTypeMap {
+                    key_type: Box::new(ScSpecTypeDef::Symbol),
+                    value_type: Box::new(ScSpecTypeDef::U32),
+                })),
+            },
+        ],
+        returns: Vec::new(),
+    }
+}
+
+#[test]
+fn test_json_args_all_supported_scval_types() {
+    use soroban_cost_estimator::xdr_helper::parse_json_args_scvals;
+    use stellar_xdr::ScVal;
+
+    let json = r#"[
+        {"type": "bool", "value": true},
+        {"type": "u32", "value": 42},
+        {"type": "i32", "value": -17},
+        {"type": "u64", "value": 1000000},
+        {"type": "i64", "value": -999999},
+        {"type": "string", "value": "hello world"},
+        {"type": "symbol", "value": "my_sym_1"},
+        {"type": "bytes", "value": "0xdeadbeef"},
+        {"type": "address", "value": "CATFGUK47IOTMS4IQQDHUY3UEEJF5EUHDP3M4UYQW4G6IVSTF57JTGOK"},
+        {"type": "void", "value": null},
+        {"type": "vec", "value": [{"type": "u32", "value": 1}, {"type": "u32", "value": 2}]},
+        {"type": "map", "value": [{"key": {"type": "symbol", "value": "k"}, "val": {"type": "i64", "value": 7}}]}
+    ]"#;
+
+    let vals = parse_json_args_scvals(json, None, &[]).expect("all 12 types should parse");
+    assert_eq!(vals.len(), 12);
+    assert_eq!(vals[0], ScVal::Bool(true));
+    assert_eq!(vals[1], ScVal::U32(42));
+    assert_eq!(vals[2], ScVal::I32(-17));
+    assert_eq!(vals[3], ScVal::U64(1_000_000));
+    assert_eq!(vals[4], ScVal::I64(-999_999));
+    assert!(matches!(vals[5], ScVal::String(_)));
+    assert!(matches!(vals[6], ScVal::Symbol(_)));
+    assert!(matches!(vals[7], ScVal::Bytes(_)));
+    assert!(matches!(vals[8], ScVal::Address(_)));
+    assert_eq!(vals[9], ScVal::Void);
+    assert!(matches!(vals[10], ScVal::Vec(Some(_))));
+    assert!(matches!(vals[11], ScVal::Map(Some(_))));
+}
+
+#[test]
+fn test_json_args_named_parameters_and_nested_values_with_shell_metacharacters() {
+    use soroban_cost_estimator::xdr_helper::parse_json_args_scvals;
+    use stellar_xdr::ScVal;
+
+    let funcs = vec![complex_spec_function()];
+    let raw_shell_str = r#"echo $HOME && rm -rf /; `whoami` "quoted" 'single' | grep $1"#;
+    let doc = serde_json::json!({
+        // deliberately out of declaration order to verify reordering by spec name
+        "limits": {
+            "type": "map",
+            "value": [
+                {
+                    "key": {"type": "symbol", "value": "max_ops"},
+                    "val": {"type": "u32", "value": 500}
+                }
+            ]
+        },
+        "note": {"type": "string", "value": raw_shell_str},
+        "tags": {
+            "type": "vec",
+            "value": [
+                {"type": "symbol", "value": "alpha_1"},
+                {"type": "symbol", "value": "beta_2"}
+            ]
+        },
+        "step": {"type": "i64", "value": -123},
+        "enabled": {"type": "bool", "value": false}
+    });
+
+    let vals = parse_json_args_scvals(&doc.to_string(), Some("configure"), &funcs)
+        .expect("named parameters should validate and reorder");
+    assert_eq!(vals.len(), 5);
+    assert_eq!(vals[0], ScVal::Bool(false));
+    assert_eq!(vals[1], ScVal::I64(-123));
+    match &vals[2] {
+        ScVal::String(s) => assert_eq!(s.0.as_slice(), raw_shell_str.as_bytes()),
+        other => panic!("expected ScVal::String, got {other:?}"),
+    }
+    assert!(matches!(vals[3], ScVal::Vec(Some(_))));
+    assert!(matches!(vals[4], ScVal::Map(Some(_))));
+}
+
+#[test]
+fn test_json_args_rejects_floating_point_numbers_and_unsupported_types() {
+    use soroban_cost_estimator::xdr_helper::parse_json_args_scvals;
+
+    let funcs = vec![complex_spec_function()];
+
+    for bad_float in [
+        r#"[{"type": "i64", "value": 3.14}]"#,
+        r#"[{"type": "u32", "value": 1.5}]"#,
+        r#"[{"type": "i32", "value": -2.75}]"#,
+        r#"[{"type": "u64", "value": "42.0"}]"#,
+        "[1.25]",
+    ] {
+        let err = parse_json_args_scvals(bad_float, None, &[])
+            .expect_err("floating-point number must be rejected");
+        assert!(
+            err.to_string().contains("floating-point"),
+            "unexpected error for {bad_float}: {err}"
+        );
+    }
+
+    let unsupported = r#"[{"type": "f64", "value": 1}]"#;
+    let err = parse_json_args_scvals(unsupported, None, &[])
+        .expect_err("unsupported type must fail clearly");
+    assert!(
+        err.to_string()
+            .contains("unsupported JSON argument type 'f64'"),
+        "got: {err}"
+    );
+
+    let bad_param_name = r#"{"unknown_param": {"type": "i64", "value": 1}}"#;
+    let err = parse_json_args_scvals(bad_param_name, Some("configure"), &funcs)
+        .expect_err("unknown parameter name must fail");
+    assert!(
+        err.to_string()
+            .contains("unknown parameter 'unknown_param'"),
+        "got: {err}"
+    );
+
+    let wrong_spec_type = serde_json::json!({
+        "enabled": {"type": "string", "value": "true"},
+        "step": {"type": "i64", "value": 1},
+        "note": {"type": "string", "value": "ok"},
+        "tags": {"type": "vec", "value": []},
+        "limits": {"type": "map", "value": []}
+    });
+    let err = parse_json_args_scvals(&wrong_spec_type.to_string(), Some("configure"), &funcs)
+        .expect_err("contract-spec type mismatch must fail");
+    assert!(err.to_string().contains("type mismatch"), "got: {err}");
+}
+
+#[test]
+fn test_cli_estimate_args_file_dry_run_validates_before_simulation() {
+    let args_path =
+        std::env::temp_dir().join(format!("sce-args-valid-{}.json", std::process::id()));
+    std::fs::write(&args_path, r#"{"step": {"type": "i64", "value": 99}}"#)
+        .expect("write args file");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--fn",
+            "increment",
+            "--args-file",
+        ])
+        .arg(&args_path)
+        .arg("--dry-run")
+        .output()
+        .expect("run estimate --args-file --dry-run");
+
+    let _ = std::fs::remove_file(&args_path);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "expected success, stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("I64(99)"),
+        "dry-run output should show parsed ScVal I64(99), got: {stdout}"
+    );
+}

@@ -268,6 +268,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             r#fn,
             id,
             args: contract_args,
+            args_file,
             interactive: interactive_flag,
             cache_ttl,
             compare,
@@ -289,6 +290,10 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 (Some(fmt), _) => fmt,
                 (None, true) => cli::OutputFormat::Json,
                 (None, false) => cli::OutputFormat::Table,
+            };
+            let contract_args = match args_file {
+                Some(ref path) => vec![xdr_helper::load_json_args_marker(path)?],
+                None => contract_args,
             };
             let paths = resolve_wasm_paths(&wasm, wasm_dir.as_deref())?;
             if wasm.len() > 1 || wasm_dir.is_some() {
@@ -908,12 +913,9 @@ async fn simulate_report(
         req.verbose,
     )?;
 
-    let sc_vals: Vec<stellar_xdr::ScVal> = req
-        .args
-        .iter()
-        .map(|a| xdr_helper::parse_arg_scval(a))
-        .collect();
-    debug!(arg_count = sc_vals.len(), "parsed arguments");
+    let resolved_args = xdr_helper::resolve_invocation_args(req.fn_name, req.args, req.functions)?;
+    let sc_vals: Vec<stellar_xdr::ScVal> = resolved_args.into_iter().map(|(_, v)| v).collect();
+    debug!(arg_count = sc_vals.len(), "parsed and validated arguments");
 
     let tx_xdr = xdr_helper::build_simulation_tx_envelope(
         req.wasm_bytes,
@@ -921,12 +923,6 @@ async fn simulate_report(
         req.fn_name,
         &sc_vals,
     )?;
-
-    xdr_helper::validate_args_against_spec(req.fn_name, req.args, req.functions)?;
-    debug!(
-        arg_count = req.args.len(),
-        "validated arguments against contract spec"
-    );
 
     let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
     debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
@@ -1394,17 +1390,16 @@ async fn cmd_estimate_repeat(
         }
 
         if dry_run {
-            let sc_vals: Vec<stellar_xdr::ScVal> = args
-                .iter()
-                .map(|a| xdr_helper::parse_arg_scval(a))
-                .collect();
+            let resolved_args =
+                xdr_helper::resolve_invocation_args(fn_name, args, &wasm_info.functions)?;
+            let sc_vals: Vec<stellar_xdr::ScVal> =
+                resolved_args.iter().map(|(_, v)| v.clone()).collect();
             let tx_xdr = xdr_helper::build_simulation_tx_envelope(
                 &wasm_info.bytes,
                 contract_id,
                 fn_name,
                 &sc_vals,
             )?;
-            xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
             let tx_b64 =
                 base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
             let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
@@ -1432,8 +1427,8 @@ async fn cmd_estimate_repeat(
                 }
             );
             println!();
-            println!("  Arguments ({}):", args.len());
-            for (i, (arg, sc_val)) in args.iter().zip(&sc_vals).enumerate() {
+            println!("  Arguments ({}):", resolved_args.len());
+            for (i, (arg, sc_val)) in resolved_args.iter().enumerate() {
                 println!("    [{i}] {arg} → {sc_val:?}");
             }
             println!();
@@ -1456,17 +1451,16 @@ async fn cmd_estimate_repeat(
             verbose,
         )?;
 
-        let sc_vals: Vec<stellar_xdr::ScVal> = args
-            .iter()
-            .map(|a| xdr_helper::parse_arg_scval(a))
-            .collect();
+        let resolved_args =
+            xdr_helper::resolve_invocation_args(fn_name, args, &wasm_info.functions)?;
+        let sc_vals: Vec<stellar_xdr::ScVal> =
+            resolved_args.into_iter().map(|(_, v)| v).collect();
         let tx_xdr = xdr_helper::build_simulation_tx_envelope(
             &wasm_info.bytes,
             contract_id,
             fn_name,
             &sc_vals,
         )?;
-        xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
         let tx_b64 =
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
 
@@ -1788,11 +1782,11 @@ async fn estimate_once(
         // without contacting the network. The envelope is built here because
         // no RPC traffic is performed.
         if dry_run {
-            let sc_vals: Vec<stellar_xdr::ScVal> = args
-                .iter()
-                .map(|a| xdr_helper::parse_arg_scval(a))
-                .collect();
-            debug!(arg_count = sc_vals.len(), "parsed arguments");
+            let resolved_args =
+                xdr_helper::resolve_invocation_args(fn_name, args, &wasm_info.functions)?;
+            let sc_vals: Vec<stellar_xdr::ScVal> =
+                resolved_args.iter().map(|(_, v)| v.clone()).collect();
+            debug!(arg_count = sc_vals.len(), "parsed and validated arguments");
 
             let tx_xdr = xdr_helper::build_simulation_tx_envelope(
                 &wasm_info.bytes,
@@ -1800,11 +1794,6 @@ async fn estimate_once(
                 fn_name,
                 &sc_vals,
             )?;
-            xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
-            debug!(
-                arg_count = args.len(),
-                "validated arguments against contract spec"
-            );
 
             let tx_b64 =
                 base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
@@ -1835,8 +1824,8 @@ async fn estimate_once(
                 }
             );
             println!();
-            println!("  Arguments ({}):", args.len());
-            for (i, (arg, sc_val)) in args.iter().zip(&sc_vals).enumerate() {
+            println!("  Arguments ({}):", resolved_args.len());
+            for (i, (arg, sc_val)) in resolved_args.iter().enumerate() {
                 println!("    [{i}] {arg} â†’ {sc_val:?}");
             }
             println!();

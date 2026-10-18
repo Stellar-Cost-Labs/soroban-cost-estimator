@@ -208,6 +208,17 @@ pub enum Command {
         #[arg(long = "arg", value_name = "KEY=VAL")]
         args: Vec<String>,
 
+        /// Path to a JSON file containing typed invocation arguments
+        /// (`bool`, `u32`, `i32`, `u64`, `i64`, `string`, `symbol`, `bytes`,
+        /// `address`, `void`, `vec`, `map`) and/or named parameters.
+        #[arg(
+            long = "args-file",
+            visible_alias = "arg-file",
+            value_name = "PATH",
+            conflicts_with = "args"
+        )]
+        args_file: Option<PathBuf>,
+
         /// Prompt interactively for the function and its arguments, using
         /// the contract spec for names and types. Explicit `--fn`/`--arg`
         /// values take precedence; the prompt only fills in the gaps.

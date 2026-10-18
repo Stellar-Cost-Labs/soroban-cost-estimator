@@ -15,6 +15,7 @@ Options:
       --fn <FN>            Contract function name to invoke
       --id <ID>            Deployed contract ID (64 hex chars) to invoke. Required when --fn is used
       --arg <KEY=VAL>      Function arguments as key=value pairs (value is type-inferred)
+      --args-file <PATH>   Path to a JSON file containing typed and/or named invocation arguments
   -i, --interactive        Prompt for the function and its arguments using the contract spec
       --json               Output as JSON instead of a human-readable table
   -h, --help               Print help
@@ -32,6 +33,13 @@ Options:
   cannot simulate against a zeroed ID.
 - **`--arg` values are type-inferred**: `true`/`false` → bool, integers →
   i64/u64, everything else → string. Enough for cost estimation.
+- **`--args-file <PATH>`** loads typed and/or named invocation arguments from
+  a JSON file. Supported `ScVal` types are `bool`, `u32`, `i32`, `u64`, `i64`,
+  `string`, `symbol`, `bytes`, `address`, `void`, `vec`, and `map`. The file
+  may be an array of positional/named `{ "name", "type", "value" }` objects or
+  a JSON object mapping parameter names to typed values. File syntax,
+  parameter names, and contract-spec types are validated before simulation;
+  floating-point numbers are rejected for numeric types.
 - **`--interactive` / `-i`** prompts for the function and its arguments
   instead of requiring `--fn`/`--arg` up front. The contract spec provides
   names and types (`Enter step (i64): `); each answer is validated against
