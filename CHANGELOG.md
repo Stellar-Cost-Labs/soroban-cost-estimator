@@ -30,15 +30,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   network, pruning older ones after the new snapshot is safely on disk.
 - `config snapshot prune --older-than <DAYS>` — delete snapshots recorded more
   than D days ago. Pure file I/O, so it is safe offline and in a cron job.
-
-### Fixed
-
-- Snapshot retention never deletes the newest snapshot for a network, however
-  old it is or however small `--retain` is, so a `config diff` always has a
-  pair left to compare.
-
-### Added
-
 - `--timeout` global flag — configurable HTTP request timeout for RPC calls
   in seconds (default 30).
 - `--max-retries` global flag — configurable maximum number of retry attempts
@@ -47,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `config diff --summary` — print a single-line summary
   (`X pricing changes, Y non-pricing changes`) instead of the full diff, for CI
   status lines. Exit code and auto-save side effects are unchanged.
-- `CHANGELOG.md` following the Keep a Changelog format.
+- `CHANGELOG.md` following the Keep a Changelog 1.1.0 standard.
 - `docs/migration.md` — migration guide for users coming from
   `stellar contract invoke --cost`.
 - End-to-end integration tests in `tests/cli_tests.rs` covering every CLI
@@ -66,8 +57,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "fee_distribution": { ... } }`) instead of a bare array; the per-function
   records moved under the `functions` key.
 
+### Deprecated
+
+- Nothing deprecated in this release cycle.
+
+### Removed
+
+- Nothing removed in this release cycle.
+
 ### Fixed
 
+- Snapshot retention never deletes the newest snapshot for a network, however
+  old it is or however small `--retain` is, so a `config diff` always has a
+  pair left to compare.
 - Restore the `cache stats` subcommand wiring that a CLI refactor merge
   dropped, leaving `cmd_cache_stats` unreachable dead code.
 - WASM function signatures are now resolved against the *defined* function
@@ -80,6 +82,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Restore the WebSocket RPC client (`rpc::ws`) after the merge of `main`
   dropped its `AppError` variants and `resolve_ws_endpoint`, which broke
   compilation and red-flagged every CI job.
+
+### Security
+
+- Credential HTTP headers (`Authorization`, `Proxy-Authorization`, `X-API-Key`,
+  `API-Key`, `Cookie`) passed via `--header` / `-H` are redacted as
+  `<redacted>` in verbose and tracing logs so bearer tokens and API keys never
+  leak into terminal output or CI logs.
 
 ## [0.1.0] - 2026-08-13
 
