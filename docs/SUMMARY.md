@@ -28,4 +28,5 @@
 - [Migrating from the Stellar CLI](migration.md)
 - [Verification](verification.md)
 - [Contributing](contributing.md)
+- [Troubleshooting](troubleshooting.md)
 - [FAQ](faq.md)

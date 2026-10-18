@@ -1,187 +1,189 @@
 # Troubleshooting Guide
 
-This guide covers common errors, their causes, and solutions when using the soroban-cost-estimator.
-
-## Common Errors by Category
-
-### File & WASM Errors
-
-#### Error: `File not found: <path>`
-**Cause**: The specified WASM file path does not exist or is incorrect.
-**Solution**: Verify the path to the `.wasm` file is correct and the file exists. Use an absolute path or ensure the relative path is from the current working directory.
-
-#### Error: `WASM validation error: <details>`
-**Cause**: The WASM file fails structural validation (malformed binary, invalid sections, etc.).
-**Solution**: Rebuild the contract with `cargo build --target wasm32-unknown-unknown --release` and ensure the output `.wasm` file is not corrupted.
-
-#### Error: `WASM parse error: <details>`
-**Cause**: The WASM parser encountered an error reading the binary (e.g., truncated file, invalid LEB128 encoding).
-**Solution**: Verify the WASM file is complete and not corrupted. Rebuild if necessary.
-
-#### Error: `no exported functions found in WASM binary`
-**Cause**: The WASM file has no exported functions, meaning it's not a valid Soroban contract or was built incorrectly.
-**Solution**: Ensure the contract has `#[contractimpl]` functions and is built with the correct target. Check that `cargo build --target wasm32-unknown-unknown --release` produces a valid contract.
+This guide documents common RPC, WASM, and network errors encountered when running `soroban-cost-estimator`, their root causes, and step-by-step solutions.
 
 ---
 
-### RPC & Network Errors
+## 1. Common Errors & Solutions
 
-#### Error: `RPC error (status <code>): <message>`
-**Cause**: The Soroban RPC node returned an error response. Common codes:
-- `-32600`: Invalid request (malformed JSON-RPC)
-- `-32601`: Method not found (RPC version mismatch)
-- `-32602`: Invalid params (bad arguments to `simulateTransaction`)
-- `-32603`: Internal error (node issue)
-- `-32000` to `-32099`: Server-defined errors (e.g., contract not found, out of gas)
-**Solution**: Check the RPC error message for details. Verify the contract ID is correct, the network matches the contract deployment, and the function arguments match the contract's interface.
+### 1.1 `HostError (Error(Contract, #X))` — Contract Panic During Simulation
 
-#### Error: `HTTP request failed: <details>`
-**Cause**: Network-level failure connecting to the RPC endpoint (DNS resolution, connection timeout, TLS error, etc.).
-**Solution**: 
-- Verify internet connectivity
-- Check the RPC URL is correct (use `--rpc-url` to override)
-- Ensure the RPC node is operational (check status page)
-- Try a different network (`testnet`, `mainnet`, `futurenet`)
-
-#### Error: `RPC endpoint not configured for network: <network>`
-**Cause**: An unknown network name was provided (not `testnet`, `mainnet`, or `futurenet`) and no custom `--rpc-url` was given.
-**Solution**: Use a supported network name or provide a custom RPC URL with `--rpc-url https://your-rpc-endpoint`.
-
-#### Error: `simulation returned no cost data and no latest ledger — check --id, --fn, and the RPC endpoint`
-**Cause**: The `simulateTransaction` RPC call succeeded but returned no resource usage data. This typically happens when:
-- The contract ID (`--id`) is wrong or not deployed on the target network
-- The function name (`--fn`) doesn't exist on the contract
-- The RPC endpoint is for a different network than where the contract is deployed
-- The RPC schema has changed and the tool needs updating
-**Solution**: 
-- Verify the contract ID is correct (64 hex chars or `C...` strkey)
-- Ensure the contract is deployed on the target network
-- Check the function name matches exactly (case-sensitive)
-- Try with `--rpc-url` pointing to a known-good endpoint
-
----
-
-### Transaction Construction Errors
-
-#### Error: `Transaction construction error: contract id required for function invocation (pass --id <64-hex>)`
-**Cause**: A function name was provided via `--fn` but no contract ID was given via `--id`.
-**Solution**: Provide the deployed contract ID with `--id <contract-id>`.
-
-#### Error: `Transaction construction error: invalid contract id (expected 64 hex chars or a C… strkey): <details>`
-**Cause**: The contract ID format is invalid. Must be either 64 hex characters or a `C...` strkey (SEP-23 format).
-**Solution**: Use the contract ID from `stellar contract deploy` output or the Stellar dashboard.
-
-#### Error: `Transaction construction error: ScSymbol: <details>`
-**Cause**: The function name contains invalid characters for a Soroban symbol (must be valid UTF-8, max 32 bytes).
-**Solution**: Ensure the function name matches the contract's exported function name exactly.
-
-#### Error: `Transaction construction error: ScVal args: <details>`
-**Cause**: Argument encoding failed (e.g., too many arguments, argument type mismatch).
-**Solution**: Check the number and format of `--arg` values. The tool infers types: `true`/`false` → `Bool`, integers → `I64`/`U64`, everything else → `String`.
-
----
-
-### XDR Errors
-
-#### Error: `XDR decode error: base64 decode: <details>`
-**Cause**: Failed to decode base64-encoded XDR data from the RPC response.
-**Solution**: This usually indicates an RPC version mismatch or corrupted response. Try updating the tool or using a different RPC endpoint.
-
-#### Error: `XDR decode error: LedgerEntryData from_xdr: <details>`
-**Cause**: The XDR data from the RPC cannot be parsed as a `LedgerEntryData`.
-**Solution**: RPC schema may have changed. Check for tool updates.
-
-#### Error: `XDR decode error: expected ConfigSetting entry, got <type>`
-**Cause**: The RPC returned a ledger entry that is not a `ConfigSetting` when fetching network configuration.
-**Solution**: The network may not have the expected config settings. This can happen on older protocol versions.
-
-#### Error: `XDR encode error: <details>`
-**Cause**: Failed to encode a transaction envelope to XDR (should not happen in normal operation).
-**Solution**: Report as a bug with the exact error message.
-
----
-
-### Configuration & Snapshot Errors
-
-#### Error: `Snapshot not found: <path>`
-**Cause**: The specified config snapshot file does not exist.
-**Solution**: 
-- Run `soroban-cost-estimator config snapshot` first to create a baseline
-- Check the snapshot directory (`~/.soroban-cost-estimator/snapshots/`)
-- Use `--against` to specify an explicit snapshot path for `config diff`
-
-#### Error: `Snapshot parse error: <details>`
-**Cause**: The snapshot file exists but contains invalid JSON or missing required fields.
-**Solution**: Delete the corrupted snapshot and run `config snapshot` again to regenerate.
-
-#### Error: `No snapshots available for network: <network>`
-**Cause**: No snapshots have been created for the specified network yet.
-**Solution**: Run `soroban-cost-estimator config snapshot --network <network>` to create the first snapshot.
-
-#### Error: `Config fetch error: <details>`
-**Cause**: Failed to fetch config settings from the RPC node (network error or RPC error).
-**Solution**: Check network connectivity and RPC endpoint. The node may not support `getLedgerEntries` for config settings.
-
-#### Error: `Config setting not found: <setting>`
-**Cause**: A specific config setting (e.g., `ContractComputeV0`) is not present on the network.
-**Solution**: The network may be on an older protocol version. Some settings are only available after certain protocol upgrades.
-
----
-
-### Simulation & Fee Calculation Errors
-
-#### Error: `Simulation failed: <details>`
-**Cause**: The `simulateTransaction` RPC call failed. The error message from the RPC is included.
-**Common subcases**:
-- "Contract not found" → Contract ID wrong or not deployed
-- "Function not found" → Function name doesn't match
-- "Invalid arguments" → Argument types don't match contract interface
-- "Out of gas" → Transaction exceeds gas limits
-**Solution**: Check the specific error message and verify contract ID, function name, and arguments.
-
-#### Error: `Fee calculation error: <details>`
-**Cause**: Internal error computing the fee breakdown from simulation results.
-**Solution**: This is likely a bug. Report with the simulation output and error details.
-
----
-
-### Cache Errors
-
-#### Error: `could not determine home directory`
-**Cause**: The tool cannot find the user's home directory to locate the cache/snapshot directories.
-**Solution**: Ensure the `HOME` environment variable is set (Linux/macOS) or `USERPROFILE` (Windows).
-
-#### Cache verification fails: `<filename>` reported as corrupt
-**Cause**: A cache entry file is not valid JSON or is missing required fields.
-**Solution**: Run `soroban-cost-estimator cache verify` to see all corrupt entries. Delete the corrupt files manually from `~/.soroban-cost-estimator/cache/` or clear the entire cache directory.
-
----
-
-## Debugging Tips
-
-### Enable Debug Logging
-Set the `RUST_LOG` environment variable for verbose output:
-```bash
-RUST_LOG=debug soroban-cost-estimator estimate --wasm contract.wasm --network testnet
+**Symptom:**
+```text
+Error: simulation error: HostError: Error(Contract, #1)
+```
+or
+```text
+Error: simulation error: HostError: Error(WasmVm, InvalidAction)
 ```
 
-### Enable RPC Debugging
-Log raw RPC requests and responses:
-```bash
-SCE_DEBUG_RPC=1 soroban-cost-estimator estimate --wasm contract.wasm --network testnet
+**Root Cause:**
+The Soroban VM trapped while executing your contract function during `simulateTransaction`. Typical causes include:
+- Calling a function before the contract's `initialize` / `__constructor` has been invoked on-chain.
+- Passing arguments that violate a contract assertion or `panic_with_error!`.
+- Reading a persistent/instance storage key that does not exist yet on the deployed contract (`--id`).
+
+**Resolution:**
+1. Verify that the deployed contract (`--id`) on `--network` has been initialized.
+2. Check the contract's `#[contracterror]` enum definition to map `#X` to its human-readable variant name.
+3. Inspect the expected parameter types with `wasm info`:
+   ```bash
+   soroban-cost-estimator wasm info --wasm path/to/contract.wasm
+   ```
+4. Supply valid arguments matching the expected types:
+   ```bash
+   soroban-cost-estimator estimate \
+     --wasm path/to/contract.wasm \
+     --id <64-char-hex-contract-id> \
+     --fn transfer \
+     --arg from=G... --arg to=G... --arg amount=100 \
+     --network testnet
+   ```
+
+---
+
+### 1.2 `TransactionSimulationFailed` — Footprint, Contract ID, or Auth Missing
+
+**Symptom:**
+```text
+Error: simulation error: TransactionSimulationFailed: contract instance not found
+```
+or
+```text
+Error: --id <CONTRACT_ID> is required when --fn is specified
 ```
 
-### Common Workflow Issues
+**Root Cause:**
+- You specified `--fn <function_name>` without `--id`, or passed a contract ID (`C...` / 64-char hex) that is not deployed on the selected `--network` (e.g., passing a Testnet contract ID while targeting `--network mainnet`).
+- Or the contract's ledger entry TTL has expired (archived state) and requires restoration before simulation can succeed.
 
-| Issue | Likely Cause | Fix |
-|-------|--------------|-----|
-| Estimates seem wrong | Network config drift | Run `config diff` to check for pricing changes |
-| "Skipped" functions in `estimate-all` | Function requires arguments | Use `estimate` with `--fn` and `--arg` for specific functions |
-| Fee shows 0 or very low | Fee rate config not fetched | Check warnings about "fee rate source unavailable" |
-| Different results on re-run | Network state changed | Normal — ledger state affects simulation |
+**Resolution:**
+1. Confirm the contract is deployed on the target `--network` and its 64-character hex contract ID is valid.
+2. If you only want to estimate the cost of **uploading** the WASM bytecode (before deployment), omit `--fn` and `--id`:
+   ```bash
+   soroban-cost-estimator estimate --wasm path/to/contract.wasm --network testnet
+   ```
+3. If the contract entry is archived on-chain, restore it using `stellar contract restore` before simulating invocations.
 
-### Getting Help
+---
 
-1. Check existing issues: https://github.com/your-repo/soroban-cost-estimator/issues
-2. Run with `RUST_LOG=debug` and include output when filing a bug
-3. Include: command run, network, contract ID (if public), and full error message
+### 1.3 `ConfigSettingNotFound` — Protocol Version Mismatch or Non-Soroban Node
+
+**Symptom:**
+```text
+Error: config setting not found on ledger: CONFIG_SETTING_CONTRACT_COMPUTE_V0
+```
+or
+```text
+Warning: fee rate source(s) ContractComputeV0 unavailable — affected rate(s) set to 0
+```
+
+**Root Cause:**
+The RPC endpoint returned an empty `entries` array for one or more Soroban `ConfigSettingId` ledger keys. This happens when:
+- The RPC node is still syncing or has not upgraded to Soroban (Protocol 20+).
+- A custom `--rpc-url` points to a Horizon REST endpoint instead of a Soroban JSON-RPC endpoint.
+
+**Resolution:**
+1. Verify the node's health and protocol version:
+   ```bash
+   curl -s -X POST https://soroban-testnet.stellar.org \
+     -H "Content-Type: application/json" \
+     -d '{"jsonrpc":"2.0","id":1,"method":"getLatestLedger"}'
+   ```
+2. Ensure `--rpc-url` points to a Soroban RPC endpoint (not Horizon).
+
+---
+
+### 1.4 `429 Too Many Requests` / Connection Timeouts — RPC Rate Limiting
+
+**Symptom:**
+```text
+Error: RPC error (-32005): 429 Too Many Requests
+```
+or
+```text
+Error: HTTP request timed out after 30s
+```
+
+**Root Cause:**
+Public RPC endpoints enforce rate limits per IP address, which can be triggered during large `estimate-all` batch runs or frequent `watch` polling.
+
+**Resolution:**
+1. Increase retry resilience and client-side rate limiting:
+   ```bash
+   soroban-cost-estimator estimate-all \
+     --wasm contract.wasm \
+     --id <contract-id> \
+     --network testnet \
+     --max-retries 5 \
+     --timeout 60
+   ```
+2. Configure a commercial RPC provider with `--rpc-url` and authentication headers (`-H`), plus a `--fallback-rpc-url`:
+   ```bash
+   soroban-cost-estimator estimate \
+     --wasm contract.wasm \
+     --network mainnet \
+     --rpc-url https://mainnet.provider.example.com \
+     --fallback-rpc-url https://backup.provider.example.com \
+     -H "Authorization=Bearer $RPC_TOKEN"
+   ```
+
+---
+
+### 1.5 `InvalidSpec` / Missing `contractspecv0` Section
+
+**Symptom:**
+```text
+Error: invalid WASM binary: malformed custom section 'contractspecv0'
+```
+or `wasm info` reports `Has Contract Spec: false`.
+
+**Root Cause:**
+- The `.wasm` file was compiled without the `soroban-sdk` contract macro (`#[contractimpl]`), or a custom post-processing tool (`wasm-strip` / aggressive `wasm-opt`) stripped the `contractspecv0` custom section.
+
+**Resolution:**
+1. Rebuild the contract using `stellar contract build` or `cargo build --target wasm32-unknown-unknown --release`.
+2. If optimizing with `stellar contract optimize` or `wasm-opt`, ensure custom section `contractspecv0` is preserved.
+
+---
+
+## 2. Debugging with `--verbose` and `RUST_LOG`
+
+`soroban-cost-estimator` uses `tracing` for structured diagnostic logging to `stderr` (never polluting `--json` output on `stdout`).
+
+### Enable Verbose Output (`--verbose` / `-v`)
+```bash
+soroban-cost-estimator --verbose estimate --wasm contract.wasm --network testnet
+```
+
+### Enable Fine-Grained `RUST_LOG` Filtering
+```bash
+# Log all crate spans and RPC payloads at DEBUG level
+RUST_LOG=soroban_cost_estimator=debug soroban-cost-estimator estimate \
+  --wasm contract.wasm \
+  --network testnet
+
+# Trace low-level XDR encoding and HTTP retries
+RUST_LOG=soroban_cost_estimator::rpc=trace,soroban_cost_estimator::wasm=debug \
+  soroban-cost-estimator config snapshot --network testnet
+```
+
+> **Security Note:** Sensitive HTTP headers (`Authorization`, `X-API-Key`, `API-Key`, `Cookie`, `Proxy-Authorization`) are automatically masked as `<redacted>` in all verbose and debug logs.
+
+---
+
+## 3. Frequently Asked Questions (FAQ)
+
+### Q: Why does `estimate` require `--id` when `--fn` is passed?
+`simulateTransaction` executes your contract's function against the live ledger state (reading contract instance storage and code). Without a deployed contract ID (`--id`), the RPC node has no on-chain contract instance to load. To estimate contract **upload** costs before deployment, run `estimate --wasm <file>` without `--fn`.
+
+### Q: Why are my cached estimates marked as stale after `config diff`?
+When on-chain `CONFIG_SETTING` fee rates change on the network, any cached simulation fee calculated under the old rates no longer reflects live network pricing. Clear or refresh the cache with:
+```bash
+soroban-cost-estimator estimate --wasm contract.wasm --network testnet --clear-cache
+```
+
+### Q: Where are snapshots and cached estimates stored on disk?
+By default, all data is stored under `~/.soroban-cost-estimator/`:
+- `~/.soroban-cost-estimator/snapshots/<network>-<timestamp>.json`
+- `~/.soroban-cost-estimator/cache/estimates.db`
