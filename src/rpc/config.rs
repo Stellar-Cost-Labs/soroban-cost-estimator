@@ -104,6 +104,17 @@ pub struct GetLedgerEntriesResponse {
     pub latest_ledger: Option<u64>,
 }
 
+impl GetLedgerEntriesResponse {
+    /// Extract the RPC response's `latestLedger` as a positive `u32` ledger
+    /// sequence, or `None` when absent, zero, or out of `u32` range.
+    #[must_use]
+    pub fn source_ledger_sequence(&self) -> Option<u32> {
+        self.latest_ledger
+            .and_then(|ledger| u32::try_from(ledger).ok())
+            .filter(|&ledger| ledger > 0)
+    }
+}
+
 /// A raw decoded config setting entry from the ledger.
 ///
 /// The XDR bytes are decoded from the base64 `xdr` field of the ledger entry.
@@ -112,6 +123,9 @@ pub struct ConfigSettingEntryRaw {
     pub id: ConfigSettingId,
     pub config_xdr: String,
     pub last_modified_ledger: u32,
+    /// Network ledger sequence (`latestLedger`) at which the RPC served this
+    /// config entry, or `None` when the RPC omitted `latestLedger`.
+    pub source_ledger: Option<u32>,
 }
 
 /// Fetches a specific config setting entry from the ledger.
@@ -132,6 +146,7 @@ pub async fn fetch_config_setting(
     let response: GetLedgerEntriesResponse = client
         .call("getLedgerEntries", serde_json::to_value(params)?)
         .await?;
+    let source_ledger = response.source_ledger_sequence();
 
     let entry = response
         .entries
@@ -142,12 +157,14 @@ pub async fn fetch_config_setting(
     trace!(
         setting = setting_id.human_name(),
         last_modified = entry.last_modified_ledger_seq,
+        source_ledger = ?source_ledger,
         "config setting fetched"
     );
     Ok(ConfigSettingEntryRaw {
         id: setting_id,
         config_xdr: entry.xdr,
         last_modified_ledger: entry.last_modified_ledger_seq.unwrap_or(0),
+        source_ledger,
     })
 }
 
@@ -186,6 +203,7 @@ pub async fn fetch_all_config_settings(
     let response: GetLedgerEntriesResponse = client
         .call("getLedgerEntries", serde_json::to_value(params)?)
         .await?;
+    let source_ledger = response.source_ledger_sequence();
 
     // Build a lookup: entry key base64 → ConfigSettingEntryRaw
     let mut entry_by_key: std::collections::HashMap<String, ConfigSettingEntryRaw> =
@@ -195,6 +213,7 @@ pub async fn fetch_all_config_settings(
             id: ConfigSettingId::ContractComputeV0, // placeholder; corrected after key matching below
             config_xdr: entry.xdr,
             last_modified_ledger: entry.last_modified_ledger_seq.unwrap_or(0),
+            source_ledger,
         };
         entry_by_key.insert(entry.key, raw);
     }
