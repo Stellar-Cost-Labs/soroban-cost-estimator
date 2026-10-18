@@ -595,6 +595,11 @@ pub enum ConfigAction {
         /// older ones once the new snapshot is safely on disk.
         #[arg(long, value_name = "COUNT")]
         retain: Option<usize>,
+
+        /// Skip writing a new file when an existing snapshot for the same
+        /// network and ledger already records identical configuration values.
+        #[arg(long)]
+        skip_duplicate_ledger: bool,
     },
     /// List all saved config snapshots with their timestamp and ledger.
     List {

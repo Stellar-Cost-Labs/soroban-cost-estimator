@@ -31,10 +31,20 @@ fn snapshots_dir() -> AppResult<PathBuf> {
 /// # Network calls
 /// None — pure file I/O.
 pub fn save_snapshot(snapshot: &ConfigSnapshot, out_path: Option<&str>) -> AppResult<PathBuf> {
+    let dir = snapshots_dir()?;
+    save_snapshot_in(&dir, snapshot, out_path)
+}
+
+/// Saves a config snapshot into `dir` (or to `out_path` when supplied).
+pub fn save_snapshot_in(
+    dir: &Path,
+    snapshot: &ConfigSnapshot,
+    out_path: Option<&str>,
+) -> AppResult<PathBuf> {
     let path = match out_path {
         Some(p) => PathBuf::from(p),
         None => {
-            let dir = snapshots_dir()?;
+            std::fs::create_dir_all(dir)?;
             let filename = format!(
                 "{}-{}.json",
                 snapshot.network,
@@ -48,6 +58,184 @@ pub fn save_snapshot(snapshot: &ConfigSnapshot, out_path: Option<&str>) -> AppRe
     std::fs::write(&path, json)?;
     debug!(path = %path.display(), network = snapshot.network, ledger = snapshot.ledger, "snapshot saved");
     Ok(path)
+}
+
+/// Returns `true` when two snapshots carry identical normalized configuration
+/// values and protocol version metadata (ignoring capture timestamp and ledger).
+pub fn snapshots_have_same_config(a: &ConfigSnapshot, b: &ConfigSnapshot) -> bool {
+    a.protocol_version == b.protocol_version
+        && a.contract_compute == b.contract_compute
+        && a.contract_ledger_cost == b.contract_ledger_cost
+        && a.contract_historical_data == b.contract_historical_data
+        && a.contract_events == b.contract_events
+        && a.contract_bandwidth == b.contract_bandwidth
+        && a.state_archival == b.state_archival
+}
+
+/// Returns `true` when two snapshots are for the same network and ledger and
+/// have identical normalized configuration values.
+pub fn is_same_ledger_duplicate(a: &ConfigSnapshot, b: &ConfigSnapshot) -> bool {
+    a.network == b.network && a.ledger == b.ledger && snapshots_have_same_config(a, b)
+}
+
+/// Classification of an existing snapshot on disk that shares the same
+/// network and ledger sequence as a newly captured snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DuplicateLedgerMatch {
+    /// An existing snapshot at the same ledger has identical config values.
+    ExactDuplicate {
+        existing_path: PathBuf,
+        existing_timestamp: String,
+    },
+    /// An existing snapshot at the same ledger has different config values.
+    SameLedgerChangedConfig {
+        existing_path: PathBuf,
+        existing_timestamp: String,
+    },
+}
+
+/// Report returned by [`save_snapshot_with_duplicate_policy`] and
+/// [`save_snapshot_with_duplicate_policy_in`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SnapshotSaveReport {
+    /// `true` if a new snapshot file was written to disk; `false` if skipped.
+    pub saved: bool,
+    /// Path of the newly written snapshot, or of the existing duplicate when skipped.
+    pub path: PathBuf,
+    /// `true` when an identical snapshot for the same network and ledger already existed.
+    pub duplicate_ledger: bool,
+    /// `true` when another snapshot for the same network and ledger existed with different config values.
+    pub config_changed_at_same_ledger: bool,
+    /// Path of the matching same-ledger snapshot, if any.
+    pub existing_path: Option<PathBuf>,
+    /// Human-readable status or warning describing how a same-ledger match was handled.
+    pub message: Option<String>,
+}
+
+/// Searches `dir` for an existing snapshot on `candidate.network` captured at
+/// `candidate.ledger`.
+pub fn find_same_ledger_snapshot_in(
+    dir: &Path,
+    candidate: &ConfigSnapshot,
+) -> AppResult<Option<DuplicateLedgerMatch>> {
+    if !dir.exists() {
+        return Ok(None);
+    }
+    let paths = list_snapshots_in(dir, &candidate.network)?;
+    for path in paths.into_iter().rev() {
+        let existing = load_snapshot_from_path(&path.to_string_lossy())?;
+        if existing.network == candidate.network && existing.ledger == candidate.ledger {
+            if snapshots_have_same_config(&existing, candidate) {
+                return Ok(Some(DuplicateLedgerMatch::ExactDuplicate {
+                    existing_path: path,
+                    existing_timestamp: existing.timestamp,
+                }));
+            }
+            return Ok(Some(DuplicateLedgerMatch::SameLedgerChangedConfig {
+                existing_path: path,
+                existing_timestamp: existing.timestamp,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// Saves a snapshot using the default snapshots directory while applying the
+/// caller's duplicate-ledger policy (`skip_duplicate_ledger`).
+pub fn save_snapshot_with_duplicate_policy(
+    snapshot: &ConfigSnapshot,
+    out_path: Option<&str>,
+    skip_duplicate_ledger: bool,
+) -> AppResult<SnapshotSaveReport> {
+    let dir = snapshots_dir()?;
+    save_snapshot_with_duplicate_policy_in(&dir, snapshot, out_path, skip_duplicate_ledger)
+}
+
+/// Saves a snapshot into `dir` while detecting existing snapshots captured at
+/// the same ledger for the same network.
+///
+/// - When an identical snapshot at the same ledger exists and `skip_duplicate_ledger`
+///   is `true`, no new file is written and `saved = false` is returned.
+/// - When an identical snapshot at the same ledger exists and `skip_duplicate_ledger`
+///   is `false`, the new snapshot is written alongside a duplicate warning message.
+/// - When a snapshot at the same ledger exists but its configuration values
+///   differ, the new snapshot is always written (`saved = true`,
+///   `config_changed_at_same_ledger = true`).
+pub fn save_snapshot_with_duplicate_policy_in(
+    dir: &Path,
+    snapshot: &ConfigSnapshot,
+    out_path: Option<&str>,
+    skip_duplicate_ledger: bool,
+) -> AppResult<SnapshotSaveReport> {
+    if out_path.is_none() {
+        if let Some(matched) = find_same_ledger_snapshot_in(dir, snapshot)? {
+            match matched {
+                DuplicateLedgerMatch::ExactDuplicate {
+                    existing_path,
+                    existing_timestamp,
+                } => {
+                    if skip_duplicate_ledger {
+                        let msg = format!(
+                            "Skipped duplicate snapshot for network '{}' at ledger {} (identical to {} captured at {})",
+                            snapshot.network,
+                            snapshot.ledger,
+                            existing_path.display(),
+                            existing_timestamp
+                        );
+                        return Ok(SnapshotSaveReport {
+                            saved: false,
+                            path: existing_path.clone(),
+                            duplicate_ledger: true,
+                            config_changed_at_same_ledger: false,
+                            existing_path: Some(existing_path),
+                            message: Some(msg),
+                        });
+                    }
+                    let path = save_snapshot_in(dir, snapshot, None)?;
+                    let msg = format!(
+                        "Duplicate snapshot captured for network '{}' at ledger {} (identical config already recorded at {}); pass --skip-duplicate-ledger to skip",
+                        snapshot.network, snapshot.ledger, existing_timestamp
+                    );
+                    return Ok(SnapshotSaveReport {
+                        saved: true,
+                        path,
+                        duplicate_ledger: true,
+                        config_changed_at_same_ledger: false,
+                        existing_path: Some(existing_path),
+                        message: Some(msg),
+                    });
+                }
+                DuplicateLedgerMatch::SameLedgerChangedConfig {
+                    existing_path,
+                    existing_timestamp,
+                } => {
+                    let path = save_snapshot_in(dir, snapshot, None)?;
+                    let msg = format!(
+                        "Preserved snapshot for network '{}' at ledger {}: configuration values changed compared to snapshot at {}",
+                        snapshot.network, snapshot.ledger, existing_timestamp
+                    );
+                    return Ok(SnapshotSaveReport {
+                        saved: true,
+                        path,
+                        duplicate_ledger: false,
+                        config_changed_at_same_ledger: true,
+                        existing_path: Some(existing_path),
+                        message: Some(msg),
+                    });
+                }
+            }
+        }
+    }
+
+    let path = save_snapshot_in(dir, snapshot, out_path)?;
+    Ok(SnapshotSaveReport {
+        saved: true,
+        path,
+        duplicate_ledger: false,
+        config_changed_at_same_ledger: false,
+        existing_path: None,
+        message: None,
+    })
 }
 
 /// Loads the most recent snapshot for a given network.
