@@ -8,6 +8,7 @@ use soroban_cost_estimator::cli;
 use soroban_cost_estimator::config_snapshot;
 use soroban_cost_estimator::error;
 use soroban_cost_estimator::interactive;
+use soroban_cost_estimator::paths;
 use soroban_cost_estimator::report;
 use soroban_cost_estimator::report::formatter::{
     ReportFormatter, ReportOptions, TableFormatter, formatter_by_name,
@@ -146,20 +147,25 @@ struct EstimateAllJsonReport {
     fee_distribution: report::cost_report::FeeDistribution,
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 struct FileConfig {
     network: Option<String>,
     rpc_url: Option<String>,
+    rpc_fallback_url: Option<String>,
     json: Option<bool>,
+    format: Option<String>,
+    timeout: Option<u64>,
+    connect_timeout: Option<u64>,
+    max_retries: Option<usize>,
+    rps: Option<u64>,
+    headers: Option<Vec<String>>,
+    precision: Option<u32>,
+    max_cache_size_mb: Option<u64>,
+    max_cache_entries: Option<usize>,
 }
 
 fn config_path(cli_path: Option<&str>) -> std::path::PathBuf {
-    cli_path.map(std::path::PathBuf::from).unwrap_or_else(|| {
-        dirs::config_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("soroban-cost-estimator")
-            .join("config.toml")
-    })
+    paths::config_file_path_with_source(cli_path).0
 }
 
 fn load_config(cli_path: Option<&str>) -> error::AppResult<FileConfig> {
@@ -171,6 +177,29 @@ fn load_config(cli_path: Option<&str>) -> error::AppResult<FileConfig> {
         .map_err(|e| error::AppError::Config(format!("{}: {e}", path.display())))?;
     toml::from_str(&content)
         .map_err(|e| error::AppError::Config(format!("{}: {e}", path.display())))
+}
+
+fn cli_flag_was_passed(long_name: &str, short_name: Option<&str>) -> bool {
+    let long_exact = format!("--{long_name}");
+    let long_prefix = format!("--{long_name}=");
+    let short_exact = short_name.map(|s| format!("-{s}"));
+    for arg in std::env::args_os() {
+        let Some(text) = arg.to_str() else {
+            continue;
+        };
+        if text == "--" {
+            break;
+        }
+        if text == long_exact || text.starts_with(&long_prefix) {
+            return true;
+        }
+        if let Some(ref s) = short_exact {
+            if text == s {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn env_string(cli_value: String, file_value: &str, env: &str) -> String {
@@ -215,7 +244,7 @@ async fn main() {
         info!(command = ?args.command, verbose = args.verbose, quiet = args.quiet, "starting soroban-cost-estimator");
     }
 
-    if let Err(err) = run(args).await {
+    if let Err(err) = Box::pin(run(args)).await {
         error!(error = %err, "command failed");
         eprintln!("Error: {err}");
         std::process::exit(1);
@@ -224,27 +253,64 @@ async fn main() {
 
 #[allow(clippy::too_many_lines)]
 async fn run(args: cli::Cli) -> error::AppResult<()> {
-    let file = load_config(args.config.as_deref())?;
-    let rps = args.rps;
-    let timeout = args.timeout;
-    let connect_timeout = args.connect_timeout;
-    let max_retries = args.max_retries;
+    let cli_config_path = args.config.clone();
+    let file = load_config(cli_config_path.as_deref())?;
+    let file_snapshot = file.clone();
+    let rps = args.rps.or(file.rps);
+    let timeout = if cli_flag_was_passed("timeout", None) {
+        args.timeout
+    } else {
+        file.timeout.unwrap_or(args.timeout)
+    };
+    let connect_timeout = if cli_flag_was_passed("connect-timeout", None) {
+        args.connect_timeout
+    } else {
+        file.connect_timeout.unwrap_or(args.connect_timeout)
+    };
+    let max_retries = if cli_flag_was_passed("max-retries", None) {
+        args.max_retries
+    } else {
+        file.max_retries.unwrap_or(args.max_retries)
+    };
     let verbose = args.verbose;
     // `--precision` is a single global flag; read it once so every command
     // reads the same value.
-    let precision = args.precision;
-    let fallback = args.rpc_fallback_url.as_deref();
+    let precision = if cli_flag_was_passed("precision", None) {
+        args.precision
+    } else {
+        file.precision.unwrap_or(args.precision)
+    };
+    let fallback_owned = args
+        .rpc_fallback_url
+        .clone()
+        .or_else(|| file.rpc_fallback_url.clone());
+    let fallback = fallback_owned.as_deref();
     let cli_format = args.format;
-    let headers = args.headers;
+    let cli_headers = args.headers.clone();
+    let headers = if args.headers.is_empty() {
+        file.headers.clone().unwrap_or_default()
+    } else {
+        args.headers
+    };
     // `--quiet` is a single global flag; bind it once so every command in
     // `run()` reads the same value.
     let quiet = args.quiet;
+    let max_cache_size_mb = if cli_flag_was_passed("max-cache-size-mb", None) {
+        args.max_cache_size_mb
+    } else {
+        file.max_cache_size_mb.unwrap_or(args.max_cache_size_mb)
+    };
+    let max_cache_entries = if cli_flag_was_passed("max-cache-entries", None) {
+        args.max_cache_entries
+    } else {
+        file.max_cache_entries.unwrap_or(args.max_cache_entries)
+    };
     // Bound the on-disk estimate cache before any command can write to it.
     // A `--max-cache-size-mb` of 0 disables the byte quota; 0 entries
     // disables the entry quota.
     cache::set_cache_limits(cache::CacheLimits {
-        max_bytes: args.max_cache_size_mb.saturating_mul(1024 * 1024),
-        max_entries: args.max_cache_entries,
+        max_bytes: max_cache_size_mb.saturating_mul(1024 * 1024),
+        max_entries: max_cache_entries,
     })?;
 
     let format = match cli_format {
@@ -579,6 +645,29 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 )
                 .await
             }
+            cli::ConfigAction::Show {
+                network,
+                rpc_url,
+                json,
+            } => cmd_config_show(
+                cli_config_path.as_deref(),
+                &file_snapshot,
+                network.as_deref(),
+                rpc_url.as_deref(),
+                args.rpc_fallback_url.as_deref(),
+                cli_format,
+                json,
+                args.rps,
+                timeout,
+                connect_timeout,
+                max_retries,
+                precision,
+                max_cache_size_mb,
+                max_cache_entries,
+                &cli_headers,
+                quiet,
+                verbose,
+            ),
         },
         cli::Command::Cache { action } => {
             handle_cache_action(
@@ -624,11 +713,413 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct EffectiveSettingEntry {
+    value: serde_json::Value,
+    source: &'static str,
+}
+
+fn is_sensitive_credential_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "authorization" | "proxy-authorization" | "x-api-key" | "api-key" | "cookie"
+    ) || lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("key")
+        || lower.contains("auth")
+        || lower.contains("password")
+        || lower.contains("credential")
+}
+
+fn redact_header_entry(raw: &str) -> String {
+    let sep_pos = match (raw.find('='), raw.find(':')) {
+        (Some(eq), Some(colon)) => Some(eq.min(colon)),
+        (Some(eq), None) => Some(eq),
+        (None, Some(colon)) => Some(colon),
+        (None, None) => None,
+    };
+    if let Some(pos) = sep_pos {
+        let name = raw[..pos].trim();
+        if is_sensitive_credential_name(name) {
+            return format!("{name}=<redacted>");
+        }
+    }
+    raw.to_string()
+}
+
+fn redact_url_credentials(url: &str) -> String {
+    let (scheme_prefix, after_scheme) = match url.split_once("://") {
+        Some((scheme, rest)) => (format!("{scheme}://"), rest),
+        None => (String::new(), url),
+    };
+
+    let auth_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..auth_end];
+    let path_and_more = &after_scheme[auth_end..];
+
+    let redacted_authority = if let Some((userinfo, host_port)) = authority.rsplit_once('@') {
+        if let Some((user, _pass)) = userinfo.split_once(':') {
+            format!("{user}:<redacted>@{host_port}")
+        } else {
+            format!("<redacted>@{host_port}")
+        }
+    } else {
+        authority.to_string()
+    };
+
+    let redacted_tail = if let Some((before_query, query_and_frag)) = path_and_more.split_once('?')
+    {
+        let (query, frag) = match query_and_frag.split_once('#') {
+            Some((q, f)) => (q, format!("#{f}")),
+            None => (query_and_frag, String::new()),
+        };
+        let redacted_params: Vec<String> = query
+            .split('&')
+            .map(|pair| {
+                if let Some((k, _)) = pair.split_once('=') {
+                    if is_sensitive_credential_name(k) {
+                        return format!("{k}=<redacted>");
+                    }
+                }
+                pair.to_string()
+            })
+            .collect();
+        format!("{before_query}?{}{frag}", redacted_params.join("&"))
+    } else {
+        path_and_more.to_string()
+    };
+
+    format!("{scheme_prefix}{redacted_authority}{redacted_tail}")
+}
+
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::fn_params_excessive_bools)]
+fn cmd_config_show(
+    cli_config_path: Option<&str>,
+    file: &FileConfig,
+    cli_network: Option<&str>,
+    cli_rpc_url: Option<&str>,
+    cli_fallback_url: Option<&str>,
+    cli_format: Option<cli::OutputFormat>,
+    json_flag: bool,
+    cli_rps: Option<u64>,
+    timeout: u64,
+    connect_timeout: u64,
+    max_retries: usize,
+    precision: u32,
+    max_cache_size_mb: u64,
+    max_cache_entries: usize,
+    cli_headers: &[String],
+    quiet: bool,
+    verbose: bool,
+) -> error::AppResult<()> {
+    use std::collections::BTreeMap;
+
+    let (cfg_path, cfg_source) = paths::config_file_path_with_source(cli_config_path);
+    let cfg_exists = cfg_path.exists();
+    let data_dir_path = paths::data_dir()?;
+
+    let env_network = std::env::var("SOROBAN_NETWORK")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let (network_val, network_source) = if let Some(net) = cli_network {
+        (net.to_string(), "cli")
+    } else if let Some(net) = env_network {
+        (net, "env")
+    } else if let Some(ref net) = file.network {
+        (net.clone(), "config_file")
+    } else {
+        ("testnet".to_string(), "default")
+    };
+
+    let (raw_rpc_url, rpc_url_source) = if let Some(url) = cli_rpc_url {
+        (url.to_string(), "cli")
+    } else if let Some(ref url) = file.rpc_url {
+        (url.clone(), "config_file")
+    } else {
+        let default_ep = rpc::client::resolve_endpoint(&network_val, None)
+            .unwrap_or_else(|_| "https://soroban-testnet.stellar.org".to_string());
+        (default_ep, "default")
+    };
+    let redacted_rpc_url = redact_url_credentials(&raw_rpc_url);
+
+    let (fallback_val, fallback_source) = if let Some(url) = cli_fallback_url {
+        (
+            serde_json::Value::String(redact_url_credentials(url)),
+            "cli",
+        )
+    } else if let Some(ref url) = file.rpc_fallback_url {
+        (
+            serde_json::Value::String(redact_url_credentials(url)),
+            "config_file",
+        )
+    } else {
+        (serde_json::Value::Null, "default")
+    };
+
+    let env_json = std::env::var("SOROBAN_JSON")
+        .ok()
+        .and_then(|v| v.parse::<bool>().ok());
+    let (format_val, format_source) = if let Some(fmt) = cli_format {
+        (fmt.as_str().to_string(), "cli")
+    } else if json_flag {
+        ("json".to_string(), "cli")
+    } else if let Some(b) = env_json {
+        (if b { "json" } else { "table" }.to_string(), "env")
+    } else if let Some(ref fmt) = file.format {
+        (fmt.to_ascii_lowercase(), "config_file")
+    } else if let Some(b) = file.json {
+        (if b { "json" } else { "table" }.to_string(), "config_file")
+    } else {
+        ("table".to_string(), "default")
+    };
+
+    let timeout_source = if cli_flag_was_passed("timeout", None) {
+        "cli"
+    } else if file.timeout.is_some() {
+        "config_file"
+    } else {
+        "default"
+    };
+    let connect_timeout_source = if cli_flag_was_passed("connect-timeout", None) {
+        "cli"
+    } else if file.connect_timeout.is_some() {
+        "config_file"
+    } else {
+        "default"
+    };
+    let max_retries_source = if cli_flag_was_passed("max-retries", None) {
+        "cli"
+    } else if file.max_retries.is_some() {
+        "config_file"
+    } else {
+        "default"
+    };
+    let (rps_val, rps_source) = if let Some(r) = cli_rps {
+        (serde_json::Value::from(r), "cli")
+    } else if let Some(r) = file.rps {
+        (serde_json::Value::from(r), "config_file")
+    } else {
+        (serde_json::Value::Null, "default")
+    };
+
+    let (raw_headers, headers_source): (Vec<String>, &'static str) = if !cli_headers.is_empty() {
+        (cli_headers.to_vec(), "cli")
+    } else if let Some(ref h) = file.headers {
+        (h.clone(), "config_file")
+    } else {
+        (Vec::new(), "default")
+    };
+    let redacted_headers: Vec<String> =
+        raw_headers.iter().map(|h| redact_header_entry(h)).collect();
+
+    let precision_source = if cli_flag_was_passed("precision", None) {
+        "cli"
+    } else if file.precision.is_some() {
+        "config_file"
+    } else {
+        "default"
+    };
+    let max_cache_size_source = if cli_flag_was_passed("max-cache-size-mb", None) {
+        "cli"
+    } else if file.max_cache_size_mb.is_some() {
+        "config_file"
+    } else {
+        "default"
+    };
+    let max_cache_entries_source = if cli_flag_was_passed("max-cache-entries", None) {
+        "cli"
+    } else if file.max_cache_entries.is_some() {
+        "config_file"
+    } else {
+        "default"
+    };
+    let quiet_source = if quiet || cli_flag_was_passed("quiet", Some("q")) {
+        "cli"
+    } else {
+        "default"
+    };
+    let verbose_source = if verbose || cli_flag_was_passed("verbose", Some("v")) {
+        "cli"
+    } else {
+        "default"
+    };
+
+    let mut settings: BTreeMap<String, EffectiveSettingEntry> = BTreeMap::new();
+    settings.insert(
+        "config_file".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::String(cfg_path.display().to_string()),
+            source: cfg_source,
+        },
+    );
+    settings.insert(
+        "connect_timeout".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::from(connect_timeout),
+            source: connect_timeout_source,
+        },
+    );
+    settings.insert(
+        "data_dir".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::String(data_dir_path.display().to_string()),
+            source: "default",
+        },
+    );
+    settings.insert(
+        "format".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::String(format_val.clone()),
+            source: format_source,
+        },
+    );
+    settings.insert(
+        "headers".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::from(redacted_headers),
+            source: headers_source,
+        },
+    );
+    settings.insert(
+        "max_cache_entries".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::from(max_cache_entries),
+            source: max_cache_entries_source,
+        },
+    );
+    settings.insert(
+        "max_cache_size_mb".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::from(max_cache_size_mb),
+            source: max_cache_size_source,
+        },
+    );
+    settings.insert(
+        "max_retries".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::from(max_retries),
+            source: max_retries_source,
+        },
+    );
+    settings.insert(
+        "network".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::String(network_val),
+            source: network_source,
+        },
+    );
+    settings.insert(
+        "precision".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::from(precision),
+            source: precision_source,
+        },
+    );
+    settings.insert(
+        "quiet".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::Bool(quiet),
+            source: quiet_source,
+        },
+    );
+    settings.insert(
+        "rpc_fallback_url".to_string(),
+        EffectiveSettingEntry {
+            value: fallback_val,
+            source: fallback_source,
+        },
+    );
+    settings.insert(
+        "rpc_url".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::String(redacted_rpc_url),
+            source: rpc_url_source,
+        },
+    );
+    settings.insert(
+        "rps".to_string(),
+        EffectiveSettingEntry {
+            value: rps_val,
+            source: rps_source,
+        },
+    );
+    settings.insert(
+        "timeout".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::from(timeout),
+            source: timeout_source,
+        },
+    );
+    settings.insert(
+        "verbose".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::Bool(verbose),
+            source: verbose_source,
+        },
+    );
+
+    let emit_json = json_flag || matches!(cli_format, Some(cli::OutputFormat::Json));
+    if emit_json {
+        let doc = serde_json::json!({
+            "config_file": {
+                "path": cfg_path.display().to_string(),
+                "exists": cfg_exists,
+                "source": cfg_source,
+            },
+            "settings": settings,
+        });
+        println!("{}", serde_json::to_string_pretty(&doc)?);
+        return Ok(());
+    }
+
+    let mut table = Table::new();
+    table.set_header(vec!["Setting", "Value", "Source"]);
+    for (key, entry) in &settings {
+        let display_val = match &entry.value {
+            serde_json::Value::Null => "(none)".to_string(),
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Array(arr) => {
+                if arr.is_empty() {
+                    "[]".to_string()
+                } else {
+                    arr.iter()
+                        .map(|v| v.as_str().unwrap_or_default())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            }
+            other => other.to_string(),
+        };
+        table.add_row(vec![
+            Cell::new(key),
+            Cell::new(display_val),
+            Cell::new(entry.source),
+        ]);
+    }
+    println!("{table}");
+    Ok(())
+}
+
 /// `completions` command: generate shell completion script to stdout.
 fn cmd_completions(shell: clap_complete::Shell) {
-    let mut cmd = cli::Cli::command();
-    let bin_name = cmd.get_name().to_string();
-    clap_complete::generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
+    let run_gen = move || {
+        let mut cmd = cli::Cli::command();
+        let bin_name = cmd.get_name().to_string();
+        clap_complete::generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
+    };
+    if let Ok(handle) = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_gen)
+    {
+        let _ = handle.join();
+    } else {
+        run_gen();
+    }
 }
 
 /// True when a simulation response carried neither cost data, nor

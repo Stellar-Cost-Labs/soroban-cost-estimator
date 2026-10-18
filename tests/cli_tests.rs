@@ -4475,3 +4475,155 @@ fn test_config_snapshot_diff_makes_no_network_calls() {
         "offline diff must not resolve a network; got: {stderr}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// config show / config explain (issue #485)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_config_show_defaults_and_deterministic_ordering() {
+    let home = temp_home("config-show-defaults");
+    let missing_cfg = home.join("nonexistent-config.toml");
+
+    let (stdout1, stderr1, code1) = run_cli_quiet(
+        &[
+            "--config",
+            missing_cfg.to_str().unwrap(),
+            "config",
+            "show",
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code1, 0, "config show --json should succeed: {stderr1}");
+
+    let (stdout2, stderr2, code2) = run_cli_quiet(
+        &[
+            "--config",
+            missing_cfg.to_str().unwrap(),
+            "config",
+            "explain",
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code2, 0, "config explain --json should succeed: {stderr2}");
+    assert_eq!(
+        stdout1, stdout2,
+        "config show and config explain must produce identical deterministic JSON"
+    );
+
+    let parsed: serde_json::Value = serde_json::from_str(&stdout1).expect("valid JSON");
+    assert_eq!(parsed["config_file"]["exists"], false);
+    assert_eq!(parsed["config_file"]["source"], "cli");
+    assert_eq!(parsed["settings"]["network"]["value"], "testnet");
+    assert_eq!(parsed["settings"]["network"]["source"], "default");
+    assert_eq!(parsed["settings"]["timeout"]["value"], 30);
+    assert_eq!(parsed["settings"]["timeout"]["source"], "default");
+    assert_eq!(parsed["settings"]["connect_timeout"]["value"], 5);
+    assert_eq!(parsed["settings"]["connect_timeout"]["source"], "default");
+}
+
+#[test]
+fn test_config_show_precedence_and_credential_redaction() {
+    let home = temp_home("config-show-precedence");
+    let cfg_path = home.join("config.toml");
+    std::fs::write(
+        &cfg_path,
+        r#"
+network = "futurenet"
+rpc_url = "https://admin:super_secret_pw@rpc.example.com/soroban?api_key=file_secret_key&mode=fast"
+timeout = 45
+rps = 12
+headers = ["Authorization=Bearer file_secret_token", "X-Custom=visible"]
+"#,
+    )
+    .expect("write config.toml");
+
+    // 1. Config file values override defaults and redact secrets.
+    let (stdout_file, stderr_file, code_file) = run_cli_quiet(
+        &[
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "config",
+            "show",
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code_file, 0, "config show with file failed: {stderr_file}");
+    assert!(
+        !stdout_file.contains("super_secret_pw")
+            && !stdout_file.contains("file_secret_key")
+            && !stdout_file.contains("file_secret_token"),
+        "credentials must be redacted from output: {stdout_file}"
+    );
+
+    let file_json: serde_json::Value = serde_json::from_str(&stdout_file).expect("valid JSON");
+    assert_eq!(file_json["config_file"]["exists"], true);
+    assert_eq!(file_json["settings"]["network"]["value"], "futurenet");
+    assert_eq!(file_json["settings"]["network"]["source"], "config_file");
+    assert_eq!(file_json["settings"]["timeout"]["value"], 45);
+    assert_eq!(file_json["settings"]["timeout"]["source"], "config_file");
+    assert_eq!(file_json["settings"]["rps"]["value"], 12);
+    assert_eq!(file_json["settings"]["rps"]["source"], "config_file");
+    assert_eq!(
+        file_json["settings"]["rpc_url"]["value"],
+        "https://admin:<redacted>@rpc.example.com/soroban?api_key=<redacted>&mode=fast"
+    );
+    assert_eq!(file_json["settings"]["rpc_url"]["source"], "config_file");
+    assert_eq!(
+        file_json["settings"]["headers"]["value"],
+        serde_json::json!(["Authorization=<redacted>", "X-Custom=visible"])
+    );
+    assert_eq!(file_json["settings"]["headers"]["source"], "config_file");
+
+    // 2. CLI overrides beat config file values and also redact credentials.
+    let (stdout_cli, stderr_cli, code_cli) = run_cli_quiet(
+        &[
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--timeout",
+            "90",
+            "--header",
+            "x-api-key: cli_top_secret",
+            "config",
+            "show",
+            "--network",
+            "mainnet",
+            "--rpc-url",
+            "https://token_only@mainnet.example.com?token=cli_secret_tok",
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code_cli, 0,
+        "config show with CLI overrides failed: {stderr_cli}"
+    );
+    assert!(
+        !stdout_cli.contains("cli_top_secret")
+            && !stdout_cli.contains("token_only")
+            && !stdout_cli.contains("cli_secret_tok"),
+        "CLI credentials must be redacted: {stdout_cli}"
+    );
+
+    let cli_json: serde_json::Value = serde_json::from_str(&stdout_cli).expect("valid JSON");
+    assert_eq!(cli_json["settings"]["network"]["value"], "mainnet");
+    assert_eq!(cli_json["settings"]["network"]["source"], "cli");
+    assert_eq!(cli_json["settings"]["timeout"]["value"], 90);
+    assert_eq!(cli_json["settings"]["timeout"]["source"], "cli");
+    assert_eq!(
+        cli_json["settings"]["rpc_url"]["value"],
+        "https://<redacted>@mainnet.example.com?token=<redacted>"
+    );
+    assert_eq!(cli_json["settings"]["rpc_url"]["source"], "cli");
+    assert_eq!(
+        cli_json["settings"]["headers"]["value"],
+        serde_json::json!(["x-api-key=<redacted>"])
+    );
+    assert_eq!(cli_json["settings"]["headers"]["source"], "cli");
+    // rps was not overridden on CLI, so it still comes from config_file
+    assert_eq!(cli_json["settings"]["rps"]["value"], 12);
+    assert_eq!(cli_json["settings"]["rps"]["source"], "config_file");
+}
