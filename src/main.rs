@@ -16,7 +16,7 @@ use soroban_cost_estimator::rpc;
 use soroban_cost_estimator::wasm;
 use soroban_cost_estimator::xdr_helper;
 use std::path::PathBuf;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// Status of a single function in an `estimate-all` run.
@@ -198,13 +198,7 @@ async fn main() {
     cli::init_color(args.color);
     cli::init_quiet(args.quiet);
 
-    let default_level = if args.quiet {
-        "warn"
-    } else if args.verbose {
-        "debug"
-    } else {
-        "info"
-    };
+    let default_level = if args.verbose { "debug" } else { "off" };
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -217,8 +211,8 @@ async fn main() {
     }
 
     if let Err(err) = run(args).await {
-        error!(error = %err, category = err.error_category(), "command failed");
         eprintln!("Error: {err}");
+        debug!(error = %err, category = err.error_category(), "command failed");
         std::process::exit(err.exit_code());
     }
 }

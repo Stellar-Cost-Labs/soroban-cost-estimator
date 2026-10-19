@@ -4486,7 +4486,7 @@ fn test_stable_exit_codes_for_automation() {
     let home = temp_home("stable-exit-codes");
 
     // 1. Success (0): normal report on stdout, no `Error:` on stderr.
-    let (stdout, stderr, code) = run_cli_in_home(
+    let (stdout, stderr, code) = run_cli_quiet(
         &[
             "wasm-info",
             "--wasm",
@@ -4614,7 +4614,7 @@ fn test_stable_exit_codes_for_automation() {
         "snap-b.json",
         &snapshot_json_fee("testnet", 101, 250),
     );
-    let (stdout, stderr, code) = run_cli_in_home(
+    let (stdout, stderr, code) = run_cli_quiet(
         &[
             "config",
             "snapshot",
