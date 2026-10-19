@@ -2730,8 +2730,18 @@ async fn cmd_estimate_diff(
     })
     .await?;
 
+    let abi_diff = if old_info.has_spec && new_info.has_spec {
+        Some(report::diff::compare_contract_abi(
+            &old_info.functions,
+            &new_info.functions,
+        ))
+    } else {
+        None
+    };
+
     if format == "json" {
-        let diff = report::diff::build_cost_report_diff(&old_report, &new_report);
+        let diff =
+            report::diff::build_cost_report_diff_with_abi(&old_report, &new_report, abi_diff);
         let output = serde_json::json!({
             "wasm_a": old_report,
             "wasm_b": new_report,
@@ -2741,7 +2751,11 @@ async fn cmd_estimate_diff(
     } else {
         println!(
             "{}",
-            report::diff::format_cost_report_diff(&old_report, &new_report)
+            report::diff::format_cost_report_diff_with_abi(
+                &old_report,
+                &new_report,
+                abi_diff.as_ref()
+            )
         );
     }
 
@@ -3376,7 +3390,13 @@ fn cmd_wasm_info(
         if !wasm_info.imports.is_empty() {
             println!("  Imports:   {}", wasm_info.imports.len());
             for (i, imp) in wasm_info.imports.iter().enumerate() {
-                println!("    [{}] {}::{} ({})", i + 1, imp.module, imp.name, imp.kind);
+                println!(
+                    "    [{}] {}::{} ({})",
+                    i + 1,
+                    imp.module,
+                    imp.name,
+                    imp.kind
+                );
             }
         }
         println!(

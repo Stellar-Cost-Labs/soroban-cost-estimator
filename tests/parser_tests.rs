@@ -1068,7 +1068,10 @@ fn test_contract_imports_reported_in_metadata() {
     let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(path)
         .expect("failed to load contract fixture");
 
-    assert!(!wasm_info.imports.is_empty(), "contract should declare imports");
+    assert!(
+        !wasm_info.imports.is_empty(),
+        "contract should declare imports"
+    );
     for imp in &wasm_info.imports {
         assert!(!imp.module.is_empty(), "module name should not be empty");
         assert!(!imp.name.is_empty(), "import name should not be empty");
@@ -1078,7 +1081,11 @@ fn test_contract_imports_reported_in_metadata() {
     let host_imps: Vec<_> = wasm_info.host_imports().collect();
     assert_eq!(
         host_imps.len(),
-        wasm_info.imports.iter().filter(|i| i.module == "env").count()
+        wasm_info
+            .imports
+            .iter()
+            .filter(|i| i.module == "env")
+            .count()
     );
     for imp in host_imps {
         assert_eq!(imp.module, "env");
@@ -1127,4 +1134,107 @@ fn test_synthetic_imports_function_and_memory_kinds() {
     let json_val = serde_json::to_value(&meta.imports).expect("serialize ImportInfo");
     assert_eq!(json_val[0]["kind"], "function");
     assert_eq!(json_val[1]["kind"], "memory");
+}
+
+#[test]
+fn test_contract_abi_diff_fixtures_and_scenarios() {
+    let contract_path = Path::new("tests/fixtures/contract.wasm");
+    let minimal_path = Path::new("tests/fixtures/minimal.wasm");
+
+    let contract_info =
+        soroban_cost_estimator::wasm::parser::load_wasm(contract_path).expect("load contract.wasm");
+    let minimal_info =
+        soroban_cost_estimator::wasm::parser::load_wasm(minimal_path).expect("load minimal.wasm");
+
+    assert!(contract_info.has_spec, "contract.wasm should have spec");
+    assert!(!minimal_info.has_spec, "minimal.wasm should not have spec");
+
+    // 1. Missing spec handling: if either or both have no spec, ABI diff is None
+    let diff_none1 = if contract_info.has_spec && minimal_info.has_spec {
+        Some(soroban_cost_estimator::report::diff::compare_contract_abi(
+            &contract_info.functions,
+            &minimal_info.functions,
+        ))
+    } else {
+        None
+    };
+    assert!(
+        diff_none1.is_none(),
+        "missing spec should yield None for abi_diff"
+    );
+
+    let diff_none2 = if minimal_info.has_spec {
+        Some(soroban_cost_estimator::report::diff::compare_contract_abi(
+            &minimal_info.functions,
+            &minimal_info.functions,
+        ))
+    } else {
+        None
+    };
+    assert!(
+        diff_none2.is_none(),
+        "missing spec on both should yield None for abi_diff"
+    );
+
+    // 2. Identical specs: diff is empty
+    let diff_identical = soroban_cost_estimator::report::diff::compare_contract_abi(
+        &contract_info.functions,
+        &contract_info.functions,
+    );
+    assert!(diff_identical.is_empty());
+    let formatted_identical =
+        soroban_cost_estimator::report::diff::format_abi_diff(&diff_identical);
+    assert!(formatted_identical.contains("unchanged"));
+
+    // 3. Added function
+    let mut added_fns = contract_info.functions.clone();
+    added_fns.push(soroban_cost_estimator::wasm::parser::FunctionInfo {
+        name: "reset".to_string(),
+        param_count: 0,
+        result_count: 0,
+        params: Vec::new(),
+        returns: Vec::new(),
+    });
+    let diff_added = soroban_cost_estimator::report::diff::compare_contract_abi(
+        &contract_info.functions,
+        &added_fns,
+    );
+    assert_eq!(diff_added.added_functions, vec!["reset()"]);
+    assert!(diff_added.removed_functions.is_empty());
+    assert!(diff_added.modified_functions.is_empty());
+
+    // 4. Removed function
+    let diff_removed = soroban_cost_estimator::report::diff::compare_contract_abi(
+        &added_fns,
+        &contract_info.functions,
+    );
+    assert_eq!(diff_removed.removed_functions, vec!["reset()"]);
+    assert!(diff_removed.added_functions.is_empty());
+    assert!(diff_removed.modified_functions.is_empty());
+
+    // 5. Parameter and return type changes
+    let mut modified_fns = contract_info.functions.clone();
+    for f in &mut modified_fns {
+        if f.name == "increment" {
+            f.params[0].type_name = "u64".to_string();
+            f.returns[0].type_name = "u64".to_string();
+        }
+    }
+    let diff_mod = soroban_cost_estimator::report::diff::compare_contract_abi(
+        &contract_info.functions,
+        &modified_fns,
+    );
+    assert_eq!(diff_mod.modified_functions.len(), 1);
+    let m = &diff_mod.modified_functions[0];
+    assert_eq!(m.name, "increment");
+    assert_eq!(m.param_changes.len(), 1);
+    assert_eq!(m.param_changes[0].name, "step");
+    assert_eq!(m.param_changes[0].old_type.as_deref(), Some("i64"));
+    assert_eq!(m.param_changes[0].new_type.as_deref(), Some("u64"));
+    assert_eq!(m.old_return.as_deref(), Some("i64"));
+    assert_eq!(m.new_return.as_deref(), Some("u64"));
+
+    let formatted_mod = soroban_cost_estimator::report::diff::format_abi_diff(&diff_mod);
+    assert!(formatted_mod.contains("Modified functions:"));
+    assert!(formatted_mod.contains("increment:"));
 }
