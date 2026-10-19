@@ -1028,3 +1028,36 @@ fn test_load_wasm_detects_synthetic_debug_section() {
 
     let _ = std::fs::remove_file(&temp);
 }
+
+#[test]
+fn test_load_wasm_rejects_oversized_file() {
+    let temp = std::env::temp_dir().join(format!("sce-oversized-{}.wasm", std::process::id()));
+    std::fs::write(&temp, vec![0u8; 1000]).expect("write temp file");
+
+    let err = soroban_cost_estimator::wasm::parser::load_wasm_with_limit(&temp, 500)
+        .expect_err("should reject oversized file");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exceeds maximum allowed size"),
+        "error should indicate size exceeded: {msg}"
+    );
+    assert!(
+        msg.contains("limit is 500 bytes"),
+        "error should include configured maximum: {msg}"
+    );
+    assert!(
+        msg.contains(&temp.display().to_string()),
+        "error should contain file path: {msg}"
+    );
+
+    let _ = std::fs::remove_file(&temp);
+}
+
+#[test]
+fn test_load_wasm_accepts_file_within_limit() {
+    let path = Path::new("tests/fixtures/minimal.wasm");
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm_with_limit(path, 1024)
+        .expect("minimal.wasm (44 bytes) should load fine with 1024 limit");
+    assert_eq!(wasm_info.bytes.len(), 44);
+}

@@ -422,7 +422,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 (None, true) => cli::OutputFormat::Json,
                 (None, false) => cli::OutputFormat::Table,
             };
-            cmd_wasm_info(&wasm, format, quiet)
+            cmd_wasm_info(&wasm, format, quiet, args.max_wasm_size)
         }
         cli::Command::Wasm { action } => match action {
             cli::WasmAction::Info { wasm, json } => {
@@ -431,7 +431,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     (None, true) => cli::OutputFormat::Json,
                     (None, false) => cli::OutputFormat::Table,
                 };
-                cmd_wasm_info(&wasm.to_string_lossy(), format, quiet)
+                cmd_wasm_info(&wasm.to_string_lossy(), format, quiet, args.max_wasm_size)
             }
         },
         cli::Command::Config { action } => match action {
@@ -3313,8 +3313,16 @@ async fn estimate_all_function(
 ///
 /// # Network calls
 /// None â€” pure file I/O + parsing.
-fn cmd_wasm_info(wasm_path: &str, format: cli::OutputFormat, quiet: bool) -> error::AppResult<()> {
-    let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
+fn cmd_wasm_info(
+    wasm_path: &str,
+    format: cli::OutputFormat,
+    quiet: bool,
+    max_bytes: Option<u64>,
+) -> error::AppResult<()> {
+    let wasm_info = wasm::parser::load_wasm_with_limit(
+        std::path::Path::new(wasm_path),
+        max_bytes.unwrap_or(wasm::parser::DEFAULT_MAX_WASM_FILE_SIZE_BYTES),
+    )?;
     let hash = wasm_info.wasm_hash.clone();
 
     if format == cli::OutputFormat::Json {
