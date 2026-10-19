@@ -182,9 +182,21 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Simulate a single contract invocation and print the cost report.
+    ///
+    /// Repeat `--wasm` (or pass `--wasm-dir`) to evaluate several contracts
+    /// in one batch run and print a multi-contract cost summary.
     Estimate {
-        #[arg(long, short)]
-        wasm: String,
+        /// Path to a compiled Soroban contract `.wasm` file. Repeat the flag
+        /// to evaluate multiple contracts in a single batch run.
+        #[arg(long, short, value_name = "PATH", required_unless_present = "wasm_dir")]
+        wasm: Vec<PathBuf>,
+
+        /// Directory of `.wasm` files to evaluate as a batch (non-recursive).
+        #[arg(long, value_name = "DIR")]
+        wasm_dir: Option<PathBuf>,
+
+        /// Network to simulate against.
         #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
         #[arg(long)]
@@ -275,9 +287,22 @@ pub enum Command {
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=100))]
         repeat: u32,
     },
+
+    /// Enumerate all public contract functions and estimate each one.
+    ///
+    /// Repeat `--wasm` (or pass `--wasm-dir`) to estimate several contracts
+    /// in one batch run and print a multi-contract cost summary.
     EstimateAll {
-        #[arg(long, short)]
-        wasm: String,
+        /// Path to a compiled Soroban contract `.wasm` file. Repeat the flag
+        /// to estimate multiple contracts in a single batch run.
+        #[arg(long, short, value_name = "PATH", required_unless_present = "wasm_dir")]
+        wasm: Vec<PathBuf>,
+
+        /// Directory of `.wasm` files to estimate as a batch (non-recursive).
+        #[arg(long, value_name = "DIR")]
+        wasm_dir: Option<PathBuf>,
+
+        /// Network to simulate against.
         #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
 
@@ -313,6 +338,11 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect a compiled Soroban WASM artifact (offline).
+    Wasm {
+        #[command(subcommand)]
+        action: WasmAction,
+    },
     Config {
         #[command(subcommand)]
         action: ConfigAction,
@@ -336,6 +366,20 @@ pub enum Command {
         /// Target shell for completion script generation.
         #[arg(value_enum)]
         shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum WasmAction {
+    /// Print size, SHA-256, exported signatures, embedded metadata, and the
+    /// section size summary for a WASM file. Fully offline: no RPC calls.
+    Info {
+        /// Path to the compiled Soroban contract `.wasm` file.
+        wasm: PathBuf,
+
+        /// Output the full parsed spec/metadata as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 

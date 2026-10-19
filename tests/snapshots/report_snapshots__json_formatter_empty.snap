@@ -28,7 +28,6 @@ expression: JsonFormatter.format(&empty)
   "tx_size": 0,
   "warnings": [],
   "wasm_hash": "0000000000000000",
-  "wasm_size": 0,
   "write_bytes": 0,
   "write_entries": 0
 }
