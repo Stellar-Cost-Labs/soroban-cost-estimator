@@ -1238,3 +1238,87 @@ fn test_contract_abi_diff_fixtures_and_scenarios() {
     assert!(formatted_mod.contains("Modified functions:"));
     assert!(formatted_mod.contains("increment:"));
 }
+
+#[test]
+fn test_fuzz_boundaries_malformed_wasm_inputs() {
+    use soroban_cost_estimator::wasm::parser::{
+        enumerate_module_metadata, parse_contract_spec_entries, validate_wasm,
+        validate_wasm_memory_limits,
+    };
+
+    // 1. Empty input
+    assert!(validate_wasm(&[]).is_err());
+    assert!(enumerate_module_metadata(&[]).is_err());
+    assert!(parse_contract_spec_entries(&[]).is_err());
+    assert_eq!(validate_wasm_memory_limits(&[]), None);
+
+    // 2. Corrupted magic header
+    let bad_magic = [0x00, 0x61, 0x73, 0x00, 0x01, 0x00, 0x00, 0x00];
+    assert!(validate_wasm(&bad_magic).is_err());
+    assert!(enumerate_module_metadata(&bad_magic).is_err());
+    assert!(parse_contract_spec_entries(&bad_magic).is_err());
+
+    // 3. Truncated section header
+    let truncated_section = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01];
+    assert!(validate_wasm(&truncated_section).is_err());
+    assert!(enumerate_module_metadata(&truncated_section).is_err());
+    assert!(parse_contract_spec_entries(&truncated_section).is_err());
+
+    // 4. Custom section claiming huge length
+    let mut bad_custom = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+    bad_custom.push(0x00); // custom section id
+    bad_custom.extend_from_slice(&[0x80, 0x80, 0x04]); // LEB128 huge length
+    bad_custom.extend_from_slice(b"short");
+    assert!(validate_wasm(&bad_custom).is_err());
+    assert!(enumerate_module_metadata(&bad_custom).is_err());
+    assert!(parse_contract_spec_entries(&bad_custom).is_err());
+
+    // 5. contractspecv0 with malformed XDR payload
+    let mut malformed_spec = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+    let mut custom_payload = Vec::new();
+    let name = "contractspecv0";
+    custom_payload.push(name.len() as u8);
+    custom_payload.extend_from_slice(name.as_bytes());
+    // Invalid XDR bytes (e.g. invalid discriminant or truncated data)
+    custom_payload.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x01, 0x02]);
+    malformed_spec.push(0x00);
+    malformed_spec.push(custom_payload.len() as u8);
+    malformed_spec.extend_from_slice(&custom_payload);
+
+    let spec_res = parse_contract_spec_entries(&malformed_spec);
+    assert!(
+        spec_res.is_err(),
+        "malformed XDR payload in contractspecv0 must fail gracefully"
+    );
+}
+
+#[test]
+fn test_fuzz_seed_corpus_fixtures_succeed() {
+    use soroban_cost_estimator::wasm::parser::{
+        enumerate_module_metadata, parse_contract_spec_entries, validate_wasm,
+        validate_wasm_memory_limits,
+    };
+
+    let fixtures = [
+        "tests/fixtures/minimal.wasm",
+        "tests/fixtures/zeroarg.wasm",
+        "tests/fixtures/contract.wasm",
+    ];
+
+    for path_str in fixtures {
+        let bytes = std::fs::read(path_str)
+            .unwrap_or_else(|e| panic!("failed to read seed fixture {path_str}: {e}"));
+
+        // All seed corpus files must be valid WASM
+        assert!(validate_wasm(&bytes).is_ok(), "valid wasm: {path_str}");
+        assert!(
+            enumerate_module_metadata(&bytes).is_ok(),
+            "metadata enumeration: {path_str}"
+        );
+        let _ = validate_wasm_memory_limits(&bytes);
+        assert!(
+            parse_contract_spec_entries(&bytes).is_ok(),
+            "spec entries: {path_str}"
+        );
+    }
+}

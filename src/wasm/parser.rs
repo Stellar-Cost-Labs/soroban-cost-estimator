@@ -604,6 +604,7 @@ pub fn parse_contract_spec_entries(
         let data = section.data();
         let mut cursor = Cursor::new(data);
         while (cursor.position() as usize) < data.len() {
+            let prev_pos = cursor.position();
             let mut limited = stellar_xdr::Limited::new(&mut cursor, stellar_xdr::Limits::none());
             let entry = stellar_xdr::ScSpecEntry::read_xdr(&mut limited).map_err(|e| {
                 AppError::WasmParse(format!(
@@ -611,6 +612,11 @@ pub fn parse_contract_spec_entries(
                     entries.len()
                 ))
             })?;
+            if cursor.position() <= prev_pos {
+                return Err(AppError::WasmParse(
+                    "zero-byte progress while decoding contractspecv0 entry".to_string(),
+                ));
+            }
             entries.push(entry);
         }
     }
