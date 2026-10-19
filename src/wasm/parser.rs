@@ -976,13 +976,17 @@ pub struct MemoryInfo {
 }
 
 /// Information about an import declared by a WASM module.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Records the origin module (e.g. `"env"` for Soroban host functions), the symbol
+/// name, and the imported entity kind (`function`, `memory`, `table`, `global`, `tag`).
+/// Preserves deterministic declaration ordering from the binary's import section.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ImportInfo {
-    /// Module name the import is pulled from.
+    /// Module name the import is pulled from (e.g. `"env"` for Soroban host functions).
     pub module: String,
     /// Name of the imported item.
     pub name: String,
-    /// Human-readable kind, e.g. `function`, `memory`, `global`.
+    /// Human-readable kind, e.g. `function`, `memory`, `table`, `global`, `tag`.
     pub kind: String,
 }
 
@@ -1253,6 +1257,13 @@ pub struct WasmInfo {
 }
 
 impl WasmInfo {
+    /// Returns an iterator over imports from the Soroban host module ([`HOST_IMPORT_MODULE`]).
+    pub fn host_imports(&self) -> impl Iterator<Item = &ImportInfo> {
+        self.imports
+            .iter()
+            .filter(|imp| imp.module == HOST_IMPORT_MODULE)
+    }
+
     /// Size accounting for the whole file: the module header plus one entry
     /// per section, each with its share of the file.
     #[must_use]

@@ -3373,6 +3373,12 @@ fn cmd_wasm_info(
         for (i, fn_info) in wasm_info.functions.iter().enumerate() {
             println!("    [{}] {}", i + 1, wasm::parser::format_function(fn_info));
         }
+        if !wasm_info.imports.is_empty() {
+            println!("  Imports:   {}", wasm_info.imports.len());
+            for (i, imp) in wasm_info.imports.iter().enumerate() {
+                println!("    [{}] {}::{} ({})", i + 1, imp.module, imp.name, imp.kind);
+            }
+        }
         println!(
             "  Contract spec: {}",
             if wasm_info.has_spec {
@@ -3461,6 +3467,20 @@ fn wasm_info_json(
                 "total_size": s.total_size,
                 "percent": s.percent,
                 "custom": s.id == Some(0),
+            })
+        }).collect::<Vec<_>>(),
+        "imports": wasm_info.imports.iter().map(|i| {
+            serde_json::json!({
+                "module": i.module,
+                "name": i.name,
+                "kind": i.kind,
+            })
+        }).collect::<Vec<_>>(),
+        "host_imports": wasm_info.host_imports().map(|i| {
+            serde_json::json!({
+                "module": i.module,
+                "name": i.name,
+                "kind": i.kind,
             })
         }).collect::<Vec<_>>(),
         "module": {
