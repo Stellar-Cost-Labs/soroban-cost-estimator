@@ -150,6 +150,7 @@ struct EstimateAllJsonReport {
 struct FileConfig {
     network: Option<String>,
     rpc_url: Option<String>,
+    proxy: Option<String>,
     json: Option<bool>,
 }
 
@@ -239,6 +240,12 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
     // `--quiet` is a single global flag; bind it once so every command in
     // `run()` reads the same value.
     let quiet = args.quiet;
+    // Explicit `--proxy` overrides `proxy` in the config file, which in turn
+    // overrides standard proxy environment variables (`HTTPS_PROXY`,
+    // `HTTP_PROXY`, `ALL_PROXY`). Validated up front so malformed proxy URLs
+    // fail immediately with a clear configuration error.
+    let proxy = args.proxy.as_deref().or(file.proxy.as_deref());
+    rpc::client::set_default_proxy(proxy)?;
     // Bound the on-disk estimate cache before any command can write to it.
     // A `--max-cache-size-mb` of 0 disables the byte quota; 0 entries
     // disables the entry quota.

@@ -47,6 +47,9 @@ pub enum AppError {
     #[error("failed to parse HTTP header: {0}")]
     InvalidHeader(String),
 
+    #[error("failed to configure HTTP proxy: {0}")]
+    InvalidProxy(String),
+
     /// A non-success HTTP status returned by the RPC endpoint.
     ///
     /// Transient statuses (429/5xx) are retried by the RPC client; this error
@@ -203,6 +206,7 @@ mod tests {
                 message: "boom".to_string(),
             },
             AppError::InvalidHeader("missing '=' separator".to_string()),
+            AppError::InvalidProxy("unsupported scheme 'ftp'".to_string()),
             AppError::WsConnect("wss://host/ws: refused".to_string()),
             AppError::WsProtocol("malformed RPC message".to_string()),
             AppError::WsClosed,
@@ -238,6 +242,7 @@ mod tests {
             AppError::XdrDecode("invalid base64".to_string()),
             AppError::FileNotFound("a.wasm".to_string()),
             AppError::InvalidHeader("missing '=' separator".to_string()),
+            AppError::InvalidProxy("unsupported scheme 'ftp'".to_string()),
         ];
         for sample in samples {
             let rendered = sample.to_string();

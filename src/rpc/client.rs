@@ -179,6 +179,7 @@ struct HealthResponse {
 pub struct RpcClient {
     url: String,
     fallback_url: Option<String>,
+    proxy_url: Option<String>,
     client: reqwest::Client,
     dedup: Arc<Mutex<DedupState>>,
     /// Fixed-rate limiter shared by every network call, when enabled.
@@ -363,6 +364,40 @@ impl RpcClient {
         )
     }
 
+    /// Create a new RPC client with an explicit HTTP/HTTPS proxy URL for both
+    /// primary and fallback RPC requests.
+    ///
+    /// Precedence: an explicit `proxy` argument overrides any process-wide
+    /// default set via [`set_default_proxy`], which in turn overrides standard
+    /// proxy environment variables (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`).
+    /// When both `proxy` and [`default_proxy`] are `None`, `reqwest`'s standard
+    /// environment proxy detection applies.
+    ///
+    /// # Errors
+    /// Returns [`AppError::InvalidProxy`] when `proxy` is malformed or uses an
+    /// unsupported scheme.
+    pub fn with_proxy(
+        url: &str,
+        fallback_url: Option<&str>,
+        rps: Option<u64>,
+        timeout: Duration,
+        max_retries: usize,
+        proxy: Option<&str>,
+        verbose: bool,
+    ) -> AppResult<Self> {
+        Self::with_fallback_headers_connect_timeout_proxy(
+            url,
+            fallback_url,
+            rps,
+            timeout,
+            DEFAULT_CONNECT_TIMEOUT,
+            max_retries,
+            &[],
+            proxy,
+            verbose,
+        )
+    }
+
     /// Create a new RPC client with an optional fallback URL, optional rate
     /// limit, request timeout, TCP connect timeout, retry policy, and custom
     /// HTTP headers attached to every request.
@@ -373,7 +408,9 @@ impl RpcClient {
     /// request timeout then applies to the connect phase too).
     /// # Errors
     /// Returns [`AppError::InvalidHeader`] when any supplied header is
-    /// malformed.
+    /// malformed, or [`AppError::InvalidProxy`] when a default proxy configured
+    /// via [`set_default_proxy`] is invalid.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_fallback_headers_connect_timeout(
         url: &str,
         fallback_url: Option<&str>,
@@ -384,6 +421,47 @@ impl RpcClient {
         headers: &[String],
         verbose: bool,
     ) -> AppResult<Self> {
+        Self::with_fallback_headers_connect_timeout_proxy(
+            url,
+            fallback_url,
+            rps,
+            timeout,
+            connect_timeout,
+            max_retries,
+            headers,
+            None,
+            verbose,
+        )
+    }
+
+    /// Create a new RPC client with an optional fallback URL, optional rate
+    /// limit, request timeout, TCP connect timeout, retry policy, custom HTTP
+    /// headers, and an explicit HTTP/HTTPS proxy URL.
+    ///
+    /// Both primary (`url`) and fallback (`fallback_url`) RPC calls share the
+    /// underlying HTTP client and therefore route through the same proxy
+    /// configuration.
+    ///
+    /// # Errors
+    /// Returns [`AppError::InvalidHeader`] when any supplied header is
+    /// malformed, or [`AppError::InvalidProxy`] when `proxy` (or the default
+    /// proxy configured via [`set_default_proxy`]) is invalid.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_fallback_headers_connect_timeout_proxy(
+        url: &str,
+        fallback_url: Option<&str>,
+        rps: Option<u64>,
+        timeout: Duration,
+        connect_timeout: Duration,
+        max_retries: usize,
+        headers: &[String],
+        proxy: Option<&str>,
+        verbose: bool,
+    ) -> AppResult<Self> {
+        let effective_proxy = proxy.map(|p| p.trim().to_string()).or_else(default_proxy);
+        let redacted_proxy = effective_proxy
+            .as_deref()
+            .map_or_else(|| "(env/default)".to_string(), redact_proxy_url);
         debug!(
             url,
             ?fallback_url,
@@ -392,10 +470,15 @@ impl RpcClient {
             ?connect_timeout,
             max_retries,
             headers = %redacted_headers(headers),
+            proxy = %redacted_proxy,
             "creating RPC client"
         );
         let headers = parse_headers(headers)?;
-        Ok(Self::from_parts(
+        let reqwest_proxy = match effective_proxy.as_deref() {
+            Some(raw) => Some(validate_proxy_url(raw)?),
+            None => None,
+        };
+        Ok(Self::from_parts_with_proxy(
             url,
             fallback_url,
             rps,
@@ -403,14 +486,17 @@ impl RpcClient {
             connect_timeout,
             max_retries,
             headers,
+            effective_proxy,
+            reqwest_proxy,
             verbose,
         ))
     }
 
-    /// Shared, infallible construction path for every public constructor.
+    /// Shared, infallible construction path for infallible constructors.
     ///
-    /// `headers` has already been parsed and validated by the caller, so this
-    /// only wires the client together.
+    /// Picks up any process-wide default proxy configured via
+    /// [`set_default_proxy`].
+    #[allow(clippy::too_many_arguments)]
     fn from_parts(
         url: &str,
         fallback_url: Option<&str>,
@@ -421,20 +507,56 @@ impl RpcClient {
         headers: HeaderMap,
         verbose: bool,
     ) -> Self {
+        let effective_proxy = default_proxy();
+        let reqwest_proxy = effective_proxy
+            .as_deref()
+            .and_then(|raw| validate_proxy_url(raw).ok());
+        Self::from_parts_with_proxy(
+            url,
+            fallback_url,
+            rps,
+            timeout,
+            connect_timeout,
+            max_retries,
+            headers,
+            effective_proxy,
+            reqwest_proxy,
+            verbose,
+        )
+    }
+
+    /// Shared construction path once headers and optional proxy have been
+    /// validated.
+    #[allow(clippy::too_many_arguments)]
+    fn from_parts_with_proxy(
+        url: &str,
+        fallback_url: Option<&str>,
+        rps: Option<u64>,
+        timeout: Duration,
+        connect_timeout: Duration,
+        max_retries: usize,
+        headers: HeaderMap,
+        proxy_url: Option<String>,
+        reqwest_proxy: Option<reqwest::Proxy>,
+        verbose: bool,
+    ) -> Self {
+        let mut builder = reqwest::Client::builder()
+            .timeout(timeout)
+            .connect_timeout(connect_timeout)
+            .tcp_keepalive(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .default_headers(headers.clone());
+        if let Some(proxy) = reqwest_proxy {
+            builder = builder.proxy(proxy);
+        }
         Self {
             url: url.to_string(),
             fallback_url: fallback_url.map(String::from),
+            proxy_url,
             // `ClientBuilder::build` only fails on invalid configuration (a
-            // default builder cannot), so fall back to a plain client to keep
+            // validated builder cannot), so fall back to a plain client to keep
             // construction infallible.
-            client: reqwest::Client::builder()
-                .timeout(timeout)
-                .connect_timeout(connect_timeout)
-                .tcp_keepalive(Duration::from_secs(30))
-                .pool_idle_timeout(Duration::from_secs(90))
-                .default_headers(headers.clone())
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            client: builder.build().unwrap_or_else(|_| reqwest::Client::new()),
             dedup: Arc::new(Mutex::new(DedupState::default())),
             limiter: rps.and_then(build_rate_limiter),
             max_retries,
@@ -442,6 +564,19 @@ impl RpcClient {
             headers,
             verbose,
         }
+    }
+
+    /// Returns the explicit proxy URL configured for this client, if any.
+    #[must_use]
+    pub fn proxy_url(&self) -> Option<&str> {
+        self.proxy_url.as_deref()
+    }
+
+    /// Returns the explicit proxy URL configured for this client with any
+    /// embedded `user:password@` credentials replaced by `<redacted>@`.
+    #[must_use]
+    pub fn redacted_proxy_url(&self) -> Option<String> {
+        self.proxy_url.as_deref().map(redact_proxy_url)
     }
 
     /// Returns the custom HTTP headers configured for this client.
@@ -990,6 +1125,140 @@ pub fn parse_headers(raw_headers: &[String]) -> AppResult<HeaderMap> {
         headers.insert(name, value);
     }
     Ok(headers)
+}
+
+/// Process-wide explicit proxy URL configured from CLI `--proxy` or the
+/// config file's `proxy` setting.
+static DEFAULT_PROXY_URL: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
+
+fn default_proxy_slot() -> &'static std::sync::Mutex<Option<String>> {
+    DEFAULT_PROXY_URL.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Sets the process-wide default explicit HTTP/HTTPS proxy URL for [`RpcClient`].
+///
+/// Validates `proxy` immediately when `Some` so invalid `--proxy` or config
+/// values fail fast at CLI startup before any network call is attempted.
+///
+/// # Errors
+/// Returns [`AppError::InvalidProxy`] if `proxy` is not a valid `http://` or
+/// `https://` proxy URL.
+pub fn set_default_proxy(proxy: Option<&str>) -> AppResult<()> {
+    let normalized = match proxy {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            let _ = validate_proxy_url(trimmed)?;
+            Some(trimmed.to_string())
+        }
+        None => None,
+    };
+    if let Ok(mut guard) = default_proxy_slot().lock() {
+        *guard = normalized;
+    }
+    Ok(())
+}
+
+/// Returns the process-wide default explicit proxy URL, if configured via
+/// [`set_default_proxy`].
+#[must_use]
+pub fn default_proxy() -> Option<String> {
+    default_proxy_slot()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+/// Masks any `user:password@` or `user@` credentials in a proxy URL with
+/// `<redacted>@` so proxy URLs are safe to include in logs and error messages.
+#[must_use]
+pub fn redact_proxy_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let Some((scheme, after_scheme)) = trimmed.split_once("://") else {
+        return trimmed.to_string();
+    };
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let (authority, path_tail) = after_scheme.split_at(authority_end);
+    let Some((_, host_port)) = authority.rsplit_once('@') else {
+        return trimmed.to_string();
+    };
+    format!("{scheme}://{REDACTED}@{host_port}{path_tail}")
+}
+
+/// Validates an explicit HTTP/HTTPS proxy URL and builds a [`reqwest::Proxy`]
+/// that routes all HTTP and HTTPS RPC requests through it.
+///
+/// # Errors
+/// Returns [`AppError::InvalidProxy`] when `raw` is empty, contains whitespace,
+/// uses a scheme other than `http://` or `https://`, omits a host, specifies an
+/// invalid port, or is rejected by `reqwest::Proxy::all`.
+pub fn validate_proxy_url(raw: &str) -> AppResult<reqwest::Proxy> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::InvalidProxy(
+            "proxy URL must not be empty".to_string(),
+        ));
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(AppError::InvalidProxy(
+            "proxy URL must not contain whitespace".to_string(),
+        ));
+    }
+
+    let redacted = redact_proxy_url(trimmed);
+    let Some((scheme, after_scheme)) = trimmed.split_once("://") else {
+        return Err(AppError::InvalidProxy(format!(
+            "'{redacted}' is missing an http:// or https:// scheme"
+        )));
+    };
+
+    let scheme_lower = scheme.to_ascii_lowercase();
+    if scheme_lower != "http" && scheme_lower != "https" {
+        return Err(AppError::InvalidProxy(format!(
+            "unsupported proxy scheme '{scheme}' (expected 'http' or 'https')"
+        )));
+    }
+
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
+
+    if host_port.is_empty() || host_port.starts_with(':') {
+        return Err(AppError::InvalidProxy(format!(
+            "'{redacted}' is missing a proxy host"
+        )));
+    }
+
+    let port_part = if let Some(rest) = host_port.strip_prefix('[') {
+        let Some((_, after_bracket)) = rest.split_once(']') else {
+            return Err(AppError::InvalidProxy(format!(
+                "invalid IPv6 host in '{redacted}'"
+            )));
+        };
+        after_bracket.strip_prefix(':')
+    } else {
+        host_port.rsplit_once(':').map(|(_, p)| p)
+    };
+
+    if let Some(port_str) = port_part {
+        let Ok(port) = port_str.parse::<u16>() else {
+            return Err(AppError::InvalidProxy(format!(
+                "invalid proxy port '{port_str}' in '{redacted}'"
+            )));
+        };
+        if port == 0 {
+            return Err(AppError::InvalidProxy(format!(
+                "proxy port must be between 1 and 65535 in '{redacted}'"
+            )));
+        }
+    }
+
+    reqwest::Proxy::all(trimmed)
+        .map_err(|e| AppError::InvalidProxy(format!("invalid proxy URL '{redacted}': {e}")))
 }
 
 #[cfg(test)]
@@ -2201,5 +2470,97 @@ mod header_tests {
         // A malformed argument has no name to classify; it is echoed verbatim
         // because it cannot carry a parsed credential name.
         assert_eq!(redacted_headers(&["garbage".to_string()]), "garbage");
+    }
+
+    #[test]
+    fn test_redact_proxy_url_masks_credentials() {
+        assert_eq!(
+            super::redact_proxy_url("http://alice:s3cr3t@proxy.internal:8080"),
+            "http://<redacted>@proxy.internal:8080"
+        );
+        assert_eq!(
+            super::redact_proxy_url("https://token@proxy.internal:8443/path"),
+            "https://<redacted>@proxy.internal:8443/path"
+        );
+        assert_eq!(
+            super::redact_proxy_url("http://proxy.internal:8080"),
+            "http://proxy.internal:8080"
+        );
+    }
+
+    #[test]
+    fn test_validate_proxy_url_accepts_http_and_https_proxies() {
+        for valid in [
+            "http://127.0.0.1:8080",
+            "https://proxy.example.com:8443",
+            "http://user:pass@proxy.example.com:3128",
+            "http://[::1]:8080",
+        ] {
+            assert!(
+                super::validate_proxy_url(valid).is_ok(),
+                "expected {valid:?} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_proxy_url_rejects_invalid_configs_with_clear_error() {
+        for (invalid, expected_fragment) in [
+            ("", "must not be empty"),
+            ("   ", "must not be empty"),
+            ("http://proxy.example.com:8080/ extra", "whitespace"),
+            (
+                "proxy.example.com:8080",
+                "missing an http:// or https:// scheme",
+            ),
+            (
+                "socks5://127.0.0.1:1080",
+                "unsupported proxy scheme 'socks5'",
+            ),
+            (
+                "ftp://proxy.example.com:21",
+                "unsupported proxy scheme 'ftp'",
+            ),
+            ("http://", "missing a proxy host"),
+            ("http://:8080", "missing a proxy host"),
+            ("http://user:secret@:8080", "missing a proxy host"),
+            ("http://proxy.example.com:0", "between 1 and 65535"),
+            ("http://proxy.example.com:99999", "invalid proxy port"),
+        ] {
+            let err = super::validate_proxy_url(invalid)
+                .expect_err(&format!("{invalid:?} must be rejected"));
+            assert!(matches!(err, AppError::InvalidProxy(_)));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(expected_fragment),
+                "expected {msg:?} to contain {expected_fragment:?}"
+            );
+            assert!(
+                !msg.contains("secret"),
+                "error message must redact proxy credentials: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_client_with_proxy_stores_and_redacts_proxy_url() {
+        let client = RpcClient::with_proxy(
+            "http://localhost:8000",
+            Some("http://localhost:8001"),
+            None,
+            Duration::from_secs(5),
+            0,
+            Some("http://user:topsecret@127.0.0.1:8888"),
+            false,
+        )
+        .expect("valid proxy URL");
+        assert_eq!(
+            client.proxy_url(),
+            Some("http://user:topsecret@127.0.0.1:8888")
+        );
+        assert_eq!(
+            client.redacted_proxy_url().as_deref(),
+            Some("http://<redacted>@127.0.0.1:8888")
+        );
     }
 }

@@ -137,6 +137,16 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "URL")]
     pub rpc_fallback_url: Option<String>,
 
+    /// Explicit HTTP/HTTPS proxy URL for all RPC requests (primary and
+    /// fallback), e.g. `http://proxy.internal:8080`.
+    ///
+    /// Precedence: `--proxy` overrides `proxy` in the config file, which in
+    /// turn overrides standard proxy environment variables (`HTTPS_PROXY`,
+    /// `HTTP_PROXY`, `ALL_PROXY`). When omitted, standard proxy environment
+    /// variables are used automatically.
+    #[arg(long, visible_alias = "http-proxy", global = true, value_name = "URL")]
+    pub proxy: Option<String>,
+
     /// Retry transient RPC failures up to N times (default 3), using
     /// exponential backoff (500ms, then doubled between attempts). 0
     /// disables retries entirely.
