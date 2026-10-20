@@ -47,6 +47,9 @@ pub enum AppError {
     #[error("failed to parse HTTP header: {0}")]
     InvalidHeader(String),
 
+    #[error("failed to configure HTTP proxy: {0}")]
+    InvalidProxy(String),
+
     /// A non-success HTTP status returned by the RPC endpoint.
     ///
     /// Transient statuses (429/5xx) are retried by the RPC client; this error

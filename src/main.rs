@@ -225,6 +225,7 @@ async fn main() {
 #[allow(clippy::too_many_lines)]
 async fn run(args: cli::Cli) -> error::AppResult<()> {
     let file = load_config(args.config.as_deref())?;
+    rpc::client::set_explicit_proxy(args.rpc_proxy.as_deref())?;
     let rps = args.rps;
     let timeout = args.timeout;
     let connect_timeout = args.connect_timeout;
