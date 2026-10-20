@@ -1,6 +1,40 @@
 use std::path::Path;
 
 #[test]
+fn test_validate_imported_memory_limits() {
+    let bytes = include_bytes!("fixtures/imported_memory.wasm");
+
+    let warning = soroban_cost_estimator::wasm::parser::validate_wasm_memory_limits(bytes)
+        .expect("imported memory above the Soroban limit should warn");
+
+    assert!(warning.contains("Imported memory[0]"), "got: {warning}");
+    assert!(warning.contains("maximum size 611 pages"), "got: {warning}");
+}
+
+#[test]
+fn test_validate_absent_memory_has_no_warning() {
+    let bytes = include_bytes!("fixtures/minimal.wasm");
+
+    assert!(soroban_cost_estimator::wasm::parser::validate_wasm_memory_limits(bytes).is_none());
+}
+
+#[test]
+fn test_validate_defined_memory_limits() {
+    // Header + a memory section declaring a 611-page maximum.
+    let bytes = [
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x05, 0x05, 0x01, 0x01, 0x01, 0xe3, 0x04,
+    ];
+
+    let warning = soroban_cost_estimator::wasm::parser::validate_wasm_memory_limits(&bytes)
+        .expect("defined memory above the Soroban limit should warn");
+
+    assert!(
+        warning.contains("Memory: maximum size 611 pages"),
+        "got: {warning}"
+    );
+}
+
+#[test]
 fn test_load_minimal_wasm() {
     let path = Path::new("tests/fixtures/minimal.wasm");
     assert!(path.exists(), "test WASM fixture not found");
