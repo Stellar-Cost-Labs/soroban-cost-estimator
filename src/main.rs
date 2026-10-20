@@ -263,6 +263,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
         cli::Command::Estimate {
             wasm,
             wasm_dir,
+            manifest,
             network,
             rpc_url,
             r#fn,
@@ -290,6 +291,36 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 (None, true) => cli::OutputFormat::Json,
                 (None, false) => cli::OutputFormat::Table,
             };
+            if let Some(path) = manifest {
+                let network = env_string(network, &default_network, "SOROBAN_NETWORK");
+                let entries = soroban_cost_estimator::manifest::load(
+                    &path,
+                    &network,
+                    rpc_url.as_deref().or(default_rpc_url.as_deref()),
+                )?;
+                if dry_run {
+                    println!("{}", serde_json::to_string_pretty(&entries)?);
+                    return Ok(());
+                }
+                return cmd_batch(
+                    &[],
+                    &network,
+                    rpc_url.as_deref().or(default_rpc_url.as_deref()),
+                    fallback,
+                    None,
+                    None,
+                    &[],
+                    format.as_str(),
+                    rps,
+                    timeout,
+                    connect_timeout,
+                    max_retries,
+                    verbose,
+                    &headers,
+                    Some(&entries),
+                )
+                .await;
+            }
             let paths = resolve_wasm_paths(&wasm, wasm_dir.as_deref())?;
             if wasm.len() > 1 || wasm_dir.is_some() {
                 // Multi-contract run: aggregate every contract into a single
@@ -309,6 +340,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     max_retries,
                     verbose,
                     &headers,
+                    None,
                 )
                 .await
             } else {
@@ -385,6 +417,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     max_retries,
                     verbose,
                     &headers,
+                    None,
                 )
                 .await
             } else {
@@ -5344,14 +5377,21 @@ async fn cmd_batch(
     max_retries: usize,
     verbose: bool,
     extra_headers: &[String],
+    manifest: Option<&[soroban_cost_estimator::manifest::Entry]>,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
 
-    let total = wasm_paths.len();
+    let total = manifest.map_or(wasm_paths.len(), <[_]>::len);
     let span = info_span!("cmd_batch", contracts = total, network);
     async move {
-        let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
+        let endpoint = rpc::client::resolve_endpoint(
+            network,
+            manifest
+                .and_then(|entries| entries.first())
+                .and_then(|e| e.rpc_url.as_deref())
+                .or(rpc_url),
+        )?;
         let client = rpc::client::RpcClient::with_fallback_headers_connect_timeout(
             &endpoint,
             rpc_fallback_url,
@@ -5364,7 +5404,9 @@ async fn cmd_batch(
         )?;
 
         // Fail fast on an unreachable endpoint before simulating every contract.
-        client.health_check().await?;
+        if manifest.is_none() {
+            client.health_check().await?;
+        }
 
         let sc_vals: Vec<stellar_xdr::ScVal> = args
             .iter()
@@ -5375,7 +5417,37 @@ async fn cmd_batch(
 
         let mut contracts: Vec<report::cost_report::ContractCostSummary> =
             Vec::with_capacity(total);
-        for (i, path) in wasm_paths.iter().enumerate() {
+        for i in 0..total {
+            let entry = manifest.map(|entries| &entries[i]);
+            let path = entry.map_or_else(|| wasm_paths[i].as_path(), |e| e.wasm.as_path());
+            let network = entry.and_then(|e| e.network.as_deref()).unwrap_or(network);
+            let contract_id = entry.map_or(contract_id, |e| e.id.as_deref());
+            let fn_name = entry.map_or(fn_name, |e| Some(e.function.as_str()));
+            let args = entry.map_or(args, |e| e.args.as_slice());
+            let entry_vals: Vec<_> = args
+                .iter()
+                .map(|a| xdr_helper::parse_arg_scval(a))
+                .collect();
+            let sc_vals = if entry.is_some() {
+                &entry_vals
+            } else {
+                &sc_vals
+            };
+            let entry_client = entry
+                .map(|e| {
+                    rpc::client::RpcClient::with_fallback_headers_connect_timeout(
+                        e.rpc_url.as_deref().unwrap_or_default(),
+                        rpc_fallback_url,
+                        rps,
+                        std::time::Duration::from_secs(timeout),
+                        std::time::Duration::from_secs(connect_timeout),
+                        max_retries,
+                        extra_headers,
+                        verbose,
+                    )
+                })
+                .transpose()?;
+            let client = entry_client.as_ref().unwrap_or(&client);
             if text_mode {
                 println!("[{}/{}] {}", i + 1, total, path.display());
             }
@@ -5404,7 +5476,14 @@ async fn cmd_batch(
             contracts.push(summary);
         }
 
-        let batch = report::cost_report::BatchCostReport::new(network.to_string(), contracts);
+        let batch = report::cost_report::BatchCostReport::new(
+            if manifest.is_some() {
+                "manifest".to_string()
+            } else {
+                network.to_string()
+            },
+            contracts,
+        );
 
         match format {
             "json" => println!("{}", report::cost_report::format_batch_report_json(&batch)),
