@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
 use governor::{Quota, RateLimiter};
@@ -198,11 +199,57 @@ pub struct RpcClient {
     pub verbose: bool,
 }
 
+/// Explicit process-local proxy used by CLI-created RPC clients. This is not
+/// written to the environment, so one invocation cannot alter other tools.
+static EXPLICIT_PROXY: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+
+/// Configure the explicit HTTP(S) proxy for subsequently created clients.
+///
+/// An explicit proxy takes precedence over `HTTP_PROXY`/`HTTPS_PROXY` because
+/// reqwest evaluates configured proxies before environment-derived settings.
+/// Credentials are intentionally never retained in diagnostics or logs.
+pub fn set_explicit_proxy(proxy_url: Option<&str>) -> AppResult<()> {
+    if let Some(proxy_url) = proxy_url {
+        reqwest::Proxy::all(proxy_url).map_err(|e| AppError::InvalidProxy(e.to_string()))?;
+    }
+    let proxy = EXPLICIT_PROXY.get_or_init(|| RwLock::new(None));
+    let mut configured = proxy
+        .write()
+        .map_err(|_| AppError::InvalidProxy("proxy configuration lock poisoned".to_string()))?;
+    *configured = proxy_url.map(str::to_owned);
+    Ok(())
+}
+
+fn explicit_proxy() -> Option<String> {
+    EXPLICIT_PROXY
+        .get()
+        .and_then(|proxy| proxy.read().ok().and_then(|configured| configured.clone()))
+}
+
 impl RpcClient {
     /// Create a new RPC client pointing at the given URL, without rate
     /// limiting and with the default request timeout.
     pub fn new(url: &str) -> Self {
         Self::with_rate_limit(url, None, false)
+    }
+
+    /// Create a client that routes its RPC traffic through `proxy_url`.
+    ///
+    /// This per-client constructor is primarily useful for embedders and
+    /// tests; the CLI configures the same behavior through `--rpc-proxy`.
+    pub fn with_proxy(url: &str, proxy_url: &str) -> AppResult<Self> {
+        reqwest::Proxy::all(proxy_url).map_err(|e| AppError::InvalidProxy(e.to_string()))?;
+        Ok(Self::from_parts_with_proxy(
+            url,
+            None,
+            None,
+            DEFAULT_TIMEOUT,
+            DEFAULT_CONNECT_TIMEOUT,
+            DEFAULT_MAX_RETRIES,
+            HeaderMap::new(),
+            false,
+            Some(proxy_url),
+        ))
     }
 
     /// Create a new RPC client pointing at the given URL, optionally capping
@@ -421,20 +468,38 @@ impl RpcClient {
         headers: HeaderMap,
         verbose: bool,
     ) -> Self {
+        Self::from_parts_with_proxy(
+            url,
+            fallback_url,
+            rps,
+            timeout,
+            connect_timeout,
+            max_retries,
+            headers,
+            verbose,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_parts_with_proxy(
+        url: &str,
+        fallback_url: Option<&str>,
+        rps: Option<u64>,
+        timeout: Duration,
+        connect_timeout: Duration,
+        max_retries: usize,
+        headers: HeaderMap,
+        verbose: bool,
+        proxy_url: Option<&str>,
+    ) -> Self {
         Self {
             url: url.to_string(),
             fallback_url: fallback_url.map(String::from),
             // `ClientBuilder::build` only fails on invalid configuration (a
             // default builder cannot), so fall back to a plain client to keep
             // construction infallible.
-            client: reqwest::Client::builder()
-                .timeout(timeout)
-                .connect_timeout(connect_timeout)
-                .tcp_keepalive(Duration::from_secs(30))
-                .pool_idle_timeout(Duration::from_secs(90))
-                .default_headers(headers.clone())
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            client: build_http_client(timeout, connect_timeout, headers.clone(), proxy_url),
             dedup: Arc::new(Mutex::new(DedupState::default())),
             limiter: rps.and_then(build_rate_limiter),
             max_retries,
@@ -793,6 +858,26 @@ impl RpcClient {
         trace!(method, "RPC call succeeded");
         Ok(result.clone())
     }
+}
+
+fn build_http_client(
+    timeout: Duration,
+    connect_timeout: Duration,
+    headers: HeaderMap,
+    proxy_url: Option<&str>,
+) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(connect_timeout)
+        .tcp_keepalive(Duration::from_secs(30))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .default_headers(headers);
+    if let Some(proxy_url) = proxy_url.map(str::to_owned).or_else(explicit_proxy) {
+        if let Ok(proxy) = reqwest::Proxy::all(proxy_url) {
+            builder = builder.proxy(proxy);
+        }
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// Rewrap a reqwest error whose connect phase timed out into an

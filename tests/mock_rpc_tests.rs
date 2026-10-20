@@ -46,6 +46,23 @@ async fn mock_rpc_fixture_handles_simulate_transaction_and_health() {
 }
 
 #[tokio::test]
+async fn explicit_proxy_routes_rpc_requests_through_local_proxy() {
+    let proxy = common::start_mock_rpc_server().await;
+    common::stub_jsonrpc_success(&proxy, "getHealth", json!({ "status": "healthy" })).await;
+
+    // The target is deliberately unreachable. A successful response proves
+    // reqwest sent the request to the explicit local proxy instead.
+    let client = RpcClient::with_proxy("http://unreachable.invalid", proxy.uri().as_str())
+        .expect("local HTTP proxy URL should be valid");
+    let health: serde_json::Value = client
+        .call("getHealth", json!({}))
+        .await
+        .expect("explicit proxy should forward the RPC request");
+
+    assert_eq!(health["status"], "healthy");
+}
+
+#[tokio::test]
 async fn mock_rpc_fixture_handles_ledger_entries_and_network_payloads() {
     let server = common::start_mock_rpc_server().await;
 
