@@ -127,6 +127,10 @@ pub enum AppError {
     #[error("failed to calculate fee: {0}")]
     FeeCalc(String),
 
+    // ── Typed invocation arguments (#486) ───────────────────────────
+    #[error("failed to parse args file: {0}")]
+    ArgsFile(String),
+
     // ── Config ──────────────────────────────────────────────────────
     #[error("failed to process config: {0}")]
     Config(String),
@@ -217,6 +221,7 @@ mod tests {
             AppError::NoSnapshots("testnet".to_string()),
             AppError::SimulationFailed("no cost data".to_string()),
             AppError::TxConstruction("contract id required".to_string()),
+            AppError::ArgsFile("arguments.json: unsupported type 'udt'".to_string()),
             AppError::FeeCalc("invalid XLM value".to_string()),
             AppError::ConfigFetch("boom".to_string()),
             AppError::ConfigSettingNotFound("CONFIG_SETTING_CONTRACT_COMPUTE_V0".to_string()),
