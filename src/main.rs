@@ -151,7 +151,12 @@ struct FileConfig {
     network: Option<String>,
     rpc_url: Option<String>,
     json: Option<bool>,
+    /// Cache freshness period used when `estimate` omits `--cache-ttl`.
+    cache_ttl: Option<String>,
 }
+
+/// Default period for reusing an estimate before it is re-simulated.
+const DEFAULT_CACHE_TTL: &str = "7d";
 
 fn config_path(cli_path: Option<&str>) -> std::path::PathBuf {
     cli_path.map(std::path::PathBuf::from).unwrap_or_else(|| {
@@ -259,6 +264,11 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
     };
     let default_network = file.network.unwrap_or_else(|| "testnet".to_string());
     let default_rpc_url = file.rpc_url;
+    let default_cache_ttl = file
+        .cache_ttl
+        .as_deref()
+        .unwrap_or(DEFAULT_CACHE_TTL)
+        .to_string();
     match args.command {
         cli::Command::Estimate {
             wasm,
@@ -291,6 +301,9 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 (None, false) => cli::OutputFormat::Table,
             };
             let paths = resolve_wasm_paths(&wasm, wasm_dir.as_deref())?;
+            // A command-line TTL wins over config.toml. In the absence of
+            // both, estimates are reusable for seven days.
+            let cache_ttl = cache_ttl.as_deref().unwrap_or(&default_cache_ttl);
             if wasm.len() > 1 || wasm_dir.is_some() {
                 // Multi-contract run: aggregate every contract into a single
                 // batch summary instead of printing per-invocation reports.
@@ -326,7 +339,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     r#fn.as_deref(),
                     &contract_args,
                     interactive_flag,
-                    cache_ttl.as_deref(),
+                    Some(cache_ttl),
                     compare,
                     clear_cache,
                     no_cache,
