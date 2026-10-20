@@ -176,6 +176,12 @@ pub struct Cli {
     )]
     pub precision: u32,
 
+    /// Maximum WASM file size to read into memory, in bytes (default: 16 MiB).
+    ///
+    /// Prevents unbounded memory allocation when inspecting large or hostile WASM files.
+    #[arg(long, global = true, value_name = "BYTES")]
+    pub max_wasm_size: Option<u64>,
+
     #[command(subcommand)]
     pub command: Command,
 }
