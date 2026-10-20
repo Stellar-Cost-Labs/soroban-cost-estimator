@@ -180,7 +180,9 @@ struct HealthResponse {
 pub struct RpcClient {
     url: String,
     fallback_url: Option<String>,
-    client: reqwest::Client,
+    // Legacy infallible constructors retain configuration failures and report
+    // them before sending any request. Never fall back to a direct connection.
+    client: Result<reqwest::Client, String>,
     dedup: Arc<Mutex<DedupState>>,
     /// Fixed-rate limiter shared by every network call, when enabled.
     limiter: Option<Arc<governor::DefaultDirectRateLimiter>>,
@@ -210,7 +212,8 @@ static EXPLICIT_PROXY: OnceLock<RwLock<Option<String>>> = OnceLock::new();
 /// Credentials are intentionally never retained in diagnostics or logs.
 pub fn set_explicit_proxy(proxy_url: Option<&str>) -> AppResult<()> {
     if let Some(proxy_url) = proxy_url {
-        reqwest::Proxy::all(proxy_url).map_err(|e| AppError::InvalidProxy(e.to_string()))?;
+        reqwest::Proxy::all(proxy_url)
+            .map_err(|_| AppError::InvalidProxy("invalid proxy URL".to_string()))?;
     }
     let proxy = EXPLICIT_PROXY.get_or_init(|| RwLock::new(None));
     let mut configured = proxy
@@ -238,8 +241,9 @@ impl RpcClient {
     /// This per-client constructor is primarily useful for embedders and
     /// tests; the CLI configures the same behavior through `--rpc-proxy`.
     pub fn with_proxy(url: &str, proxy_url: &str) -> AppResult<Self> {
-        reqwest::Proxy::all(proxy_url).map_err(|e| AppError::InvalidProxy(e.to_string()))?;
-        Ok(Self::from_parts_with_proxy(
+        reqwest::Proxy::all(proxy_url)
+            .map_err(|_| AppError::InvalidProxy("invalid proxy URL".to_string()))?;
+        let client = Self::from_parts_with_proxy(
             url,
             None,
             None,
@@ -249,7 +253,9 @@ impl RpcClient {
             HeaderMap::new(),
             false,
             Some(proxy_url),
-        ))
+        );
+        client.check_client_configuration()?;
+        Ok(client)
     }
 
     /// Create a new RPC client pointing at the given URL, optionally capping
@@ -442,7 +448,7 @@ impl RpcClient {
             "creating RPC client"
         );
         let headers = parse_headers(headers)?;
-        Ok(Self::from_parts(
+        let client = Self::from_parts(
             url,
             fallback_url,
             rps,
@@ -451,7 +457,9 @@ impl RpcClient {
             max_retries,
             headers,
             verbose,
-        ))
+        );
+        client.check_client_configuration()?;
+        Ok(client)
     }
 
     /// Shared, infallible construction path for every public constructor.
@@ -496,10 +504,8 @@ impl RpcClient {
         Self {
             url: url.to_string(),
             fallback_url: fallback_url.map(String::from),
-            // `ClientBuilder::build` only fails on invalid configuration (a
-            // default builder cannot), so fall back to a plain client to keep
-            // construction infallible.
-            client: build_http_client(timeout, connect_timeout, headers.clone(), proxy_url),
+            client: build_http_client(timeout, connect_timeout, headers.clone(), proxy_url)
+                .map_err(|error| error.to_string()),
             dedup: Arc::new(Mutex::new(DedupState::default())),
             limiter: rps.and_then(build_rate_limiter),
             max_retries,
@@ -507,6 +513,13 @@ impl RpcClient {
             headers,
             verbose,
         }
+    }
+
+    fn check_client_configuration(&self) -> AppResult<()> {
+        self.client
+            .as_ref()
+            .map(|_| ())
+            .map_err(|message| AppError::Config(message.clone()))
     }
 
     /// Returns the custom HTTP headers configured for this client.
@@ -755,7 +768,11 @@ impl RpcClient {
         url: &str,
         connect_timeout: Duration,
     ) -> AppResult<Value> {
-        let client = self.client.clone();
+        let client = self
+            .client
+            .as_ref()
+            .map_err(|message| AppError::Config(message.clone()))?
+            .clone();
         let url = url.to_string();
         let request_body = body.clone();
         let limiter = self.limiter.clone();
@@ -865,7 +882,7 @@ fn build_http_client(
     connect_timeout: Duration,
     headers: HeaderMap,
     proxy_url: Option<&str>,
-) -> reqwest::Client {
+) -> AppResult<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .timeout(timeout)
         .connect_timeout(connect_timeout)
@@ -873,11 +890,29 @@ fn build_http_client(
         .pool_idle_timeout(Duration::from_secs(90))
         .default_headers(headers);
     if let Some(proxy_url) = proxy_url.map(str::to_owned).or_else(explicit_proxy) {
-        if let Ok(proxy) = reqwest::Proxy::all(proxy_url) {
-            builder = builder.proxy(proxy);
-        }
+        let proxy = reqwest::Proxy::all(proxy_url)
+            .map_err(|_| AppError::InvalidProxy("invalid proxy URL".to_string()))?;
+        builder = builder.proxy(proxy);
     }
-    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+    builder
+        .build()
+        .map_err(|_| AppError::Config("failed to build RPC HTTP client".to_string()))
+}
+
+#[cfg(test)]
+mod proxy_builder_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_proxy_is_an_error_instead_of_a_direct_client() {
+        let result = build_http_client(
+            DEFAULT_TIMEOUT,
+            DEFAULT_CONNECT_TIMEOUT,
+            HeaderMap::new(),
+            Some("http://[invalid"),
+        );
+        assert!(matches!(result, Err(AppError::InvalidProxy(_))));
+    }
 }
 
 /// Rewrap a reqwest error whose connect phase timed out into an

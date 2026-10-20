@@ -1,5 +1,54 @@
 mod common;
 
+#[tokio::test]
+async fn global_proxy_applies_to_standard_client_and_fallback() {
+    // Isolate process-global configuration from other concurrently running tests.
+    const CHILD: &str = "SCE_GLOBAL_PROXY_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "global_proxy_applies_to_standard_client_and_fallback",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+
+    let proxy = common::start_mock_rpc_server().await;
+    wiremock::Mock::given(wiremock::matchers::header("host", "primary.invalid"))
+        .respond_with(wiremock::ResponseTemplate::new(502))
+        .expect(1)
+        .mount(&proxy)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::header("host", "fallback.invalid"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({"jsonrpc":"2.0","id":1,"result":{"status":"healthy"}}),
+        ))
+        .expect(1)
+        .mount(&proxy)
+        .await;
+    soroban_cost_estimator::rpc::client::set_explicit_proxy(Some(&proxy.uri())).unwrap();
+    let client = RpcClient::with_fallback_headers_connect_timeout(
+        "http://primary.invalid",
+        Some("http://fallback.invalid"),
+        None,
+        std::time::Duration::from_secs(3),
+        std::time::Duration::from_secs(1),
+        0,
+        &[],
+        false,
+    )
+    .unwrap();
+    let result: serde_json::Value = client
+        .call("getHealth", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(result["status"], "healthy");
+}
+
 use serde_json::json;
 
 use soroban_cost_estimator::error::AppError;
