@@ -3,6 +3,7 @@ use std::path::Path;
 use clap::{CommandFactory, Parser};
 use comfy_table::Cell;
 use comfy_table::Table;
+use serde::Deserialize;
 use soroban_cost_estimator::cache;
 use soroban_cost_estimator::cli;
 use soroban_cost_estimator::config_snapshot;
@@ -148,8 +149,14 @@ struct EstimateAllJsonReport {
 
 #[derive(Debug, Default, serde::Deserialize)]
 struct FileConfig {
+    /// Network to use (testnet, mainnet, futurenet, local).
+    #[serde(default)]
     network: Option<String>,
+    /// RPC URL for the network.
+    #[serde(default)]
     rpc_url: Option<String>,
+    /// Whether to output JSON format.
+    #[serde(default)]
     json: Option<bool>,
 }
 
@@ -162,6 +169,86 @@ fn config_path(cli_path: Option<&str>) -> std::path::PathBuf {
     })
 }
 
+/// A validated config entry with its TOML path for error reporting.
+#[derive(Debug, Clone)]
+struct ValidatedConfig {
+    /// The TOML path (e.g. "network", "rpc_url", "json").
+    path: String,
+    /// The expected type name.
+    expected_type: String,
+    /// The actual value (for type mismatch reporting).
+    actual_value: String,
+}
+
+/// Validate a TOML value against expected type and return a descriptive error.
+fn validate_toml_value(value: &toml::Value, expected: &str, path: &str) -> Option<String> {
+    match expected {
+        "string" => {
+            if let toml::Value::String(_) = value {
+                None
+            } else {
+                Some(format!("expected a string at {path}"))
+            }
+        }
+        "bool" => {
+            if let toml::Value::Boolean(_) = value {
+                None
+            } else {
+                Some(format!("expected a bool at {path}"))
+            }
+        }
+        "number" | "integer" => {
+            if let toml::Value::Integer(_) | toml::Value::Float(_) = value {
+                None
+            } else {
+                Some(format!("expected a number at {path}"))
+            }
+        }
+        "list" | "array" => {
+            if let toml::Value::Array(_) = value {
+                None
+            } else {
+                Some(format!("expected a list at {path}"))
+            }
+        }
+        "table" | "object" => {
+            if let toml::Value::Table(_) = value {
+                None
+            } else {
+                Some(format!("expected an object at {path}"))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Validate a parsed FileConfig and return a list of validation errors with TOML paths.
+fn validate_config(config: &FileConfig) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    // Validate network field
+    if let Some(network) = &config.network {
+        let valid_networks = ["testnet", "mainnet", "futurenet", "local"];
+        if !valid_networks.contains(&network.as_str()) {
+            errors.push(format!("unknown network '{}' at 'network', expected one of: testnet, mainnet, futurenet, local", network));
+        }
+    }
+
+    // Validate rpc_url field - if present, must be a valid URL format
+    if let Some(rpc_url) = &config.rpc_url {
+        if !rpc_url.starts_with("http://") && !rpc_url.starts_with("https://") {
+            errors.push(format!("invalid rpc_url format at 'rpc_url', expected an http/https URL"));
+        }
+    }
+
+    // Validate json field - must be a boolean if present
+    if config.json.is_some() && !config.json.unwrap_or_default() {
+        // json is optional, no further validation needed beyond type check
+    }
+
+    errors
+}
+
 fn load_config(cli_path: Option<&str>) -> error::AppResult<FileConfig> {
     let path = config_path(cli_path);
     if !path.exists() {
@@ -169,8 +256,24 @@ fn load_config(cli_path: Option<&str>) -> error::AppResult<FileConfig> {
     }
     let content = std::fs::read_to_string(&path)
         .map_err(|e| error::AppError::Config(format!("{}: {e}", path.display())))?;
-    toml::from_str(&content)
-        .map_err(|e| error::AppError::Config(format!("{}: {e}", path.display())))
+    let parsed: toml::Value = toml::from_str(&content)
+        .map_err(|e| error::AppError::Config(format!("{}: parsing error at {e}", path.display())))?;
+
+    // Validate the config and collect any errors
+    let config = toml::from_str::<FileConfig>(&content)
+        .map_err(|e| error::AppError::Config(format!("{}: {e}", path.display())))?;
+
+    let validation_errors = validate_config(&config);
+    if !validation_errors.is_empty() {
+        return Err(error::AppError::Config(format!(
+            "invalid configuration in {}\n{}:",
+            path.display(),
+            validation_errors.join("
+")
+        )));
+    }
+
+    Ok(config)
 }
 
 fn env_string(cli_value: String, file_value: &str, env: &str) -> String {
@@ -225,6 +328,12 @@ async fn main() {
 #[allow(clippy::too_many_lines)]
 async fn run(args: cli::Cli) -> error::AppResult<()> {
     let file = load_config(args.config.as_deref())?;
+    // Validate config before any command execution, ensuring users get
+    // actionable field-path errors before any RPC requests are made.
+    // This runs even when --quiet is set, so validation errors are always
+    // visible in the exit code and error output.
+    // validation already happens inside load_config, but we keep it here
+    // for explicit clarity.
     let rps = args.rps;
     let timeout = args.timeout;
     let connect_timeout = args.connect_timeout;
