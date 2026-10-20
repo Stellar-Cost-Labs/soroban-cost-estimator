@@ -158,4 +158,32 @@ renders the same value with thousands separators as
 `Simulated at ledger sequence: 3,961,544`.
 
 Use `--format json`, `--format csv`, or `--format markdown` when feeding the result into CI, spreadsheets, or documentation. `--json` remains a backward-compatible alias for `--format json`. The
-result is also written to the estimate cache(see [Caching](../concepts/caching.md)).
+result is also written to the estimate cache (see [Caching](../concepts/caching.md)).
+
+## JSON Schema & Compatibility Policy
+
+Downstream scripts, CI pipelines, and dashboards can rely on a stable JSON contract across report families:
+
+1. **Single Estimate (`estimate --format json`)**:
+   - **Required top-level keys**: `function` (string), `wasm_hash` (string), `cpu_instructions` (u64), `memory_bytes` (u64), `tx_size` (u32), `read_entries` (u32), `write_entries` (u32), `read_bytes` (u32), `write_bytes` (u32), `fee` (object), `ledger_sequence` (u32), `network` (string), `rpc_latency_ms` (u64), `warnings` (array of resource warning objects), and `contract_meta` (object).
+   - **Required `fee` keys**: `non_refundable_stroops` (i64), `refundable_stroops` (i64), `cpu_fee_stroops` (i64), `storage_fee_stroops` (i64), `bandwidth_fee_stroops` (i64), `base_fee_stroops` (i64), `total_stroops` (i64), `total_xlm` (string), and `fee_percentages` (map of component name to percentage string).
+   - **Optional / conditional keys**:
+     - `wasm_size` (u64): omitted when `0`.
+     - `wasm_sections` (array) and `section_sizes` (object): omitted when no local WASM section breakdown is available.
+     - `suggestions` and `optimization_suggestions` (arrays): included by default, omitted when `--quiet` is passed.
+     - `history` (array): omitted unless `--history` is enabled.
+     - `projections` (array): omitted unless `--project` is enabled; per-projection `usd` (f64) is omitted when no USD rate is provided.
+2. **Batch & Multi-Function Reports (`BatchCostReport` / `EstimateAllSummary`)**:
+   - Batch contract summaries always emit `network` (string), `contracts` (array), `total_contracts` (usize), `succeeded` (usize), and `failed` (usize). Each contract entry requires `path` (string) and omits optional metric fields (`wasm_hash`, `function_count`, `upload_cost_stroops`, `min_invocation_fee_stroops`, `max_invocation_fee_stroops`, `functions_simulated`) when `None`, or omits `error` when evaluation succeeded.
+3. **Diffs (`CostDelta` / `ConfigDiff`)**:
+   - Cost diffs emit `cpu_instructions`, `memory_bytes`, `fee_stroops`, `read_entries`, and `write_entries`, where each metric object contains `previous` (i64), `current` (i64), `absolute` (i64), and `percent` (`f64` or `null` when `previous` is `0`).
+   - Config diffs emit `old_snapshot`, `new_snapshot`, `changes` (array of `FieldDiff` with `field_path`, `setting_id`, `setting_name`, `old_value`, `new_value`, `is_pricing_change`, and `explanation`), and `has_pricing_changes` (bool).
+4. **WASM Inspection (`SectionSizeBreakdown` / `WasmStructureSummary`)**:
+   - Section breakdowns emit `total_size` (usize), `header_size` (usize), and `sections` (array of `SectionSize` with `name`, `id`, `offset`, `end`, `size`, `header_size`, `total_size`, and `percent`).
+   - Structure summaries emit `initial_pages`, `max_pages`, `imports_count`, `exports_count`, `has_start_function`, and `tables_count`.
+
+### Compatibility Policy
+
+- **Additive changes (non-breaking)**: Adding new top-level or nested keys, or adding new optional fields that are omitted when unconfigured, is considered backward-compatible and may occur in minor or patch releases. JSON consumers must ignore unknown keys (`#[serde(deny_unknown_fields)]` is not recommended for downstream parsers).
+- **Breaking changes**: Removing or renaming an existing required key, changing the JSON value type of an existing key (for example, changing a number to a string or vice versa), or changing whether an optional field is omitted vs. `null` requires a major version bump or an explicit deprecation cycle.
+
