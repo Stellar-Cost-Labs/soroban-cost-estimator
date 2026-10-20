@@ -11,8 +11,11 @@
 //! directory, so they never see — or clobber — the developer's real
 //! snapshots and cache.
 
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
 
 use sha2::Digest;
 use soroban_cost_estimator::cache;
@@ -54,6 +57,80 @@ fn temp_home(label: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("failed to create temp home");
     dir
+}
+
+fn spawn_rpc_health_stub(health_status: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind RPC stub");
+    let address = listener.local_addr().expect("read RPC stub address");
+    thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().expect("accept RPC request");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .expect("set RPC stub read timeout");
+            let request = read_http_request(&mut stream);
+            let request: serde_json::Value =
+                serde_json::from_slice(&request).expect("parse JSON-RPC request");
+            let result = match request["method"].as_str().expect("RPC method") {
+                "getHealth" => serde_json::json!({ "status": health_status }),
+                "getNetwork" => serde_json::json!({
+                    "networkPassphrase": "Test SDF Network ; September 2015",
+                    "protocolVersion": 23
+                }),
+                "getVersionInfo" => serde_json::json!({
+                    "version": "23.0.0",
+                    "captiveCoreVersion": "stellar-core 23.0.0"
+                }),
+                method => panic!("unexpected RPC method: {method}"),
+            };
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": result
+            })
+            .to_string();
+            write_http_response(&mut stream, body.as_bytes());
+        }
+    });
+    format!("http://{address}")
+}
+
+fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
+    let mut request = Vec::new();
+    let mut chunk = [0; 1024];
+    loop {
+        let count = stream.read(&mut chunk).expect("read RPC request");
+        assert_ne!(count, 0, "RPC request ended before body was complete");
+        request.extend_from_slice(&chunk[..count]);
+        if let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if name.eq_ignore_ascii_case("content-length") {
+                        value.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .expect("RPC request content length");
+            let body_start = header_end + 4;
+            if request.len() >= body_start + content_length {
+                return request[body_start..body_start + content_length].to_vec();
+            }
+        }
+    }
+}
+
+fn write_http_response(stream: &mut TcpStream, body: &[u8]) {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .expect("write RPC response headers");
+    stream.write_all(body).expect("write RPC response body");
 }
 
 /// A minimal but structurally valid config snapshot, matching `ConfigSnapshot`.
@@ -157,6 +234,69 @@ fn test_help_output() {
         stdout.contains("--rpc-fallback-url"),
         "help should list --rpc-fallback-url flag"
     );
+}
+
+#[test]
+fn test_rpc_health_json_reports_endpoint_details() {
+    let rpc_url = spawn_rpc_health_stub("healthy");
+    let (stdout, stderr, code) = run_cli(&[
+        "rpc",
+        "health",
+        "--rpc-url",
+        &rpc_url,
+        "--json",
+        "--max-retries",
+        "0",
+    ]);
+
+    assert_eq!(code, 0, "healthy RPC should exit 0; stderr: {stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("health JSON");
+    assert_eq!(report["status"], "healthy");
+    assert_eq!(
+        report["network_passphrase"],
+        "Test SDF Network ; September 2015"
+    );
+    assert_eq!(report["protocol_version"], 23);
+    assert_eq!(report["core_version"], "stellar-core 23.0.0");
+    assert!(report["latency_ms"].is_number());
+}
+
+#[test]
+fn test_rpc_health_degraded_json_exits_nonzero() {
+    let rpc_url = spawn_rpc_health_stub("degraded");
+    let (stdout, stderr, code) = run_cli(&[
+        "rpc",
+        "health",
+        "--rpc-url",
+        &rpc_url,
+        "--json",
+        "--max-retries",
+        "0",
+    ]);
+
+    assert_eq!(code, 1, "degraded RPC should exit 1; stderr: {stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("health JSON");
+    assert_eq!(report["status"], "degraded");
+}
+
+#[test]
+fn test_rpc_health_unreachable_json_exits_nonzero() {
+    let (stdout, stderr, code) = run_cli(&[
+        "rpc",
+        "health",
+        "--rpc-url",
+        DEAD_RPC,
+        "--json",
+        "--max-retries",
+        "0",
+        "--timeout",
+        "1",
+    ]);
+
+    assert_eq!(code, 1, "unreachable RPC should exit 1; stderr: {stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("health JSON");
+    assert_eq!(report["status"], "unreachable");
+    assert!(report["error"].is_string());
 }
 
 #[test]
@@ -931,7 +1071,7 @@ fn test_estimate_nonexistent_wasm_file() {
         "a missing WASM file should exit 1; stderr: {stderr}"
     );
     assert!(
-        stderr.starts_with("Error:"),
+        stderr.lines().any(|line| line.starts_with("Error:")),
         "runtime failures are reported on stderr as `Error: …`; got: {stderr}"
     );
     assert!(

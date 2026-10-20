@@ -83,6 +83,17 @@ pub struct EstimateAllResult {
     pub contract_meta: wasm::parser::ContractMeta,
 }
 
+#[derive(Debug, serde::Serialize)]
+struct RpcHealthReport {
+    status: String,
+    network_passphrase: Option<String>,
+    protocol_version: Option<u32>,
+    core_version: Option<String>,
+    latency_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
 impl EstimateAllResult {
     /// Build a `skipped` result (function could not be simulated).
     fn skipped(function: &str, reason: impl Into<String>) -> Self {
@@ -206,6 +217,7 @@ async fn main() {
         "info"
     };
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level)),
         )
@@ -216,8 +228,8 @@ async fn main() {
     }
 
     if let Err(err) = run(args).await {
-        error!(error = %err, "command failed");
         eprintln!("Error: {err}");
+        error!(error = %err, "command failed");
         std::process::exit(1);
     }
 }
@@ -597,6 +609,30 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             )
             .await
         }
+        cli::Command::Rpc { action } => match action {
+            cli::RpcAction::Health {
+                network,
+                rpc_url,
+                json,
+            } => {
+                let output_json = match args.format {
+                    Some(output_format) => output_format == cli::OutputFormat::Json,
+                    None => json || format == cli::OutputFormat::Json,
+                };
+                cmd_rpc_health(
+                    &env_string(network, &default_network, "SOROBAN_NETWORK"),
+                    rpc_url.as_deref().or(default_rpc_url.as_deref()),
+                    fallback,
+                    rps,
+                    timeout,
+                    max_retries,
+                    &headers,
+                    verbose,
+                    output_json,
+                )
+                .await
+            }
+        },
         cli::Command::Watch {
             network,
             interval,
@@ -629,6 +665,142 @@ fn cmd_completions(shell: clap_complete::Shell) {
     let mut cmd = cli::Cli::command();
     let bin_name = cmd.get_name().to_string();
     clap_complete::generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
+}
+
+/// Check RPC health, network identity, and the running Stellar Core version.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_rpc_health(
+    network: &str,
+    rpc_url: Option<&str>,
+    fallback_url: Option<&str>,
+    rps: Option<u64>,
+    timeout: u64,
+    max_retries: usize,
+    headers: &[String],
+    verbose: bool,
+    json: bool,
+) -> error::AppResult<()> {
+    let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
+    let client = rpc::client::RpcClient::with_fallback_headers(
+        &endpoint,
+        fallback_url,
+        rps,
+        std::time::Duration::from_secs(timeout),
+        max_retries,
+        headers,
+        verbose,
+    )?;
+
+    let started = std::time::Instant::now();
+    let health = match client.get_health().await {
+        Ok(health) => health,
+        Err(err) => {
+            let report = RpcHealthReport {
+                status: "unreachable".to_string(),
+                network_passphrase: None,
+                protocol_version: None,
+                core_version: None,
+                latency_ms: started.elapsed().as_millis(),
+                error: Some(err.to_string()),
+            };
+            print_rpc_health_report(&report, json)?;
+            return Err(error::AppError::Rpc {
+                status: -1,
+                message: format!("RPC health check failed for {endpoint}: {err}"),
+            });
+        }
+    };
+
+    let network_info = match client.get_network().await {
+        Ok(info) => info,
+        Err(err) => {
+            let report = RpcHealthReport {
+                status: "degraded".to_string(),
+                network_passphrase: None,
+                protocol_version: None,
+                core_version: None,
+                latency_ms: started.elapsed().as_millis(),
+                error: Some(format!("unable to fetch network details: {err}")),
+            };
+            print_rpc_health_report(&report, json)?;
+            return Err(error::AppError::Rpc {
+                status: -1,
+                message: format!("unable to fetch network details from {endpoint}: {err}"),
+            });
+        }
+    };
+
+    let version_info = match client.get_version_info().await {
+        Ok(info) => info,
+        Err(err) => {
+            let report = RpcHealthReport {
+                status: "degraded".to_string(),
+                network_passphrase: Some(network_info.network_passphrase),
+                protocol_version: Some(network_info.protocol_version),
+                core_version: None,
+                latency_ms: started.elapsed().as_millis(),
+                error: Some(format!("unable to fetch Core version: {err}")),
+            };
+            print_rpc_health_report(&report, json)?;
+            return Err(error::AppError::Rpc {
+                status: -1,
+                message: format!("unable to fetch Core version from {endpoint}: {err}"),
+            });
+        }
+    };
+
+    let status = health.status;
+    let report = RpcHealthReport {
+        status: status.clone(),
+        network_passphrase: Some(network_info.network_passphrase),
+        protocol_version: Some(network_info.protocol_version),
+        core_version: version_info.captive_core_version,
+        latency_ms: started.elapsed().as_millis(),
+        error: None,
+    };
+    print_rpc_health_report(&report, json)?;
+
+    if status == "healthy" {
+        Ok(())
+    } else {
+        Err(error::AppError::Rpc {
+            status: -1,
+            message: format!("RPC endpoint {endpoint} reported status: {status}"),
+        })
+    }
+}
+
+fn print_rpc_health_report(report: &RpcHealthReport, json: bool) -> error::AppResult<()> {
+    if json {
+        let output = serde_json::to_string_pretty(report).map_err(|err| {
+            error::AppError::Config(format!("failed to serialize health report: {err}"))
+        })?;
+        println!("{output}");
+    } else {
+        println!("Health Status: {}", report.status);
+        println!(
+            "Network Passphrase: {}",
+            report
+                .network_passphrase
+                .as_deref()
+                .unwrap_or("Unavailable")
+        );
+        println!(
+            "Protocol Version: {}",
+            report
+                .protocol_version
+                .map_or_else(|| "Unavailable".to_string(), |version| version.to_string())
+        );
+        println!(
+            "Core Version: {}",
+            report.core_version.as_deref().unwrap_or("Unavailable")
+        );
+        println!("Round-trip latency: {} ms", report.latency_ms);
+        if let Some(message) = &report.error {
+            println!("Error: {message}");
+        }
+    }
+    Ok(())
 }
 
 /// True when a simulation response carried neither cost data, nor

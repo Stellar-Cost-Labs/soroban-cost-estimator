@@ -161,9 +161,25 @@ struct DedupState {
 /// plus ledger-window information; the health check only needs `status`.
 /// Extra fields in the response are ignored by serde.
 #[derive(Debug, Deserialize)]
-struct HealthResponse {
+pub struct HealthResponse {
     /// Node health status: `healthy`, `degraded`, or `unhealthy`.
-    status: String,
+    pub status: String,
+}
+
+/// Network details returned by the `getNetwork` JSON-RPC method.
+#[derive(Debug, Deserialize)]
+pub struct NetworkResponse {
+    #[serde(rename = "networkPassphrase")]
+    pub network_passphrase: String,
+    #[serde(rename = "protocolVersion")]
+    pub protocol_version: u32,
+}
+
+/// Version details returned by `getVersionInfo`.
+#[derive(Debug, Deserialize)]
+pub struct VersionInfoResponse {
+    #[serde(rename = "captiveCoreVersion", default)]
+    pub captive_core_version: Option<String>,
 }
 
 /// A minimal JSON-RPC 2.0 client for Soroban RPC endpoints.
@@ -473,8 +489,8 @@ impl RpcClient {
     /// # Network calls
     /// Makes at most one `getHealth` RPC call to the configured endpoint.
     pub async fn health_check(&self) -> AppResult<()> {
-        let health: HealthResponse = self
-            .call("getHealth", serde_json::json!({}))
+        let health = self
+            .get_health()
             .await
             .map_err(|e| {
                 AppError::Rpc {
@@ -499,6 +515,21 @@ impl RpcClient {
                 ),
             })
         }
+    }
+
+    /// Fetch the node health status from the configured endpoint.
+    pub async fn get_health(&self) -> AppResult<HealthResponse> {
+        self.call("getHealth", serde_json::json!({})).await
+    }
+
+    /// Fetch network identity and protocol version from the configured endpoint.
+    pub async fn get_network(&self) -> AppResult<NetworkResponse> {
+        self.call("getNetwork", serde_json::json!({})).await
+    }
+
+    /// Fetch RPC and captive Stellar Core version details from the endpoint.
+    pub async fn get_version_info(&self) -> AppResult<VersionInfoResponse> {
+        self.call("getVersionInfo", serde_json::json!({})).await
     }
 
     /// Send a JSON-RPC request and deserialize the response.
@@ -1771,6 +1802,43 @@ mod tests {
             .health_check()
             .await
             .expect("healthy endpoint passes");
+    }
+
+    #[tokio::test]
+    async fn test_get_network_deserializes_network_details() {
+        let (url, _) = spawn_json_rpc_stub_with_result(
+            0,
+            r#"{"networkPassphrase":"Test SDF Network ; September 2015","protocolVersion":23}"#,
+        )
+        .await;
+        let network = RpcClient::new(&url)
+            .get_network()
+            .await
+            .expect("network details deserialize");
+
+        assert_eq!(
+            network.network_passphrase,
+            "Test SDF Network ; September 2015"
+        );
+        assert_eq!(network.protocol_version, 23);
+    }
+
+    #[tokio::test]
+    async fn test_get_version_info_deserializes_core_version() {
+        let (url, _) = spawn_json_rpc_stub_with_result(
+            0,
+            r#"{"version":"23.0.0","captiveCoreVersion":"stellar-core 23.0.0"}"#,
+        )
+        .await;
+        let version = RpcClient::new(&url)
+            .get_version_info()
+            .await
+            .expect("version details deserialize");
+
+        assert_eq!(
+            version.captive_core_version.as_deref(),
+            Some("stellar-core 23.0.0")
+        );
     }
 
     /// A reachable endpoint reporting anything other than `healthy` (e.g.

@@ -351,6 +351,10 @@ pub enum Command {
         #[command(subcommand)]
         action: CacheAction,
     },
+    Rpc {
+        #[command(subcommand)]
+        action: RpcAction,
+    },
     Watch {
         #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
@@ -378,6 +382,23 @@ pub enum WasmAction {
         wasm: PathBuf,
 
         /// Output the full parsed spec/metadata as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RpcAction {
+    /// Check the health and network details of an RPC endpoint.
+    Health {
+        #[arg(long, default_value = "testnet")]
+        network: String,
+
+        /// Explicit RPC URL (overrides network-based resolution).
+        #[arg(long)]
+        rpc_url: Option<String>,
+        /// Output the health report as JSON.
+        /// Output the health report as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -805,5 +826,31 @@ mod tests {
                 "completion script for {shell:?} should reference {bin_name}"
             );
         }
+    }
+
+    #[test]
+    fn test_rpc_health_command_accepts_network_and_rpc_url() {
+        let cli = Cli::try_parse_from([
+            "soroban-cost-estimator",
+            "rpc",
+            "health",
+            "--network",
+            "mainnet",
+            "--rpc-url",
+            "https://rpc.example.com",
+            "--json",
+        ])
+        .expect("rpc health arguments parse");
+
+        assert!(matches!(
+            cli.command,
+            Command::Rpc {
+                action: RpcAction::Health {
+                    network,
+                    rpc_url: Some(rpc_url),
+                    json: true,
+                }
+            } if network == "mainnet" && rpc_url == "https://rpc.example.com"
+        ));
     }
 }
