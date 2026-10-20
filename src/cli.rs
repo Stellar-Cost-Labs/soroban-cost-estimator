@@ -208,6 +208,15 @@ pub enum Command {
         #[arg(long = "arg", value_name = "KEY=VAL")]
         args: Vec<String>,
 
+        /// Read typed invocation arguments from a JSON file (issue #486),
+        /// e.g. `{"args": [{"name": "step", "type": "i64", "value": 5}]}`.
+        /// Every entry declares its Soroban type explicitly; parameter names
+        /// and types are validated against the contract spec before any
+        /// simulation. Cannot be combined with `--arg` or `--interactive`;
+        /// see the docs for the full format, supported types, and examples.
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["args", "interactive"])]
+        args_file: Option<PathBuf>,
+
         /// Prompt interactively for the function and its arguments, using
         /// the contract spec for names and types. Explicit `--fn`/`--arg`
         /// values take precedence; the prompt only fills in the gaps.
@@ -286,6 +295,19 @@ pub enum Command {
         /// fee/CPU consistency across runs.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=100))]
         repeat: u32,
+
+        /// In batch mode (repeated `--wasm` or `--wasm-dir`), keep
+        /// processing the remaining files after an individual file fails
+        /// (issue #482). Successful estimates are preserved alongside every
+        /// failure, each failed path with its error is included in the
+        /// structured output, and the final exit status is still non-zero
+        /// when any item failed. Without this flag a batch stops at the
+        /// first file-scoped failure (fail-fast). Process-wide failures
+        /// (bad configuration, unreachable endpoint, output errors) always
+        /// abort immediately, with or without this flag. Ignored for
+        /// single-file runs.
+        #[arg(long)]
+        keep_going: bool,
     },
 
     /// Enumerate all public contract functions and estimate each one.
@@ -331,6 +353,19 @@ pub enum Command {
         /// configuration has changed since the last snapshot.
         #[arg(long)]
         auto_snapshot: bool,
+
+        /// In batch mode (repeated `--wasm` or `--wasm-dir`), keep
+        /// processing the remaining files after an individual file fails
+        /// (issue #482). Successful estimates are preserved alongside every
+        /// failure, each failed path with its error is included in the
+        /// structured output, and the final exit status is still non-zero
+        /// when any item failed. Without this flag a batch stops at the
+        /// first file-scoped failure (fail-fast). Process-wide failures
+        /// (bad configuration, unreachable endpoint, output errors) always
+        /// abort immediately, with or without this flag. Ignored for
+        /// single-file runs.
+        #[arg(long)]
+        keep_going: bool,
     },
     WasmInfo {
         #[arg(long, short)]

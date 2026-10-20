@@ -1576,6 +1576,23 @@ pub struct BatchCostReport {
     pub succeeded: usize,
     /// Contracts that recorded at least one error.
     pub failed: usize,
+    /// True when the batch stopped at the first file-scoped failure because
+    /// `--keep-going` was not set (issue #482). Serialized as `false` only
+    /// when meaningful; absent from JSON when the batch ran to completion
+    /// (or `--keep-going` collected every failure).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub aborted: bool,
+    /// Paths that were resolved but never processed because a fail-fast
+    /// batch stopped early (issue #482). Empty unless `aborted` is true;
+    /// omitted from JSON when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_attempted: Vec<String>,
+}
+
+/// Serde `skip_serializing_if` predicate for the [`BatchCostReport::aborted`]
+/// flag: only a `true` flag is worth a JSON key of its own.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl BatchCostReport {
@@ -1591,6 +1608,8 @@ impl BatchCostReport {
             total_contracts,
             succeeded,
             failed,
+            aborted: false,
+            not_attempted: Vec::new(),
         }
     }
 }
@@ -1635,13 +1654,24 @@ pub fn format_batch_report_table(report: &BatchCostReport) -> String {
             Cell::new(contract.status()),
         ]);
     }
-
     output.push_str(&table.to_string());
     output.push('\n');
+
     output.push_str(&format!(
         "\n{} succeeded, {} failed.\n",
         report.succeeded, report.failed
     ));
+
+    if report.aborted && !report.not_attempted.is_empty() {
+        output.push_str(&format!(
+            "\nBatch stopped at the first failure (fail-fast). {} file(s) not attempted:\n",
+            report.not_attempted.len()
+        ));
+        for path in &report.not_attempted {
+            output.push_str(&format!("  - {path}\n"));
+        }
+        output.push_str("Re-run with --keep-going to process the rest.\n");
+    }
 
     let errors: Vec<&ContractCostSummary> = report
         .contracts
@@ -1746,6 +1776,17 @@ pub fn format_batch_report_markdown(report: &BatchCostReport) -> String {
                 contract.path,
                 contract.error.as_deref().unwrap_or("unknown error")
             ));
+        }
+    }
+
+    if report.aborted && !report.not_attempted.is_empty() {
+        output.push_str(&format!(
+            "\n**Batch stopped at the first failure (fail-fast).** {} file(s) not \
+             attempted (re-run with `--keep-going` to process the rest):\n\n",
+            report.not_attempted.len()
+        ));
+        for path in &report.not_attempted {
+            output.push_str(&format!("- `{path}`\n"));
         }
     }
 
@@ -2116,6 +2157,78 @@ mod tests {
         };
         assert_eq!(parsed["total_contracts"], 1);
         assert_eq!(parsed["contracts"][0]["function_count"], 2);
+    }
+
+    /// Issue #482: a batch that ran to completion (or collected every
+    /// failure under `--keep-going`) omits the fail-fast bookkeeping keys
+    /// entirely, keeping the established JSON schema unchanged.
+    #[test]
+    fn test_batch_report_json_omits_fail_fast_fields_by_default() {
+        let report = BatchCostReport::new(
+            "testnet",
+            vec![ContractCostSummary::unloadable("bad.wasm", "boom")],
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&format_batch_report_json(&report))
+            .expect("batch report JSON must parse");
+        assert!(parsed.get("aborted").is_none());
+        assert!(parsed.get("not_attempted").is_none());
+    }
+
+    /// Issue #482: a fail-fast abort records the fact plus every path that
+    /// was resolved but never processed.
+    #[test]
+    fn test_batch_report_json_includes_fail_fast_fields_when_aborted() {
+        let mut report = BatchCostReport::new(
+            "testnet",
+            vec![ContractCostSummary::unloadable("bad.wasm", "boom")],
+        );
+        report.aborted = true;
+        report.not_attempted = vec!["good.wasm".to_string()];
+        let parsed: serde_json::Value = serde_json::from_str(&format_batch_report_json(&report))
+            .expect("batch report JSON must parse");
+        assert_eq!(parsed["aborted"], true);
+        assert_eq!(parsed["not_attempted"], serde_json::json!(["good.wasm"]));
+        // The failed row still carries its path and diagnostic.
+        assert_eq!(parsed["contracts"][0]["path"], "bad.wasm");
+        assert_eq!(parsed["contracts"][0]["error"], "boom");
+    }
+
+    #[test]
+    fn test_format_batch_report_table_lists_not_attempted() {
+        let mut report = BatchCostReport::new(
+            "testnet",
+            vec![ContractCostSummary::unloadable("bad.wasm", "boom")],
+        );
+        report.aborted = true;
+        report.not_attempted = vec!["good.wasm".to_string()];
+        let out = format_batch_report_table(&report);
+        assert!(
+            out.contains("fail-fast"),
+            "table should name the mode: {out}"
+        );
+        assert!(
+            out.contains("good.wasm"),
+            "table should list unattempted paths"
+        );
+        assert!(
+            out.contains("--keep-going"),
+            "table should point at the opt-in flag"
+        );
+    }
+
+    #[test]
+    fn test_format_batch_report_markdown_lists_not_attempted() {
+        let mut report = BatchCostReport::new(
+            "testnet",
+            vec![ContractCostSummary::unloadable("bad.wasm", "boom")],
+        );
+        report.aborted = true;
+        report.not_attempted = vec!["good.wasm".to_string(), "c.wasm".to_string()];
+        let out = format_batch_report_markdown(&report);
+        assert!(out.contains("fail-fast"));
+        assert!(out.contains("`good.wasm`"));
+        assert!(out.contains("`c.wasm`"));
+        assert!(out.contains("--keep-going"));
     }
 
     fn report_with_rates(rates: FeeRates) -> CostReport {

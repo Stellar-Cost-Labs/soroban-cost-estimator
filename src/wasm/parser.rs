@@ -771,8 +771,12 @@ pub fn format_contract_meta(meta: &ContractMeta) -> String {
 }
 
 /// Human-readable name for a `ScSpecTypeDef`.
+///
+/// Also used by the `--args-file` validator (issue #486) to name the spec
+/// type in mismatch errors, so both validation paths describe types the
+/// same way.
 #[must_use]
-fn spec_type_name(t: &stellar_xdr::ScSpecTypeDef) -> &'static str {
+pub fn spec_type_name(t: &stellar_xdr::ScSpecTypeDef) -> &'static str {
     match t {
         stellar_xdr::ScSpecTypeDef::Val => "val",
         stellar_xdr::ScSpecTypeDef::Bool => "bool",

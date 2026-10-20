@@ -17,6 +17,8 @@ use std::process::Command;
 use sha2::Digest;
 use soroban_cost_estimator::cache;
 
+mod common;
+
 /// An RPC URL that is guaranteed not to answer: port 1 on loopback.
 /// Used to drive the network error path without leaving the machine.
 const DEAD_RPC: &str = "http://127.0.0.1:1";
@@ -4473,5 +4475,466 @@ fn test_config_snapshot_diff_makes_no_network_calls() {
     assert!(
         !stderr.contains("failed to locate RPC endpoint"),
         "offline diff must not resolve a network; got: {stderr}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Batch keep-going / fail-fast tests (issue #482)
+//
+// These drive the real binary against an in-process wiremock RPC server:
+// the batch's health check, simulation, and (degraded) config fetches all
+// hit http://127.0.0.1:<ephemeral>, so the suite stays offline and
+// deterministic.
+// ─────────────────────────────────────────────────────────────────────
+
+use serde_json::Value;
+use wiremock::MockServer;
+
+/// Stub the minimal RPC surface a batch run needs: a healthy endpoint and a
+/// `simulateTransaction` that reports a known authoritative resource fee.
+async fn stub_batch_rpc(server: &MockServer) {
+    common::stub_jsonrpc_success(
+        server,
+        "getHealth",
+        serde_json::json!({ "status": "healthy", "latestLedger": 42 }),
+    )
+    .await;
+    common::stub_jsonrpc_success(
+        server,
+        "simulateTransaction",
+        serde_json::json!({
+            "latestLedger": 42,
+            "minResourceFee": "100",
+            "cost": { "cpuInsns": "1000", "memBytes": "1000" }
+        }),
+    )
+    .await;
+}
+
+/// A syntactically valid 32-byte contract ID: function invocations inside a
+/// batch require `--id`, so the "valid" fixture file passes one.
+const BATCH_TEST_CONTRACT_ID: &str =
+    "0000000000000000000000000000000000000000000000000000000000000001";
+
+/// Write one file into `dir` and return its display path.
+fn write_batch_file(dir: &Path, name: &str, bytes: &[u8]) -> String {
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).expect("failed to write batch fixture");
+    path.display().to_string()
+}
+
+/// Set up a temp HOME containing one invalid and one valid WASM file, with
+/// names chosen so the invalid file sorts (and is passed) first.
+fn batch_dir_with_invalid_and_valid(label: &str) -> (PathBuf, String, String) {
+    let home = temp_home(label);
+    let dir = home.join("wasm");
+    std::fs::create_dir_all(&dir).expect("failed to create wasm dir");
+    let bad = write_batch_file(&dir, "a_invalid.wasm", b"this is not WebAssembly");
+    let good_bytes = std::fs::read("tests/fixtures/zeroarg.wasm").expect("fixture readable");
+    let good = write_batch_file(&dir, "b_valid.wasm", &good_bytes);
+    (home, bad, good)
+}
+
+#[tokio::test]
+async fn batch_default_is_fail_fast_and_lists_unattempted_files() {
+    let (home, bad, good) = batch_dir_with_invalid_and_valid("batch-fail-fast");
+    let server = common::start_mock_rpc_server().await;
+    stub_batch_rpc(&server).await;
+    let rpc = server.uri();
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "estimate",
+            "--wasm",
+            bad.as_str(),
+            "--wasm",
+            good.as_str(),
+            "--rpc-url",
+            rpc.as_str(),
+            "--id",
+            BATCH_TEST_CONTRACT_ID,
+            "--format",
+            "json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 1,
+        "a batch with a failing file exits non-zero by default: {stderr}"
+    );
+
+    let report: Value = serde_json::from_str(&stdout).expect("stdout must stay valid JSON");
+    assert_eq!(report["aborted"], true, "default mode must abort the batch");
+    assert_eq!(
+        report["not_attempted"],
+        serde_json::json!([good.as_str()]),
+        "the unprocessed file must be listed, not silently dropped"
+    );
+    assert_eq!(report["total_contracts"], 1);
+    assert_eq!(report["failed"], 1);
+    assert_eq!(report["succeeded"], 0);
+
+    let contracts = report["contracts"].as_array().expect("contracts array");
+    assert_eq!(contracts.len(), 1, "only the first file is attempted");
+    assert_eq!(contracts[0]["path"], bad.as_str());
+    let error = contracts[0]["error"].as_str().expect("error message");
+    assert!(
+        error.contains("failed to load WASM"),
+        "the failure should carry a useful diagnostic: {error}"
+    );
+}
+
+#[tokio::test]
+async fn batch_keep_going_processes_remaining_files() {
+    let (home, bad, good) = batch_dir_with_invalid_and_valid("batch-keep-going");
+    let server = common::start_mock_rpc_server().await;
+    stub_batch_rpc(&server).await;
+    let rpc = server.uri();
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "estimate",
+            "--wasm",
+            bad.as_str(),
+            "--wasm",
+            good.as_str(),
+            "--rpc-url",
+            rpc.as_str(),
+            "--id",
+            BATCH_TEST_CONTRACT_ID,
+            "--format",
+            "json",
+            "--keep-going",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 1,
+        "keep-going still exits non-zero when any item failed: {stderr}"
+    );
+
+    let report: Value = serde_json::from_str(&stdout).expect("stdout must stay valid JSON");
+    assert!(
+        report.get("aborted").is_none(),
+        "a keep-going batch is not an aborted batch"
+    );
+    assert!(report.get("not_attempted").is_none());
+    assert_eq!(report["total_contracts"], 2);
+    assert_eq!(report["succeeded"], 1);
+    assert_eq!(report["failed"], 1);
+
+    let contracts = report["contracts"].as_array().expect("contracts array");
+    assert_eq!(contracts.len(), 2);
+    // Deterministic input ordering: the failing file first, the good one after.
+    assert_eq!(contracts[0]["path"], bad.as_str());
+    assert!(
+        contracts[0]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("failed to load WASM"))
+    );
+    assert_eq!(contracts[1]["path"], good.as_str());
+    assert!(
+        contracts[1].get("error").is_none(),
+        "the successful estimate must be preserved"
+    );
+    assert_eq!(
+        contracts[1]["upload_cost_stroops"], 100,
+        "the good file's simulated fee survives the sibling failure"
+    );
+    assert!(contracts[1]["wasm_hash"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn batch_keep_going_reports_every_failure() {
+    let home = temp_home("batch-multiple-failures");
+    let dir = home.join("wasm");
+    std::fs::create_dir_all(&dir).expect("failed to create wasm dir");
+    let bad = write_batch_file(&dir, "a_invalid.wasm", b"this is not WebAssembly");
+    let good_bytes = std::fs::read("tests/fixtures/zeroarg.wasm").expect("fixture readable");
+    let good = write_batch_file(&dir, "b_valid.wasm", &good_bytes);
+
+    // The valid file parses but its simulation fails (file-scoped), so the
+    // keep-going batch records both failures.
+    let server = common::start_mock_rpc_server().await;
+    common::stub_jsonrpc_success(
+        &server,
+        "getHealth",
+        serde_json::json!({ "status": "healthy", "latestLedger": 42 }),
+    )
+    .await;
+    common::stub_jsonrpc_error(&server, "simulateTransaction", -32602, "invalid params").await;
+    let rpc = server.uri();
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "estimate",
+            "--wasm",
+            bad.as_str(),
+            "--wasm",
+            good.as_str(),
+            "--rpc-url",
+            rpc.as_str(),
+            "--id",
+            BATCH_TEST_CONTRACT_ID,
+            "--format",
+            "json",
+            "--keep-going",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "multiple failures still exit non-zero: {stderr}");
+
+    let report: Value = serde_json::from_str(&stdout).expect("stdout must stay valid JSON");
+    assert_eq!(report["failed"], 2, "both failures must be reported");
+    let contracts = report["contracts"].as_array().expect("contracts array");
+    assert_eq!(contracts.len(), 2);
+    assert!(
+        contracts[0]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("failed to load WASM"))
+    );
+    assert!(
+        contracts[1]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("upload simulation failed")),
+        "simulation failures are recorded per file: {:?}",
+        contracts[1]["error"]
+    );
+    // The file loaded fine (hash present) — the row is `partial`, not a
+    // blank error, distinguishing "measured something" from "no estimate".
+    assert!(contracts[1]["wasm_hash"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn batch_directory_mode_is_sorted_and_fail_fast_by_default() {
+    let (home, bad, good) = batch_dir_with_invalid_and_valid("batch-dir-fail-fast");
+    let dir = home.join("wasm");
+    let dir_str = dir.display().to_string();
+    let server = common::start_mock_rpc_server().await;
+    stub_batch_rpc(&server).await;
+    let rpc = server.uri();
+
+    // Default: the sorted-first invalid file fails and the batch stops.
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "estimate",
+            "--wasm-dir",
+            dir_str.as_str(),
+            "--rpc-url",
+            rpc.as_str(),
+            "--id",
+            BATCH_TEST_CONTRACT_ID,
+            "--format",
+            "json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "directory batch fails fast by default: {stderr}");
+    let report: Value = serde_json::from_str(&stdout).expect("stdout must stay valid JSON");
+    assert_eq!(report["aborted"], true);
+    assert_eq!(report["not_attempted"], serde_json::json!([good.as_str()]));
+    assert_eq!(report["contracts"][0]["path"], bad.as_str());
+
+    // Keep-going: the directory is fully processed in sorted order.
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "estimate",
+            "--wasm-dir",
+            dir_str.as_str(),
+            "--rpc-url",
+            rpc.as_str(),
+            "--id",
+            BATCH_TEST_CONTRACT_ID,
+            "--format",
+            "json",
+            "--keep-going",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 1,
+        "keep-going directory batch still exits 1: {stderr}"
+    );
+    let report: Value = serde_json::from_str(&stdout).expect("stdout must stay valid JSON");
+    let contracts = report["contracts"].as_array().expect("contracts array");
+    assert_eq!(contracts.len(), 2);
+    assert_eq!(contracts[0]["path"], bad.as_str());
+    assert_eq!(contracts[1]["path"], good.as_str());
+    assert_eq!(report["succeeded"], 1);
+}
+
+#[tokio::test]
+async fn batch_all_success_exits_zero_without_keep_going() {
+    let home = temp_home("batch-all-success");
+    let dir = home.join("wasm");
+    std::fs::create_dir_all(&dir).expect("failed to create wasm dir");
+    let a_bytes = std::fs::read("tests/fixtures/zeroarg.wasm").expect("fixture readable");
+    let a = write_batch_file(&dir, "a.wasm", &a_bytes);
+    let b_bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("fixture readable");
+    let b = write_batch_file(&dir, "b.wasm", &b_bytes);
+
+    let server = common::start_mock_rpc_server().await;
+    stub_batch_rpc(&server).await;
+    let rpc = server.uri();
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "estimate",
+            "--wasm",
+            a.as_str(),
+            "--wasm",
+            b.as_str(),
+            "--rpc-url",
+            rpc.as_str(),
+            "--id",
+            BATCH_TEST_CONTRACT_ID,
+            "--format",
+            "json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "an all-success batch exits 0: {stderr}");
+    let report: Value = serde_json::from_str(&stdout).expect("stdout must stay valid JSON");
+    assert_eq!(report["failed"], 0);
+    assert_eq!(report["succeeded"], 2);
+    assert!(report.get("aborted").is_none());
+    assert!(report.get("not_attempted").is_none());
+}
+
+#[tokio::test]
+async fn batch_fatal_endpoint_failure_is_not_a_per_file_failure() {
+    let (home, bad, good) = batch_dir_with_invalid_and_valid("batch-fatal-endpoint");
+
+    // A dead endpoint is a process-wide failure: with or without
+    // `--keep-going` it aborts immediately and is never recorded as a
+    // per-file row.
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "estimate",
+            "--wasm",
+            bad.as_str(),
+            "--wasm",
+            good.as_str(),
+            "--rpc-url",
+            DEAD_RPC,
+            "--format",
+            "json",
+            "--keep-going",
+            "--max-retries",
+            "0",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "an unreachable endpoint is fatal: {stderr}");
+    assert!(
+        stderr.contains("unable to reach RPC endpoint"),
+        "the fatal error should explain itself: {stderr}"
+    );
+    assert!(
+        !stdout.contains("contracts"),
+        "a fatal error must not emit a batch report: {stdout}"
+    );
+}
+
+#[test]
+fn batch_unknown_network_is_fatal_even_with_keep_going() {
+    let home = temp_home("batch-unknown-network");
+    let dir = home.join("wasm");
+    std::fs::create_dir_all(&dir).expect("failed to create wasm dir");
+    let a_bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("fixture readable");
+    let a = write_batch_file(&dir, "a.wasm", &a_bytes);
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "estimate",
+            "--wasm",
+            a.as_str(),
+            "--network",
+            "no-such-network",
+            "--format",
+            "json",
+            "--keep-going",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "an unknown network is fatal: {stderr}");
+    assert!(
+        stderr.contains("not configured for network no-such-network"),
+        "the error should name the network: {stderr}"
+    );
+    assert!(
+        !stdout.contains("contracts"),
+        "a fatal config error must not emit a batch report: {stdout}"
+    );
+}
+
+#[tokio::test]
+async fn batch_fail_fast_note_names_unattempted_files_in_table_output() {
+    let (home, bad, good) = batch_dir_with_invalid_and_valid("batch-table-note");
+    let server = common::start_mock_rpc_server().await;
+    stub_batch_rpc(&server).await;
+    let rpc = server.uri();
+
+    let (stdout, _stderr, code) = run_cli_quiet(
+        &[
+            "estimate",
+            "--wasm",
+            bad.as_str(),
+            "--wasm",
+            good.as_str(),
+            "--rpc-url",
+            rpc.as_str(),
+            "--id",
+            BATCH_TEST_CONTRACT_ID,
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1);
+    assert!(
+        stdout.contains("Batch stopped at the first failure (fail-fast)"),
+        "table output should explain the early stop: {stdout}"
+    );
+    assert!(
+        stdout.contains(good.as_str()),
+        "table output should name the unattempted file: {stdout}"
+    );
+}
+
+#[tokio::test]
+async fn estimate_all_batch_supports_keep_going() {
+    let (home, bad, good) = batch_dir_with_invalid_and_valid("estimate-all-keep-going");
+    let server = common::start_mock_rpc_server().await;
+    stub_batch_rpc(&server).await;
+    let rpc = server.uri();
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "estimate-all",
+            "--wasm",
+            bad.as_str(),
+            "--wasm",
+            good.as_str(),
+            "--rpc-url",
+            rpc.as_str(),
+            "--id",
+            BATCH_TEST_CONTRACT_ID,
+            "--format",
+            "json",
+            "--keep-going",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "estimate-all keep-going exits 1: {stderr}");
+    let report: Value = serde_json::from_str(&stdout).expect("stdout must stay valid JSON");
+    let contracts = report["contracts"].as_array().expect("contracts array");
+    assert_eq!(
+        contracts.len(),
+        2,
+        "estimate-all batch processes both files"
+    );
+    assert!(contracts[0]["error"].as_str().is_some());
+    assert!(
+        contracts[1].get("error").is_none(),
+        "the good file is still estimated"
     );
 }

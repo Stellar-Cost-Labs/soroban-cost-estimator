@@ -268,6 +268,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             r#fn,
             id,
             args: contract_args,
+            args_file,
             interactive: interactive_flag,
             cache_ttl,
             compare,
@@ -282,6 +283,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             dry_run,
             project,
             repeat,
+            keep_going,
         } => {
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
@@ -290,6 +292,17 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 (None, true) => cli::OutputFormat::Json,
                 (None, false) => cli::OutputFormat::Table,
             };
+            // Parse typed arguments from `--args-file` up front (#486):
+            // malformed JSON or invalid values fail here, before path
+            // resolution or any RPC traffic. Validation against the contract
+            // spec happens per WASM (the spec lives in the file) and always
+            // before the simulation itself.
+            let typed_args_owned = match args_file.as_deref() {
+                Some(path) => Some(xdr_helper::parse_args_file(path)?),
+                None => None,
+            };
+            let typed_args = typed_args_owned.as_deref();
+
             let paths = resolve_wasm_paths(&wasm, wasm_dir.as_deref())?;
             if wasm.len() > 1 || wasm_dir.is_some() {
                 // Multi-contract run: aggregate every contract into a single
@@ -302,6 +315,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     id.as_deref(),
                     r#fn.as_deref(),
                     &contract_args,
+                    typed_args,
                     format.as_str(),
                     rps,
                     timeout,
@@ -309,6 +323,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     max_retries,
                     verbose,
                     &headers,
+                    keep_going,
                 )
                 .await
             } else {
@@ -325,6 +340,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     id.as_deref(),
                     r#fn.as_deref(),
                     &contract_args,
+                    typed_args,
                     interactive_flag,
                     cache_ttl.as_deref(),
                     compare,
@@ -362,6 +378,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             fn_names,
             json,
             auto_snapshot,
+            keep_going,
         } => {
             let format = match (args.format, json) {
                 (Some(fmt), _) => fmt,
@@ -378,6 +395,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     id.as_deref(),
                     None,
                     &[],
+                    None,
                     format.as_str(),
                     rps,
                     timeout,
@@ -385,6 +403,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     max_retries,
                     verbose,
                     &headers,
+                    keep_going,
                 )
                 .await
             } else {
@@ -872,6 +891,10 @@ struct SimulationRequest<'a> {
     contract_id: Option<&'a str>,
     fn_name: Option<&'a str>,
     args: &'a [String],
+    /// Typed arguments from `--args-file` (#486). When present they replace
+    /// the string `args` entirely: values come from the file (already XDR-
+    /// converted) and validation checks names and types against the spec.
+    typed_args: Option<&'a [xdr_helper::TypedArg]>,
     rps: Option<u64>,
     timeout: u64,
     connect_timeout: u64,
@@ -908,12 +931,32 @@ async fn simulate_report(
         req.verbose,
     )?;
 
-    let sc_vals: Vec<stellar_xdr::ScVal> = req
-        .args
-        .iter()
-        .map(|a| xdr_helper::parse_arg_scval(a))
-        .collect();
-    debug!(arg_count = sc_vals.len(), "parsed arguments");
+    let sc_vals: Vec<stellar_xdr::ScVal> = match req.typed_args {
+        // Typed `--args-file` arguments (#486): validate names and types
+        // against the contract spec first; the validator returns the values
+        // in the function's declaration order.
+        Some(typed) => {
+            let ordered = xdr_helper::validate_typed_args_against_spec(
+                req.fn_name,
+                typed,
+                req.functions,
+            )?;
+            debug!(arg_count = ordered.len(), "validated typed arguments against contract spec");
+            ordered
+        }
+        None => {
+            // `--arg KEY=VALUE` keeps its positional string validation.
+            xdr_helper::validate_args_against_spec(req.fn_name, req.args, req.functions)?;
+            debug!(
+                arg_count = req.args.len(),
+                "validated arguments against contract spec"
+            );
+            req.args
+                .iter()
+                .map(|a| xdr_helper::parse_arg_scval(a))
+                .collect()
+        }
+    };
 
     let tx_xdr = xdr_helper::build_simulation_tx_envelope(
         req.wasm_bytes,
@@ -921,12 +964,6 @@ async fn simulate_report(
         req.fn_name,
         &sc_vals,
     )?;
-
-    xdr_helper::validate_args_against_spec(req.fn_name, req.args, req.functions)?;
-    debug!(
-        arg_count = req.args.len(),
-        "validated arguments against contract spec"
-    );
 
     let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
     debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
@@ -1033,6 +1070,7 @@ async fn cmd_estimate(
     contract_id: Option<&str>,
     fn_name: Option<&str>,
     args: &[String],
+    typed_args: Option<&[xdr_helper::TypedArg]>,
     interactive_flag: bool,
     cache_ttl: Option<&str>,
     compare: bool,
@@ -1082,6 +1120,7 @@ async fn cmd_estimate(
             contract_id,
             fn_name,
             args,
+            typed_args,
             format,
             rps,
             timeout,
@@ -1104,6 +1143,7 @@ async fn cmd_estimate(
             contract_id,
             fn_name,
             args,
+            typed_args,
             format,
             rps,
             timeout,
@@ -1128,6 +1168,7 @@ async fn cmd_estimate(
             contract_id,
             fn_name,
             args,
+            typed_args,
             interactive_flag,
             cache_ttl,
             clear_cache,
@@ -1158,6 +1199,7 @@ async fn cmd_estimate(
         contract_id,
         fn_name,
         args,
+        typed_args,
         interactive_flag,
         cache_ttl,
         compare,
@@ -1306,6 +1348,7 @@ async fn cmd_estimate_repeat(
     contract_id: Option<&str>,
     fn_name: Option<&str>,
     args: &[String],
+    typed_args: Option<&[xdr_helper::TypedArg]>,
     interactive_flag: bool,
     cache_ttl: Option<&str>,
     clear_cache: bool,
@@ -1372,6 +1415,13 @@ async fn cmd_estimate_repeat(
 
         wasm_info.validate_wasm_limits(65536, 2048)?;
 
+        // Typed `--args-file` arguments get a canonical XDR-derived cache
+        // key (#486); `--arg` strings keep using their raw form.
+        let cache_args: Vec<String> = match typed_args {
+            Some(typed) => xdr_helper::typed_cache_args(typed)?,
+            None => args.to_vec(),
+        };
+
         let wasm_hash = wasm::parser::wasm_sha256_hex(&wasm_info.bytes);
         let wasm_size = wasm_info.bytes.len() as u64;
         let function_name = fn_name.unwrap_or("(wasm upload)");
@@ -1384,7 +1434,7 @@ async fn cmd_estimate_repeat(
         let fresh = if no_cache {
             None
         } else {
-            fresh_cached_estimate(&wasm_hash, function_name, args, ttl_secs)?
+            fresh_cached_estimate(&wasm_hash, function_name, &cache_args, ttl_secs)?
         };
         if let Some(fresh) = fresh {
             let ttl_secs = ttl_secs.unwrap_or_default();
@@ -1394,17 +1444,25 @@ async fn cmd_estimate_repeat(
         }
 
         if dry_run {
-            let sc_vals: Vec<stellar_xdr::ScVal> = args
-                .iter()
-                .map(|a| xdr_helper::parse_arg_scval(a))
-                .collect();
+            let sc_vals: Vec<stellar_xdr::ScVal> = match typed_args {
+                Some(typed) => xdr_helper::validate_typed_args_against_spec(
+                    fn_name,
+                    typed,
+                    &wasm_info.functions,
+                )?,
+                None => {
+                    xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
+                    args.iter()
+                        .map(|a| xdr_helper::parse_arg_scval(a))
+                        .collect()
+                }
+            };
             let tx_xdr = xdr_helper::build_simulation_tx_envelope(
                 &wasm_info.bytes,
                 contract_id,
                 fn_name,
                 &sc_vals,
             )?;
-            xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
             let tx_b64 =
                 base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
             let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
@@ -1432,8 +1490,8 @@ async fn cmd_estimate_repeat(
                 }
             );
             println!();
-            println!("  Arguments ({}):", args.len());
-            for (i, (arg, sc_val)) in args.iter().zip(&sc_vals).enumerate() {
+            println!("  Arguments ({}):", arg_labels.len());
+            for (i, (arg, sc_val)) in arg_labels.iter().zip(&sc_vals).enumerate() {
                 println!("    [{i}] {arg} → {sc_val:?}");
             }
             println!();
@@ -1456,17 +1514,25 @@ async fn cmd_estimate_repeat(
             verbose,
         )?;
 
-        let sc_vals: Vec<stellar_xdr::ScVal> = args
-            .iter()
-            .map(|a| xdr_helper::parse_arg_scval(a))
-            .collect();
+        let sc_vals: Vec<stellar_xdr::ScVal> = match typed_args {
+            Some(typed) => xdr_helper::validate_typed_args_against_spec(
+                fn_name,
+                typed,
+                &wasm_info.functions,
+            )?,
+            None => {
+                xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
+                args.iter()
+                    .map(|a| xdr_helper::parse_arg_scval(a))
+                    .collect()
+            }
+        };
         let tx_xdr = xdr_helper::build_simulation_tx_envelope(
             &wasm_info.bytes,
             contract_id,
             fn_name,
             &sc_vals,
         )?;
-        xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
         let tx_b64 =
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
 
@@ -1555,7 +1621,7 @@ async fn cmd_estimate_repeat(
                     let _ = cache::save_estimate(
                         &wasm_hash,
                         function_name,
-                        args,
+                        &cache_args,
                         network,
                         latest_ledger,
                         fee.total_stroops,
@@ -1663,6 +1729,7 @@ async fn estimate_once(
     contract_id: Option<&str>,
     fn_name: Option<&str>,
     args: &[String],
+    typed_args: Option<&[xdr_helper::TypedArg]>,
     interactive_flag: bool,
     cache_ttl: Option<&str>,
     compare: bool,
@@ -1747,6 +1814,16 @@ async fn estimate_once(
         // Validate WASM memory and table constraints against network limits (defaults: 64KB max size, 2048 pages)
         wasm_info.validate_wasm_limits(65536, 2048)?;
 
+        // Typed `--args-file` arguments (#486) get a canonical XDR-derived
+        // cache key; `--arg` strings keep using their raw form. The key is
+        // computed once and reused by every cache operation below, so a
+        // typed run and a string run can never collide, and strings full of
+        // shell metacharacters stay literal data.
+        let cache_args: Vec<String> = match typed_args {
+            Some(typed) => xdr_helper::typed_cache_args(typed)?,
+            None => args.to_vec(),
+        };
+
         let wasm_hash = wasm::parser::wasm_sha256_hex(&wasm_info.bytes);
         let wasm_size = wasm_info.bytes.len() as u64;
         let function_name = fn_name.unwrap_or("(wasm upload)");
@@ -1762,7 +1839,7 @@ async fn estimate_once(
         // With `--compare`, read the estimate cached by the *previous* run
         // before the simulation below upserts this one away.
         let previous = if compare {
-            cache::load_estimate(&wasm_hash, function_name, args)?
+            cache::load_estimate(&wasm_hash, function_name, &cache_args)?
         } else {
             None
         };
@@ -1775,7 +1852,7 @@ async fn estimate_once(
             // Bypass every cache read, even under `--cache-ttl`.
             None
         } else {
-            fresh_cached_estimate(&wasm_hash, &function_name, args, ttl_secs)?
+            fresh_cached_estimate(&wasm_hash, &function_name, &cache_args, ttl_secs)?
         };
         if let Some(fresh) = fresh {
             let ttl_secs = ttl_secs.unwrap_or_default();
@@ -1788,10 +1865,36 @@ async fn estimate_once(
         // without contacting the network. The envelope is built here because
         // no RPC traffic is performed.
         if dry_run {
-            let sc_vals: Vec<stellar_xdr::ScVal> = args
-                .iter()
-                .map(|a| xdr_helper::parse_arg_scval(a))
-                .collect();
+            // Resolve the values exactly as the simulation would: typed
+            // `--args-file` entries are spec-validated (and reordered to the
+            // declaration order) first; `--arg` strings keep positional
+            // validation. Either way an invalid argument fails here, before
+            // any network access.
+            let (sc_vals, arg_labels): (Vec<stellar_xdr::ScVal>, Vec<String>) = match typed_args {
+                Some(typed) => {
+                    let ordered = xdr_helper::validate_typed_args_against_spec(
+                        fn_name,
+                        typed,
+                        &wasm_info.functions,
+                    )?;
+                    let labels = typed
+                        .iter()
+                        .map(|a| match &a.name {
+                            Some(name) => format!("{name}: {}", a.type_name),
+                            None => a.type_name.clone(),
+                        })
+                        .collect();
+                    (ordered, labels)
+                }
+                None => {
+                    xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
+                    let vals = args
+                        .iter()
+                        .map(|a| xdr_helper::parse_arg_scval(a))
+                        .collect();
+                    (vals, args.to_vec())
+                }
+            };
             debug!(arg_count = sc_vals.len(), "parsed arguments");
 
             let tx_xdr = xdr_helper::build_simulation_tx_envelope(
@@ -1800,11 +1903,6 @@ async fn estimate_once(
                 fn_name,
                 &sc_vals,
             )?;
-            xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
-            debug!(
-                arg_count = args.len(),
-                "validated arguments against contract spec"
-            );
 
             let tx_b64 =
                 base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
@@ -1860,6 +1958,7 @@ async fn estimate_once(
             contract_id,
             fn_name,
             args,
+            typed_args,
             rps,
             timeout,
             connect_timeout,
@@ -1904,7 +2003,7 @@ async fn estimate_once(
             let _ = cache::save_estimate(
                 &wasm_hash,
                 function_name,
-                args,
+                &cache_args,
                 network,
                 report.ledger,
                 report.fee.total_stroops,
@@ -2142,6 +2241,7 @@ async fn emit_watch_estimate(
     contract_id: Option<&str>,
     fn_name: Option<&str>,
     args: &[String],
+    typed_args: Option<&[xdr_helper::TypedArg]>,
     format: &str,
     rps: Option<u64>,
     timeout: u64,
@@ -2161,6 +2261,7 @@ async fn emit_watch_estimate(
         contract_id,
         fn_name,
         args,
+        typed_args,
         // Watch mode never prompts; it re-simulates on every rebuild.
         false,
         None,
@@ -2241,6 +2342,7 @@ async fn estimate_watch_poll_once(
     contract_id: Option<&str>,
     fn_name: Option<&str>,
     args: &[String],
+    typed_args: Option<&[xdr_helper::TypedArg]>,
     format: &str,
     rps: Option<u64>,
     timeout: u64,
@@ -2285,6 +2387,7 @@ async fn estimate_watch_poll_once(
         contract_id,
         fn_name,
         args,
+        typed_args,
         format,
         rps,
         timeout,
@@ -2323,6 +2426,7 @@ async fn cmd_estimate_watch(
     contract_id: Option<&str>,
     fn_name: Option<&str>,
     args: &[String],
+    typed_args: Option<&[xdr_helper::TypedArg]>,
     format: &str,
     rps: Option<u64>,
     timeout: u64,
@@ -2366,6 +2470,7 @@ async fn cmd_estimate_watch(
                 contract_id,
                 fn_name,
                 args,
+                typed_args,
                 format,
                 rps,
                 timeout,
@@ -2410,6 +2515,7 @@ async fn cmd_estimate_watch(
                     contract_id,
                     fn_name,
                     args,
+                    typed_args,
                     format,
                     rps,
                     timeout,
@@ -2639,6 +2745,7 @@ async fn cmd_estimate_diff(
     contract_id: Option<&str>,
     fn_name: Option<&str>,
     args: &[String],
+    typed_args: Option<&[xdr_helper::TypedArg]>,
     format: &str,
     rps: Option<u64>,
     timeout: u64,
@@ -2695,6 +2802,7 @@ async fn cmd_estimate_diff(
         contract_id,
         fn_name,
         args,
+        typed_args,
         rps,
         timeout,
         connect_timeout,
@@ -2719,6 +2827,7 @@ async fn cmd_estimate_diff(
         contract_id,
         fn_name,
         args,
+        typed_args,
         rps,
         timeout,
         connect_timeout,
@@ -5209,9 +5318,15 @@ async fn simulate_envelope(
 ///
 /// A contract that cannot be parsed is reported as an `error` row; a contract
 /// that parses is summarized even if some simulations fail, so one bad contract
-/// (or one bad function) never aborts the whole batch. When `fn_name` is given,
-/// only that function is simulated with the caller's `sc_vals`; otherwise every
-/// zero-parameter function is simulated.
+/// (or one bad function) is recorded on its own row instead of aborting the
+/// run (`--keep-going`) or the whole batch (fail-fast; see [`cmd_batch`]).
+/// When `fn_name` is given, only that function is simulated with the caller's
+/// arguments; otherwise every zero-parameter function is simulated.
+///
+/// Arguments — `--arg` strings or typed `--args-file` entries (#486) — are
+/// validated against this contract's spec *before* any simulation, so
+/// invalid input never reaches the network. Typed arguments are returned by
+/// the validator in the function's declaration order.
 #[allow(clippy::too_many_lines)]
 async fn batch_contract_summary(
     client: &rpc::client::RpcClient,
@@ -5219,8 +5334,9 @@ async fn batch_contract_summary(
     network: &str,
     contract_id: Option<&str>,
     fn_name: Option<&str>,
-    sc_vals: &[stellar_xdr::ScVal],
+    cache_args: &[String],
     args: &[String],
+    typed_args: Option<&[xdr_helper::TypedArg]>,
 ) -> report::cost_report::ContractCostSummary {
     use sha2::Digest;
 
@@ -5239,6 +5355,42 @@ async fn batch_contract_summary(
     let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_info.bytes));
     let function_count = wasm_info.functions.len();
 
+    // Validate the invocation arguments against *this* contract's spec
+    // before any simulation (#486). A mismatch is a file-scoped failure —
+    // sibling contracts may well have a matching spec — so it lands on this
+    // row and the batch policy (fail-fast / keep-going) decides what happens
+    // next.
+    let validation_failure = |err: String| report::cost_report::ContractCostSummary {
+        path: display.clone(),
+        wasm_hash: Some(wasm_hash.clone()),
+        function_count: Some(function_count),
+        upload_cost_stroops: None,
+        min_invocation_fee_stroops: None,
+        max_invocation_fee_stroops: None,
+        functions_simulated: Some(0),
+        error: Some(format!("argument validation failed: {err}")),
+    };
+    let sc_vals: Vec<stellar_xdr::ScVal> = match typed_args {
+        Some(typed) => {
+            match xdr_helper::validate_typed_args_against_spec(
+                fn_name,
+                typed,
+                &wasm_info.functions,
+            ) {
+                Ok(ordered) => ordered,
+                Err(e) => return validation_failure(e.to_string()),
+            }
+        }
+        None => {
+            if let Err(e) =
+                xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)
+            {
+                return validation_failure(e.to_string());
+            }
+            args.iter().map(|a| xdr_helper::parse_arg_scval(a)).collect()
+        }
+    };
+
     let mut errors: Vec<String> = Vec::new();
 
     // Bytecode-upload cost — the same envelope `estimate` uses when no function
@@ -5251,11 +5403,6 @@ async fn batch_contract_summary(
             None
         }
     };
-
-    // Invocation fees across the contract's exported functions.
-    if let Err(e) = xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions) {
-        errors.push(format!("argument validation failed: {e}"));
-    }
 
     let candidates: Vec<&wasm::parser::FunctionInfo> = fn_name.map_or_else(
         || {
@@ -5292,7 +5439,7 @@ async fn batch_contract_summary(
                 let _ = cache::save_estimate(
                     &wasm_hash,
                     &fn_info.name,
-                    args,
+                    cache_args,
                     network,
                     outcome.ledger,
                     outcome.fee_stroops,
@@ -5325,9 +5472,19 @@ async fn batch_contract_summary(
 /// `estimate`/`estimate-all` batch mode: evaluate every resolved WASM file and
 /// print one aggregated multi-contract cost summary.
 ///
-/// Contract failures never abort the run; each is captured in its summary row
-/// and the process still exits non-zero when any contract failed, so scripts
-/// notice partial failures without losing the report.
+/// By default the batch is **fail-fast**: the first file-scoped failure stops
+/// processing, the report records the failure (with its path and error) plus
+/// the paths that were not attempted (`aborted` / `not_attempted`, issue
+/// #482), and the process exits non-zero. With `--keep-going`, every file is
+/// processed, each failure is captured in its own summary row, and the process
+/// still exits non-zero when any contract failed — so scripts notice partial
+/// failures without losing the report.
+///
+/// Only file-scoped failures (unreadable/unparseable WASM, failed
+/// simulations, failed argument validation) are subject to this policy.
+/// Process-wide failures — endpoint resolution, an unhealthy RPC endpoint,
+/// client construction — always abort the whole batch immediately, with or
+/// without `--keep-going`.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn cmd_batch(
     wasm_paths: &[std::path::PathBuf],
@@ -5337,6 +5494,7 @@ async fn cmd_batch(
     contract_id: Option<&str>,
     fn_name: Option<&str>,
     args: &[String],
+    typed_args: Option<&[xdr_helper::TypedArg]>,
     format: &str,
     rps: Option<u64>,
     timeout: u64,
@@ -5344,6 +5502,7 @@ async fn cmd_batch(
     max_retries: usize,
     verbose: bool,
     extra_headers: &[String],
+    keep_going: bool,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -5366,15 +5525,24 @@ async fn cmd_batch(
         // Fail fast on an unreachable endpoint before simulating every contract.
         client.health_check().await?;
 
-        let sc_vals: Vec<stellar_xdr::ScVal> = args
-            .iter()
-            .map(|a| xdr_helper::parse_arg_scval(a))
-            .collect();
+        // Typed `--args-file` arguments (#486) get a canonical XDR-derived
+        // cache key once for the whole batch; the simulation values
+        // themselves are resolved per contract, because each contract's own
+        // spec decides validation and (for named arguments) ordering.
+        let cache_args: Vec<String> = match typed_args {
+            Some(typed) => xdr_helper::typed_cache_args(typed)?,
+            None => args.to_vec(),
+        };
 
         let text_mode = format == "table" || format == "markdown";
 
         let mut contracts: Vec<report::cost_report::ContractCostSummary> =
             Vec::with_capacity(total);
+        // Fail-fast bookkeeping (#482): when a file fails and `--keep-going`
+        // was not set, the remaining paths are recorded as not attempted
+        // instead of being silently dropped from the report.
+        let mut aborted = false;
+        let mut not_attempted: Vec<String> = Vec::new();
         for (i, path) in wasm_paths.iter().enumerate() {
             if text_mode {
                 println!("[{}/{}] {}", i + 1, total, path.display());
@@ -5385,8 +5553,9 @@ async fn cmd_batch(
                 network,
                 contract_id,
                 fn_name,
-                &sc_vals,
+                &cache_args,
                 args,
+                typed_args,
             )
             .await;
             if text_mode {
@@ -5401,10 +5570,20 @@ async fn cmd_batch(
                     ),
                 }
             }
+            let failed = !summary.is_ok();
             contracts.push(summary);
+            if failed && !keep_going {
+                // Fail-fast: stop here. The paths after this one are listed
+                // as not attempted so nothing is silently dropped.
+                aborted = true;
+                not_attempted.extend(wasm_paths[i + 1..].iter().map(|p| p.display().to_string()));
+                break;
+            }
         }
 
-        let batch = report::cost_report::BatchCostReport::new(network.to_string(), contracts);
+        let mut batch = report::cost_report::BatchCostReport::new(network.to_string(), contracts);
+        batch.aborted = aborted;
+        batch.not_attempted = not_attempted;
 
         match format {
             "json" => println!("{}", report::cost_report::format_batch_report_json(&batch)),
@@ -5414,6 +5593,18 @@ async fn cmd_batch(
                 report::cost_report::format_batch_report_markdown(&batch)
             ),
             _ => println!("{}", report::cost_report::format_batch_report_table(&batch)),
+        }
+
+        // In fail-fast mode the early stop is a batch-level fact that the
+        // JSON (via `aborted`/`not_attempted`), CSV, and Markdown formats
+        // cannot express inline. Text formats embed the note themselves;
+        // machine formats get it on stderr so their stdout stays parseable.
+        if batch.aborted && !batch.not_attempted.is_empty() && !text_mode {
+            eprintln!(
+                "Batch stopped at the first failure (fail-fast): {} file(s) not attempted \
+                 (pass --keep-going to process the rest)",
+                batch.not_attempted.len()
+            );
         }
 
         // Surface partial failures to scripts; the summary above is already
