@@ -1016,6 +1016,16 @@ async fn simulate_report(
         )?)
         .unwrap_or(0);
 
+    // Archival restoration fee (#524): a distinct component reported next to
+    // the resource fee, never merged into it. A malformed value degrades to
+    // unknown (absent) rather than failing the run, matching how
+    // `minResourceFee` is tolerated above.
+    let restore_fee_stroops = rpc::simulate::parse_restore_fee(&response.restore_fee)
+        .unwrap_or_else(|err| {
+            debug!(error = %err, "ignoring malformed restoreFee");
+            None
+        });
+
     debug!(
         cpu_instructions,
         memory_bytes, latest_ledger, total_fee_stroops, "simulation complete"
@@ -1060,6 +1070,7 @@ async fn simulate_report(
         read_bytes,
         write_bytes,
         fee,
+        restore_fee_stroops,
         ledger: latest_ledger,
         network: req.network.to_string(),
         rpc_latency_ms,
@@ -1624,6 +1635,14 @@ async fn cmd_estimate_repeat(
                 }
                 info!(total_stroops = fee.total_stroops, total_xlm = %fee.total_xlm, "estimate complete");
 
+                // Archival restoration fee (#524) — malformed values
+                // degrade to unknown, same policy as `simulate_report`.
+                let restore_fee_stroops = rpc::simulate::parse_restore_fee(&response.restore_fee)
+                    .unwrap_or_else(|err| {
+                        debug!(error = %err, "ignoring malformed restoreFee");
+                        None
+                    });
+
                 first_report = Some(report::cost_report::CostReport {
                     function: function_name.to_string(),
                     wasm_hash: wasm_hash.clone(),
@@ -1637,6 +1656,7 @@ async fn cmd_estimate_repeat(
                     read_bytes,
                     write_bytes,
                     fee,
+                    restore_fee_stroops,
                     ledger: latest_ledger,
                     network: network.to_string(),
                     rpc_latency_ms,
@@ -6312,6 +6332,7 @@ mod tests {
             ledger: 3_894_195,
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
+            restore_fee_stroops: None,
             rates: None,
             warnings: Vec::new(),
             history: None,
