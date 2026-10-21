@@ -506,6 +506,8 @@ soroban-cost-estimator cache delete --all --yes                   # everything
   (or a declined prompt) aborts without deleting
 - A filter is required — `cache delete` without one is refused unless
   `--all` is given
+- `--all` removes every entry on every network and cannot be combined with a
+  filter, so a whole-cache deletion is never silently narrowed
 - Selection and deletion happen in a single transaction, so the reported
   count always matches the number of removed rows
 

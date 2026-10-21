@@ -476,6 +476,8 @@ pub enum CacheAction {
         older_than: Option<String>,
 
         /// Delete every cached estimate, on every network.
+        ///
+        /// Cannot be combined with a filter.
         #[arg(long)]
         all: bool,
 

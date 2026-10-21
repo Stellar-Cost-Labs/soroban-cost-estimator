@@ -191,8 +191,60 @@ fn env_or_file_bool(value: bool, file: Option<bool>) -> bool {
         .unwrap_or(value)
 }
 
+/// Stack size, in bytes, of the thread the CLI runs on.
+///
+/// `clap`'s derive macros build the entire command tree on the stack, and an
+/// unoptimized build needs close to a megabyte of stack for it: every
+/// `clap::Arg` and `clap::Command` is a ~600 byte value that the generated
+/// builder chain copies onto the stack once per call. The main thread of a
+/// Windows process is capped at 1 MiB by the linker, so building the command
+/// tree there overflows the stack and aborts the process before any command
+/// runs.
+///
+/// Running the CLI on a dedicated thread with a generous stack keeps the
+/// command tree off the (small) process main thread and leaves headroom for
+/// future commands. The cost is one extra thread per invocation.
+const CLI_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+/// Exit code used when the CLI worker thread panics.
+///
+/// This matches the status Rust uses for a panic that unwinds out of
+/// `main`, so the process exit code stays the same whether or not the CLI
+/// runs on a worker thread.
+const PANIC_EXIT_CODE: i32 = 101;
+
+/// Entry point of the CLI.
+///
+/// The real work happens on a dedicated thread with a large stack (see
+/// [`CLI_STACK_SIZE`]); this function only starts that thread and turns its
+/// result into the process exit code.
+fn main() {
+    let handle = match std::thread::Builder::new()
+        .name("soroban-cost-estimator".to_string())
+        .stack_size(CLI_STACK_SIZE)
+        .spawn(run_cli)
+    {
+        Ok(handle) => handle,
+        Err(err) => {
+            eprintln!("Error: failed to start the CLI worker thread: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    match handle.join() {
+        Ok(exit_code) => std::process::exit(exit_code),
+        // The panic message has already been printed by the default panic
+        // hook; only the exit status is left to propagate.
+        Err(_) => std::process::exit(PANIC_EXIT_CODE),
+    }
+}
+
+/// Runs the CLI and returns the process exit code.
+///
+/// `0` means the command succeeded, `1` means it failed with a reported
+/// error.
 #[tokio::main]
-async fn main() {
+async fn run_cli() -> i32 {
     let args = cli::Cli::parse();
 
     cli::init_color(args.color);
@@ -218,8 +270,10 @@ async fn main() {
     if let Err(err) = run(args).await {
         error!(error = %err, "command failed");
         eprintln!("Error: {err}");
-        std::process::exit(1);
+        return 1;
     }
+
+    0
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5164,6 +5218,17 @@ fn cmd_cache_delete(
     json: bool,
 ) -> error::AppResult<()> {
     let filter = build_cache_filter(network, function, wasm_hash, since, to, older_than)?;
+
+    // `--all` means "every entry on every network". Combining it with a
+    // filter would be ambiguous — the filter would silently narrow a
+    // whole-cache deletion — so the combination is rejected instead.
+    if all && !filter_is_empty(&filter) {
+        return Err(error::AppError::General(
+            "--all cannot be combined with a filter — --all removes every cached \
+             estimate on every network; drop --all to delete only the matching entries"
+                .to_string(),
+        ));
+    }
 
     if !all && filter_is_empty(&filter) {
         return Err(error::AppError::General(

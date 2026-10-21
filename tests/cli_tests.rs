@@ -4867,3 +4867,100 @@ fn test_cache_delete_rejects_an_invalid_duration() {
         "stderr should explain the problem: {stderr}"
     );
 }
+
+/// The CLI must not depend on a large *process main thread* stack.
+///
+/// `clap`'s derive macros build the whole command tree on the stack, and an
+/// unoptimized build needs close to a megabyte for it. The main thread of a
+/// Windows process is capped at 1 MiB by the linker, so a CLI that builds
+/// the command tree on the main thread overflows the stack and aborts before
+/// any command runs. The CLI therefore runs on a dedicated thread with a
+/// larger stack.
+///
+/// This test reproduces that condition on Unix by shrinking the stack of the
+/// process the CLI runs in. It is deliberately stricter than the Windows
+/// limit so that the headroom stays comfortable.
+#[cfg(unix)]
+#[test]
+fn test_cli_runs_with_a_tiny_main_thread_stack() {
+    let home = temp_home("tiny-stack");
+    let bin = env!("CARGO_BIN_EXE_soroban-cost-estimator");
+
+    // `ulimit -s` is in KiB. 256 KiB is far below what the command tree
+    // needs when it is built on the main thread, and far below the 1 MiB
+    // Windows main thread limit.
+    // `sh -c SCRIPT BIN ARGS...` puts BIN in `$0` and the arguments in
+    // `"$@"`, so the script can exec the binary without quoting its path.
+    let script = "ulimit -s 256 2>/dev/null || exit 0; exec \"$0\" \"$@\"";
+
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .arg(bin)
+        .arg("cache")
+        .arg("list")
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .output()
+        .expect("failed to run CLI");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let code = output.status.code().unwrap_or(-1);
+
+    assert_eq!(
+        code, 0,
+        "the CLI must run on a small main-thread stack; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("stack overflow"),
+        "the CLI must not overflow the stack: {stderr}"
+    );
+    assert!(
+        stdout.contains("No cached estimates match the filters."),
+        "the command should have run to completion: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_delete_all_cannot_be_combined_with_a_filter() {
+    let home = temp_home("cache-delete-all-with-filter");
+    seed_cache_entry_for(
+        &home,
+        "testnet",
+        "transfer",
+        42,
+        &chrono::Utc::now().to_rfc3339(),
+    );
+    seed_cache_entry_for(
+        &home,
+        "mainnet",
+        "approve",
+        43,
+        &chrono::Utc::now().to_rfc3339(),
+    );
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &["cache", "delete", "--all", "--network", "testnet", "--yes"],
+        Some(&home),
+    );
+    assert_ne!(
+        code, 0,
+        "--all combined with a filter should be rejected; stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("--all cannot be combined with a filter"),
+        "stderr should explain the conflict: {stderr}"
+    );
+
+    // Nothing may be deleted when the command is rejected.
+    let (stdout, stderr, code) = run_cli_quiet(&["cache", "list", "--json"], Some(&home));
+    assert_eq!(code, 0, "cache list should exit 0; stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    assert_eq!(
+        parsed.as_array().expect("JSON array").len(),
+        2,
+        "a rejected deletion must not remove anything"
+    );
+}

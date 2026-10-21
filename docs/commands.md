@@ -935,7 +935,7 @@ soroban-cost-estimator cache delete [OPTIONS]
 | `--since <DATE/TIME>` | | | — | Earliest timestamp or date; alias `--from` |
 | `--to <TIMESTAMP>` | | | — | Latest timestamp or date |
 | `--older-than <DURATION>` | | | — | Only entries older than this age (`30d`, `12h`, `3600`) |
-| `--all` | | | `false` | Delete every cached estimate, on every network |
+| `--all` | | | `false` | Delete every cached estimate, on every network (cannot be combined with a filter) |
 | `--dry-run` | | | `false` | Report the number of matching entries without deleting them |
 | `--yes` | `-y` | | `false` | Skip the confirmation prompt |
 | `--json` | | | `false` | Output as JSON instead of a human-readable summary |
@@ -947,6 +947,9 @@ soroban-cost-estimator cache delete [OPTIONS]
   `--dry-run` reports exactly what would be removed.
 - At least one filter is required; without one the command is refused
   unless `--all` is given.
+- `--all` means "every entry on every network" and cannot be combined with a
+  filter; the combination is rejected so a whole-cache deletion is never
+  silently narrowed.
 - Without `--yes` the command asks for confirmation; in a non-interactive
   session the prompt cannot be answered, so the command aborts without
   deleting anything.

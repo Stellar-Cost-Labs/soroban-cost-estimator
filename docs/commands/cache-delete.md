@@ -15,7 +15,7 @@ Options:
       --since <DATE/TIME>      Earliest timestamp or date [aliases: --from]
       --to <TIMESTAMP>         Latest timestamp or date
       --older-than <DURATION>  Only entries older than this age (e.g. "30d", "12h", "3600")
-      --all                    Delete every cached estimate, on every network
+      --all                    Delete every cached estimate, on every network (cannot be combined with a filter)
       --dry-run                Report how many entries would be removed without deleting them
   -y, --yes                    Skip the confirmation prompt (required in non-interactive sessions)
       --json                   Output as JSON instead of a human-readable summary
@@ -36,6 +36,10 @@ Options:
   refused unless `--all` is given, so a stray invocation cannot wipe the
   cache. `--all` is the explicit opt-in for a whole-cache removal and still
   requires a confirmation.
+- `--all` means "every cached estimate on every network". It **cannot be
+  combined with a filter**: the combination is rejected with
+  `--all cannot be combined with a filter`, so a whole-cache deletion can
+  never be silently narrowed by a stray `--network`.
 - Selection and deletion run inside a single SQLite transaction: the
   reported count always matches the number of removed rows, and a failure
   leaves the cache untouched.
