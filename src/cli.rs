@@ -413,7 +413,7 @@ pub enum CacheAction {
         #[arg(long, value_parser = NetworkValueParser)]
         network: Option<String>,
 
-        /// Filter by function name (--function, --fn).
+        /// Filter by function name (exact match).
         #[arg(long = "fn", visible_alias = "function")]
         r#fn: Option<String>,
 
@@ -421,7 +421,7 @@ pub enum CacheAction {
         #[arg(long)]
         wasm_hash: Option<String>,
 
-        /// Earliest timestamp or date (--from, --since).
+        /// Earliest timestamp or date.
         #[arg(long = "since", visible_alias = "from", value_name = "DATE/TIME")]
         since: Option<String>,
 
@@ -455,7 +455,7 @@ pub enum CacheAction {
         #[arg(long, value_parser = NetworkValueParser)]
         network: Option<String>,
 
-        /// Filter by function name (--function, --fn).
+        /// Filter by function name (exact match).
         #[arg(long = "fn", visible_alias = "function")]
         r#fn: Option<String>,
 
@@ -463,7 +463,7 @@ pub enum CacheAction {
         #[arg(long)]
         wasm_hash: Option<String>,
 
-        /// Earliest timestamp or date (--from, --since).
+        /// Earliest timestamp or date.
         #[arg(long = "since", visible_alias = "from", value_name = "DATE/TIME")]
         since: Option<String>,
 

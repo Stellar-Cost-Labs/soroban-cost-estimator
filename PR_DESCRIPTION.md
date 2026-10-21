@@ -223,6 +223,8 @@ soroban-cost-estimator cache delete [OPTIONS]
   `refusing to delete cached estimates without a filter — pass a filter (e.g. --network) or --all
   to remove every entry`. `--all` is the explicit opt-in for a whole-cache removal and still
   requires a confirmation.
+* `--all` **cannot be combined with a filter** — `--all` means "every entry on every network",
+  and a stray `--network` would silently narrow a whole-cache deletion.
 * `--json` reports `matched`, `removed` and `dry_run`.
 * `--older-than` is resolved into an inclusive upper timestamp bound; when combined with
   `--to`, the **earlier** bound wins. An unparseable duration is an error (never a silent
@@ -243,6 +245,21 @@ soroban-cost-estimator cache delete [OPTIONS]
 `load_last_two_snapshot_payloads()` and diff with `diff_payloads()`, so a stored field this build
 does not model is reported instead of silently ignored. The exit-code semantics, the
 auto-save of a post-upgrade snapshot and the stale-cache cross-reference are unchanged.
+
+### 3.9 Dependency bumps (unrelated to the issues, but required for a green CI)
+
+Three RustSec advisories were published after the last green run on `main` and now fail the
+`cargo deny`/`cargo audit` jobs for every PR:
+
+| Advisory | Crate | Fixed in |
+|---|---|---|
+| RUSTSEC-2026-0381 | `webpki-roots` | 1.0.10 |
+| RUSTSEC-2026-0382 | `rustls-webpki` | 0.103.16 |
+| RUSTSEC-2026-0383 | `webpki-root-certs` | 1.0.10 |
+
+All three concern the distrusted `emSign ECC Root CA - G3` certificate. The `Cargo.lock` is
+bumped accordingly (patch releases only, no API change), which makes `cargo deny` report
+`advisories ok, bans ok, licenses ok, sources ok`.
 
 ### 3.7 `src/main.rs` — the CLI runs on a thread with a real stack
 
