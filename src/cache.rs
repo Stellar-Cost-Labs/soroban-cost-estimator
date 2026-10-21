@@ -514,6 +514,7 @@ fn create_user_only_db_file(path: &Path) -> AppResult<bool> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn create_user_only_db_file(_path: &Path) -> AppResult<bool> {
     Ok(false)
 }
