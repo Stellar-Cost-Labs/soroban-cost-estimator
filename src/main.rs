@@ -5086,6 +5086,7 @@ async fn handle_cache_action(
 
 /// `cache recover` command: quarantine a corrupt SQLite cache database to a timestamped backup and initialize a fresh cache.
 fn cmd_cache_recover(force: bool, json: bool, quiet: bool) -> error::AppResult<()> {
+    // Perform non-destructive cache recovery, preserving corrupt files for inspection.
     let report = cache::recover_cache(force)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
