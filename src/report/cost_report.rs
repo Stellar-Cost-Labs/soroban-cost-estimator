@@ -534,6 +534,12 @@ pub struct CostReport {
     /// RPC round-trip time of the `simulateTransaction` call, in
     /// milliseconds. Helps identify slow or overloaded RPC endpoints.
     pub rpc_latency_ms: u64,
+    /// Sanitized host identifier of the RPC endpoint that served the estimate.
+    #[serde(default)]
+    pub rpc_endpoint: String,
+    /// Whether the primary or fallback endpoint served the successful response.
+    #[serde(default)]
+    pub rpc_role: String,
     /// Fee rates used to compute the breakdown (carried so optimization
     /// suggestions can quantify per-resource savings). Excluded from
     /// serialized output; `None` when the rates were unavailable.
@@ -2144,7 +2150,7 @@ mod tests {
             },
             ledger: 3_894_195,
             network: "testnet".to_string(),
-            rpc_latency_ms: 87,
+            rpc_latency_ms: 87,`n            rpc_endpoint: String::new(),`n            rpc_role: String::new(),
             rates: Some(rates),
             warnings: Vec::new(),
             history: None,
@@ -2265,7 +2271,7 @@ mod tests {
             },
             ledger: 0,
             network: "testnet".to_string(),
-            rpc_latency_ms: 0,
+            rpc_latency_ms: 0,`n            rpc_endpoint: String::new(),`n            rpc_role: String::new(),
             rates: None,
             warnings: Vec::new(),
             history: None,

@@ -1639,7 +1639,10 @@ async fn cmd_estimate_repeat(
                     fee,
                     ledger: latest_ledger,
                     network: network.to_string(),
-                    rpc_latency_ms,
+        rpc_latency_ms,
+        rpc_endpoint: client.sanitized_host(),
+        rpc_role: client.served_role().to_string(),
+
                     rates: Some(fee_rates),
                     warnings: Vec::new(),
                     history: None,

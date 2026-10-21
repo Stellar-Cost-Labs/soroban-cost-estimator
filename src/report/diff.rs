@@ -552,7 +552,7 @@ mod tests {
             },
             ledger: 100,
             network: "testnet".to_string(),
-            rpc_latency_ms: 42,
+            rpc_latency_ms: 42,`n            rpc_endpoint: String::new(),`n            rpc_role: String::new(),
             rates: None,
             warnings: Vec::new(),
             history: None,
