@@ -272,6 +272,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cache_ttl,
             compare,
             clear_cache,
+            recover_cache,
             no_cache,
             history,
             json,
@@ -283,6 +284,17 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             project,
             repeat,
         } => {
+            if recover_cache {
+                if let Ok(false) = cache::check_cache_health() {
+                    let rep = cache::recover_cache(true)?;
+                    if !args.quiet {
+                        eprintln!(
+                            "Quarantined corrupt cache database to {} and initialized fresh cache.",
+                            rep.backup_path.display()
+                        );
+                    }
+                }
+            }
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
             let format = match (args.format, json) {
@@ -4970,7 +4982,33 @@ async fn handle_cache_action(
             quiet,
         ),
         cli::CacheAction::Stats { json } => cmd_cache_stats(json, quiet),
+        cli::CacheAction::Recover { force, json } => cmd_cache_recover(force, json, quiet),
     }
+}
+
+/// `cache recover` command: quarantine a corrupt SQLite cache database to a timestamped backup and initialize a fresh cache.
+fn cmd_cache_recover(force: bool, json: bool, quiet: bool) -> error::AppResult<()> {
+    let report = cache::recover_cache(force)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if !quiet {
+        println!("Cache recovery complete:");
+        println!(
+            "  Quarantined corrupt database: {}",
+            report.backup_path.display()
+        );
+        for sidecar in &report.sidecars_quarantined {
+            println!("  Quarantined sidecar:          {}", sidecar.display());
+        }
+        println!(
+            "  Initialized fresh cache database: {}",
+            report.new_path.display()
+        );
+        println!(
+            "Notice: Previously cached estimates have been reset; the original file has been preserved for inspection."
+        );
+    }
+    Ok(())
 }
 
 /// `cache query` / `config cache query` command: list cached estimates matching the given filters.

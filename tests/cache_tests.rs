@@ -2784,3 +2784,289 @@ fn test_legacy_database_without_io_column_still_loads() {
         );
     });
 }
+
+// ── Permission tests (#519) ──────────────────────────────────────────
+
+#[cfg(unix)]
+#[test]
+fn test_new_cache_database_and_directory_have_user_only_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    with_temp_home(|tmp| {
+        let data_dir = tmp.join(".soroban-cost-estimator");
+        let db_file = data_dir.join("cache.db");
+        assert!(!data_dir.exists());
+
+        // Saving an estimate should initialize data_dir and cache.db
+        cache::save_estimate(
+            "perm_hash",
+            "perm_func",
+            &[],
+            "testnet",
+            1,
+            100,
+            10,
+            5,
+            None,
+            true,
+        )
+        .expect("save estimate");
+
+        assert!(data_dir.exists(), "data_dir should exist");
+        assert!(db_file.exists(), "cache.db should exist");
+
+        let dir_perms = std::fs::metadata(&data_dir)
+            .expect("dir metadata")
+            .permissions();
+        let dir_mode = dir_perms.mode() & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "cache directory must have 0700 (user-only) permissions, got 0{:o}",
+            dir_mode
+        );
+
+        let file_perms = std::fs::metadata(&db_file)
+            .expect("file metadata")
+            .permissions();
+        let file_mode = file_perms.mode() & 0o777;
+        assert_eq!(
+            file_mode, 0o600,
+            "cache database file must have 0600 (user-only) permissions, got 0{:o}",
+            file_mode
+        );
+
+        // Also verify WAL sidecar permissions if present
+        let wal_file = data_dir.join("cache.db-wal");
+        if wal_file.exists() {
+            let wal_mode = std::fs::metadata(&wal_file)
+                .expect("wal metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                wal_mode, 0o600,
+                "WAL sidecar must have 0600 permissions, got 0{:o}",
+                wal_mode
+            );
+        }
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn test_existing_database_permissions_are_preserved() {
+    use std::os::unix::fs::PermissionsExt;
+    with_temp_home(|tmp| {
+        let data_dir = tmp.join(".soroban-cost-estimator");
+        std::fs::create_dir_all(&data_dir).expect("create dir");
+
+        let db_file = data_dir.join("cache.db");
+        // Create an empty database file with custom permissive permissions (0644)
+        {
+            let conn = rusqlite::Connection::open(&db_file).expect("open dummy db");
+            cache::ensure_cache_schema(&conn).expect("schema");
+        }
+        std::fs::set_permissions(&db_file, std::fs::Permissions::from_mode(0o644))
+            .expect("set perms");
+
+        let initial_mode = std::fs::metadata(&db_file)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(initial_mode, 0o644);
+
+        // Calling cache operations on an existing database must not silently alter permissions
+        cache::save_estimate(
+            "exist_hash",
+            "exist_func",
+            &[],
+            "testnet",
+            1,
+            100,
+            10,
+            5,
+            None,
+            true,
+        )
+        .expect("save estimate");
+
+        let final_mode = std::fs::metadata(&db_file)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            final_mode, 0o644,
+            "existing database permissions must not be silently altered"
+        );
+    });
+}
+
+// ── Corruption & Recovery tests (#518) ────────────────────────────────
+
+#[test]
+fn test_distinguish_corruption_from_other_sqlite_errors() {
+    // SQLITE_CORRUPT (11) is corruption
+    let corrupt_err = rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error {
+            code: rusqlite::ErrorCode::DatabaseCorrupt,
+            extended_code: 11,
+        },
+        Some("database disk image is malformed".to_string()),
+    );
+    assert!(cache::is_database_corrupt_error(&corrupt_err));
+
+    // SQLITE_NOTADB (extended 26) is corruption
+    let notadb_err = rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error {
+            code: rusqlite::ErrorCode::CannotOpen,
+            extended_code: 26,
+        },
+        Some("file is not a database".to_string()),
+    );
+    assert!(cache::is_database_corrupt_error(&notadb_err));
+
+    // SQLITE_PERM (3) is NOT corruption
+    let perm_err = rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error {
+            code: rusqlite::ErrorCode::PermissionDenied,
+            extended_code: 3,
+        },
+        Some("permission denied".to_string()),
+    );
+    assert!(!cache::is_database_corrupt_error(&perm_err));
+
+    // SQLITE_BUSY (5) is NOT corruption
+    let busy_err = rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error {
+            code: rusqlite::ErrorCode::DatabaseBusy,
+            extended_code: 5,
+        },
+        Some("database is locked".to_string()),
+    );
+    assert!(!cache::is_database_corrupt_error(&busy_err));
+
+    // SQLITE_FULL (13) is NOT corruption
+    let full_err = rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error {
+            code: rusqlite::ErrorCode::DiskFull,
+            extended_code: 13,
+        },
+        Some("database or disk is full".to_string()),
+    );
+    assert!(!cache::is_database_corrupt_error(&full_err));
+}
+
+#[test]
+fn test_corrupt_database_fails_without_destroying_file() {
+    with_temp_home(|tmp| {
+        let data_dir = tmp.join(".soroban-cost-estimator");
+        std::fs::create_dir_all(&data_dir).expect("create dir");
+        let db_file = data_dir.join("cache.db");
+
+        // Write junk to simulate a corrupted database file
+        let corrupt_content = b"THIS IS DEFINITELY NOT A VALID SQLITE DATABASE FILE HEADER";
+        std::fs::write(&db_file, corrupt_content).expect("write corrupt db");
+
+        // Normal operations must fail with CacheCorrupt
+        let err = cache::load_estimate("any_hash", "any_fn", &[]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cache database corrupt"),
+            "expected CacheCorrupt error, got: {msg}"
+        );
+
+        // Acceptance criterion: Original corrupt database must NOT be deleted or overwritten automatically
+        assert!(
+            db_file.exists(),
+            "original corrupt database must still exist"
+        );
+        let content_after = std::fs::read(&db_file).expect("read db after failure");
+        assert_eq!(
+            content_after, corrupt_content,
+            "original corrupt database content must remain unmodified after failed initialization"
+        );
+    });
+}
+
+#[test]
+fn test_recover_cache_quarantines_corrupt_database_and_initializes_fresh() {
+    with_temp_home(|tmp| {
+        let data_dir = tmp.join(".soroban-cost-estimator");
+        std::fs::create_dir_all(&data_dir).expect("create dir");
+        let db_file = data_dir.join("cache.db");
+
+        let corrupt_content = b"CORRUPTED_SQLITE_DATABASE_PAGES_GARBAGE";
+        std::fs::write(&db_file, corrupt_content).expect("write corrupt db");
+
+        // Create a dummy sidecar to test sidecar quarantining
+        let wal_file = data_dir.join("cache.db-wal");
+        std::fs::write(&wal_file, b"DUMMY_WAL").expect("write wal");
+
+        // Health check should report false (corrupt)
+        assert!(!cache::check_cache_health().expect("health check"));
+
+        // Recover cache
+        let report = cache::recover_cache(false).expect("recover cache");
+
+        // Verify backup file exists and holds the original corrupt content
+        assert!(report.backup_path.exists(), "backup file must exist");
+        let backup_content = std::fs::read(&report.backup_path).expect("read backup");
+        assert_eq!(
+            backup_content, corrupt_content,
+            "backup file must contain the exact original corrupt content"
+        );
+
+        // Verify sidecar was quarantined
+        assert!(
+            !report.sidecars_quarantined.is_empty(),
+            "sidecar should be quarantined"
+        );
+        for sidecar in &report.sidecars_quarantined {
+            assert!(
+                sidecar.exists(),
+                "sidecar backup must exist: {}",
+                sidecar.display()
+            );
+        }
+
+        // Verify fresh database is initialized and works
+        assert!(db_file.exists(), "new cache.db must exist");
+        let fresh_content = std::fs::read(&db_file).expect("read fresh db");
+        assert_ne!(
+            fresh_content, corrupt_content,
+            "new cache.db must not be the corrupt one"
+        );
+
+        // Saving and loading on the fresh database must succeed
+        cache::save_estimate(
+            "new_hash",
+            "new_func",
+            &[],
+            "testnet",
+            42,
+            500,
+            50,
+            25,
+            None,
+            true,
+        )
+        .expect("save on recovered cache");
+
+        let loaded = cache::load_estimate("new_hash", "new_func", &[])
+            .expect("load on recovered cache")
+            .expect("estimate exists");
+        assert_eq!(loaded.ledger, 42);
+
+        // Recovering again without force should return an error because database is healthy now
+        let err = cache::recover_cache(false).unwrap_err();
+        assert!(
+            err.to_string().contains("not corrupt"),
+            "recovering healthy cache without --force should fail"
+        );
+
+        // But recovering with force should succeed
+        let force_report = cache::recover_cache(true).expect("force recover");
+        assert!(force_report.backup_path.exists());
+    });
+}

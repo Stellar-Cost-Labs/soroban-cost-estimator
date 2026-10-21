@@ -151,6 +151,9 @@ pub enum AppError {
     Json(#[from] serde_json::Error),
 
     // ── Cache database ─────────────────────────────────────────────
+    #[error("cache database corrupt: {0}")]
+    CacheCorrupt(String),
+
     #[error("failed to access cache database: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
@@ -235,6 +238,7 @@ mod tests {
             AppError::ConfigFetch("boom".to_string()),
             AppError::ConfigSettingNotFound("CONFIG_SETTING_CONTRACT_COMPUTE_V0".to_string()),
             AppError::Json(serde_json::from_str::<u8>("nope").unwrap_err()),
+            AppError::CacheCorrupt("cache.db: malformed disk image".to_string()),
             AppError::General("could not determine home directory".to_string()),
         ];
 
