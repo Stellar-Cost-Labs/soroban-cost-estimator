@@ -191,8 +191,60 @@ fn env_or_file_bool(value: bool, file: Option<bool>) -> bool {
         .unwrap_or(value)
 }
 
+/// Stack size, in bytes, of the thread the CLI runs on.
+///
+/// `clap`'s derive macros build the entire command tree on the stack, and an
+/// unoptimized build needs close to a megabyte of stack for it: every
+/// `clap::Arg` and `clap::Command` is a ~600 byte value that the generated
+/// builder chain copies onto the stack once per call. The main thread of a
+/// Windows process is capped at 1 MiB by the linker, so building the command
+/// tree there overflows the stack and aborts the process before any command
+/// runs.
+///
+/// Running the CLI on a dedicated thread with a generous stack keeps the
+/// command tree off the (small) process main thread and leaves headroom for
+/// future commands. The cost is one extra thread per invocation.
+const CLI_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+/// Exit code used when the CLI worker thread panics.
+///
+/// This matches the status Rust uses for a panic that unwinds out of
+/// `main`, so the process exit code stays the same whether or not the CLI
+/// runs on a worker thread.
+const PANIC_EXIT_CODE: i32 = 101;
+
+/// Entry point of the CLI.
+///
+/// The real work happens on a dedicated thread with a large stack (see
+/// [`CLI_STACK_SIZE`]); this function only starts that thread and turns its
+/// result into the process exit code.
+fn main() {
+    let handle = match std::thread::Builder::new()
+        .name("soroban-cost-estimator".to_string())
+        .stack_size(CLI_STACK_SIZE)
+        .spawn(run_cli)
+    {
+        Ok(handle) => handle,
+        Err(err) => {
+            eprintln!("Error: failed to start the CLI worker thread: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    match handle.join() {
+        Ok(exit_code) => std::process::exit(exit_code),
+        // The panic message has already been printed by the default panic
+        // hook; only the exit status is left to propagate.
+        Err(_) => std::process::exit(PANIC_EXIT_CODE),
+    }
+}
+
+/// Runs the CLI and returns the process exit code.
+///
+/// `0` means the command succeeded, `1` means it failed with a reported
+/// error.
 #[tokio::main]
-async fn main() {
+async fn run_cli() -> i32 {
     let args = cli::Cli::parse();
 
     cli::init_color(args.color);
@@ -218,8 +270,10 @@ async fn main() {
     if let Err(err) = run(args).await {
         error!(error = %err, "command failed");
         eprintln!("Error: {err}");
-        std::process::exit(1);
+        return 1;
     }
+
+    0
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4039,6 +4093,30 @@ fn stale_estimates_for(network: &str, ledger: u32) -> Vec<cache::CachedEstimate>
         .unwrap_or_default()
 }
 
+/// Loads the snapshot a diff compares against.
+///
+/// Either an explicit path or the latest snapshot for the network. The
+/// payload keeps any field this build does not recognize so the diff can
+/// report it instead of ignoring it.
+///
+/// # Network calls
+/// None — pure file I/O.
+fn load_baseline_payload(
+    network: &str,
+    against_path: Option<&str>,
+) -> error::AppResult<config_snapshot::model::SnapshotPayload> {
+    match against_path {
+        Some(path) => {
+            debug!(path, "loading snapshot from path");
+            config_snapshot::store::load_snapshot_payload_from_path(path)
+        }
+        None => {
+            debug!("loading latest snapshot");
+            config_snapshot::store::load_latest_snapshot_payload(network)
+        }
+    }
+}
+
 /// `config diff` command: compare current config against a snapshot.
 /// `config diff` command: compare current config against a snapshot.
 ///
@@ -4076,16 +4154,7 @@ async fn cmd_config_diff(
 
     let span = info_span!("cmd_config_diff", network);
     async {
-        let old_snapshot = match against_path {
-            Some(path) => {
-                debug!(path, "loading snapshot from path");
-                config_snapshot::store::load_snapshot_from_path(path)?
-            }
-            None => {
-                debug!("loading latest snapshot");
-                config_snapshot::store::load_latest_snapshot(network)?
-            }
-        };
+        let old_payload = load_baseline_payload(network, against_path)?;
 
         let new_snapshot = fetch_config_snapshot(
             network,
@@ -4098,8 +4167,10 @@ async fn cmd_config_diff(
             verbose,
         )
         .await?;
+        let new_payload =
+            config_snapshot::model::SnapshotPayload::from_snapshot(new_snapshot.clone());
 
-        let mut diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
+        let mut diff = config_snapshot::diff::diff_payloads(&old_payload, &new_payload);
         if pricing_only {
             diff = config_snapshot::diff::pricing_only(&diff);
         }
@@ -4198,8 +4269,10 @@ fn cmd_config_diff_against_previous(
     quiet: bool,
 ) -> error::AppResult<()> {
     debug!(network, "diffing the two most recent snapshots");
-    let (old_snapshot, new_snapshot) = config_snapshot::store::load_last_two_snapshots(network)?;
-    let mut diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
+    let (old_payload, new_payload) =
+        config_snapshot::store::load_last_two_snapshot_payloads(network)?;
+    let new_ledger = new_payload.snapshot.ledger;
+    let mut diff = config_snapshot::diff::diff_payloads(&old_payload, &new_payload);
     if pricing_only {
         diff = config_snapshot::diff::pricing_only(&diff);
     }
@@ -4212,7 +4285,7 @@ fn cmd_config_diff_against_previous(
     if json_flag {
         let json_output = serde_json::json!({
             "diff": diff,
-            "stale_estimates": stale_estimates_for(network, new_snapshot.ledger),
+            "stale_estimates": stale_estimates_for(network, new_ledger),
         });
         println!("{}", serde_json::to_string_pretty(&json_output)?);
     } else if summary {
@@ -4227,7 +4300,7 @@ fn cmd_config_diff_against_previous(
                 threshold_percent,
             )
         );
-        print_stale_estimates(network, new_snapshot.ledger, quiet);
+        print_stale_estimates(network, new_ledger, quiet);
     }
 
     let exit_code = config_snapshot::diff::resolve_exit_code(
@@ -4822,48 +4895,6 @@ fn cmd_cache_verify(quiet: bool) -> error::AppResult<()> {
     Ok(())
 }
 
-/// `cache list` command: list every cached estimate for a network.
-///
-/// Prints a table (or the full records as a JSON array when `--json` is
-/// passed), newest estimate first. An empty cache prints a friendly message.
-///
-/// # Network calls
-/// None â€” pure SQLite I/O.
-fn cmd_cache_list(network: &str, json: bool) -> error::AppResult<()> {
-    let estimates = cache::list_cached_estimates(network)?;
-
-    if json {
-        println!("{}", serde_json::to_string_pretty(&estimates)?);
-        return Ok(());
-    }
-
-    if estimates.is_empty() {
-        println!("No cached estimates for {network}.");
-        return Ok(());
-    }
-
-    let mut table = Table::new();
-    table.set_header(vec![
-        "Function",
-        "WASM Hash",
-        "Fee (stroops)",
-        "Ledger",
-        "Timestamp",
-    ]);
-    for e in &estimates {
-        table.add_row(vec![
-            Cell::new(e.function.as_str()),
-            Cell::new(truncate_hash(&e.wasm_hash)),
-            Cell::new(e.total_stroops),
-            Cell::new(e.ledger),
-            Cell::new(e.timestamp.as_str()),
-        ]);
-    }
-    println!("{table}");
-    println!("{} cached estimate(s) for {network}.", estimates.len());
-    Ok(())
-}
-
 /// Truncate a WASM hash to its first 12 characters for compact table display.
 fn truncate_hash(hash: &str) -> String {
     if hash.chars().count() > 12 {
@@ -4898,6 +4929,7 @@ fn cmd_cache_clear(network: &str, quiet: bool) -> error::AppResult<()> {
 /// # Network calls
 /// None â€” pure file I/O.
 /// Dispatch cache actions for either `cache <action>` or `config cache <action>`.
+#[allow(clippy::too_many_lines)]
 async fn handle_cache_action(
     action: cli::CacheAction,
     cli_format: Option<cli::OutputFormat>,
@@ -4945,7 +4977,50 @@ async fn handle_cache_action(
             )
             .await
         }
-        cli::CacheAction::List { network, json } => cmd_cache_list(&network, json),
+        cli::CacheAction::List {
+            network,
+            r#fn,
+            wasm_hash,
+            since,
+            to,
+            older_than,
+            limit,
+            offset,
+            json,
+        } => cmd_cache_list(
+            network.as_deref(),
+            r#fn.as_deref(),
+            wasm_hash.as_deref(),
+            since.as_deref(),
+            to.as_deref(),
+            older_than.as_deref(),
+            limit,
+            offset,
+            json,
+        ),
+        cli::CacheAction::Delete {
+            network,
+            r#fn,
+            wasm_hash,
+            since,
+            to,
+            older_than,
+            all,
+            dry_run,
+            yes,
+            json,
+        } => cmd_cache_delete(
+            network.as_deref(),
+            r#fn.as_deref(),
+            wasm_hash.as_deref(),
+            since.as_deref(),
+            to.as_deref(),
+            older_than.as_deref(),
+            all,
+            dry_run,
+            yes,
+            json,
+        ),
         cli::CacheAction::Verify => cmd_cache_verify(quiet),
         cli::CacheAction::Clear { network } => cmd_cache_clear(&network, quiet),
         cli::CacheAction::Prune => cmd_cache_prune(),
@@ -4971,6 +5046,261 @@ async fn handle_cache_action(
         ),
         cli::CacheAction::Stats { json } => cmd_cache_stats(json, quiet),
     }
+}
+
+/// Builds a cache filter from the CLI flags shared by `cache list` and
+/// `cache delete`.
+///
+/// The same builder is used by both commands so a filter selects exactly
+/// the same entries when listing and when deleting.
+///
+/// `--older-than` is an upper bound on the entry timestamp as well; when
+/// both bounds are given the earlier one wins.
+///
+/// # Network calls
+/// None — pure validation.
+fn build_cache_filter(
+    network: Option<&str>,
+    function: Option<&str>,
+    wasm_hash: Option<&str>,
+    since: Option<&str>,
+    to: Option<&str>,
+    older_than: Option<&str>,
+) -> error::AppResult<cache::CacheFilter> {
+    let since_dt = match since {
+        Some(value) => Some(cache::parse_since_timestamp(value)?),
+        None => None,
+    };
+    let to_dt = match to {
+        Some(value) => Some(cache::parse_to_timestamp(value)?),
+        None => None,
+    };
+
+    let cutoff = match older_than {
+        Some(age) => {
+            let seconds = parse_duration_secs(age)?;
+            let seconds = i64::try_from(seconds).unwrap_or(i64::MAX);
+            Some(chrono::Utc::now() - chrono::TimeDelta::seconds(seconds))
+        }
+        None => None,
+    };
+
+    // The earlier of the two upper bounds wins.
+    let to_dt = match (to_dt, cutoff) {
+        (Some(explicit), Some(cutoff)) => Some(explicit.min(cutoff)),
+        (explicit, cutoff) => explicit.or(cutoff),
+    };
+
+    let filter = cache::CacheFilter {
+        function: function.map(str::to_string),
+        wasm_hash: wasm_hash.map(str::to_string),
+        network: network.map(str::to_string),
+        min_fee: None,
+        max_fee: None,
+        since: since_dt,
+        to: to_dt,
+    };
+    filter.validate()?;
+    Ok(filter)
+}
+
+/// Parses a duration like `3600`, `3600s`, `30m`, `1h`, or `1d` into seconds.
+///
+/// Unlike [`parse_interval_secs`], an unparseable duration is an error
+/// rather than a silent fallback: a mistyped `--older-than` must not widen
+/// or narrow a deletion by accident.
+fn parse_duration_secs(input: &str) -> error::AppResult<u64> {
+    let trimmed = input.trim().to_ascii_lowercase();
+    let (num_part, mult) = match trimmed.chars().last() {
+        Some('s') => (&trimmed[..trimmed.len() - 1], 1u64),
+        Some('m') => (&trimmed[..trimmed.len() - 1], 60u64),
+        Some('h') => (&trimmed[..trimmed.len() - 1], 3_600u64),
+        Some('d') => (&trimmed[..trimmed.len() - 1], 86_400u64),
+        _ => (trimmed.as_str(), 1u64),
+    };
+    num_part
+        .parse::<u64>()
+        .map(|value| value.saturating_mul(mult))
+        .map_err(|_| {
+            error::AppError::General(format!(
+                "invalid duration {input:?}: expected a number optionally followed by s, m, h or d"
+            ))
+        })
+}
+
+/// `cache list` command: list the cached estimates matching the given
+/// filters.
+///
+/// Prints a table (or the full records as JSON when `--json` is passed). The
+/// listing is paginated and bounded so a large cache cannot flood the
+/// terminal.
+///
+/// # Network calls
+/// None — pure local SQLite I/O.
+#[allow(clippy::too_many_arguments)]
+fn cmd_cache_list(
+    network: Option<&str>,
+    function: Option<&str>,
+    wasm_hash: Option<&str>,
+    since: Option<&str>,
+    to: Option<&str>,
+    older_than: Option<&str>,
+    limit: usize,
+    offset: usize,
+    json: bool,
+) -> error::AppResult<()> {
+    let filter = build_cache_filter(network, function, wasm_hash, since, to, older_than)?;
+    let listing = cache::list_cached_estimates_paginated(&filter, limit, offset)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&listing.entries)?);
+        return Ok(());
+    }
+
+    if listing.entries.is_empty() {
+        println!("No cached estimates match the filters.");
+        return Ok(());
+    }
+
+    let mut table = Table::new();
+    if crate::cli::should_colorize() {
+        table.enforce_styling();
+    } else {
+        table.force_no_tty();
+    }
+    table.set_header(vec![
+        "Timestamp",
+        "Function",
+        "Network",
+        "WASM Hash",
+        "Fee (stroops)",
+        "Ledger",
+    ]);
+    for e in &listing.entries {
+        table.add_row(vec![
+            Cell::new(e.timestamp.as_str()),
+            Cell::new(e.function.as_str()),
+            Cell::new(e.network.as_str()),
+            Cell::new(truncate_hash(&e.wasm_hash)),
+            Cell::new(e.total_stroops),
+            Cell::new(e.ledger),
+        ]);
+    }
+    println!("{table}");
+    println!(
+        "Showing {} of {} matching estimate(s) (offset {}).",
+        listing.entries.len(),
+        listing.total,
+        listing.offset
+    );
+    Ok(())
+}
+
+/// `cache delete` command: remove the cached estimates matching the filters.
+///
+/// The command reports how many entries match before touching anything and
+/// requires an explicit confirmation (interactive prompt or `--yes`) before
+/// deleting. `--dry-run` stops after the count.
+///
+/// # Network calls
+/// None — pure local SQLite I/O.
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+fn cmd_cache_delete(
+    network: Option<&str>,
+    function: Option<&str>,
+    wasm_hash: Option<&str>,
+    since: Option<&str>,
+    to: Option<&str>,
+    older_than: Option<&str>,
+    all: bool,
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+) -> error::AppResult<()> {
+    let filter = build_cache_filter(network, function, wasm_hash, since, to, older_than)?;
+
+    // `--all` means "every entry on every network". Combining it with a
+    // filter would be ambiguous — the filter would silently narrow a
+    // whole-cache deletion — so the combination is rejected instead.
+    if all && !filter_is_empty(&filter) {
+        return Err(error::AppError::General(
+            "--all cannot be combined with a filter — --all removes every cached \
+             estimate on every network; drop --all to delete only the matching entries"
+                .to_string(),
+        ));
+    }
+
+    if !all && filter_is_empty(&filter) {
+        return Err(error::AppError::General(
+            "refusing to delete cached estimates without a filter — pass a filter \
+             (e.g. --network) or --all to remove every entry"
+                .to_string(),
+        ));
+    }
+
+    let matched = cache::count_cached_estimates(&filter)?;
+
+    if dry_run {
+        if json {
+            let payload = serde_json::json!({
+                "matched": matched,
+                "removed": 0,
+                "dry_run": true,
+            });
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        } else {
+            println!("Would delete {matched} cached estimate(s) — dry run, nothing removed.");
+        }
+        return Ok(());
+    }
+
+    if matched == 0 {
+        if json {
+            let payload = serde_json::json!({
+                "matched": 0,
+                "removed": 0,
+                "dry_run": false,
+            });
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        } else {
+            println!("No cached estimates match the filters — nothing to delete.");
+        }
+        return Ok(());
+    }
+
+    if !yes && !confirm(&format!("Delete {matched} cached estimate(s)?")) {
+        println!("Aborted — no cached estimates deleted (pass --yes to skip the prompt).");
+        return Ok(());
+    }
+
+    let removed = cache::delete_cached_estimates(&filter)?;
+
+    if json {
+        let payload = serde_json::json!({
+            "matched": matched,
+            "removed": removed,
+            "dry_run": false,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!("Deleted {removed} cached estimate(s).");
+    }
+
+    Ok(())
+}
+
+/// Whether the filter constrains anything at all.
+///
+/// An empty filter matches every cached estimate, which is why a
+/// destructive operation refuses to run without an explicit opt-in.
+fn filter_is_empty(filter: &cache::CacheFilter) -> bool {
+    filter.function.is_none()
+        && filter.wasm_hash.is_none()
+        && filter.network.is_none()
+        && filter.min_fee.is_none()
+        && filter.max_fee.is_none()
+        && filter.since.is_none()
+        && filter.to.is_none()
 }
 
 /// `cache query` / `config cache query` command: list cached estimates matching the given filters.

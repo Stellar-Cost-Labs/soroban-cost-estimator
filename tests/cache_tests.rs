@@ -2784,3 +2784,332 @@ fn test_legacy_database_without_io_column_still_loads() {
         );
     });
 }
+
+// ── Cache listing and filtered deletion (#516, #517) ───────────────────────
+
+/// Seeds one cache entry for the listing and deletion tests.
+fn seed_listing_entry(
+    wasm_hash: &str,
+    function: &str,
+    network: &str,
+    ledger: u32,
+    total_stroops: i64,
+) {
+    cache::save_estimate(
+        wasm_hash,
+        function,
+        &[],
+        network,
+        ledger,
+        total_stroops,
+        100,
+        50,
+        None,
+        true,
+    )
+    .expect("seed estimate");
+}
+
+/// A filter that matches nothing but is still valid.
+fn filter_for_network(network: &str) -> cache::CacheFilter {
+    cache::CacheFilter {
+        network: Some(network.to_string()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_list_cached_estimates_paginated_filters_by_network() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+        seed_listing_entry("bb22", "approve", "mainnet", 2, 200);
+
+        let listing = cache::list_cached_estimates_paginated(&filter_for_network("testnet"), 50, 0)
+            .expect("list estimates");
+
+        assert_eq!(listing.total, 1);
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].function, "transfer");
+        assert_eq!(listing.entries[0].network, "testnet");
+    });
+}
+
+#[test]
+fn test_list_cached_estimates_paginated_without_network_filter_covers_every_network() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+        seed_listing_entry("bb22", "approve", "mainnet", 2, 200);
+
+        let listing = cache::list_cached_estimates_paginated(&cache::CacheFilter::default(), 50, 0)
+            .expect("list estimates");
+
+        assert_eq!(listing.total, 2);
+        assert_eq!(listing.entries.len(), 2);
+    });
+}
+
+#[test]
+fn test_list_cached_estimates_paginated_matches_function_exactly() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+        seed_listing_entry("aa11", "approve", "testnet", 2, 200);
+
+        let filter = cache::CacheFilter {
+            function: Some("transfer".to_string()),
+            ..Default::default()
+        };
+        let listing =
+            cache::list_cached_estimates_paginated(&filter, 50, 0).expect("list estimates");
+
+        assert_eq!(listing.total, 1);
+        assert_eq!(listing.entries[0].function, "transfer");
+    });
+}
+
+#[test]
+fn test_list_cached_estimates_paginated_matches_wasm_hash_prefix() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aabbccdd", "transfer", "testnet", 1, 100);
+        seed_listing_entry("ffeeddcc", "transfer", "testnet", 2, 200);
+
+        let filter = cache::CacheFilter {
+            wasm_hash: Some("aabb".to_string()),
+            ..Default::default()
+        };
+        let listing =
+            cache::list_cached_estimates_paginated(&filter, 50, 0).expect("list estimates");
+
+        assert_eq!(listing.total, 1);
+        assert_eq!(listing.entries[0].wasm_hash, "aabbccdd");
+    });
+}
+
+#[test]
+fn test_list_cached_estimates_paginated_empty_result() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+
+        let filter = cache::CacheFilter {
+            function: Some("does-not-exist".to_string()),
+            ..Default::default()
+        };
+        let listing =
+            cache::list_cached_estimates_paginated(&filter, 50, 0).expect("list estimates");
+
+        assert_eq!(listing.total, 0);
+        assert!(listing.entries.is_empty());
+    });
+}
+
+#[test]
+fn test_list_cached_estimates_paginated_paginates() {
+    with_temp_home(|_tmp| {
+        for index in 0..5u32 {
+            seed_listing_entry("aa11", &format!("fn{index}"), "testnet", index + 1, 100);
+        }
+
+        let first = cache::list_cached_estimates_paginated(&cache::CacheFilter::default(), 2, 0)
+            .expect("list estimates");
+        assert_eq!(first.total, 5);
+        assert_eq!(first.entries.len(), 2);
+        assert_eq!(first.limit, 2);
+        assert_eq!(first.offset, 0);
+
+        let second = cache::list_cached_estimates_paginated(&cache::CacheFilter::default(), 2, 2)
+            .expect("list estimates");
+        assert_eq!(second.total, 5);
+        assert_eq!(second.entries.len(), 2);
+        assert_eq!(second.offset, 2);
+
+        // The pages must not overlap.
+        let first_names: Vec<&str> = first.entries.iter().map(|e| e.function.as_str()).collect();
+        let second_names: Vec<&str> = second.entries.iter().map(|e| e.function.as_str()).collect();
+        for name in &second_names {
+            assert!(!first_names.contains(name), "pages overlap on {name}");
+        }
+    });
+}
+
+#[test]
+fn test_list_cached_estimates_paginated_caps_the_limit() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+
+        let listing =
+            cache::list_cached_estimates_paginated(&cache::CacheFilter::default(), 100_000, 0)
+                .expect("list estimates");
+        assert_eq!(listing.limit, cache::MAX_LIST_LIMIT);
+    });
+}
+
+#[test]
+fn test_list_cached_estimates_paginated_rejects_an_invalid_wasm_hash() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+
+        let filter = cache::CacheFilter {
+            wasm_hash: Some("not-hex".to_string()),
+            ..Default::default()
+        };
+        let error =
+            cache::list_cached_estimates_paginated(&filter, 50, 0).expect_err("invalid hash");
+        assert!(
+            error.to_string().contains("invalid wasm hash filter"),
+            "error should explain the bad hash: {error}"
+        );
+    });
+}
+
+#[test]
+fn test_list_cached_estimates_paginated_filters_by_time_range() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+
+        let now = chrono::Utc::now();
+        let inside = cache::CacheFilter {
+            since: Some(now - chrono::TimeDelta::hours(1)),
+            to: Some(now + chrono::TimeDelta::hours(1)),
+            ..Default::default()
+        };
+        assert_eq!(
+            cache::list_cached_estimates_paginated(&inside, 50, 0)
+                .expect("list estimates")
+                .total,
+            1
+        );
+
+        let outside = cache::CacheFilter {
+            since: Some(now + chrono::TimeDelta::hours(1)),
+            ..Default::default()
+        };
+        assert_eq!(
+            cache::list_cached_estimates_paginated(&outside, 50, 0)
+                .expect("list estimates")
+                .total,
+            0
+        );
+    });
+}
+
+#[test]
+fn test_count_cached_estimates_matches_the_listing() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+        seed_listing_entry("bb22", "approve", "testnet", 2, 200);
+        seed_listing_entry("cc33", "transfer", "mainnet", 3, 300);
+
+        let filter = filter_for_network("testnet");
+        assert_eq!(cache::count_cached_estimates(&filter).expect("count"), 2);
+        assert_eq!(
+            cache::list_cached_estimates_paginated(&filter, 50, 0)
+                .expect("list estimates")
+                .total,
+            2
+        );
+    });
+}
+
+#[test]
+fn test_delete_cached_estimates_removes_only_the_matching_entries() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+        seed_listing_entry("aa11", "approve", "testnet", 2, 200);
+        seed_listing_entry("bb22", "transfer", "mainnet", 3, 300);
+
+        let filter = cache::CacheFilter {
+            network: Some("testnet".to_string()),
+            function: Some("transfer".to_string()),
+            ..Default::default()
+        };
+        let removed = cache::delete_cached_estimates(&filter).expect("delete estimates");
+        assert_eq!(removed, 1);
+
+        // The matching entry is gone, the others survive untouched.
+        let remaining =
+            cache::list_cached_estimates_paginated(&cache::CacheFilter::default(), 50, 0)
+                .expect("list estimates");
+        assert_eq!(remaining.total, 2);
+        let functions: Vec<&str> = remaining
+            .entries
+            .iter()
+            .map(|e| e.function.as_str())
+            .collect();
+        assert!(functions.contains(&"approve"));
+        assert!(functions.contains(&"transfer"));
+    });
+}
+
+#[test]
+fn test_delete_cached_estimates_without_matches_removes_nothing() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+
+        let filter = cache::CacheFilter {
+            function: Some("does-not-exist".to_string()),
+            ..Default::default()
+        };
+        let removed = cache::delete_cached_estimates(&filter).expect("delete estimates");
+        assert_eq!(removed, 0);
+        assert_eq!(
+            cache::list_cached_estimates_paginated(&cache::CacheFilter::default(), 50, 0)
+                .expect("list estimates")
+                .total,
+            1
+        );
+    });
+}
+
+#[test]
+fn test_delete_cached_estimates_never_touches_other_networks() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+        seed_listing_entry("bb22", "transfer", "mainnet", 2, 200);
+
+        let removed =
+            cache::delete_cached_estimates(&filter_for_network("testnet")).expect("delete");
+        assert_eq!(removed, 1);
+
+        let mainnet = filter_for_network("mainnet");
+        assert_eq!(
+            cache::list_cached_estimates_paginated(&mainnet, 50, 0)
+                .expect("list estimates")
+                .total,
+            1
+        );
+    });
+}
+
+#[test]
+fn test_delete_cached_estimates_uses_the_same_matching_as_queries() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+        seed_listing_entry("bb22", "approve", "testnet", 2, 200);
+
+        let filter = cache::CacheFilter {
+            function: Some("transfer".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cache::count_cached_estimates(&filter).expect("count"),
+            cache::query_cache(&filter).expect("query").len()
+        );
+        assert_eq!(cache::delete_cached_estimates(&filter).expect("delete"), 1);
+    });
+}
+
+#[test]
+fn test_delete_cached_estimates_rejects_an_invalid_filter() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+
+        let filter = cache::CacheFilter {
+            wasm_hash: Some("zz".to_string()),
+            ..Default::default()
+        };
+        let error = cache::delete_cached_estimates(&filter).expect_err("invalid hash");
+        assert!(
+            error.to_string().contains("invalid wasm hash filter"),
+            "error should explain the bad hash: {error}"
+        );
+    });
+}

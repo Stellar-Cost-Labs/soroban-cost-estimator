@@ -62,6 +62,83 @@ pub struct ConfigSnapshot {
     pub state_archival: Option<StateArchivalV0>,
 }
 
+/// Top-level field names of [`ConfigSnapshot`] understood by this build.
+///
+/// Any other top-level field found in a stored snapshot is reported as an
+/// *unknown* field rather than being silently dropped.
+pub const KNOWN_SNAPSHOT_FIELDS: &[&str] = &[
+    "network",
+    "timestamp",
+    "ledger",
+    "protocol_version",
+    "contract_compute",
+    "contract_ledger_cost",
+    "contract_historical_data",
+    "contract_events",
+    "contract_bandwidth",
+    "state_archival",
+];
+
+/// A snapshot together with any top-level fields this build does not model.
+///
+/// Deserialization stays forward-compatible: `serde` ignores fields it does
+/// not know, so a snapshot written by a newer version of the tool still
+/// loads. [`SnapshotPayload::unknown_fields`] keeps those fields around so
+/// a diff can surface them explicitly instead of pretending nothing
+/// changed.
+#[derive(Debug, Clone)]
+pub struct SnapshotPayload {
+    /// The deserialized snapshot.
+    pub snapshot: ConfigSnapshot,
+    /// Top-level fields present in the stored JSON that this build does not
+    /// understand, keyed by field name.
+    pub unknown_fields: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+impl SnapshotPayload {
+    /// Wrap an already-parsed snapshot (no unknown fields).
+    pub fn from_snapshot(snapshot: ConfigSnapshot) -> Self {
+        Self {
+            snapshot,
+            unknown_fields: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Parse a snapshot from JSON text, capturing unrecognized top-level
+    /// fields.
+    ///
+    /// Unknown fields never make parsing fail — they are collected in
+    /// [`SnapshotPayload::unknown_fields`] so callers can report them.
+    pub fn parse(json: &str) -> Result<Self, serde_json::Error> {
+        let value: serde_json::Value = serde_json::from_str(json)?;
+        let snapshot: ConfigSnapshot = serde_json::from_value(value.clone())?;
+        let unknown_fields = value
+            .as_object()
+            .map(|object| {
+                object
+                    .iter()
+                    .filter(|(name, _)| !KNOWN_SNAPSHOT_FIELDS.contains(&name.as_str()))
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Self {
+            snapshot,
+            unknown_fields,
+        })
+    }
+
+    /// Names of the unrecognized top-level fields, sorted.
+    pub fn unknown_field_names(&self) -> Vec<String> {
+        self.unknown_fields.keys().cloned().collect()
+    }
+
+    /// Whether the payload carries at least one unrecognized field.
+    pub fn has_unknown_fields(&self) -> bool {
+        !self.unknown_fields.is_empty()
+    }
+}
+
 /// ConfigSettingContractComputeV0
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContractComputeV0 {

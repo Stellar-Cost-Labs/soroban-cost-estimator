@@ -405,13 +405,91 @@ pub enum CacheAction {
         network: Option<String>,
     },
 
-    /// List every cached estimate for a network (newest first).
+    /// List cached estimates with optional filters (newest first).
+    ///
+    /// Without `--network`, entries from every network are listed.
     List {
-        /// Network whose cached estimates to list.
-        #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
-        network: String,
+        /// Network to filter by (omit to list every network).
+        #[arg(long, value_parser = NetworkValueParser)]
+        network: Option<String>,
+
+        /// Filter by function name (exact match).
+        #[arg(long = "fn", visible_alias = "function")]
+        r#fn: Option<String>,
+
+        /// Filter by WASM hash (prefix match, hexadecimal).
+        #[arg(long)]
+        wasm_hash: Option<String>,
+
+        /// Earliest timestamp or date.
+        #[arg(long = "since", visible_alias = "from", value_name = "DATE/TIME")]
+        since: Option<String>,
+
+        /// Latest timestamp or date.
+        #[arg(long, value_name = "TIMESTAMP")]
+        to: Option<String>,
+
+        /// Only entries older than this age (e.g. "30d", "12h", "3600").
+        #[arg(long, value_name = "DURATION")]
+        older_than: Option<String>,
+
+        /// Maximum number of entries to return.
+        #[arg(long, default_value_t = crate::cache::DEFAULT_LIST_LIMIT)]
+        limit: usize,
+
+        /// Number of matching entries to skip before listing.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
 
         /// Output the full cached-estimate records as a JSON array.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Delete the cached estimates matching the given filters.
+    ///
+    /// Requires at least one filter (or `--all`), and asks for confirmation
+    /// before removing anything unless `--yes` is given.
+    Delete {
+        /// Network to filter by (omit to match every network).
+        #[arg(long, value_parser = NetworkValueParser)]
+        network: Option<String>,
+
+        /// Filter by function name (exact match).
+        #[arg(long = "fn", visible_alias = "function")]
+        r#fn: Option<String>,
+
+        /// Filter by WASM hash (prefix match, hexadecimal).
+        #[arg(long)]
+        wasm_hash: Option<String>,
+
+        /// Earliest timestamp or date.
+        #[arg(long = "since", visible_alias = "from", value_name = "DATE/TIME")]
+        since: Option<String>,
+
+        /// Latest timestamp or date.
+        #[arg(long, value_name = "TIMESTAMP")]
+        to: Option<String>,
+
+        /// Only entries older than this age (e.g. "30d", "12h", "3600").
+        #[arg(long, value_name = "DURATION")]
+        older_than: Option<String>,
+
+        /// Delete every cached estimate, on every network.
+        ///
+        /// Cannot be combined with a filter.
+        #[arg(long)]
+        all: bool,
+
+        /// Report how many entries would be removed without deleting them.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip the confirmation prompt (required in non-interactive sessions).
+        #[arg(long, short = 'y')]
+        yes: bool,
+
+        /// Output as JSON instead of a human-readable summary.
         #[arg(long)]
         json: bool,
     },

@@ -1554,6 +1554,117 @@ pub fn query_estimates(network: &str, filter: &QueryFilter) -> AppResult<Vec<Cac
     query_cache(&cache_filter)
 }
 
+/// Default number of entries returned by a cache listing.
+pub const DEFAULT_LIST_LIMIT: usize = 50;
+
+/// Maximum number of entries a single cache listing may return.
+pub const MAX_LIST_LIMIT: usize = 1000;
+
+/// A page of cached estimates together with the total number of matches.
+///
+/// `total` counts every entry matching the filter, before pagination, so a
+/// caller can tell "3 of 120 shown" from "3 of 3 shown".
+#[derive(Debug, Clone)]
+pub struct CacheListing {
+    /// The entries on this page.
+    pub entries: Vec<CachedEstimate>,
+    /// Total number of entries matching the filter.
+    pub total: usize,
+    /// Number of entries skipped before this page.
+    pub offset: usize,
+    /// Maximum number of entries requested (after capping).
+    pub limit: usize,
+}
+
+/// Lists the cached estimates matching `filter`, one bounded page at a time.
+///
+/// The filter semantics are exactly those of [`query_cache`]; this only
+/// adds pagination on top. `limit` is capped at [`MAX_LIST_LIMIT`] so a
+/// listing can never dump an unbounded cache to the terminal.
+///
+/// # Network calls
+/// None — pure local SQLite I/O.
+pub fn list_cached_estimates_paginated(
+    filter: &CacheFilter,
+    limit: usize,
+    offset: usize,
+) -> AppResult<CacheListing> {
+    let limit = limit.min(MAX_LIST_LIMIT);
+    let matched = query_cache(filter)?;
+    let total = matched.len();
+    let entries = matched.into_iter().skip(offset).take(limit).collect();
+    Ok(CacheListing {
+        entries,
+        total,
+        offset,
+        limit,
+    })
+}
+
+/// Counts the cached estimates matching `filter`.
+///
+/// # Network calls
+/// None — pure local SQLite I/O.
+pub fn count_cached_estimates(filter: &CacheFilter) -> AppResult<usize> {
+    Ok(query_cache(filter)?.len())
+}
+
+/// Deletes the cached estimates matching `filter`.
+///
+/// Selection and deletion happen inside a single transaction, so the
+/// reported count always matches the number of removed rows and a failure
+/// leaves the cache untouched. The matching semantics are exactly those of
+/// [`query_cache`] — the filter is validated the same way and matched with
+/// the same [`CacheFilter::matches`] implementation.
+///
+/// # Network calls
+/// None — pure local SQLite I/O.
+pub fn delete_cached_estimates(filter: &CacheFilter) -> AppResult<usize> {
+    filter.validate()?;
+
+    let _guard = WRITE_LOCK
+        .lock()
+        .map_err(|e| AppError::General(format!("cache write lock poisoned: {e}")))?;
+
+    let mut conn = open_db()?;
+    let tx = conn.transaction()?;
+
+    let keys: Vec<(String, String, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
+             cpu_instructions, memory_bytes, timestamp, duration_ms, success, io_json \
+             FROM estimates",
+        )?;
+        let rows = stmt.query_map([], estimate_from_row)?;
+
+        let mut keys = Vec::new();
+        for row in rows {
+            let cached = row?;
+            // An entry written by a newer tool cannot be interpreted; it is
+            // left alone rather than deleted blindly.
+            let Ok(cached) = migrate_to_latest(cached) else {
+                continue;
+            };
+            if filter.matches(&cached) {
+                keys.push((cached.wasm_hash, cached.function, cached.args_hash));
+            }
+        }
+        keys
+    };
+
+    let mut removed = 0usize;
+    for (wasm_hash, function, args_hash) in &keys {
+        removed += tx.execute(
+            "DELETE FROM estimates WHERE wasm_hash = ?1 AND function = ?2 AND args_hash = ?3",
+            rusqlite::params![wasm_hash, function, args_hash],
+        )?;
+    }
+
+    tx.commit()?;
+    debug!(removed, "deleted cached estimates");
+    Ok(removed)
+}
+
 /// Export every cached estimate as a deterministic, JSON-serializable list.
 ///
 /// All rows are read from the SQLite cache, migrated to the current schema,

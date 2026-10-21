@@ -4475,3 +4475,492 @@ fn test_config_snapshot_diff_makes_no_network_calls() {
         "offline diff must not resolve a network; got: {stderr}"
     );
 }
+
+// ── Cache listing and filtered deletion (#516, #517) ───────────────────────
+
+#[test]
+fn test_cache_list_help_documents_the_filters() {
+    let (stdout, stderr, code) = run_cli(&["cache", "list", "--help"]);
+    assert_eq!(code, 0, "cache list help should exit 0; stderr: {stderr}");
+    for flag in [
+        "--network",
+        "--fn",
+        "--wasm-hash",
+        "--since",
+        "--to",
+        "--older-than",
+        "--limit",
+        "--offset",
+    ] {
+        assert!(
+            stdout.contains(flag),
+            "cache list help should document {flag}: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_cache_delete_help_documents_the_safety_flags() {
+    let (stdout, stderr, code) = run_cli(&["cache", "delete", "--help"]);
+    assert_eq!(code, 0, "cache delete help should exit 0; stderr: {stderr}");
+    for flag in ["--dry-run", "--yes", "--all"] {
+        assert!(
+            stdout.contains(flag),
+            "cache delete help should document {flag}: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_cache_list_on_an_empty_cache() {
+    let home = temp_home("cache-list-empty");
+    let (stdout, stderr, code) = run_cli_quiet(&["cache", "list"], Some(&home));
+    assert_eq!(code, 0, "cache list should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("No cached estimates match the filters"),
+        "empty listing should say so: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_list_json_output_has_stable_fields() {
+    let home = temp_home("cache-list-json");
+    seed_cache_entry(&home, &chrono::Utc::now().to_rfc3339());
+
+    let (stdout, stderr, code) = run_cli_quiet(&["cache", "list", "--json"], Some(&home));
+    assert_eq!(code, 0, "cache list --json should exit 0; stderr: {stderr}");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    let entries = parsed.as_array().expect("JSON array of records");
+    assert_eq!(entries.len(), 1);
+
+    let entry = &entries[0];
+    for field in [
+        "network",
+        "wasm_hash",
+        "function",
+        "ledger",
+        "total_stroops",
+        "cpu_instructions",
+        "memory_bytes",
+        "timestamp",
+        "success",
+    ] {
+        assert!(
+            entry.get(field).is_some(),
+            "entry should expose {field}: {entry}"
+        );
+    }
+    // The cache never stores the argument payload itself, only its hash.
+    assert!(
+        entry.get("args").is_none(),
+        "entry should not expose argument values: {entry}"
+    );
+}
+
+#[test]
+fn test_cache_list_filters_by_network() {
+    let home = temp_home("cache-list-network");
+    let now = chrono::Utc::now().to_rfc3339();
+    seed_cache_entry_for(&home, "testnet", "transfer", 42, &now);
+    seed_cache_entry_for(&home, "mainnet", "approve", 43, &now);
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &["cache", "list", "--network", "testnet", "--json"],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "cache list should exit 0; stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    let entries = parsed.as_array().expect("JSON array of records");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["network"], "testnet");
+}
+
+#[test]
+fn test_cache_list_combines_filters() {
+    let home = temp_home("cache-list-combined");
+    let now = chrono::Utc::now().to_rfc3339();
+    seed_cache_entry_for(&home, "testnet", "transfer", 42, &now);
+    seed_cache_entry_for(&home, "testnet", "approve", 43, &now);
+    seed_cache_entry_for(&home, "mainnet", "burn", 44, &now);
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "cache",
+            "list",
+            "--network",
+            "testnet",
+            "--fn",
+            "transfer",
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "cache list should exit 0; stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    let entries = parsed.as_array().expect("JSON array of records");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["function"], "transfer");
+}
+
+#[test]
+fn test_cache_list_filters_by_wasm_hash_prefix() {
+    let home = temp_home("cache-list-hash");
+    seed_cache_entry(&home, &chrono::Utc::now().to_rfc3339());
+
+    let wasm_bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
+    let hash = hex::encode(sha2::Sha256::digest(&wasm_bytes));
+    let prefix = &hash[..8];
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &["cache", "list", "--wasm-hash", prefix, "--json"],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "cache list should exit 0; stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    let entries = parsed.as_array().expect("JSON array of records");
+    assert_eq!(entries.len(), 1);
+}
+
+#[test]
+fn test_cache_list_rejects_an_invalid_wasm_hash() {
+    let home = temp_home("cache-list-bad-hash");
+    let (_stdout, stderr, code) =
+        run_cli_quiet(&["cache", "list", "--wasm-hash", "not-hex"], Some(&home));
+    assert_ne!(code, 0, "an invalid hash should fail");
+    assert!(
+        stderr.contains("invalid wasm hash filter"),
+        "stderr should explain the problem: {stderr}"
+    );
+}
+
+#[test]
+fn test_cache_list_rejects_an_invalid_timestamp() {
+    let home = temp_home("cache-list-bad-date");
+    let (_stdout, stderr, code) =
+        run_cli_quiet(&["cache", "list", "--since", "yesterday"], Some(&home));
+    assert_ne!(code, 0, "an invalid timestamp should fail");
+    assert!(
+        stderr.contains("invalid timestamp or date"),
+        "stderr should explain the problem: {stderr}"
+    );
+}
+
+#[test]
+fn test_cache_list_honours_the_limit() {
+    let home = temp_home("cache-list-limit");
+    let now = chrono::Utc::now().to_rfc3339();
+    seed_cache_entry_for(&home, "testnet", "transfer", 42, &now);
+    seed_cache_entry_for(&home, "testnet", "approve", 43, &now);
+    seed_cache_entry_for(&home, "testnet", "burn", 44, &now);
+
+    let (stdout, stderr, code) = run_cli_quiet(&["cache", "list", "--limit", "2"], Some(&home));
+    assert_eq!(code, 0, "cache list should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("Showing 2 of 3 matching estimate(s)"),
+        "listing should report the page: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_delete_without_a_filter_is_refused() {
+    let home = temp_home("cache-delete-no-filter");
+    seed_cache_entry(&home, &chrono::Utc::now().to_rfc3339());
+
+    let (_stdout, stderr, code) = run_cli_quiet(&["cache", "delete", "--yes"], Some(&home));
+    assert_ne!(code, 0, "deleting without a filter should fail");
+    assert!(
+        stderr.contains("refusing to delete cached estimates without a filter"),
+        "stderr should explain the refusal: {stderr}"
+    );
+
+    // Nothing was removed.
+    let (stdout, stderr, code) = run_cli_quiet(&["cache", "list", "--json"], Some(&home));
+    assert_eq!(code, 0, "cache list should exit 0; stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    assert_eq!(parsed.as_array().expect("JSON array").len(), 1);
+}
+
+#[test]
+fn test_cache_delete_dry_run_reports_the_count_without_deleting() {
+    let home = temp_home("cache-delete-dry-run");
+    let now = chrono::Utc::now().to_rfc3339();
+    seed_cache_entry_for(&home, "testnet", "transfer", 42, &now);
+    seed_cache_entry_for(&home, "testnet", "approve", 43, &now);
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &["cache", "delete", "--network", "testnet", "--dry-run"],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "dry run should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("Would delete 2 cached estimate(s)"),
+        "dry run should report the count: {stdout}"
+    );
+
+    // Nothing was removed.
+    let (stdout, stderr, code) = run_cli_quiet(&["cache", "list", "--json"], Some(&home));
+    assert_eq!(code, 0, "cache list should exit 0; stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    assert_eq!(parsed.as_array().expect("JSON array").len(), 2);
+}
+
+#[test]
+fn test_cache_delete_with_yes_removes_only_the_matching_entries() {
+    let home = temp_home("cache-delete-yes");
+    let now = chrono::Utc::now().to_rfc3339();
+    seed_cache_entry_for(&home, "testnet", "transfer", 42, &now);
+    seed_cache_entry_for(&home, "mainnet", "approve", 43, &now);
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &["cache", "delete", "--network", "testnet", "--yes"],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "cache delete should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("Deleted 1 cached estimate(s)"),
+        "deletion should report the count: {stdout}"
+    );
+
+    // The other network is untouched.
+    let (stdout, stderr, code) = run_cli_quiet(&["cache", "list", "--json"], Some(&home));
+    assert_eq!(code, 0, "cache list should exit 0; stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    let entries = parsed.as_array().expect("JSON array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["network"], "mainnet");
+}
+
+#[test]
+fn test_cache_delete_without_confirmation_aborts() {
+    let home = temp_home("cache-delete-abort");
+    seed_cache_entry(&home, &chrono::Utc::now().to_rfc3339());
+
+    // No `--yes`: the confirmation cannot be given in a non-interactive
+    // session, so nothing is deleted.
+    let (stdout, stderr, code) =
+        run_cli_quiet(&["cache", "delete", "--network", "testnet"], Some(&home));
+    assert_eq!(
+        code, 0,
+        "an aborted deletion is not an error; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Aborted"),
+        "the command should report the abort: {stdout}"
+    );
+
+    let (stdout, stderr, code) = run_cli_quiet(&["cache", "list", "--json"], Some(&home));
+    assert_eq!(code, 0, "cache list should exit 0; stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    assert_eq!(parsed.as_array().expect("JSON array").len(), 1);
+}
+
+#[test]
+fn test_cache_delete_all_removes_every_entry() {
+    let home = temp_home("cache-delete-all");
+    let now = chrono::Utc::now().to_rfc3339();
+    seed_cache_entry_for(&home, "testnet", "transfer", 42, &now);
+    seed_cache_entry_for(&home, "mainnet", "approve", 43, &now);
+
+    let (stdout, stderr, code) = run_cli_quiet(&["cache", "delete", "--all", "--yes"], Some(&home));
+    assert_eq!(
+        code, 0,
+        "cache delete --all should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Deleted 2 cached estimate(s)"),
+        "deletion should report the count: {stdout}"
+    );
+
+    let (stdout, stderr, code) = run_cli_quiet(&["cache", "list", "--json"], Some(&home));
+    assert_eq!(code, 0, "cache list should exit 0; stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    assert_eq!(parsed.as_array().expect("JSON array").len(), 0);
+}
+
+#[test]
+fn test_cache_delete_json_output() {
+    let home = temp_home("cache-delete-json");
+    seed_cache_entry(&home, &chrono::Utc::now().to_rfc3339());
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &["cache", "delete", "--network", "testnet", "--yes", "--json"],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 0,
+        "cache delete --json should exit 0; stderr: {stderr}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    assert_eq!(parsed["matched"], 1);
+    assert_eq!(parsed["removed"], 1);
+    assert_eq!(parsed["dry_run"], false);
+}
+
+#[test]
+fn test_cache_delete_older_than_filter() {
+    let home = temp_home("cache-delete-older-than");
+    // One entry from 2020 and one from now: only the old one is older than a
+    // year.
+    seed_cache_entry_for(
+        &home,
+        "testnet",
+        "transfer",
+        42,
+        "2020-01-01T00:00:00+00:00",
+    );
+    seed_cache_entry_for(
+        &home,
+        "testnet",
+        "approve",
+        43,
+        &chrono::Utc::now().to_rfc3339(),
+    );
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "cache",
+            "delete",
+            "--network",
+            "testnet",
+            "--older-than",
+            "365d",
+            "--dry-run",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "cache delete should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("Would delete 1 cached estimate(s)"),
+        "only the stale entry should match: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_delete_rejects_an_invalid_duration() {
+    let home = temp_home("cache-delete-bad-duration");
+    let (_stdout, stderr, code) = run_cli_quiet(
+        &[
+            "cache",
+            "delete",
+            "--network",
+            "testnet",
+            "--older-than",
+            "soon",
+            "--dry-run",
+        ],
+        Some(&home),
+    );
+    assert_ne!(code, 0, "an invalid duration should fail");
+    assert!(
+        stderr.contains("invalid duration"),
+        "stderr should explain the problem: {stderr}"
+    );
+}
+
+/// The CLI must not depend on a large *process main thread* stack.
+///
+/// `clap`'s derive macros build the whole command tree on the stack, and an
+/// unoptimized build needs close to a megabyte for it. The main thread of a
+/// Windows process is capped at 1 MiB by the linker, so a CLI that builds
+/// the command tree on the main thread overflows the stack and aborts before
+/// any command runs. The CLI therefore runs on a dedicated thread with a
+/// larger stack.
+///
+/// This test reproduces that condition on Unix by shrinking the stack of the
+/// process the CLI runs in. It is deliberately stricter than the Windows
+/// limit so that the headroom stays comfortable.
+#[cfg(unix)]
+#[test]
+fn test_cli_runs_with_a_tiny_main_thread_stack() {
+    let home = temp_home("tiny-stack");
+    let bin = env!("CARGO_BIN_EXE_soroban-cost-estimator");
+
+    // `ulimit -s` is in KiB. 256 KiB is far below what the command tree
+    // needs when it is built on the main thread, and far below the 1 MiB
+    // Windows main thread limit.
+    // `sh -c SCRIPT BIN ARGS...` puts BIN in `$0` and the arguments in
+    // `"$@"`, so the script can exec the binary without quoting its path.
+    let script = "ulimit -s 256 2>/dev/null || exit 0; exec \"$0\" \"$@\"";
+
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .arg(bin)
+        .arg("cache")
+        .arg("list")
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .output()
+        .expect("failed to run CLI");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let code = output.status.code().unwrap_or(-1);
+
+    assert_eq!(
+        code, 0,
+        "the CLI must run on a small main-thread stack; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("stack overflow"),
+        "the CLI must not overflow the stack: {stderr}"
+    );
+    assert!(
+        stdout.contains("No cached estimates match the filters."),
+        "the command should have run to completion: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_delete_all_cannot_be_combined_with_a_filter() {
+    let home = temp_home("cache-delete-all-with-filter");
+    seed_cache_entry_for(
+        &home,
+        "testnet",
+        "transfer",
+        42,
+        &chrono::Utc::now().to_rfc3339(),
+    );
+    seed_cache_entry_for(
+        &home,
+        "mainnet",
+        "approve",
+        43,
+        &chrono::Utc::now().to_rfc3339(),
+    );
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &["cache", "delete", "--all", "--network", "testnet", "--yes"],
+        Some(&home),
+    );
+    assert_ne!(
+        code, 0,
+        "--all combined with a filter should be rejected; stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("--all cannot be combined with a filter"),
+        "stderr should explain the conflict: {stderr}"
+    );
+
+    // Nothing may be deleted when the command is rejected.
+    let (stdout, stderr, code) = run_cli_quiet(&["cache", "list", "--json"], Some(&home));
+    assert_eq!(code, 0, "cache list should exit 0; stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    assert_eq!(
+        parsed.as_array().expect("JSON array").len(),
+        2,
+        "a rejected deletion must not remove anything"
+    );
+}
