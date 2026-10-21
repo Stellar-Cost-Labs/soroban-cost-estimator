@@ -121,3 +121,107 @@ fn cli_announces_failover_on_stderr() {
         "the fallback endpoint must have been contacted"
     );
 }
+
+/// Starts a loopback stub that serves 429 on the first request and 200 OK on
+/// subsequent requests.
+fn spawn_rate_limited_primary_stub(retry_after: &str) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind stub server");
+    let addr = listener.local_addr().expect("no local address");
+    let counter = Arc::new(AtomicUsize::new(0));
+    let server_counter = Arc::clone(&counter);
+    let retry_after_hdr = retry_after.to_string();
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let counter = Arc::clone(&server_counter);
+            let retry_after_hdr = retry_after_hdr.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let count = counter.fetch_add(1, Ordering::SeqCst);
+                let response = if count == 0 {
+                    format!(
+                        "HTTP/1.1 429 Too Many Requests\r\nRetry-After: {retry_after_hdr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else {
+                    let body = r#"{"jsonrpc":"2.0","id":1,"result":{"status":"healthy"}}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            });
+        }
+    });
+
+    (format!("http://{addr}"), counter)
+}
+
+/// A 429 Too Many Requests response is retried on the primary endpoint (honoring
+/// Retry-After) rather than triggering failover to the fallback endpoint.
+#[tokio::test]
+async fn rate_limited_429_retries_on_primary_without_failing_over() {
+    let (primary_url, primary_served) = spawn_rate_limited_primary_stub("0");
+    let (fallback_url, fallback_served) = spawn_rpc_stub();
+
+    let client = RpcClient::with_fallback(
+        &primary_url,
+        Some(&fallback_url),
+        None,
+        Duration::from_secs(5),
+        2,
+        false,
+    );
+
+    let result: AppResult<Value> = client.call("getHealth", serde_json::json!({})).await;
+    assert!(
+        result.is_ok(),
+        "request must succeed after retry on primary: {result:?}"
+    );
+    assert_eq!(
+        primary_served.load(Ordering::SeqCst),
+        2,
+        "primary stub should have served 2 requests (initial 429 + retry)"
+    );
+    assert_eq!(
+        fallback_served.load(Ordering::SeqCst),
+        0,
+        "fallback stub must not be contacted for 429 rate limits"
+    );
+}
+
+/// When max_retries is 0, a 429 response surfaces immediately without retrying
+/// or failing over to the fallback endpoint.
+#[tokio::test]
+async fn rate_limited_429_with_zero_retries_surfaces_immediately() {
+    let (primary_url, primary_served) = spawn_rate_limited_primary_stub("10");
+    let (fallback_url, fallback_served) = spawn_rpc_stub();
+
+    let client = RpcClient::with_fallback(
+        &primary_url,
+        Some(&fallback_url),
+        None,
+        Duration::from_secs(5),
+        0,
+        false,
+    );
+
+    let result: AppResult<Value> = client.call("getHealth", serde_json::json!({})).await;
+    assert!(
+        result.is_err(),
+        "request must fail immediately with max_retries=0"
+    );
+    assert_eq!(
+        primary_served.load(Ordering::SeqCst),
+        1,
+        "primary stub should only have served 1 request"
+    );
+    assert_eq!(
+        fallback_served.load(Ordering::SeqCst),
+        0,
+        "fallback stub must not be contacted"
+    );
+}

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use governor::{Quota, RateLimiter};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, Notify};
 use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
-use crate::rpc::retry::{DEFAULT_MAX_RETRIES, with_retry};
+use crate::rpc::retry::{DEFAULT_MAX_RETRIES, MAX_RETRY_DELAY, with_retry};
 
 /// Default per-request HTTP timeout applied to every RPC call. Matches the
 /// CLI's `--timeout` default (30 seconds).
@@ -893,13 +893,55 @@ fn is_transient_status(status: reqwest::StatusCode) -> bool {
 
 /// Parses a `Retry-After` response header into a delay, if present.
 ///
-/// Only the delta-seconds form (e.g. `Retry-After: 5`) is supported; the
-/// HTTP-date form and unparseable values yield `None`, falling back to the
-/// retry loop's computed backoff.
-fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+/// Supports both delta-seconds (e.g. `Retry-After: 5`) and standard HTTP-date
+/// formats (RFC 9110 / RFC 7231: IMF-fixdate, RFC 850 date, and asctime).
+///
+/// The server-requested delay is capped at [`MAX_RETRY_DELAY`].
+/// HTTP-date values that specify a time already in the past evaluate to
+/// [`Duration::ZERO`]. Malformed values yield `None`, falling back to the retry
+/// loop's computed backoff.
+pub fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
-    let seconds: u64 = value.trim().parse().ok()?;
-    Some(Duration::from_secs(seconds))
+    parse_retry_after_value(value)
+}
+
+/// Parses a `Retry-After` header value string into a delay duration.
+///
+/// Evaluates delta-seconds first (non-negative integer seconds). If that fails,
+/// attempts to parse standard HTTP-date formats (RFC 9110 / RFC 7231: IMF-fixdate,
+/// RFC 850 date, and asctime).
+///
+/// Valid values are capped at [`MAX_RETRY_DELAY`]. HTTP-date values specifying
+/// a timestamp already in the past evaluate to [`Duration::ZERO`]. Malformed values
+/// return `None`.
+pub fn parse_retry_after_value(value: &str) -> Option<Duration> {
+    let trimmed = value.trim();
+
+    // 1. Delta-seconds: non-negative integer seconds (e.g. "120")
+    if let Ok(seconds) = trimmed.parse::<u64>() {
+        return Some(Duration::from_secs(seconds).min(MAX_RETRY_DELAY));
+    }
+
+    // 2. HTTP-date: RFC 9110 / RFC 7231 formats (IMF-fixdate, RFC 850, asctime)
+    if let Ok(target_time) = httpdate::parse_http_date(trimmed) {
+        let delay = match target_time.duration_since(SystemTime::now()) {
+            Ok(duration) => duration,
+            Err(_) => Duration::ZERO,
+        };
+        return Some(delay.min(MAX_RETRY_DELAY));
+    }
+
+    // 3. RFC 2822 fallback via chrono in case of minor syntax variations
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(trimmed) {
+        let target_time: SystemTime = dt.into();
+        let delay = match target_time.duration_since(SystemTime::now()) {
+            Ok(duration) => duration,
+            Err(_) => Duration::ZERO,
+        };
+        return Some(delay.min(MAX_RETRY_DELAY));
+    }
+
+    None
 }
 
 /// Deserializes a raw JSON-RPC `result` value into the caller's type.
@@ -2307,5 +2349,113 @@ mod header_tests {
         // A malformed argument has no name to classify; it is echoed verbatim
         // because it cannot carry a parsed credential name.
         assert_eq!(redacted_headers(&["garbage".to_string()]), "garbage");
+    }
+
+    // ── Retry-After Parsing ───────────────────────────────────────
+
+    #[test]
+    fn test_parse_retry_after_delta_seconds() {
+        assert_eq!(
+            super::parse_retry_after_value("0"),
+            Some(Duration::from_secs(0))
+        );
+        assert_eq!(
+            super::parse_retry_after_value("5"),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            super::parse_retry_after_value("  30  "),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn test_parse_retry_after_excessive_delta_seconds_capped() {
+        assert_eq!(
+            super::parse_retry_after_value("3600"),
+            Some(super::MAX_RETRY_DELAY)
+        );
+        assert_eq!(
+            super::parse_retry_after_value("99999999"),
+            Some(super::MAX_RETRY_DELAY)
+        );
+    }
+
+    #[test]
+    fn test_parse_retry_after_http_date_future() {
+        let future = SystemTime::now() + Duration::from_secs(10);
+        let header_str = httpdate::fmt_http_date(future);
+        let parsed = super::parse_retry_after_value(&header_str);
+        assert!(parsed.is_some());
+        let delay = parsed.unwrap();
+        // Delay should be approximately 9-10 seconds
+        assert!(delay >= Duration::from_secs(8) && delay <= Duration::from_secs(11));
+    }
+
+    #[test]
+    fn test_parse_retry_after_http_date_past() {
+        let past = "Sun, 06 Nov 1994 08:49:37 GMT";
+        assert_eq!(super::parse_retry_after_value(past), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn test_parse_retry_after_rfc850_and_asctime_dates() {
+        let past_rfc850 = "Sunday, 06-Nov-94 08:49:37 GMT";
+        assert_eq!(
+            super::parse_retry_after_value(past_rfc850),
+            Some(Duration::ZERO)
+        );
+        let past_asctime = "Sun Nov  6 08:49:37 1994";
+        assert_eq!(
+            super::parse_retry_after_value(past_asctime),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn test_parse_retry_after_excessive_http_date_capped() {
+        let far_future = "Thu, 31 Dec 2099 23:59:59 GMT";
+        assert_eq!(
+            super::parse_retry_after_value(far_future),
+            Some(super::MAX_RETRY_DELAY)
+        );
+    }
+
+    #[test]
+    fn test_parse_retry_after_malformed_returns_none() {
+        for malformed in [
+            "",
+            "   ",
+            "not-a-date",
+            "-1",
+            "-60",
+            "2026-10-21",
+            "5 seconds",
+            "12.5",
+        ] {
+            assert_eq!(
+                super::parse_retry_after_value(malformed),
+                None,
+                "'{malformed}' should not parse as Retry-After"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_retry_after_header_map() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(super::parse_retry_after(&headers), None);
+
+        headers.insert(reqwest::header::RETRY_AFTER, HeaderValue::from_static("15"));
+        assert_eq!(
+            super::parse_retry_after(&headers),
+            Some(Duration::from_secs(15))
+        );
+
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            HeaderValue::from_static("invalid"),
+        );
+        assert_eq!(super::parse_retry_after(&headers), None);
     }
 }
