@@ -8,6 +8,10 @@ repository = "https://github.com/aigbagbobila/soroban-cost-estimator"
 rust-version = "1.85"
 default-run = "soroban-cost-estimator"
 
+[workspace]
+members = ["."]
+exclude = ["fuzz"]
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin)'] }
 

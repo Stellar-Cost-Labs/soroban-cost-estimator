@@ -11,22 +11,33 @@ management**.
   - [`estimate`](#estimate) — simulate a single invocation
   - [`estimate-all`](#estimate-all) — enumerate and estimate every function
 - [Network Config](#network-config)
-  - [`config snapshot`](#config-snapshot) — fetch and save config settings
+  - [`config snapshot`](#config-snapshot) — fetch, save, and validate config settings
   - [`config diff`](#config-diff) — compare config against a snapshot
   - [`config history`](#config-history) — chronological change log
   - [`config last-changed`](#config-last-changed) — last-change timestamps
 - [Cache Management](#cache-management)
+  - [`cache stats`](#cache-stats) — cache health overview
   - [`cache verify`](#cache-verify) — check cache integrity
   - [`cache stats`](#cache-stats) — show cache size and quotas
   - [`cache prune`](#cache-prune) — evict least-recently-accessed entries
   - [`cache warm`](#cache-warm) — pre-populate cache
   - [`cache clear`](#cache-clear) — wipe cached estimates for a network
+- [WASM Inspection](#wasm-inspection)
+  - [`wasm info`](#wasm-info) — offline contract metadata report
 - [Monitoring](#monitoring)
   - [`watch`](#watch) — poll and diff on interval
 
 ---
 
 ## Estimation
+
+> **Batch mode.** Repeating `--wasm` or passing `--wasm-dir <dir>` to `estimate`
+> or `estimate-all` evaluates every resolved contract in one run and prints an
+> aggregated multi-contract summary (function count, upload cost, and min/max
+> invocation fees per contract) instead of per-invocation output. `--json`
+> emits a structured batch report, and a contract that fails is reported in the
+> summary without aborting the rest of the run. In batch mode the `\*` above
+> marks the two WASM sources: supply at least one.
 
 ### `estimate`
 
@@ -42,7 +53,8 @@ soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
 
 | Flag | Short | Required | Default | Description |
 |------|-------|----------|---------|-------------|
-| `--wasm <WASM>` | `-w` | ✅ | — | Path to the compiled Soroban contract `.wasm` file |
+| `--wasm <PATH>` | `-w` | ✅* | — | Path to a compiled contract `.wasm` file (repeatable) |
+| `--wasm-dir <DIR>` | | ✅* | — | Directory of `.wasm` files to evaluate as a batch (non-recursive) |
 | `--network <NETWORK>` | | | `testnet` | Network to simulate against (`testnet`, `mainnet`, `futurenet`) |
 | `--rpc-url <RPC_URL>` | | | — | Explicit RPC URL (overrides network-based resolution) |
 | `--fn <FN>` | | | — | Contract function name to invoke |
@@ -234,7 +246,8 @@ soroban-cost-estimator estimate-all [OPTIONS] --wasm <WASM>
 
 | Flag | Short | Required | Default | Description |
 |------|-------|----------|---------|-------------|
-| `--wasm <WASM>` | `-w` | ✅ | — | Path to the compiled Soroban contract `.wasm` file |
+| `--wasm <PATH>` | `-w` | ✅* | — | Path to a compiled contract `.wasm` file (repeatable) |
+| `--wasm-dir <DIR>` | | ✅* | — | Directory of `.wasm` files to estimate as a batch (non-recursive) |
 | `--network <NETWORK>` | | | `testnet` | Network to simulate against |
 | `--id <ID>` | | | — | Deployed contract ID (64 hex chars) to invoke each function against |
 | `--no-cache` | | | `false` | Bypass the cache entirely: never read cached estimates, never write fresh results |
@@ -630,6 +643,38 @@ Last-changed timestamps for testnet:
 ---
 
 ## Cache Management
+
+### `cache stats`
+
+Show a cache health overview: total entries, disk usage, age of the oldest and
+newest entries, and a per-network breakdown.
+
+**Usage**
+
+```
+soroban-cost-estimator cache stats
+```
+
+**Flags**
+
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--help` | `-h` | | Print help |
+
+**Behavior**
+
+- Purely local SQLite I/O — no network calls.
+- Prints a one-line summary when the cache is empty.
+
+**Example**
+
+```bash
+soroban-cost-estimator cache stats
+# → Total entries: 12
+#   Disk usage:     48.0 KB
+```
+
+---
 
 ### `cache verify`
 
