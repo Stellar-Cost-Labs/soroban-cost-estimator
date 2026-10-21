@@ -1649,6 +1649,61 @@ fn test_cache_warm_help() {
 }
 
 #[test]
+fn test_config_cache_warm_help() {
+    let (stdout, stderr, code) = run_cli(&["config", "cache", "warm", "--help"]);
+    assert_eq!(
+        code, 0,
+        "config cache warm --help should exit 0; stderr: {stderr}"
+    );
+    for flag in ["--wasm", "--network", "--rpc-url", "--id", "--json"] {
+        assert!(
+            stdout.contains(flag),
+            "config cache warm help should mention {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_config_cache_warm_missing_wasm_errors() {
+    let (_, stderr, code) = run_cli(&["config", "cache", "warm"]);
+    assert_ne!(code, 0, "config cache warm without --wasm should error");
+    assert!(
+        stderr.contains("error") || stderr.contains("required"),
+        "stderr should indicate error: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_cache_warm_nonexistent_wasm_file() {
+    let (_, stderr, code) = run_cli(&["config", "cache", "warm", "--wasm", "no/such/file.wasm"]);
+    assert_eq!(code, 1, "a missing WASM file should exit 1");
+    assert!(
+        stderr.contains("file not found") || stderr.contains("Error: failed to perform I/O"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_cache_warm_unknown_network() {
+    let (_, stderr, code) = run_cli(&[
+        "config",
+        "cache",
+        "warm",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--network",
+        "not-a-network",
+    ]);
+    assert_eq!(code, 1, "an unknown network should exit 1");
+    assert!(
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn test_cache_warm_missing_wasm_errors() {
     let (_, stderr, code) = run_cli(&["cache", "warm"]);
     assert_ne!(code, 0, "cache warm without --wasm should error");

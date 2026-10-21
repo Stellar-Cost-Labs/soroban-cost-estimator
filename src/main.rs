@@ -499,8 +499,10 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
                     args.wasm_info,
                     args.verbose,
                     auto_snapshot,
+                    false,
                 )
                 .await
+                .map(|_| ())
             }
         }
         cli::Command::WasmInfo { wasm, json } => {
@@ -3052,6 +3054,45 @@ fn csv_row(r: &EstimateAllResult) -> String {
 /// hit the same request twice â€” the shared WASM-upload path when a function
 /// envelope is built against an undeployed contract, or identical fee-rate
 /// lookups â€” transmit each distinct `(method, params)` pair only once.
+/// Render cache warm-up progress to stderr, keeping stdout suitable for the
+/// final summary or machine-readable output.
+fn write_cache_warm_progress(
+    completed: usize,
+    total: usize,
+    function: &str,
+) -> error::AppResult<()> {
+    use std::io::Write;
+
+    let width = 24usize;
+    let filled = completed
+        .saturating_mul(width)
+        .checked_div(total)
+        .unwrap_or(0);
+    let bar = format!("{}{}", "=".repeat(filled), " ".repeat(width - filled));
+    let mut stderr = std::io::stderr().lock();
+    write!(
+        stderr,
+        "\rWarming cache [{bar}] {completed}/{total} {:<24}",
+        function
+    )?;
+    stderr.flush()?;
+    Ok(())
+}
+
+/// Choose a small, deterministic argument for cache warm-up simulations.
+fn default_warm_arg(param: &wasm::parser::ParamInfo) -> String {
+    match &param.type_def {
+        stellar_xdr::ScSpecTypeDef::Bool => "false".to_string(),
+        stellar_xdr::ScSpecTypeDef::Symbol | stellar_xdr::ScSpecTypeDef::String => {
+            "warm".to_string()
+        }
+        stellar_xdr::ScSpecTypeDef::Bytes => "00".to_string(),
+        stellar_xdr::ScSpecTypeDef::BytesN(spec) => "00".repeat(spec.n as usize),
+        stellar_xdr::ScSpecTypeDef::Address => "0".repeat(64),
+        _ => "0".to_string(),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::fn_params_excessive_bools)]
 async fn cmd_estimate_all(
@@ -3073,7 +3114,8 @@ async fn cmd_estimate_all(
     wasm_info_flag: bool,
     verbose: bool,
     auto_snapshot: bool,
-) -> error::AppResult<()> {
+    warm_cache: bool,
+) -> error::AppResult<(usize, String)> {
     use tracing::Instrument;
     use tracing::info_span;
 
@@ -3081,13 +3123,17 @@ async fn cmd_estimate_all(
     async {
         let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
         let json_flag = format == "json";
-        emit_wasm_structure(&wasm_info, verbose, wasm_info_flag, json_flag);
+        if !warm_cache {
+            emit_wasm_structure(&wasm_info, verbose, wasm_info_flag, json_flag);
+        }
 
         // Confirm the exact file being estimated up front â€” printed before any
         // endpoint resolution or simulation, so the hash is visible even when
         // the network cannot be reached.
         let wasm_hash = wasm_info.wasm_hash.clone();
-        maybe_emit_optimization_tip(&wasm_info, quiet, json_flag);
+        if !warm_cache {
+            maybe_emit_optimization_tip(&wasm_info, quiet, json_flag);
+        }
 
         // `--fn` filter (#25): validate the requested names against the WASM
         // and keep only the matching functions for simulation. A typo must
@@ -3120,7 +3166,7 @@ async fn cmd_estimate_all(
         };
 
         let json_flag = format == "json";
-        let text_mode = format == "table" || format == "markdown";
+        let text_mode = !warm_cache && (format == "table" || format == "markdown");
         if text_mode && !quiet {
             println!("WASM SHA-256: {wasm_hash}");
             println!();
@@ -3192,18 +3238,26 @@ async fn cmd_estimate_all(
 
         let mut json_results: Vec<EstimateAllResult> = Vec::new();
         let mut csv_rows: Vec<String> = Vec::new();
+        let mut warmed = 0;
         let total = selected.len();
         debug!(total, "enumerated functions");
 
+        let effective_contract_id =
+            contract_id.or(if warm_cache { Some(wasm_hash.as_str()) } else { None });
+
         for (i, fn_info) in selected.iter().enumerate() {
-            if text_mode {
+            if warm_cache {
+                if !quiet {
+                    write_cache_warm_progress(i, total, &fn_info.name)?;
+                }
+            } else if text_mode {
                 println!("[{}/{}] {}", i + 1, total, fn_info.name);
             }
             let result = estimate_all_function(
                 &client,
                 &wasm_info,
                 fn_info,
-                contract_id,
+                effective_contract_id,
                 no_cache,
                 &wasm_hash,
                 network,
@@ -3213,8 +3267,12 @@ async fn cmd_estimate_all(
                 &network_config,
                 &health_metadata,
                 precision,
+                warm_cache,
             )
             .await?;
+            if result.status == EstimateAllStatus::Ok {
+                warmed += 1;
+            }
             if format == "csv" {
                 let row = csv_row(&result);
                 csv_rows.push(row);
@@ -3265,35 +3323,42 @@ async fn cmd_estimate_all(
             }
         }
 
-        // Aggregate fee and CPU distribution across every successfully
-        // estimated function (#328): min/max/mean/median/stddev fees and
-        // min/max/mean CPU instructions for the whole batch. Skipped and
-        // errored functions carry no fee/CPU figure and are excluded.
-        let fees: Vec<i64> = json_results
-            .iter()
-            .filter_map(|r| r.fee.as_ref().map(|f| f.total_stroops))
-            .collect();
-        let cpu: Vec<u64> = json_results
-            .iter()
-            .filter_map(|r| r.cpu_instructions)
-            .collect();
-        let fee_distribution = report::cost_report::FeeDistribution::from_samples(&fees, &cpu);
-        emit_fee_distribution_summary(&fee_distribution, format == "json", precision);
+        if warm_cache && !quiet {
+            write_cache_warm_progress(total, total, "complete")?;
+            eprintln!();
+        }
 
-        if format == "json" {
-            let report = EstimateAllJsonReport {
-                functions: json_results,
-                fee_distribution,
-            };
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        } else if format == "csv" {
-            println!("function,network,ledger,wasm_hash,cpu_instructions,memory_bytes,read_entries,write_entries,read_bytes,write_bytes,tx_size,non_refundable_stroops,refundable_stroops,total_stroops,total_xlm");
-            for row in &csv_rows {
-                println!("{row}");
+        if !warm_cache {
+            // Aggregate fee and CPU distribution across every successfully
+            // estimated function (#328): min/max/mean/median/stddev fees and
+            // min/max/mean CPU instructions for the whole batch. Skipped and
+            // errored functions carry no fee/CPU figure and are excluded.
+            let fees: Vec<i64> = json_results
+                .iter()
+                .filter_map(|r| r.fee.as_ref().map(|f| f.total_stroops))
+                .collect();
+            let cpu: Vec<u64> = json_results
+                .iter()
+                .filter_map(|r| r.cpu_instructions)
+                .collect();
+            let fee_distribution = report::cost_report::FeeDistribution::from_samples(&fees, &cpu);
+            emit_fee_distribution_summary(&fee_distribution, format == "json", precision);
+
+            if format == "json" {
+                let report = EstimateAllJsonReport {
+                    functions: json_results,
+                    fee_distribution,
+                };
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if format == "csv" {
+                println!("function,network,ledger,wasm_hash,cpu_instructions,memory_bytes,read_entries,write_entries,read_bytes,write_bytes,tx_size,non_refundable_stroops,refundable_stroops,total_stroops,total_xlm");
+                for row in &csv_rows {
+                    println!("{row}");
+                }
             }
         }
 
-        Ok(())
+        Ok((warmed, wasm_hash))
     }
     .instrument(span)
     .await
@@ -3328,6 +3393,7 @@ fn emit_fee_distribution_summary(
 /// mode) progress lines are printed to stdout/stderr; machine formats keep the
 /// stream clean.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::fn_params_excessive_bools)]
 async fn estimate_all_function(
     client: &rpc::client::RpcClient,
     wasm_info: &wasm::parser::WasmInfo,
@@ -3342,32 +3408,51 @@ async fn estimate_all_function(
     network_config: &report::cost_report::NetworkConfig,
     health_metadata: &rpc::client::HealthMetadata,
     precision: u32,
+    warm_cache: bool,
 ) -> error::AppResult<EstimateAllResult> {
     use tracing::{Instrument, debug, info_span};
 
     let span =
         info_span!("estimate_all_function", fn = %fn_info.name, param_count = fn_info.param_count);
     async {
-        if fn_info.param_count > 0 {
+        if fn_info.param_count > 0 && !warm_cache {
             let reason = format!("needs --fn/--arg ({} param(s))", fn_info.param_count);
             debug!(reason, "skipping function");
             if !json_flag && !quiet {
-                println!("â”€â”€ Estimating '{}' â”€â”€ Skipped: {reason}", fn_info.name);
+                println!("── Estimating '{}' ── Skipped: {reason}", fn_info.name);
             }
             return Ok(EstimateAllResult::skipped(&fn_info.name, reason));
         }
+
+        let args = if warm_cache {
+            if fn_info.params.is_empty() {
+                vec!["0".to_string(); fn_info.param_count as usize]
+            } else {
+                fn_info
+                    .params
+                    .iter()
+                    .map(default_warm_arg)
+                    .collect::<Vec<_>>()
+            }
+        } else {
+            Vec::new()
+        };
+        let sc_vals = args
+            .iter()
+            .map(|arg| xdr_helper::parse_arg_scval(arg))
+            .collect::<Vec<_>>();
 
         let tx_xdr = match xdr_helper::build_simulation_tx_envelope(
             &wasm_info.bytes,
             contract_id,
             Some(fn_info.name.as_str()),
-            &[],
+            &sc_vals,
         ) {
             Ok(tx) => tx,
             Err(e) => {
                 debug!(error = %e, "tx construction failed");
-                if !json_flag && !quiet {
-                    eprintln!("â”€â”€ Estimating '{}' â”€â”€ Skipped: {e}", fn_info.name);
+                if !json_flag && !quiet && !warm_cache {
+                    eprintln!("── Estimating '{}' ── Skipped: {e}", fn_info.name);
                 }
                 return Ok(EstimateAllResult::skipped(&fn_info.name, e.to_string()));
             }
@@ -3382,7 +3467,7 @@ async fn estimate_all_function(
                 if missing_simulation_data(&resp) {
                     let msg = "simulation returned no cost data and no latest ledger â€” check --id and the RPC endpoint";
                     debug!(msg, "simulation missing data");
-                    if !json_flag && !quiet {
+                    if !json_flag && !quiet && !warm_cache {
                         eprintln!("â”€â”€ Estimating '{}' â”€â”€ Error: {msg}", fn_info.name);
                     }
                     return Ok(EstimateAllResult::errored(&fn_info.name, msg));
@@ -3404,10 +3489,10 @@ async fn estimate_all_function(
                 // `--no-cache` suppresses the write so a bypassed batch run
                 // leaves the local cache untouched.
                 if !no_cache {
-                    let _ = cache::save_estimate_with_metadata(
+                    let cache_res = cache::save_estimate_with_metadata(
                         wasm_hash,
                         &fn_info.name,
-                        &[],
+                        &args,
                         network,
                         ledger,
                         total_fee,
@@ -3418,6 +3503,9 @@ async fn estimate_all_function(
                         health_metadata.network_passphrase.as_deref(),
                         health_metadata.core_version.as_deref(),
                     );
+                    if warm_cache {
+                        cache_res?;
+                    }
                 }
 
                 // Itemize the fee breakdown only when we have the network's fee
@@ -3447,7 +3535,7 @@ async fn estimate_all_function(
                     },
                 };
 
-                if !json_flag && !quiet {
+                if !json_flag && !quiet && !warm_cache {
                     println!(
                         "CPU: {cpu} insns | Mem: {mem} bytes | Fee: {total_fee} stroops ({xlm} XLM) | Ledger: {ledger}"
                     );
@@ -3487,7 +3575,7 @@ async fn estimate_all_function(
             }
             Err(e) => {
                 debug!(error = %e, "simulation failed");
-                if !json_flag && !quiet {
+                if !json_flag && !quiet && !warm_cache {
                     eprintln!("Skipped â€” simulation failed: {e}");
                 }
                 Ok(EstimateAllResult::errored(&fn_info.name, e.to_string()))
@@ -5935,11 +6023,8 @@ async fn cmd_cache_warm(
     quiet: bool,
     verbose: bool,
 ) -> error::AppResult<()> {
-    let fmt = match format {
-        cli::OutputFormat::Json => "json",
-        _ => "table",
-    };
-    cmd_estimate_all(
+    let json_flag = format == cli::OutputFormat::Json;
+    let (warmed, wasm_hash) = cmd_estimate_all(
         wasm_path,
         network,
         rpc_url,
@@ -5948,7 +6033,7 @@ async fn cmd_cache_warm(
         // `cache warm` exists to populate the cache, so it never bypasses it.
         false,
         &[],
-        fmt,
+        "table",
         rps,
         timeout,
         connect_timeout,
@@ -5959,8 +6044,23 @@ async fn cmd_cache_warm(
         false,
         verbose,
         false,
+        true,
     )
-    .await
+    .await?;
+
+    if json_flag {
+        println!(
+            "{}",
+            serde_json::json!({
+                "wasm_hash": wasm_hash,
+                "network": network,
+                "warmed_functions": warmed,
+            })
+        );
+    } else {
+        println!("Warmed {warmed} functions into cache for {wasm_hash}");
+    }
+    Ok(())
 }
 
 fn cmd_config_export(network: Option<&str>, output: &str) -> error::AppResult<()> {
