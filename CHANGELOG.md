@@ -30,6 +30,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   network, pruning older ones after the new snapshot is safely on disk.
 - `config snapshot prune --older-than <DAYS>` — delete snapshots recorded more
   than D days ago. Pure file I/O, so it is safe offline and in a cron job.
+- `cache list` — the read-only cache listing now accepts the same filters as
+  `cache query` (`--network`, `--fn`, `--wasm-hash`, `--since`, `--to`, plus a
+  new `--older-than` age filter) and is paginated with `--limit` (default 50,
+  capped at 1000) and `--offset`. Without `--network` it lists entries from
+  every network.
+- `cache delete` — remove cached estimates by network, function, WASM hash,
+  time range or age instead of clearing a whole network. Supports `--dry-run`
+  (report the count, change nothing), an interactive confirmation prompt
+  (skippable with `--yes`) and `--all` for an explicit whole-cache removal. A
+  filter is required otherwise. Selection and deletion run in one transaction.
+- Config diffs now model setting **presence** explicitly: added, removed and
+  unrecognized settings are reported distinctly from numeric value changes,
+  and a missing setting is never treated as a zero value.
+- Unrecognized top-level fields in a stored snapshot are captured and
+  surfaced in `config diff` instead of being ignored silently.
+- Snapshot listings and "latest snapshot" selection are ordered by the
+  timestamp embedded in the file name, so snapshots taken with different UTC
+  offsets are ordered chronologically.
 
 ### Fixed
 
@@ -62,6 +80,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `cache list` now lists entries from **every** network unless `--network` is
+  given (it used to default to `testnet` only), matching `cache query`. The
+  `--json` output is unchanged: a JSON array of cached-estimate records.
 - `estimate-all --json` now emits an object (`{ "functions": [...],
   "fee_distribution": { ... } }`) instead of a bare array; the per-function
   records moved under the `functions` key.
