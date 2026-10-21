@@ -1,0 +1,7 @@
+version = 1
+
+[[contracts]]
+wasm = "../zeroarg.wasm"
+function = "ping"
+args = ["1"]
+id = "0000000000000000000000000000000000000000000000000000000000000000"
