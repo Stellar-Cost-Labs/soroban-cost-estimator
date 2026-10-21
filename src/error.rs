@@ -33,7 +33,11 @@ pub enum AppError {
 
     // ── RPC ─────────────────────────────────────────────────────────
     #[error("failed to execute RPC: status {status} - {message}")]
-    Rpc { status: i64, message: String },
+    Rpc {
+        status: i64,
+        message: String,
+        data: Option<serde_json::Value>,
+    },
 
     /// The endpoint answered with a transient gateway status (502/503/504),
     /// meaning it is briefly unavailable rather than misconfigured. Treated
@@ -210,6 +214,7 @@ mod tests {
             AppError::Rpc {
                 status: -32000,
                 message: "boom".to_string(),
+                data: None,
             },
             AppError::InvalidHeader("missing '=' separator".to_string()),
             AppError::WsConnect("wss://host/ws: refused".to_string()),

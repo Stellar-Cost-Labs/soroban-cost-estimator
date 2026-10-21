@@ -531,6 +531,7 @@ impl RpcClient {
                         "unable to reach RPC endpoint {url}: {e}. Check --rpc-url / --network and that the node is reachable.",
                         url = self.url
                     ),
+                    data: None,
                 }
             })?;
 
@@ -548,6 +549,7 @@ impl RpcClient {
                     url = self.url,
                     status = health.status,
                 ),
+                data: None,
             })
         }
     }
@@ -816,16 +818,19 @@ impl RpcClient {
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown error")
                 .to_string();
+            let data = error.get("data").cloned();
             debug!(method, code, message, "RPC error response");
             return Err(AppError::Rpc {
                 status: code,
                 message,
+                data,
             });
         }
 
         let result = response_body.get("result").ok_or_else(|| AppError::Rpc {
             status: status.as_u16() as i64,
             message: "response missing 'result' field".to_string(),
+            data: None,
         })?;
 
         let elapsed = start.elapsed();
@@ -1215,13 +1220,13 @@ mod tests {
             if fail_status == 200 {
                 (
                     200u16,
-                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure"}}"#
+                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure","data":{"retryable":true,"provider":"stub"}}}"#
                         .to_string(),
                 )
             } else {
                 (
                     fail_status,
-                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure"}}"#
+                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure","data":{"retryable":true,"provider":"stub"}}}"#
                         .to_string(),
                 )
             }
@@ -1901,6 +1906,31 @@ mod tests {
             "503 should be retried then succeed: {result:?}"
         );
         assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_rpc_error_preserves_code_message_and_data() {
+        let (url, counter) = spawn_stub(1, 200, r#"{"pong":true}"#).await;
+        let client = RpcClient::with_options(&url, None, Duration::from_secs(5), 0, false);
+
+        let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
+
+        match result {
+            Err(AppError::Rpc {
+                status,
+                message,
+                data,
+            }) => {
+                assert_eq!(status, -32000);
+                assert_eq!(message, "stubbed failure");
+                assert_eq!(
+                    data,
+                    Some(serde_json::json!({"retryable": true, "provider": "stub"}))
+                );
+            }
+            other => panic!("expected preserved RPC error, got {other:?}"),
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
     /// Persistent transient statuses consume every retry, and the final error
