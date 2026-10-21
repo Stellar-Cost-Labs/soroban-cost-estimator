@@ -455,7 +455,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 (None, true) => cli::OutputFormat::Json,
                 (None, false) => cli::OutputFormat::Table,
             };
-            cmd_wasm_info(&wasm, format, quiet)
+            cmd_wasm_info(&wasm, format, quiet, args.max_wasm_size)
         }
         cli::Command::Wasm { action } => match action {
             cli::WasmAction::Info { wasm, json } => {
@@ -464,7 +464,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     (None, true) => cli::OutputFormat::Json,
                     (None, false) => cli::OutputFormat::Table,
                 };
-                cmd_wasm_info(&wasm.to_string_lossy(), format, quiet)
+                cmd_wasm_info(&wasm.to_string_lossy(), format, quiet, args.max_wasm_size)
             }
         },
         cli::Command::Config { action } => match action {
@@ -2763,8 +2763,18 @@ async fn cmd_estimate_diff(
     })
     .await?;
 
+    let abi_diff = if old_info.has_spec && new_info.has_spec {
+        Some(report::diff::compare_contract_abi(
+            &old_info.functions,
+            &new_info.functions,
+        ))
+    } else {
+        None
+    };
+
     if format == "json" {
-        let diff = report::diff::build_cost_report_diff(&old_report, &new_report);
+        let diff =
+            report::diff::build_cost_report_diff_with_abi(&old_report, &new_report, abi_diff);
         let output = serde_json::json!({
             "wasm_a": old_report,
             "wasm_b": new_report,
@@ -2774,7 +2784,11 @@ async fn cmd_estimate_diff(
     } else {
         println!(
             "{}",
-            report::diff::format_cost_report_diff(&old_report, &new_report)
+            report::diff::format_cost_report_diff_with_abi(
+                &old_report,
+                &new_report,
+                abi_diff.as_ref()
+            )
         );
     }
 
@@ -3346,8 +3360,16 @@ async fn estimate_all_function(
 ///
 /// # Network calls
 /// None â€” pure file I/O + parsing.
-fn cmd_wasm_info(wasm_path: &str, format: cli::OutputFormat, quiet: bool) -> error::AppResult<()> {
-    let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
+fn cmd_wasm_info(
+    wasm_path: &str,
+    format: cli::OutputFormat,
+    quiet: bool,
+    max_bytes: Option<u64>,
+) -> error::AppResult<()> {
+    let wasm_info = wasm::parser::load_wasm_with_limit(
+        std::path::Path::new(wasm_path),
+        max_bytes.unwrap_or(wasm::parser::DEFAULT_MAX_WASM_FILE_SIZE_BYTES),
+    )?;
     let hash = wasm_info.wasm_hash.clone();
 
     if format == cli::OutputFormat::Json {
@@ -3397,6 +3419,18 @@ fn cmd_wasm_info(wasm_path: &str, format: cli::OutputFormat, quiet: bool) -> err
         println!("  Functions: {}", wasm_info.functions.len());
         for (i, fn_info) in wasm_info.functions.iter().enumerate() {
             println!("    [{}] {}", i + 1, wasm::parser::format_function(fn_info));
+        }
+        if !wasm_info.imports.is_empty() {
+            println!("  Imports:   {}", wasm_info.imports.len());
+            for (i, imp) in wasm_info.imports.iter().enumerate() {
+                println!(
+                    "    [{}] {}::{} ({})",
+                    i + 1,
+                    imp.module,
+                    imp.name,
+                    imp.kind
+                );
+            }
         }
         println!(
             "  Contract spec: {}",
@@ -3486,6 +3520,20 @@ fn wasm_info_json(
                 "total_size": s.total_size,
                 "percent": s.percent,
                 "custom": s.id == Some(0),
+            })
+        }).collect::<Vec<_>>(),
+        "imports": wasm_info.imports.iter().map(|i| {
+            serde_json::json!({
+                "module": i.module,
+                "name": i.name,
+                "kind": i.kind,
+            })
+        }).collect::<Vec<_>>(),
+        "host_imports": wasm_info.host_imports().map(|i| {
+            serde_json::json!({
+                "module": i.module,
+                "name": i.name,
+                "kind": i.kind,
             })
         }).collect::<Vec<_>>(),
         "module": {
