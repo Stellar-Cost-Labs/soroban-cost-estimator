@@ -192,17 +192,23 @@ struct DedupState {
 /// Response envelope for the `getHealth` JSON-RPC method.
 ///
 /// Stellar RPC returns node status and optional node identity metadata.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-struct HealthResponse {
+pub struct HealthResponse {
     /// Node health status: `healthy`, `degraded`, or `unhealthy`.
-    status: String,
+    pub status: String,
     /// Stellar network passphrase served by the node.
     #[serde(default)]
-    network_passphrase: Option<String>,
+    pub network_passphrase: Option<String>,
     /// Stellar Core version served by the node.
     #[serde(default)]
-    core_version: Option<String>,
+    pub core_version: Option<String>,
+    /// Latest ledger sequence number reported by the node.
+    #[serde(
+        default,
+        deserialize_with = "crate::rpc::simulate::deserialize_u64_flexible_opt"
+    )]
+    pub latest_ledger: Option<u64>,
 }
 
 /// Node identity metadata returned by `getHealth`.

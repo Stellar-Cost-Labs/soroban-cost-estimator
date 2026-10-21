@@ -100,7 +100,10 @@ pub struct LedgerEntryResult {
 #[serde(rename_all = "camelCase")]
 pub struct GetLedgerEntriesResponse {
     pub entries: Vec<LedgerEntryResult>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::rpc::simulate::deserialize_u64_flexible_opt"
+    )]
     pub latest_ledger: Option<u64>,
 }
 
