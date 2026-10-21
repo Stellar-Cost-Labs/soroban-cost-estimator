@@ -364,6 +364,10 @@ soroban-cost-estimator config diff --network testnet --summary
   no separate `config snapshot` run needed
 - Cross-references the **cache** of past `estimate` results and reports which
   cached estimates are now stale due to the pricing change
+- Distinguishes **added**, **removed** and **unknown** settings from plain
+  numeric changes: a setting that is absent from one snapshot is *missing*,
+  not zero, and a stored setting this build does not model is reported as
+  unrecognized instead of being ignored silently
 
 ### `watch`
 
@@ -456,6 +460,56 @@ soroban-cost-estimator cache clear --network mainnet
   untouched
 - The same clearing logic backs the `estimate --clear-cache` flag, so both
   paths behave identically
+
+### `cache list`
+
+Audit what is stored in the estimate cache without opening the SQLite
+database by hand.
+
+```bash
+soroban-cost-estimator cache list                       # every network
+soroban-cost-estimator cache list --network testnet     # one network
+soroban-cost-estimator cache list --fn transfer         # by function name
+soroban-cost-estimator cache list --wasm-hash aabbcc    # by WASM hash prefix
+soroban-cost-estimator cache list --since 2026-01-01 --to 2026-12-31
+soroban-cost-estimator cache list --older-than 30d      # only stale entries
+soroban-cost-estimator cache list --limit 20 --offset 40
+soroban-cost-estimator cache list --json
+```
+
+- Without `--network`, entries from **every** network are listed
+- `--fn` matches the function name exactly, `--wasm-hash` matches a
+  hexadecimal prefix, `--since`/`--to` bound the entry timestamp
+  (RFC 3339 or `YYYY-MM-DD`)
+- Results are paginated: `--limit` defaults to 50 and is capped at 1000,
+  `--offset` skips matches. The footer reports
+  `Showing X of Y matching estimate(s) (offset Z).`
+- `--json` prints the matching records as a JSON array. The cache only ever
+  stores a hash of the simulated arguments — never the argument values
+
+### `cache delete`
+
+Remove selected cache entries — by network, function, WASM hash, time range
+or age — instead of clearing a whole network.
+
+```bash
+soroban-cost-estimator cache delete --network testnet --dry-run   # count only
+soroban-cost-estimator cache delete --network testnet             # asks first
+soroban-cost-estimator cache delete --network testnet --yes       # no prompt
+soroban-cost-estimator cache delete --older-than 90d --dry-run
+soroban-cost-estimator cache delete --all --yes                   # everything
+```
+
+- Uses **exactly** the same matching rules as `cache list` / `cache query`
+- `--dry-run` prints how many entries would be removed and changes nothing
+- A deletion without `--yes` prompts for confirmation; a non-interactive run
+  (or a declined prompt) aborts without deleting
+- A filter is required — `cache delete` without one is refused unless
+  `--all` is given
+- `--all` removes every entry on every network and cannot be combined with a
+  filter, so a whole-cache deletion is never silently narrowed
+- Selection and deletion happen in a single transaction, so the reported
+  count always matches the number of removed rows
 
 ### `cache export`
 
@@ -595,6 +649,32 @@ failed to decode XDR: invalid base64
 
 A test enumerates every `AppError` variant and asserts the rendered message
 obeys the style, so a new variant cannot silently drift from the guidelines.
+
+## Configuration file
+
+Defaults for common flags can live in a `config.toml`. It is read from the
+first of these that exists:
+
+1. the path given with `--config <path>` (must exist; no other location is read)
+2. `$XDG_CONFIG_HOME/soroban-cost-estimator/config.toml`
+3. `~/.config/soroban-cost-estimator/config.toml` (the platform config dir)
+4. `~/.soroban-cost-estimator/config.toml`
+
+```toml
+default_network = "mainnet"   # used when --network is not given
+format = "json"               # table | json | csv | markdown
+timeout_secs = 60             # used when --timeout is not given
+
+[rpc_urls]                    # replaces the built-in endpoint per network
+testnet = "https://soroban-testnet.stellar.org"
+mainnet = "https://my-mainnet-rpc.example"
+```
+
+Explicit flags always win: built-in defaults < `config.toml` < CLI
+arguments. `--rpc-url` overrides `[rpc_urls]`. `[rpc_urls]` also applies to
+commands without an `--rpc-url` flag (`config snapshot`, `config diff`,
+`watch`). A missing file is fine; an unreadable or malformed one is an
+error. The older keys `network`, `rpc_url` and `json` are still accepted.
 
 ## Storage
 

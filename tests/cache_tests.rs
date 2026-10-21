@@ -1057,8 +1057,10 @@ fn test_migrate_to_latest_current_version_is_identity() {
             cpu_instructions: 10,
             memory_bytes: 5,
             timestamp: "t".to_string(),
-            duration_ms: Some(42),
+            execution_duration_ms: 42,
             success: true,
+            network_passphrase: None,
+            core_version: None,
             io: None,
         };
         let migrated = cache::migrate_to_latest(entry.clone()).expect("migrate");
@@ -1083,8 +1085,10 @@ fn test_migrate_to_latest_rejects_future_version() {
             cpu_instructions: 10,
             memory_bytes: 5,
             timestamp: "t".to_string(),
-            duration_ms: None,
+            execution_duration_ms: 0,
             success: true,
+            network_passphrase: None,
+            core_version: None,
             io: None,
         };
         let err = cache::migrate_to_latest(entry).expect_err("future version must be rejected");
@@ -1577,7 +1581,8 @@ fn test_legacy_json_cache_is_imported_transparently() {
         assert_eq!(loaded.total_stroops, 1234);
         assert_eq!(loaded.ledger, 7);
         assert_eq!(loaded.version, cache::CACHE_SCHEMA_VERSION);
-        assert_eq!(loaded.duration_ms, None);
+        assert_eq!(loaded.execution_duration_ms, 0);
+        assert_eq!(loaded.duration_ms(), None);
         assert!(loaded.success);
 
         // The legacy directory is retired once fully imported.
@@ -1698,7 +1703,8 @@ fn test_v0_unversioned_entry_migrates_to_current_schema() {
             .expect("entry should exist");
         assert_eq!(loaded.version, cache::CACHE_SCHEMA_VERSION);
         assert_eq!(loaded.ledger, 3);
-        assert_eq!(loaded.duration_ms, None, "v0 has no duration data");
+        assert_eq!(loaded.execution_duration_ms, 0, "v0 has no duration data");
+        assert_eq!(loaded.duration_ms(), None, "v0 has no duration data");
         assert!(loaded.success, "v0 entries were always successful");
     });
 }
@@ -1717,13 +1723,16 @@ fn test_v2_entry_migrates_to_v3_preserving_fields() {
         cpu_instructions: 111,
         memory_bytes: 22,
         timestamp: "2026-01-01T00:00:00Z".to_string(),
-        duration_ms: Some(1_234),
+        execution_duration_ms: 1_234,
         success: false,
+        network_passphrase: None,
+        core_version: None,
         io: None,
     };
     let migrated = cache::migrate_to_latest(entry).expect("migrate v2 to v3");
     assert_eq!(migrated.version, cache::CACHE_SCHEMA_VERSION);
-    assert_eq!(migrated.duration_ms, Some(1_234));
+    assert_eq!(migrated.execution_duration_ms, 1_234);
+    assert_eq!(migrated.duration_ms(), Some(1_234));
     assert!(!migrated.success, "a recorded failure must be preserved");
     assert_eq!(migrated.total_stroops, 4_200);
 }
@@ -1743,8 +1752,10 @@ fn test_schema_version_serialization_key() {
         cpu_instructions: 1,
         memory_bytes: 1,
         timestamp: "2026-01-01T00:00:00Z".to_string(),
-        duration_ms: None,
+        execution_duration_ms: 0,
         success: true,
+        network_passphrase: None,
+        core_version: None,
         io: None,
     };
     let json = serde_json::to_string(&entry).expect("serialize");
@@ -1795,8 +1806,10 @@ fn test_future_schema_error_names_version_and_remedy() {
         cpu_instructions: 1,
         memory_bytes: 1,
         timestamp: "2026-01-01T00:00:00Z".to_string(),
-        duration_ms: None,
+        execution_duration_ms: 0,
         success: true,
+        network_passphrase: None,
+        core_version: None,
         io: None,
     };
     let err = cache::migrate_to_latest(entry).expect_err("future version must be rejected");
@@ -2677,7 +2690,8 @@ fn test_save_estimate_with_io_roundtrip() {
             .expect("load")
             .expect("entry should exist");
         assert_eq!(loaded.io, Some(io));
-        assert_eq!(loaded.duration_ms, Some(12));
+        assert_eq!(loaded.execution_duration_ms, 12);
+        assert_eq!(loaded.duration_ms(), Some(12));
     });
 }
 
@@ -2727,7 +2741,8 @@ fn test_export_cached_estimates_includes_footprint() {
         let exported = cache::export_cached_estimates().expect("export");
         assert_eq!(exported.len(), 1);
         assert_eq!(exported[0].io, Some(io));
-        assert_eq!(exported[0].duration_ms, Some(5));
+        assert_eq!(exported[0].execution_duration_ms, 5);
+        assert_eq!(exported[0].duration_ms(), Some(5));
         assert!(exported[0].success);
     });
 }
@@ -2785,288 +2800,432 @@ fn test_legacy_database_without_io_column_still_loads() {
     });
 }
 
-// ── Permission tests (#519) ──────────────────────────────────────────
+// ── Cache listing and filtered deletion (#516, #517) ───────────────────────
 
-#[cfg(unix)]
+/// Seeds one cache entry for the listing and deletion tests.
+fn seed_listing_entry(
+    wasm_hash: &str,
+    function: &str,
+    network: &str,
+    ledger: u32,
+    total_stroops: i64,
+) {
+    cache::save_estimate(
+        wasm_hash,
+        function,
+        &[],
+        network,
+        ledger,
+        total_stroops,
+        100,
+        50,
+        None,
+        true,
+    )
+    .expect("seed estimate");
+}
+
+/// A filter that matches nothing but is still valid.
+fn filter_for_network(network: &str) -> cache::CacheFilter {
+    cache::CacheFilter {
+        network: Some(network.to_string()),
+        ..Default::default()
+    }
+}
+
 #[test]
-fn test_new_cache_database_and_directory_have_user_only_permissions() {
-    use std::os::unix::fs::PermissionsExt;
-    with_temp_home(|tmp| {
-        let data_dir = tmp.join(".soroban-cost-estimator");
-        let db_file = data_dir.join("cache.db");
-        assert!(!data_dir.exists());
+fn test_list_cached_estimates_paginated_filters_by_network() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+        seed_listing_entry("bb22", "approve", "mainnet", 2, 200);
 
-        // Saving an estimate should initialize data_dir and cache.db
-        cache::save_estimate(
-            "perm_hash",
-            "perm_func",
+        let listing = cache::list_cached_estimates_paginated(&filter_for_network("testnet"), 50, 0)
+            .expect("list estimates");
+
+        assert_eq!(listing.total, 1);
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].function, "transfer");
+        assert_eq!(listing.entries[0].network, "testnet");
+    });
+}
+
+#[test]
+fn test_list_cached_estimates_paginated_without_network_filter_covers_every_network() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+        seed_listing_entry("bb22", "approve", "mainnet", 2, 200);
+
+        let listing = cache::list_cached_estimates_paginated(&cache::CacheFilter::default(), 50, 0)
+            .expect("list estimates");
+
+        assert_eq!(listing.total, 2);
+        assert_eq!(listing.entries.len(), 2);
+    });
+}
+
+#[test]
+fn test_list_cached_estimates_paginated_matches_function_exactly() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+        seed_listing_entry("aa11", "approve", "testnet", 2, 200);
+
+        let filter = cache::CacheFilter {
+            function: Some("transfer".to_string()),
+            ..Default::default()
+        };
+        let listing =
+            cache::list_cached_estimates_paginated(&filter, 50, 0).expect("list estimates");
+
+        assert_eq!(listing.total, 1);
+        assert_eq!(listing.entries[0].function, "transfer");
+    });
+}
+
+#[test]
+fn test_list_cached_estimates_paginated_matches_wasm_hash_prefix() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aabbccdd", "transfer", "testnet", 1, 100);
+        seed_listing_entry("ffeeddcc", "transfer", "testnet", 2, 200);
+
+        let filter = cache::CacheFilter {
+            wasm_hash: Some("aabb".to_string()),
+            ..Default::default()
+        };
+        let listing =
+            cache::list_cached_estimates_paginated(&filter, 50, 0).expect("list estimates");
+
+        assert_eq!(listing.total, 1);
+        assert_eq!(listing.entries[0].wasm_hash, "aabbccdd");
+    });
+}
+
+#[test]
+fn test_list_cached_estimates_paginated_empty_result() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+
+        let filter = cache::CacheFilter {
+            function: Some("does-not-exist".to_string()),
+            ..Default::default()
+        };
+        let listing =
+            cache::list_cached_estimates_paginated(&filter, 50, 0).expect("list estimates");
+
+        assert_eq!(listing.total, 0);
+        assert!(listing.entries.is_empty());
+    });
+}
+
+#[test]
+fn test_list_cached_estimates_paginated_paginates() {
+    with_temp_home(|_tmp| {
+        for index in 0..5u32 {
+            seed_listing_entry("aa11", &format!("fn{index}"), "testnet", index + 1, 100);
+        }
+
+        let first = cache::list_cached_estimates_paginated(&cache::CacheFilter::default(), 2, 0)
+            .expect("list estimates");
+        assert_eq!(first.total, 5);
+        assert_eq!(first.entries.len(), 2);
+        assert_eq!(first.limit, 2);
+        assert_eq!(first.offset, 0);
+
+        let second = cache::list_cached_estimates_paginated(&cache::CacheFilter::default(), 2, 2)
+            .expect("list estimates");
+        assert_eq!(second.total, 5);
+        assert_eq!(second.entries.len(), 2);
+        assert_eq!(second.offset, 2);
+
+        // The pages must not overlap.
+        let first_names: Vec<&str> = first.entries.iter().map(|e| e.function.as_str()).collect();
+        let second_names: Vec<&str> = second.entries.iter().map(|e| e.function.as_str()).collect();
+        for name in &second_names {
+            assert!(!first_names.contains(name), "pages overlap on {name}");
+        }
+    });
+}
+
+#[test]
+fn test_list_cached_estimates_paginated_caps_the_limit() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+
+        let listing =
+            cache::list_cached_estimates_paginated(&cache::CacheFilter::default(), 100_000, 0)
+                .expect("list estimates");
+        assert_eq!(listing.limit, cache::MAX_LIST_LIMIT);
+    });
+}
+
+#[test]
+fn test_list_cached_estimates_paginated_rejects_an_invalid_wasm_hash() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+
+        let filter = cache::CacheFilter {
+            wasm_hash: Some("not-hex".to_string()),
+            ..Default::default()
+        };
+        let error =
+            cache::list_cached_estimates_paginated(&filter, 50, 0).expect_err("invalid hash");
+        assert!(
+            error.to_string().contains("invalid wasm hash filter"),
+            "error should explain the bad hash: {error}"
+        );
+    });
+}
+
+#[test]
+fn test_list_cached_estimates_paginated_filters_by_time_range() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+
+        let now = chrono::Utc::now();
+        let inside = cache::CacheFilter {
+            since: Some(now - chrono::TimeDelta::hours(1)),
+            to: Some(now + chrono::TimeDelta::hours(1)),
+            ..Default::default()
+        };
+        assert_eq!(
+            cache::list_cached_estimates_paginated(&inside, 50, 0)
+                .expect("list estimates")
+                .total,
+            1
+        );
+
+        let outside = cache::CacheFilter {
+            since: Some(now + chrono::TimeDelta::hours(1)),
+            ..Default::default()
+        };
+        assert_eq!(
+            cache::list_cached_estimates_paginated(&outside, 50, 0)
+                .expect("list estimates")
+                .total,
+            0
+        );
+    });
+}
+
+#[test]
+fn test_save_estimate_with_metadata_roundtrip() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate_with_metadata(
+            "hash_meta",
+            "test_fn",
             &[],
             "testnet",
-            1,
             100,
-            10,
-            5,
-            None,
+            250,
+            5000,
+            1024,
+            Some(45),
             true,
+            Some("Test SDF Network ; September 2015"),
+            Some("v21.1.0"),
         )
-        .expect("save estimate");
+        .expect("save with metadata");
 
-        assert!(data_dir.exists(), "data_dir should exist");
-        assert!(db_file.exists(), "cache.db should exist");
-
-        let dir_perms = std::fs::metadata(&data_dir)
-            .expect("dir metadata")
-            .permissions();
-        let dir_mode = dir_perms.mode() & 0o777;
+        let loaded = cache::load_estimate("hash_meta", "test_fn", &[])
+            .expect("load")
+            .expect("entry should exist");
+        assert_eq!(loaded.execution_duration_ms, 45);
+        assert_eq!(loaded.duration_ms(), Some(45));
         assert_eq!(
-            dir_mode, 0o700,
-            "cache directory must have 0700 (user-only) permissions, got 0{:o}",
-            dir_mode
+            loaded.network_passphrase.as_deref(),
+            Some("Test SDF Network ; September 2015")
         );
-
-        let file_perms = std::fs::metadata(&db_file)
-            .expect("file metadata")
-            .permissions();
-        let file_mode = file_perms.mode() & 0o777;
-        assert_eq!(
-            file_mode, 0o600,
-            "cache database file must have 0600 (user-only) permissions, got 0{:o}",
-            file_mode
-        );
-
-        // Also verify WAL sidecar permissions if present
-        let wal_file = data_dir.join("cache.db-wal");
-        if wal_file.exists() {
-            let wal_mode = std::fs::metadata(&wal_file)
-                .expect("wal metadata")
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(
-                wal_mode, 0o600,
-                "WAL sidecar must have 0600 permissions, got 0{:o}",
-                wal_mode
-            );
-        }
+        assert_eq!(loaded.core_version.as_deref(), Some("v21.1.0"));
     });
 }
 
-#[cfg(unix)]
 #[test]
-fn test_existing_database_permissions_are_preserved() {
-    use std::os::unix::fs::PermissionsExt;
-    with_temp_home(|tmp| {
-        let data_dir = tmp.join(".soroban-cost-estimator");
-        std::fs::create_dir_all(&data_dir).expect("create dir");
+fn test_count_cached_estimates_matches_the_listing() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+        seed_listing_entry("bb22", "approve", "testnet", 2, 200);
+        seed_listing_entry("cc33", "transfer", "mainnet", 3, 300);
 
-        let db_file = data_dir.join("cache.db");
-        // Create an empty database file with custom permissive permissions (0644)
-        {
-            let conn = rusqlite::Connection::open(&db_file).expect("open dummy db");
-            cache::ensure_cache_schema(&conn).expect("schema");
-        }
-        std::fs::set_permissions(&db_file, std::fs::Permissions::from_mode(0o644))
-            .expect("set perms");
-
-        let initial_mode = std::fs::metadata(&db_file)
-            .expect("metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(initial_mode, 0o644);
-
-        // Calling cache operations on an existing database must not silently alter permissions
-        cache::save_estimate(
-            "exist_hash",
-            "exist_func",
-            &[],
-            "testnet",
-            1,
-            100,
-            10,
-            5,
-            None,
-            true,
-        )
-        .expect("save estimate");
-
-        let final_mode = std::fs::metadata(&db_file)
-            .expect("metadata")
-            .permissions()
-            .mode()
-            & 0o777;
+        let filter = filter_for_network("testnet");
+        assert_eq!(cache::count_cached_estimates(&filter).expect("count"), 2);
         assert_eq!(
-            final_mode, 0o644,
-            "existing database permissions must not be silently altered"
-        );
-    });
-}
-
-// ── Corruption & Recovery tests (#518) ────────────────────────────────
-
-#[test]
-fn test_distinguish_corruption_from_other_sqlite_errors() {
-    // SQLITE_CORRUPT (11) is corruption
-    let corrupt_err = rusqlite::Error::SqliteFailure(
-        rusqlite::ffi::Error {
-            code: rusqlite::ErrorCode::DatabaseCorrupt,
-            extended_code: 11,
-        },
-        Some("database disk image is malformed".to_string()),
-    );
-    assert!(cache::is_database_corrupt_error(&corrupt_err));
-
-    // SQLITE_NOTADB (extended 26) is corruption
-    let notadb_err = rusqlite::Error::SqliteFailure(
-        rusqlite::ffi::Error {
-            code: rusqlite::ErrorCode::CannotOpen,
-            extended_code: 26,
-        },
-        Some("file is not a database".to_string()),
-    );
-    assert!(cache::is_database_corrupt_error(&notadb_err));
-
-    // SQLITE_PERM (3) is NOT corruption
-    let perm_err = rusqlite::Error::SqliteFailure(
-        rusqlite::ffi::Error {
-            code: rusqlite::ErrorCode::PermissionDenied,
-            extended_code: 3,
-        },
-        Some("permission denied".to_string()),
-    );
-    assert!(!cache::is_database_corrupt_error(&perm_err));
-
-    // SQLITE_BUSY (5) is NOT corruption
-    let busy_err = rusqlite::Error::SqliteFailure(
-        rusqlite::ffi::Error {
-            code: rusqlite::ErrorCode::DatabaseBusy,
-            extended_code: 5,
-        },
-        Some("database is locked".to_string()),
-    );
-    assert!(!cache::is_database_corrupt_error(&busy_err));
-
-    // SQLITE_FULL (13) is NOT corruption
-    let full_err = rusqlite::Error::SqliteFailure(
-        rusqlite::ffi::Error {
-            code: rusqlite::ErrorCode::DiskFull,
-            extended_code: 13,
-        },
-        Some("database or disk is full".to_string()),
-    );
-    assert!(!cache::is_database_corrupt_error(&full_err));
-}
-
-#[test]
-fn test_corrupt_database_fails_without_destroying_file() {
-    with_temp_home(|tmp| {
-        let data_dir = tmp.join(".soroban-cost-estimator");
-        std::fs::create_dir_all(&data_dir).expect("create dir");
-        let db_file = data_dir.join("cache.db");
-
-        // Write junk to simulate a corrupted database file
-        let corrupt_content = b"THIS IS DEFINITELY NOT A VALID SQLITE DATABASE FILE HEADER";
-        std::fs::write(&db_file, corrupt_content).expect("write corrupt db");
-
-        // Normal operations must fail with CacheCorrupt
-        let err = cache::load_estimate("any_hash", "any_fn", &[]).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("cache database corrupt"),
-            "expected CacheCorrupt error, got: {msg}"
-        );
-
-        // Acceptance criterion: Original corrupt database must NOT be deleted or overwritten automatically
-        assert!(
-            db_file.exists(),
-            "original corrupt database must still exist"
-        );
-        let content_after = std::fs::read(&db_file).expect("read db after failure");
-        assert_eq!(
-            content_after, corrupt_content,
-            "original corrupt database content must remain unmodified after failed initialization"
+            cache::list_cached_estimates_paginated(&filter, 50, 0)
+                .expect("list estimates")
+                .total,
+            2
         );
     });
 }
 
 #[test]
-fn test_recover_cache_quarantines_corrupt_database_and_initializes_fresh() {
-    with_temp_home(|tmp| {
-        let data_dir = tmp.join(".soroban-cost-estimator");
-        std::fs::create_dir_all(&data_dir).expect("create dir");
-        let db_file = data_dir.join("cache.db");
+fn test_delete_cached_estimates_removes_only_the_matching_entries() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+        seed_listing_entry("aa11", "approve", "testnet", 2, 200);
+        seed_listing_entry("bb22", "transfer", "mainnet", 3, 300);
 
-        let corrupt_content = b"CORRUPTED_SQLITE_DATABASE_PAGES_GARBAGE";
-        std::fs::write(&db_file, corrupt_content).expect("write corrupt db");
+        let filter = cache::CacheFilter {
+            network: Some("testnet".to_string()),
+            function: Some("transfer".to_string()),
+            ..Default::default()
+        };
+        let removed = cache::delete_cached_estimates(&filter).expect("delete estimates");
+        assert_eq!(removed, 1);
 
-        // Create a dummy sidecar to test sidecar quarantining
-        let wal_file = data_dir.join("cache.db-wal");
-        std::fs::write(&wal_file, b"DUMMY_WAL").expect("write wal");
-
-        // Health check should report false (corrupt)
-        assert!(!cache::check_cache_health().expect("health check"));
-
-        // Recover cache
-        let report = cache::recover_cache(false).expect("recover cache");
-
-        // Verify backup file exists and holds the original corrupt content
-        assert!(report.backup_path.exists(), "backup file must exist");
-        let backup_content = std::fs::read(&report.backup_path).expect("read backup");
-        assert_eq!(
-            backup_content, corrupt_content,
-            "backup file must contain the exact original corrupt content"
-        );
-
-        // Verify sidecar was quarantined
-        assert!(
-            !report.sidecars_quarantined.is_empty(),
-            "sidecar should be quarantined"
-        );
-        for sidecar in &report.sidecars_quarantined {
-            assert!(
-                sidecar.exists(),
-                "sidecar backup must exist: {}",
-                sidecar.display()
-            );
-        }
-
-        // Verify fresh database is initialized and works
-        assert!(db_file.exists(), "new cache.db must exist");
-        let fresh_content = std::fs::read(&db_file).expect("read fresh db");
-        assert_ne!(
-            fresh_content, corrupt_content,
-            "new cache.db must not be the corrupt one"
-        );
-
-        // Saving and loading on the fresh database must succeed
-        cache::save_estimate(
-            "new_hash",
-            "new_func",
-            &[],
-            "testnet",
-            42,
-            500,
-            50,
-            25,
-            None,
-            true,
-        )
-        .expect("save on recovered cache");
-
-        let loaded = cache::load_estimate("new_hash", "new_func", &[])
-            .expect("load on recovered cache")
-            .expect("estimate exists");
-        assert_eq!(loaded.ledger, 42);
-
-        // Recovering again without force should return an error because database is healthy now
-        let err = cache::recover_cache(false).unwrap_err();
-        assert!(
-            err.to_string().contains("not corrupt"),
-            "recovering healthy cache without --force should fail"
-        );
-
-        // But recovering with force should succeed
-        let force_report = cache::recover_cache(true).expect("force recover");
-        assert!(force_report.backup_path.exists());
+        // The matching entry is gone, the others survive untouched.
+        let remaining =
+            cache::list_cached_estimates_paginated(&cache::CacheFilter::default(), 50, 0)
+                .expect("list estimates");
+        assert_eq!(remaining.total, 2);
+        let functions: Vec<&str> = remaining
+            .entries
+            .iter()
+            .map(|e| e.function.as_str())
+            .collect();
+        assert!(functions.contains(&"approve"));
+        assert!(functions.contains(&"transfer"));
     });
+}
+
+#[test]
+fn test_delete_cached_estimates_without_matches_removes_nothing() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+
+        let filter = cache::CacheFilter {
+            function: Some("does-not-exist".to_string()),
+            ..Default::default()
+        };
+        let removed = cache::delete_cached_estimates(&filter).expect("delete estimates");
+        assert_eq!(removed, 0);
+        assert_eq!(
+            cache::list_cached_estimates_paginated(&cache::CacheFilter::default(), 50, 0)
+                .expect("list estimates")
+                .total,
+            1
+        );
+    });
+}
+
+#[test]
+fn test_delete_cached_estimates_never_touches_other_networks() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+        seed_listing_entry("bb22", "transfer", "mainnet", 2, 200);
+
+        let removed =
+            cache::delete_cached_estimates(&filter_for_network("testnet")).expect("delete");
+        assert_eq!(removed, 1);
+
+        let mainnet = filter_for_network("mainnet");
+        assert_eq!(
+            cache::list_cached_estimates_paginated(&mainnet, 50, 0)
+                .expect("list estimates")
+                .total,
+            1
+        );
+    });
+}
+
+#[test]
+fn test_delete_cached_estimates_uses_the_same_matching_as_queries() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+        seed_listing_entry("bb22", "approve", "testnet", 2, 200);
+
+        let filter = cache::CacheFilter {
+            function: Some("transfer".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cache::count_cached_estimates(&filter).expect("count"),
+            cache::query_cache(&filter).expect("query").len()
+        );
+        assert_eq!(cache::delete_cached_estimates(&filter).expect("delete"), 1);
+    });
+}
+
+#[test]
+fn test_delete_cached_estimates_rejects_an_invalid_filter() {
+    with_temp_home(|_tmp| {
+        seed_listing_entry("aa11", "transfer", "testnet", 1, 100);
+
+        let filter = cache::CacheFilter {
+            wasm_hash: Some("zz".to_string()),
+            ..Default::default()
+        };
+        let error = cache::delete_cached_estimates(&filter).expect_err("invalid hash");
+        assert!(
+            error.to_string().contains("invalid wasm hash filter"),
+            "error should explain the bad hash: {error}"
+        );
+    });
+}
+
+#[test]
+fn test_cached_estimate_backward_compatible_deserialization() {
+    // 1. Legacy entry with duration_ms
+    let legacy_json = r#"{
+        "schema_version": 2,
+        "wasm_hash": "h1",
+        "function": "f",
+        "args_hash": "a1",
+        "network": "testnet",
+        "ledger": 10,
+        "total_stroops": 100,
+        "cpu_instructions": 20,
+        "memory_bytes": 10,
+        "timestamp": "2026-01-01T00:00:00Z",
+        "duration_ms": 35,
+        "success": true
+    }"#;
+    let parsed: cache::CachedEstimate =
+        serde_json::from_str(legacy_json).expect("deserialize legacy duration_ms");
+    assert_eq!(parsed.execution_duration_ms, 35);
+    assert_eq!(parsed.network_passphrase, None);
+    assert_eq!(parsed.core_version, None);
+
+    // 2. Legacy entry with null duration_ms
+    let null_duration_json = r#"{
+        "schema_version": 2,
+        "wasm_hash": "h1",
+        "function": "f",
+        "args_hash": "a1",
+        "network": "testnet",
+        "ledger": 10,
+        "total_stroops": 100,
+        "cpu_instructions": 20,
+        "memory_bytes": 10,
+        "timestamp": "2026-01-01T00:00:00Z",
+        "duration_ms": null,
+        "success": true
+    }"#;
+    let parsed_null: cache::CachedEstimate =
+        serde_json::from_str(null_duration_json).expect("deserialize null duration_ms");
+    assert_eq!(parsed_null.execution_duration_ms, 0);
+
+    // 3. New entry with execution_duration_ms, network_passphrase, and core_version
+    let new_json = r#"{
+        "schema_version": 3,
+        "wasm_hash": "h2",
+        "function": "f2",
+        "args_hash": "a2",
+        "network": "testnet",
+        "ledger": 12,
+        "total_stroops": 120,
+        "cpu_instructions": 30,
+        "memory_bytes": 15,
+        "timestamp": "2026-01-01T00:00:00Z",
+        "execution_duration_ms": 78,
+        "network_passphrase": "Public Global Stellar Network ; September 2015",
+        "core_version": "v21.2.0",
+        "success": true
+    }"#;
+    let parsed_new: cache::CachedEstimate =
+        serde_json::from_str(new_json).expect("deserialize new metadata fields");
+    assert_eq!(parsed_new.execution_duration_ms, 78);
+    assert_eq!(
+        parsed_new.network_passphrase.as_deref(),
+        Some("Public Global Stellar Network ; September 2015")
+    );
+    assert_eq!(parsed_new.core_version.as_deref(), Some("v21.2.0"));
 }

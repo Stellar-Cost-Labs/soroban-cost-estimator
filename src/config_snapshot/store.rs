@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, TimeDelta, Utc};
 use tracing::{debug, trace, warn};
 
-use crate::config_snapshot::model::ConfigSnapshot;
+use crate::config_snapshot::model::{ConfigSnapshot, SnapshotPayload};
 use crate::error::{AppError, AppResult};
 
 /// Returns the base data directory: `~/.soroban-cost-estimator`.
@@ -21,6 +21,68 @@ fn snapshots_dir() -> AppResult<PathBuf> {
     let dir = snapshots_path()?;
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+/// Extracts the timestamp encoded in a snapshot file name.
+///
+/// Snapshot files are named `{network}-{timestamp}.json`, where the
+/// timestamp has its `:` characters replaced by `-` so the name is safe on
+/// every filesystem (`2026-01-02T03-04-05+00-00`).
+///
+/// This reverses that transformation and returns the original RFC 3339
+/// timestamp, or `None` when the name does not follow the
+/// `{network}-….json` pattern or when the embedded timestamp is not a valid
+/// instant. Such a file cannot be placed on the timeline, so it is skipped
+/// by the chronological ordering and by the "latest snapshot" selection.
+pub fn timestamp_from_filename(network: &str, filename: &str) -> Option<String> {
+    let prefix = format!("{network}-");
+    let stem = filename.strip_prefix(prefix.as_str())?;
+    let stem = stem.strip_suffix(".json")?;
+    if stem.is_empty() {
+        return None;
+    }
+
+    // The date part keeps its `-` separators; only the time part had its
+    // punctuation replaced.
+    let (date, time) = stem.split_once('T')?;
+    let parts: Vec<&str> = time.split('-').collect();
+    let (clock, offset) = match parts.as_slice() {
+        [hour, minute, second] => (format!("{hour}:{minute}:{second}"), None),
+        [hour, minute, second, offset_minute] => {
+            // The offset sign stays attached to the seconds field, e.g.
+            // `00+02` / `00-05`.
+            let sign_index = second.rfind(['+', '-'])?;
+            let seconds = &second[..sign_index];
+            let sign = &second[sign_index..];
+            (
+                format!("{hour}:{minute}:{seconds}"),
+                Some(format!("{sign}:{offset_minute}")),
+            )
+        }
+        [hour, minute, second, offset_hour, offset_minute] => {
+            // A negative offset lost its sign to the `-` separator.
+            (
+                format!("{hour}:{minute}:{second}"),
+                Some(format!("-{offset_hour}:{offset_minute}")),
+            )
+        }
+        _ => return None,
+    };
+    let timestamp = match offset {
+        Some(offset) => format!("{date}T{clock}{offset}"),
+        None => format!("{date}T{clock}"),
+    };
+
+    DateTime::parse_from_rfc3339(&timestamp).ok()?;
+    Some(timestamp)
+}
+
+/// Parses the timestamp encoded in a snapshot file name into a UTC instant.
+fn embedded_timestamp(network: &str, filename: &str) -> Option<DateTime<Utc>> {
+    let timestamp = timestamp_from_filename(network, filename)?;
+    DateTime::parse_from_rfc3339(&timestamp)
+        .ok()
+        .map(|instant| instant.with_timezone(&Utc))
 }
 
 /// Saves a config snapshot to disk as a JSON file.
@@ -52,35 +114,83 @@ pub fn save_snapshot(snapshot: &ConfigSnapshot, out_path: Option<&str>) -> AppRe
 
 /// Loads the most recent snapshot for a given network.
 ///
-/// Scans the snapshots directory for files matching `{network}-*.json`
-/// and returns the one with the latest timestamp in its filename.
+/// Scans the snapshots directory for files matching `{network}-*.json` and
+/// returns the one with the latest timestamp **embedded in its file name**.
+///
+/// The timestamp is parsed as an instant rather than compared as text, so
+/// snapshots recorded with different UTC offsets are still ordered
+/// chronologically. Files whose name does not encode a valid timestamp
+/// cannot be placed on the timeline and are ignored by this selection; when
+/// *no* file carries a valid timestamp, the lexicographically greatest file
+/// name is used as a fallback so a hand-written snapshot stays reachable.
 ///
 /// # Network calls
 /// None — pure file I/O.
 pub fn load_latest_snapshot(network: &str) -> AppResult<ConfigSnapshot> {
     debug!(network, "loading latest snapshot");
     let dir = snapshots_dir()?;
-    let mut entries: Vec<_> = std::fs::read_dir(&dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name().to_str().is_some_and(|name| {
-                name.starts_with(&format!("{}-", network)) && name.ends_with(".json")
-            })
-        })
-        .collect();
+    let latest = select_latest_snapshot(network, &dir)?;
 
-    entries.sort_by_key(|e| e.file_name());
-
-    let latest = entries
-        .into_iter()
-        .last()
-        .ok_or_else(|| AppError::NoSnapshots(network.to_string()))?;
-
-    let content = std::fs::read_to_string(latest.path())?;
+    let content = std::fs::read_to_string(&latest)?;
     let snapshot: ConfigSnapshot =
         serde_json::from_str(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))?;
     trace!(network, ledger = snapshot.ledger, "latest snapshot loaded");
     Ok(snapshot)
+}
+
+/// Loads the most recent snapshot for a given network, keeping any
+/// top-level fields this build does not recognize.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn load_latest_snapshot_payload(network: &str) -> AppResult<SnapshotPayload> {
+    let dir = snapshots_dir()?;
+    let latest = select_latest_snapshot(network, &dir)?;
+    load_snapshot_payload_from_path(&latest.to_string_lossy())
+}
+
+/// Picks the snapshot with the newest embedded timestamp in `dir`.
+///
+/// Falls back to the lexicographically greatest file name when no file name
+/// encodes a valid timestamp.
+fn select_latest_snapshot(network: &str, dir: &Path) -> AppResult<PathBuf> {
+    let mut candidates: Vec<(Option<DateTime<Utc>>, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(&format!("{network}-")) || !name.ends_with(".json") {
+            continue;
+        }
+        candidates.push((embedded_timestamp(network, name), entry.path()));
+    }
+
+    if candidates.is_empty() {
+        return Err(AppError::NoSnapshots(network.to_string()));
+    }
+
+    let mut best: Option<(DateTime<Utc>, PathBuf)> = None;
+    for (timestamp, path) in &candidates {
+        let Some(timestamp) = timestamp else {
+            continue;
+        };
+        let is_newer = best
+            .as_ref()
+            .is_none_or(|(best_timestamp, _)| timestamp > best_timestamp);
+        if is_newer {
+            best = Some((*timestamp, path.clone()));
+        }
+    }
+
+    if let Some((_, path)) = best {
+        return Ok(path);
+    }
+
+    // No usable timestamp anywhere: fall back to the greatest file name.
+    candidates.sort_by(|left, right| right.1.cmp(&left.1));
+    Ok(candidates[0].1.clone())
 }
 
 /// Loads the two most recent snapshots for a network, oldest first.
@@ -115,6 +225,40 @@ pub fn load_last_two_snapshots(network: &str) -> AppResult<(ConfigSnapshot, Conf
     Ok((previous, latest))
 }
 
+/// Loads the two most recent snapshots for a network, oldest first, keeping
+/// any top-level fields this build does not recognize.
+///
+/// Returns `(previous, latest)` — the pair that `config diff
+/// --against-previous` compares.
+///
+/// # Errors
+/// [`AppError::NotEnoughSnapshots`] when the network has fewer than two
+/// snapshots on disk — a diff needs two points in time to be meaningful.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn load_last_two_snapshot_payloads(
+    network: &str,
+) -> AppResult<(SnapshotPayload, SnapshotPayload)> {
+    debug!(network, "loading the two most recent snapshots");
+    let paths = list_snapshots(network)?;
+    if paths.len() < 2 {
+        return Err(AppError::NotEnoughSnapshots {
+            network: network.to_string(),
+            found: paths.len(),
+        });
+    }
+
+    let previous = load_snapshot_payload_from_path(&paths[paths.len() - 2].to_string_lossy())?;
+    let latest = load_snapshot_payload_from_path(&paths[paths.len() - 1].to_string_lossy())?;
+    trace!(
+        previous = paths[paths.len() - 2].display().to_string(),
+        latest = paths[paths.len() - 1].display().to_string(),
+        "loaded snapshot pair"
+    );
+    Ok((previous, latest))
+}
+
 /// Loads a specific snapshot from an explicit path.
 ///
 /// # Network calls
@@ -132,6 +276,19 @@ pub fn load_snapshot_from_path(path: &str) -> AppResult<ConfigSnapshot> {
     Ok(snapshot)
 }
 
+/// Loads a specific snapshot from an explicit path, keeping any top-level
+/// fields this build does not recognize.
+///
+/// Unknown fields never make the load fail — they are reported separately so
+/// callers can surface them in a diff.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn load_snapshot_payload_from_path(path: &str) -> AppResult<SnapshotPayload> {
+    let content = std::fs::read_to_string(path)?;
+    SnapshotPayload::parse(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))
+}
+
 /// Lists all snapshots for a given network, oldest → newest.
 ///
 /// # Network calls
@@ -143,22 +300,37 @@ pub fn list_snapshots(network: &str) -> AppResult<Vec<PathBuf>> {
 /// Lists the `{network}-*.json` files in `dir`, sorted oldest → newest.
 ///
 /// Filenames are `{network}-{timestamp}.json` where the timestamp is an
-/// RFC 3339 UTC instant with `:` replaced by `-`, so a plain lexicographic
-/// sort of the paths is also a chronological one.
+/// RFC 3339 instant with `:` replaced by `-`. The timestamp is parsed back
+/// out of the file name and compared as an instant, so snapshots recorded
+/// with different UTC offsets are ordered chronologically rather than
+/// lexicographically.
+///
+/// Files whose name does not encode a valid timestamp cannot be placed on
+/// the timeline; they are listed last, ordered by name between themselves,
+/// so they are never mistaken for the newest snapshot.
 fn list_snapshots_in(dir: &Path, network: &str) -> AppResult<Vec<PathBuf>> {
     let prefix = format!("{network}-");
-    let mut snapshots = Vec::new();
+    let mut snapshots: Vec<(Option<DateTime<Utc>>, PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
         if name_str.starts_with(&prefix) && name_str.ends_with(".json") {
-            snapshots.push(entry.path());
+            let timestamp = name
+                .to_str()
+                .and_then(|name| embedded_timestamp(network, name));
+            snapshots.push((timestamp, entry.path()));
         }
     }
 
-    snapshots.sort();
-    Ok(snapshots)
+    snapshots.sort_by(|left, right| match (left.0, right.0) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => left.1.cmp(&right.1),
+    });
+
+    Ok(snapshots.into_iter().map(|(_, path)| path).collect())
 }
 
 /// Applies a retention policy to the snapshots directory for `network` and
