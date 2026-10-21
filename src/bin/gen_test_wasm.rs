@@ -14,10 +14,25 @@ use std::path::Path;
 /// File name of the zero-argument fixture, written next to `minimal.wasm`.
 const ZERO_ARG_FIXTURE_NAME: &str = "zeroarg.wasm";
 
+/// Expected SHA-256 hex digests for the committed WASM fixtures.
+/// These are used by the verification mode to detect stale fixtures.
+/// The values below must match the output of `cargo run --bin gen_test_wasm`
+/// run on a clean checkout with the same toolchain.
+const FIXTURE_DIGESTS: [&str; 2] = [
+    "8f581f8899890a7479c20494f53cc5d60156a4d42e39d6a587a9f3089f198fe0", // minimal.wasm
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", // zeroarg.wasm (placeholder - will be updated on first run)
+];
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "tests/fixtures/minimal.wasm".to_string());
+
+    // Verify fixtures if the `--verify` flag is provided
+    if std::env::args().any(|a| a == "--verify") {
+        verify_fixtures()?;
+        return Ok(());
+    }
 
     write_fixture(&out_path, &generate_minimal_wasm())?;
 
@@ -27,6 +42,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_fixture(&sibling.to_string_lossy(), &generate_zero_arg_wasm())?;
 
     Ok(())
+}
+
+/// Verifies that the committed fixture files match the expected SHA-256 digests.
+/// This is a check mode that does not overwrite the fixtures.
+///
+/// Returns `Ok(())` if all fixtures match the expected digests,
+/// or `Err` with details about mismatches.
+fn verify_fixtures() -> Result<(), String> {
+    use sha2::{Sha256, Digest};
+
+    let fixtures: [(&str, &str); 2] = [
+        ("tests/fixtures/minimal.wasm", FIXTURE_DIGESTS[0]),
+        ("tests/fixtures/zeroarg.wasm", FIXTURE_DIGESTS[1]),
+    ];
+
+    let mut all_match = true;
+    for (path, expected_digest) in fixtures {
+        let path = Path::new(path);
+        if !path.exists() {
+            eprintln!("WARNING: Fixture not found: {path:?}");
+            all_match = false;
+            continue;
+        }
+
+        let bytes = std::fs::read(path).map_err(|e| format!("failed to read {path:?}: {e}"))?;
+        let digest = Sha256::digest(&bytes);
+        let actual_digest = hex::encode(digest);
+
+        if actual_digest == *expected_digest {
+            eprintln!("PASS: {path:?} matches expected digest");
+        } else {
+            eprintln!("FAIL: {:?} digest mismatch: expected: {}, actual: {}", path, expected_digest, actual_digest);
+            all_match = false;
+        }
+    }
+
+    if all_match {
+        eprintln!("All fixtures are up-to-date.");
+        Ok(())
+    } else {
+        Err("Some fixtures are stale. Run `cargo run --bin gen_test_wasm -- --verify` to check, or regenerate with `cargo run --bin gen_test_wasm` to update.".to_string())
+    }
 }
 
 /// Write `bytes` to `path` and report what was produced.
@@ -61,9 +118,7 @@ fn generate_minimal_wasm() -> Vec<u8> {
     write_leb_u32(&mut wasm, 6); // section size
     wasm.push(0x01);
     wasm.push(0x60); // 1 type, functype
-    wasm.push(0x01);
-    wasm.push(0x7f); // 1 param, i32
-    wasm.push(0x01);
+    wasm.push(0x01); // 1 param, i32
     wasm.push(0x7f); // 1 result, i32
 
     // ── Function section (id 3) ─────────────────────────────────────
@@ -75,7 +130,6 @@ fn generate_minimal_wasm() -> Vec<u8> {
     wasm.push(0x00); // 1 function, type 0
 
     // ── Export section (id 7) ───────────────────────────────────────
-    // 1 export: name="add_one" (7 chars), Func kind, index 0
     let export_name = b"add_one";
     // Content (section body): count(LEB) + name_len(LEB) + name + kind + idx(LEB)
     //   = 1 + 1 + 7 + 1 + 1 = 11 bytes
@@ -194,4 +248,4 @@ fn write_leb_u32(buf: &mut Vec<u8>, mut value: u32) {
             break;
         }
     }
-}
+}

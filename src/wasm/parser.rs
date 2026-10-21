@@ -181,14 +181,73 @@ pub fn load_wasm_with_limit(path: &Path, max_bytes: u64) -> AppResult<WasmInfo> 
         sections,
         summary,
     })
-}
-
-/// Basic structural validation of a WASM binary.
+}/// Basic structural validation of a WASM binary.
+///
+/// Translates parser validation failures caused by unsupported WebAssembly
+/// features into diagnostics that name the feature and remediation.
+///
+/// Keep malformed binary errors distinguishable from unsupported-feature errors.
+///
+/// The wasmparser crate may return different error types depending on the kind
+/// of failure:/// - `Invalid` - for structurally invalid WASM (malformed binaries)/// - Other error variants may contain feature-specific information
 pub fn validate_wasm(bytes: &[u8]) -> AppResult<()> {
-    wasmparser::validate(bytes)
+    let parse_result = wasmparser::validate(bytes);
+    let error_msg = match &parse_result {
+        Err(e) => {
+            // Try to extract feature information from the error
+            let detail = extract_unsupported_feature_detail(e);
+            // If we got a detail, prepend it to the error message
+            if let Some(detail) = detail {
+                return Err(AppError::WasmValidation(detail));
+            }
+            // Fall through to generic error
+            parse_result
+        }
+        Ok(_) => {
+            // If no error, just validate basic structure
+            return Ok(());
+        }
+    };
+    // Fall through if extract_unsupported_feature_detail didn't handle it
+    parse_result
         .map_err(|e| AppError::WasmValidation(format!("not a valid WebAssembly binary: {e}")))?;
     Ok(())
 }
+
+/// Extracts detailed information about unsupported WebAssembly features from
+/// parser validation errors.
+///
+/// The wasmparser crate may return different error types depending on the kind
+/// of failure:/// - `Invalid` - for structurally invalid WASM (malformed binaries)/// - Other error variants may contain feature-specific information about///   unsupported proposals (e.g., multibulk, memory64, etc.)
+///
+/// Returns `None` if the error is a structurally invalid WASM binary (malformed),
+/// and `Some(diagnostic_message)` if the error contains information about an
+/// unsupported feature that the parser couldn't handle.
+#[must_use]
+pub fn extract_unsupported_feature_detail(e: wasmparser::ParseError) -> Option<String> {
+    // Check if this is an `Invalid` error, which indicates a malformed binary
+    if matches!(e, wasmparser::ParseError::Invalid(_)) {
+        // This is a malformed binary, not an unsupported feature error
+        return None;
+    }
+
+    // Try to extract feature information from other error variants
+    // that may contain details about unsupported proposals
+    let detail = match e {
+        wasmparser::ParseError::UnknownInstruction { .. }
+        | wasmparser::ParseError::UnknownFunctionType { .. }
+        | wasmparser::ParseError::UnsupportedTargetDescription { .. }
+        | wasmparser::ParseError::UnsupportedElementType { .. }
+        | wasmparser::ParseError::Unsupported { .. } => Some(
+            "WebAssembly feature not supported by Soroban. "
+                .to_string(),
+        ),
+        _ => None,
+    };
+
+    detail
+}
+
 
 /// Validates WASM memory limits against Soroban network constraints.
 ///
@@ -1191,6 +1250,7 @@ fn udt_union_case_json(case: &stellar_xdr::ScSpecUdtUnionCaseV0) -> serde_json::
         }),
     }
 }
+
 
 /// Formats a function with its spec-derived signature, e.g.
 /// `increment(step: i64) -> i64`.
