@@ -196,10 +196,14 @@ soroban-cost-estimator cache delete [OPTIONS]
       --to <TIMESTAMP>           Latest timestamp or date
       --older-than <DURATION>    Only entries older than this age ("30d", "12h", "3600")
       --all                      Delete every cached estimate, on every network
+                                (cannot be combined with a filter)
       --dry-run                  Report how many entries would be removed
   -y, --yes                      Skip the confirmation prompt
       --json                     Output as JSON instead of a summary
 ```
+
+(The global flags — `--config`, `--format`, `--timeout`, `--color`, … — are accepted by both
+commands as well.)
 
 **`cache list`**
 
@@ -246,21 +250,6 @@ soroban-cost-estimator cache delete [OPTIONS]
 does not model is reported instead of silently ignored. The exit-code semantics, the
 auto-save of a post-upgrade snapshot and the stale-cache cross-reference are unchanged.
 
-### 3.9 Dependency bumps (unrelated to the issues, but required for a green CI)
-
-Three RustSec advisories were published after the last green run on `main` and now fail the
-`cargo deny`/`cargo audit` jobs for every PR:
-
-| Advisory | Crate | Fixed in |
-|---|---|---|
-| RUSTSEC-2026-0381 | `webpki-roots` | 1.0.10 |
-| RUSTSEC-2026-0382 | `rustls-webpki` | 0.103.16 |
-| RUSTSEC-2026-0383 | `webpki-root-certs` | 1.0.10 |
-
-All three concern the distrusted `emSign ECC Root CA - G3` certificate. The `Cargo.lock` is
-bumped accordingly (patch releases only, no API change), which makes `cargo deny` report
-`advisories ok, bans ok, licenses ok, sources ok`.
-
 ### 3.7 `src/main.rs` — the CLI runs on a thread with a real stack
 
 `main` now starts a dedicated worker thread with an 8 MiB stack
@@ -290,6 +279,21 @@ estimate on every network; drop --all to delete only the matching entries
 
 Nothing is deleted when the command is rejected. This keeps the two ways of deleting
 unambiguous: either *filter → delete the matching entries*, or *`--all` → delete everything*.
+
+### 3.9 Dependency bumps (unrelated to the issues, but required for a green CI)
+
+Three RustSec advisories were published after the last green run on `main` and now fail the
+`cargo deny`/`cargo audit` jobs for every PR:
+
+| Advisory | Crate | Fixed in |
+|---|---|---|
+| RUSTSEC-2026-0381 | `webpki-roots` | 1.0.10 |
+| RUSTSEC-2026-0382 | `rustls-webpki` | 0.103.16 |
+| RUSTSEC-2026-0383 | `webpki-root-certs` | 1.0.10 |
+
+All three concern the distrusted `emSign ECC Root CA - G3` certificate. The `Cargo.lock` is
+bumped accordingly (patch releases only, no API change), which makes `cargo deny` report
+`advisories ok, bans ok, licenses ok, sources ok`.
 
 ---
 
@@ -589,28 +593,29 @@ network protocol, fee-math or cache-key logic was touched.
 ## 9. Files changed
 
 ```text
- CHANGELOG.md                       |  25 +-
+ CHANGELOG.md                       |  34 ++
  Cargo.lock                         |  14 +-   (patched transitive deps only)
- README.md                          |  55 +++++
+ PR_DESCRIPTION.md                  | 674 ++++++++++++++++++  (new)
+ README.md                          |  54 ++++
  docs/SUMMARY.md                    |   2 +
- docs/commands.md                   | 101 +++++++++++
- docs/commands/cache-delete.md      | 105 ++++++++++  (new)
- docs/commands/cache-list.md        | 116 ++++++++++  (new)
- docs/commands/config-diff.md       |  10 +
- PR_DESCRIPTION.md                  | 650 ++++++++++++++++++  (new)
- src/cache.rs                       | 130 ++++++++++++
- src/cli.rs                         |  92 +++++++++
- src/config_snapshot/diff.rs        | 320 +++++++++++++++++++++++++++++--
- src/config_snapshot/model.rs       |  79 ++++++
- src/config_snapshot/store.rs       | 186 ++++++++++++--
- src/main.rs                        | 320 +++++++++++++-
- tests/cache_tests.rs               | 315 +++++++++++++++++++++
- tests/cli_tests.rs                 | 490 ++++++++++++++++++++++++++++++-
- tests/config_diff_tests.rs         | 239 ++++++++++++++++++
- tests/config_history_tests.rs      | 300 ++++++++++++++++++++++
+ docs/commands.md                   | 104 +++++++
+ docs/commands/cache-delete.md      |  99 ++++++  (new)
+ docs/commands/cache-list.md        |  88 ++++++  (new)
+ docs/commands/config-diff.md       |   9 +
+ src/cache.rs                       | 111 ++++++
+ src/cli.rs                         |  86 ++++-
+ src/config_snapshot/diff.rs        | 465 ++++++++++++++++----------
+ src/config_snapshot/model.rs       |  77 ++++
+ src/config_snapshot/store.rs       | 222 ++++++++++++--
+ src/main.rs                        | 450 ++++++++++++++++----
+ tests/cache_tests.rs               | 329 +++++++++++++
+ tests/cli_tests.rs                 | 489 ++++++++++++++
+ tests/config_diff_tests.rs         | 243 ++++++++++++
+ tests/config_history_tests.rs      | 318 +++++++++++++
+ 19 files changed, 3626 insertions(+), 242 deletions(-)
 ```
 
-No new source files, no new dependencies, no deleted files.
+No new source files, no deleted files, no new dependencies.
 
 ---
 
