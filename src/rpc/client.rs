@@ -157,13 +157,27 @@ struct DedupState {
 
 /// Response envelope for the `getHealth` JSON-RPC method.
 ///
-/// Stellar RPC returns a `status` of `healthy`, `degraded`, or `unhealthy`
-/// plus ledger-window information; the health check only needs `status`.
-/// Extra fields in the response are ignored by serde.
+/// Stellar RPC returns node status and optional node identity metadata.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct HealthResponse {
     /// Node health status: `healthy`, `degraded`, or `unhealthy`.
     status: String,
+    /// Stellar network passphrase served by the node.
+    #[serde(default)]
+    network_passphrase: Option<String>,
+    /// Stellar Core version served by the node.
+    #[serde(default)]
+    core_version: Option<String>,
+}
+
+/// Node identity metadata returned by `getHealth`.
+#[derive(Debug, Clone, Default)]
+pub struct HealthMetadata {
+    /// Stellar network passphrase, when the endpoint reports it.
+    pub network_passphrase: Option<String>,
+    /// Stellar Core version, when the endpoint reports it.
+    pub core_version: Option<String>,
 }
 
 /// A minimal JSON-RPC 2.0 client for Soroban RPC endpoints.
@@ -472,7 +486,7 @@ impl RpcClient {
     ///
     /// # Network calls
     /// Makes at most one `getHealth` RPC call to the configured endpoint.
-    pub async fn health_check(&self) -> AppResult<()> {
+    pub async fn health_check(&self) -> AppResult<HealthMetadata> {
         let health: HealthResponse = self
             .call("getHealth", serde_json::json!({}))
             .await
@@ -488,7 +502,10 @@ impl RpcClient {
 
         if health.status == "healthy" {
             debug!(url = self.url, "RPC endpoint health check passed");
-            Ok(())
+            Ok(HealthMetadata {
+                network_passphrase: health.network_passphrase,
+                core_version: health.core_version,
+            })
         } else {
             Err(AppError::Rpc {
                 status: -1,
@@ -1767,10 +1784,33 @@ mod tests {
             spawn_json_rpc_stub_with_result(0, r#"{"status":"healthy","latestLedger":42}"#).await;
         let client = RpcClient::new(&url);
 
-        client
+        let meta = client
             .health_check()
             .await
             .expect("healthy endpoint passes");
+        assert_eq!(meta.network_passphrase, None);
+        assert_eq!(meta.core_version, None);
+    }
+
+    /// A reachable endpoint reporting health metadata must populate `HealthMetadata`.
+    #[tokio::test]
+    async fn test_health_check_captures_node_metadata() {
+        let (url, _) = spawn_json_rpc_stub_with_result(
+            0,
+            r#"{"status":"healthy","networkPassphrase":"Test SDF Network ; September 2015","coreVersion":"v21.1.0"}"#,
+        )
+        .await;
+        let client = RpcClient::new(&url);
+
+        let meta = client
+            .health_check()
+            .await
+            .expect("healthy endpoint passes");
+        assert_eq!(
+            meta.network_passphrase.as_deref(),
+            Some("Test SDF Network ; September 2015")
+        );
+        assert_eq!(meta.core_version.as_deref(), Some("v21.1.0"));
     }
 
     /// A reachable endpoint reporting anything other than `healthy` (e.g.
