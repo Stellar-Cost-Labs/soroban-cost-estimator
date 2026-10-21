@@ -328,6 +328,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
             no_cache,
             history,
             json,
+            explain_fees,
             auto_snapshot,
             diff,
             wasm_new,
@@ -345,6 +346,12 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
             };
             let paths = resolve_wasm_paths(&wasm, wasm_dir.as_deref())?;
             if wasm.len() > 1 || wasm_dir.is_some() {
+                if explain_fees {
+                    return Err(error::AppError::General(
+                        "--explain-fees is only available for single-contract estimate reports"
+                            .to_string(),
+                    ));
+                }
                 // Multi-contract run: aggregate every contract into a single
                 // batch summary instead of printing per-invocation reports.
                 cmd_batch(
@@ -385,6 +392,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
                     no_cache,
                     history,
                     format.as_str(),
+                    explain_fees,
                     rps,
                     timeout,
                     connect_timeout,
@@ -935,6 +943,7 @@ struct SimulationRequest<'a> {
     extra_headers: &'a [String],
     quiet: bool,
     verbose: bool,
+    explain_fees: bool,
 }
 
 /// Simulate one WASM artifact and build its [`report::cost_report::CostReport`].
@@ -1023,7 +1032,7 @@ async fn simulate_report(
 
     let fee_rates = fetch_fee_rates(&client, req.quiet).await;
 
-    let fee = report::fee_calc::compute_fee_breakdown(
+    let fee = report::fee_calc::compute_fee_breakdown_with_options(
         total_fee_stroops,
         cpu_instructions,
         read_entries,
@@ -1032,6 +1041,7 @@ async fn simulate_report(
         tx_xdr.len() as u32,
         fee_rates,
         req.precision,
+        req.explain_fees,
     );
 
     // Warn when any resource approaches the network's protocol limits (#322).
@@ -1095,6 +1105,7 @@ async fn cmd_estimate(
     no_cache: bool,
     history: bool,
     format: &str,
+    explain_fees: bool,
     rps: Option<u64>,
     timeout: u64,
     connect_timeout: u64,
@@ -1112,6 +1123,15 @@ async fn cmd_estimate(
     dry_run: bool,
     project: Option<&str>,
 ) -> error::AppResult<()> {
+    if explain_fees
+        && (watch || diff || repeat > 1 || dry_run || !matches!(format, "table" | "json"))
+    {
+        return Err(error::AppError::General(
+            "--explain-fees requires a single simulated estimate with table or JSON output"
+                .to_string(),
+        ));
+    }
+
     // Parse the requested projection counts up front so an invalid list is
     // rejected before any RPC traffic, regardless of the output format.
     let projection_counts = match project {
@@ -1220,6 +1240,7 @@ async fn cmd_estimate(
         no_cache,
         history,
         format,
+        explain_fees,
         precision,
         extra_headers,
         rps,
@@ -1727,6 +1748,7 @@ async fn estimate_once(
     no_cache: bool,
     history: bool,
     format: &str,
+    explain_fees: bool,
     precision: u32,
     extra_headers: &[String],
     rps: Option<u64>,
@@ -1834,7 +1856,7 @@ async fn estimate_once(
         } else {
             fresh_cached_estimate(&wasm_hash, &function_name, args, ttl_secs)?
         };
-        if let Some(fresh) = fresh {
+        if let Some(fresh) = fresh.filter(|_| !explain_fees) {
             let ttl_secs = ttl_secs.unwrap_or_default();
             info!(ttl_secs, function = %function_name, "cache hit â€” reusing fresh estimate");
             print_cached_estimate(&fresh, ttl_secs, json_flag, precision, quiet);
@@ -1925,6 +1947,7 @@ async fn estimate_once(
             extra_headers,
             quiet,
             verbose,
+            explain_fees,
         })
         .await?;
 
@@ -2232,6 +2255,7 @@ async fn emit_watch_estimate(
         // not rendered and history stays off.
         false,
         format,
+        false,
         precision,
         extra_headers,
         rps,
@@ -2760,6 +2784,7 @@ async fn cmd_estimate_diff(
         extra_headers,
         quiet,
         verbose,
+        explain_fees: false,
     })
     .await?;
 
@@ -2784,6 +2809,7 @@ async fn cmd_estimate_diff(
         extra_headers,
         quiet,
         verbose,
+        explain_fees: false,
     })
     .await?;
 
@@ -3327,6 +3353,7 @@ async fn estimate_all_function(
                         total_stroops: total_fee,
                         total_xlm: xlm.clone(),
                         fee_percentages: std::collections::BTreeMap::new(),
+                        explanation: None,
                     },
                 };
 
@@ -6096,6 +6123,7 @@ mod tests {
                     total_stroops: 3,
                     total_xlm: "0.0000003".to_string(),
                     fee_percentages: std::collections::BTreeMap::new(),
+                    explanation: None,
                 }),
                 warnings: Vec::new(),
                 contract_meta: ContractMeta {
@@ -6173,6 +6201,7 @@ mod tests {
                 total_stroops: 3,
                 total_xlm: "0.0000003".to_string(),
                 fee_percentages: std::collections::BTreeMap::new(),
+                explanation: None,
             }),
             warnings: Vec::new(),
             contract_meta: ContractMeta::default(),
@@ -6308,6 +6337,7 @@ mod tests {
                 total_stroops: 15_427,
                 total_xlm: "0.0015427".to_string(),
                 fee_percentages: std::collections::BTreeMap::new(),
+                explanation: None,
             },
             ledger: 3_894_195,
             network: "testnet".to_string(),

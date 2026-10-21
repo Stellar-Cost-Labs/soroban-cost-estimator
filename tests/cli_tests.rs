@@ -2925,6 +2925,7 @@ fn test_estimate_fn_contract_fixture_populates_footprint_json() {
             "--rpc-url",
             &rpc_url,
             "--json",
+            "--explain-fees",
         ])
         .env("HOME", &home)
         .env("USERPROFILE", &home)
@@ -2954,6 +2955,14 @@ fn test_estimate_fn_contract_fixture_populates_footprint_json() {
     assert_eq!(parsed["write_bytes"], 136, "expected 136 write bytes");
     assert_eq!(parsed["cpu_instructions"], 532_502);
     assert_eq!(parsed["fee"]["total_stroops"], 15_527);
+    assert_eq!(
+        parsed["fee"]["explanation"]["cpu"]["measured_units"],
+        532_502
+    );
+    assert_eq!(
+        parsed["fee"]["explanation"]["cpu"]["fee_stroops"],
+        parsed["fee"]["cpu_fee_stroops"]
+    );
 }
 
 #[test]
@@ -2974,6 +2983,7 @@ fn test_estimate_fn_contract_fixture_populates_footprint_table() {
             "1",
             "--rpc-url",
             &rpc_url,
+            "--explain-fees",
         ])
         .env("HOME", &home)
         .env("USERPROFILE", &home)
@@ -3002,6 +3012,9 @@ fn test_estimate_fn_contract_fixture_populates_footprint_table() {
         stdout.contains("15527"),
         "table should display total fee 15527"
     );
+    assert!(stdout.contains("Fee Calculation Explanation"));
+    assert!(stdout.contains("CPU instructions"));
+    assert!(stdout.contains("10000"));
 }
 
 #[test]
@@ -3040,6 +3053,7 @@ fn test_estimate_minimal_wasm_upload_zero_footprint() {
     assert_eq!(parsed["write_entries"], 0);
     assert_eq!(parsed["read_bytes"], 0);
     assert_eq!(parsed["write_bytes"], 0);
+    assert!(parsed["fee"].get("explanation").is_none());
 }
 
 /// Regression: the mock server must read the *entire* request body before

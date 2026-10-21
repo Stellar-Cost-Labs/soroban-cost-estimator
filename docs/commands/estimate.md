@@ -15,6 +15,7 @@ Options:
       --fn <FN>            Contract function name to invoke
       --id <ID>            Deployed contract ID (64 hex chars) to invoke. Required when --fn is used
       --arg <KEY=VAL>      Function arguments as key=value pairs (value is type-inferred)
+      --explain-fees       Show configured rates, measured units, scales, and fee results
   -i, --interactive        Prompt for the function and its arguments using the contract spec
       --json               Output as JSON instead of a human-readable table
   -h, --help               Print help

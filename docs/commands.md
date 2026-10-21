@@ -69,6 +69,7 @@ soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
 | `--diff` | | | `false` | Compare two WASM builds side by side. Requires `--wasm-new` |
 | `--wasm-new <PATH>` | | | — | The "new" WASM build to compare against when `--diff` is set |
 | `--json` | | | `false` | Output as JSON instead of a human-readable table |
+| `--explain-fees` | | | `false` | For a single table or JSON estimate, include rates, measured units, scales, and fee results |
 | `--format <FORMAT>` | | | `table` | Output format: `table`, `json`, `csv`, or `markdown` (overrides `--json`) |
 | `--precision <N>` | | | `7` | Decimal places for XLM fee values (`0..=18`) |
 | `--help` | `-h` | | | Print help |

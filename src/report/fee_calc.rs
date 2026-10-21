@@ -29,6 +29,39 @@ pub struct FeeBreakdown {
     pub total_xlm: String,
     /// Percentage contribution of each fee component, summing to exactly 100.0%.
     pub fee_percentages: std::collections::BTreeMap<String, String>,
+    /// Inputs and integer arithmetic for locally derived fee components.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<FeeCalculationExplanation>,
+}
+
+/// Inputs and results for one locally derived fee component.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeeComponentExplanation {
+    /// Number of measured resource units.
+    pub measured_units: u64,
+    /// Unit measured (for example, `CPU instructions` or `read entries`).
+    pub unit: String,
+    /// Configured fee rate in stroops.
+    pub rate_stroops: i64,
+    /// Divisor applied to `measured_units * rate_stroops`.
+    pub scale: u64,
+    /// Result after integer division, in stroops.
+    pub fee_stroops: i64,
+}
+
+/// Detailed inputs for locally derived CPU, storage, and bandwidth fees.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeeCalculationExplanation {
+    /// CPU rate is stroops per 10,000 instructions.
+    pub cpu: FeeComponentExplanation,
+    /// Storage fee for ledger entries read.
+    pub storage_read_entries: FeeComponentExplanation,
+    /// Storage fee for ledger entries written.
+    pub storage_write_entries: FeeComponentExplanation,
+    /// Storage fee for disk bytes read, at a rate per 1,024 bytes.
+    pub storage_read_bytes: FeeComponentExplanation,
+    /// Bandwidth fee for XDR transaction bytes, at a rate per 1,024 bytes.
+    pub bandwidth: FeeComponentExplanation,
 }
 
 /// Fee rates sourced from the network's `ConfigSettingContract*` entries.
@@ -92,6 +125,57 @@ pub fn compute_fee_breakdown(
     tx_size: u32,
     rates: FeeRates,
     precision: u32,
+) -> FeeBreakdown {
+    compute_fee_breakdown_with_options(
+        total_resource_fee,
+        cpu_insns,
+        read_entries,
+        write_entries,
+        read_bytes,
+        tx_size,
+        rates,
+        precision,
+        false,
+    )
+}
+
+/// Compute fee components, optionally including their calculation inputs.
+#[must_use]
+pub fn compute_fee_breakdown_with_options(
+    total_resource_fee: i64,
+    cpu_insns: u64,
+    read_entries: u32,
+    write_entries: u32,
+    read_bytes: u32,
+    tx_size: u32,
+    rates: FeeRates,
+    precision: u32,
+    include_explanation: bool,
+) -> FeeBreakdown {
+    compute_fee_breakdown_inner(
+        total_resource_fee,
+        cpu_insns,
+        read_entries,
+        write_entries,
+        read_bytes,
+        tx_size,
+        rates,
+        precision,
+        include_explanation,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn compute_fee_breakdown_inner(
+    total_resource_fee: i64,
+    cpu_insns: u64,
+    read_entries: u32,
+    write_entries: u32,
+    read_bytes: u32,
+    tx_size: u32,
+    rates: FeeRates,
+    precision: u32,
+    include_explanation: bool,
 ) -> FeeBreakdown {
     // CPU fee: stroops per 10K instructions → (cpu_insns * rate) / 10000
     let cpu_fee = scaled_fee(cpu_insns, rates.fee_per_10k_insns, 10_000);
@@ -211,6 +295,90 @@ pub fn compute_fee_breakdown(
         total_stroops,
         total_xlm,
         fee_percentages,
+        explanation: include_explanation.then(|| {
+            fee_calculation_explanation(
+                cpu_insns,
+                read_entries,
+                write_entries,
+                read_bytes,
+                tx_size,
+                rates,
+                cpu_fee,
+                read_entry_fee,
+                write_entry_fee,
+                read_bytes_fee,
+                bandwidth_fee,
+            )
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fee_calculation_explanation(
+    cpu_insns: u64,
+    read_entries: u32,
+    write_entries: u32,
+    read_bytes: u32,
+    tx_size: u32,
+    rates: FeeRates,
+    cpu_fee: i64,
+    read_entry_fee: i64,
+    write_entry_fee: i64,
+    read_bytes_fee: i64,
+    bandwidth_fee: i64,
+) -> FeeCalculationExplanation {
+    FeeCalculationExplanation {
+        cpu: component_explanation(
+            cpu_insns,
+            "CPU instructions",
+            rates.fee_per_10k_insns,
+            10_000,
+            cpu_fee,
+        ),
+        storage_read_entries: component_explanation(
+            u64::from(read_entries),
+            "read entries",
+            rates.fee_per_read_entry,
+            1,
+            read_entry_fee,
+        ),
+        storage_write_entries: component_explanation(
+            u64::from(write_entries),
+            "write entries",
+            rates.fee_per_write_entry,
+            1,
+            write_entry_fee,
+        ),
+        storage_read_bytes: component_explanation(
+            u64::from(read_bytes),
+            "read bytes",
+            rates.fee_per_read_1kb,
+            1024,
+            read_bytes_fee,
+        ),
+        bandwidth: component_explanation(
+            u64::from(tx_size),
+            "transaction bytes",
+            rates.fee_per_1kb,
+            1024,
+            bandwidth_fee,
+        ),
+    }
+}
+
+fn component_explanation(
+    measured_units: u64,
+    unit: &str,
+    rate_stroops: i64,
+    scale: u64,
+    fee_stroops: i64,
+) -> FeeComponentExplanation {
+    FeeComponentExplanation {
+        measured_units,
+        unit: unit.to_string(),
+        rate_stroops,
+        scale,
+        fee_stroops,
     }
 }
 
@@ -561,5 +729,54 @@ mod tests {
         assert_eq!(breakdown.non_refundable_stroops, 4_496);
         assert_eq!(breakdown.refundable_stroops, 15_427 - 4_496);
         assert_eq!(breakdown.total_stroops, 15_527);
+    }
+
+    #[test]
+    fn test_fee_explanation_matches_integer_fee_calculation() {
+        let breakdown = compute_fee_breakdown_with_options(
+            30_000,
+            100_001,
+            2,
+            3,
+            2_049,
+            156,
+            FeeRates {
+                fee_per_10k_insns: 7,
+                fee_per_read_entry: 1_563,
+                fee_per_write_entry: 2_500,
+                fee_per_read_1kb: 447,
+                fee_per_1kb: 406,
+            },
+            DEFAULT_PRECISION,
+            true,
+        );
+        let explanation = breakdown
+            .explanation
+            .as_ref()
+            .expect("requested explanation");
+
+        assert_eq!(explanation.cpu.measured_units, 100_001);
+        assert_eq!(explanation.cpu.rate_stroops, 7);
+        assert_eq!(explanation.cpu.scale, 10_000);
+        assert_eq!(explanation.cpu.fee_stroops, 70);
+        assert_eq!(explanation.storage_read_entries.fee_stroops, 2 * 1_563);
+        assert_eq!(explanation.storage_write_entries.fee_stroops, 3 * 2_500);
+        assert_eq!(
+            explanation.storage_read_bytes.fee_stroops,
+            (2_049 * 447) / 1_024
+        );
+        assert_eq!(explanation.bandwidth.fee_stroops, (156 * 406) / 1_024);
+        assert_eq!(
+            breakdown.storage_fee_stroops,
+            explanation.storage_read_entries.fee_stroops
+                + explanation.storage_write_entries.fee_stroops
+                + explanation.storage_read_bytes.fee_stroops
+        );
+        assert_eq!(
+            breakdown.non_refundable_stroops,
+            explanation.cpu.fee_stroops
+                + breakdown.storage_fee_stroops
+                + explanation.bandwidth.fee_stroops
+        );
     }
 }

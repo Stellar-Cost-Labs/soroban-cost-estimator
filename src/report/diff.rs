@@ -549,6 +549,7 @@ mod tests {
                 total_stroops: total,
                 total_xlm: "0.0015427".to_string(),
                 fee_percentages: std::collections::BTreeMap::new(),
+                explanation: None,
             },
             ledger: 100,
             network: "testnet".to_string(),

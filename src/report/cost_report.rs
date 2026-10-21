@@ -1463,6 +1463,9 @@ pub fn format_report_table(report: &CostReport) -> String {
 
     output.push_str(&fee_table.to_string());
     output.push('\n');
+    if let Some(explanation) = &report.fee.explanation {
+        output.push_str(&format_fee_calculation_explanation(explanation));
+    }
 
     // ASCII bar chart for visual cost breakdown
     output.push_str(&render_fee_bar_chart(&report.fee, DEFAULT_CHART_WIDTH));
@@ -1480,6 +1483,37 @@ pub fn format_report_table(report: &CostReport) -> String {
     }
 
     output
+}
+
+/// Render the structured fee inputs and integer results as a table.
+#[must_use]
+pub fn format_fee_calculation_explanation(
+    explanation: &crate::report::fee_calc::FeeCalculationExplanation,
+) -> String {
+    let mut table = Table::new();
+    table.set_header(vec![
+        "Component",
+        "Measured units",
+        "Rate (stroops)",
+        "Scale",
+        "Result (stroops)",
+    ]);
+    for (label, component) in [
+        ("CPU", &explanation.cpu),
+        ("Storage read entries", &explanation.storage_read_entries),
+        ("Storage write entries", &explanation.storage_write_entries),
+        ("Storage read bytes", &explanation.storage_read_bytes),
+        ("Bandwidth", &explanation.bandwidth),
+    ] {
+        table.add_row(vec![
+            label,
+            &format!("{} {}", component.measured_units, component.unit),
+            &component.rate_stroops.to_string(),
+            &format!("÷ {}", component.scale),
+            &component.fee_stroops.to_string(),
+        ]);
+    }
+    format!("Fee Calculation Explanation:\n\n{}\n", table)
 }
 
 /// Formats a cost report as a JSON string.
@@ -2141,6 +2175,7 @@ mod tests {
                 total_stroops: 15_527,
                 total_xlm: "0.0015527".to_string(),
                 fee_percentages: std::collections::BTreeMap::new(),
+                explanation: None,
             },
             ledger: 3_894_195,
             network: "testnet".to_string(),
@@ -2262,6 +2297,7 @@ mod tests {
                 total_stroops: 0,
                 total_xlm: "0.0000000".to_string(),
                 fee_percentages: std::collections::BTreeMap::new(),
+                explanation: None,
             },
             ledger: 0,
             network: "testnet".to_string(),
@@ -2358,6 +2394,7 @@ mod tests {
             total_stroops: 10_000,
             total_xlm: "0.0010000".to_string(),
             fee_percentages: std::collections::BTreeMap::new(),
+            explanation: None,
         }
     }
 

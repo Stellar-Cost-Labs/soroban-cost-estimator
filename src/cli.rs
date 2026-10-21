@@ -253,6 +253,10 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
+        /// Show rate inputs and stroop calculations for a single table or JSON estimate.
+        #[arg(long)]
+        explain_fees: bool,
+
         /// Automatically save a new config snapshot if network pricing
         /// configuration has changed since the last snapshot.
         #[arg(long)]

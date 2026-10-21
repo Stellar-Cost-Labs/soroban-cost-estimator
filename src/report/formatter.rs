@@ -154,7 +154,13 @@ fn fee_table(report: &CostReport) -> String {
         ),
     ]);
 
-    fee_table.to_string()
+    let mut output = fee_table.to_string();
+    if let Some(explanation) = &report.fee.explanation {
+        output.push_str("\n\n");
+        output
+            .push_str(&crate::report::cost_report::format_fee_calculation_explanation(explanation));
+    }
+    output
 }
 
 impl TableFormatter {
@@ -620,6 +626,7 @@ mod tests {
                 total_stroops: 15_427,
                 total_xlm: "0.0015427".to_string(),
                 fee_percentages: std::collections::BTreeMap::new(),
+                explanation: None,
             },
             ledger: 3_894_195,
             network: "testnet".to_string(),
@@ -655,6 +662,7 @@ mod tests {
                 total_stroops: 0,
                 total_xlm: "0.0000000".to_string(),
                 fee_percentages: std::collections::BTreeMap::new(),
+                explanation: None,
             },
             ledger: 0,
             network: "mainnet".to_string(),
@@ -682,6 +690,40 @@ mod tests {
         let output = formatter.format(&sample_report());
         assert!(output.contains("testnet"));
         assert!(output.contains("3894195"));
+    }
+
+    #[test]
+    fn test_fee_explanation_is_consistent_in_table_and_json() {
+        let mut report = sample_report();
+        report.fee = crate::report::fee_calc::compute_fee_breakdown_with_options(
+            15_427,
+            532_502,
+            1,
+            1,
+            0,
+            156,
+            crate::report::fee_calc::FeeRates {
+                fee_per_10k_insns: 7,
+                fee_per_read_entry: 1_563,
+                fee_per_write_entry: 2_500,
+                fee_per_read_1kb: 447,
+                fee_per_1kb: 406,
+            },
+            crate::report::fee_calc::DEFAULT_PRECISION,
+            true,
+        );
+
+        let json = serde_json::to_value(&report).expect("serialize report");
+        let table = TableFormatter.format(&report);
+        assert_eq!(
+            json["fee"]["explanation"]["cpu"]["fee_stroops"],
+            report.fee.cpu_fee_stroops
+        );
+        assert!(table.contains("Fee Calculation Explanation"));
+        assert!(table.contains("532502 CPU instructions"));
+        assert!(table.contains("Rate (stroops)"));
+        assert!(table.contains("10000"));
+        assert!(table.contains(&json["fee"]["explanation"]["cpu"]["fee_stroops"].to_string()));
     }
 
     #[test]
