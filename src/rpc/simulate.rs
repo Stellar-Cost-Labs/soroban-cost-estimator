@@ -47,7 +47,9 @@ pub struct SimulateTransactionResponse {
     /// Minimum resource fee (base64-encoded int64 XDR).
     #[serde(default)]
     pub min_resource_fee: Option<String>,
-    /// Restore fee if state archival entry needs to be restored.
+    /// Restore fee if state archival entry needs to be restored. Returned
+    /// only when the simulation touched archived entries; decoded by
+    /// [`parse_restore_fee`].
     #[serde(default)]
     pub restore_fee: Option<String>,
     /// State changes produced by the simulation.
@@ -260,6 +262,33 @@ pub fn parse_transaction_data_resources(
     }
 }
 
+/// Decodes a fee field from a `simulateTransaction` response, in stroops.
+///
+/// Modern RPC versions return fees as plain decimal stroops strings
+/// (e.g. `"15427"`); older versions returned a base64-encoded XDR int64
+/// (big-endian, 8 bytes). Both forms are accepted for every fee field, so
+/// the two parsers below differ only in the field they read and the
+/// `label` used in error messages.
+fn parse_fee_field(fee_str: &str, label: &str) -> AppResult<i64> {
+    // Modern form: plain decimal stroops.
+    if let Ok(stroops) = fee_str.trim().parse::<i64>() {
+        return Ok(stroops);
+    }
+
+    // Legacy form: base64-encoded XDR int64 (big-endian, 8 bytes).
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, fee_str)
+        .map_err(|e| AppError::General(format!("{label}: invalid base64: {e}")))?;
+    if bytes.len() < 8 {
+        return Err(AppError::General(
+            format!("{label}: invalid XDR length: {} bytes", bytes.len()),
+        ));
+    }
+
+    let mut fee_bytes = [0u8; 8];
+    fee_bytes.copy_from_slice(&bytes[..8]);
+    Ok(i64::from_be_bytes(fee_bytes))
+}
+
 /// Extracts the resource fee from the simulation response in stroops.
 ///
 /// Modern RPC versions return `min_resource_fee` as a plain decimal string
@@ -267,24 +296,29 @@ pub fn parse_transaction_data_resources(
 /// XDR int64. Both forms are accepted.
 pub fn parse_resource_fee(min_resource_fee: &Option<String>) -> AppResult<Option<i64>> {
     match min_resource_fee {
-        Some(fee_str) => {
-            // Modern form: plain decimal stroops.
-            if let Ok(stroops) = fee_str.trim().parse::<i64>() {
-                return Ok(Some(stroops));
-            }
+        Some(fee_str) => parse_fee_field(fee_str, "resource fee").map(Some),
+        None => Ok(None),
+    }
+}
 
-            // Legacy form: base64-encoded XDR int64 (big-endian, 8 bytes).
-            let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, fee_str)
-                .map_err(|e| AppError::General(format!("resource fee: invalid base64: {e}")))?;
-
-            let fee_bytes: [u8; 8] = bytes[..8].try_into().map_err(|_| {
-                AppError::General(format!(
-                    "resource fee: invalid XDR length: {} bytes",
-                    bytes.len()
-                ))
-            })?;
-            Ok(Some(i64::from_be_bytes(fee_bytes)))
-        }
+/// Extracts the archival restore fee from the simulation response, in
+/// stroops (issue #524).
+///
+/// Soroban RPC returns `restoreFee` only when the simulated transaction
+/// touched ledger entries that expired under state archival and must be
+/// restored before the transaction can be submitted. The restore fee is a
+/// separate charge the operator pays **in addition to** the resource fee,
+/// so it is reported as its own component and deliberately never merged
+/// into the authoritative total.
+///
+/// Absence is preserved as `Ok(None)` — "the network did not report one",
+/// which is unknown, not zero — while a reported `"0"` decodes to
+/// `Some(0)`. A malformed value returns `Err`. Both the modern (plain
+/// decimal stroops) and legacy (base64 XDR int64) encodings are accepted,
+/// matching [`parse_resource_fee`].
+pub fn parse_restore_fee(restore_fee: &Option<String>) -> AppResult<Option<i64>> {
+    match restore_fee {
+        Some(fee_str) => parse_fee_field(fee_str, "restore fee").map(Some),
         None => Ok(None),
     }
 }
@@ -501,6 +535,57 @@ mod tests {
             parse_resource_fee(&Some("15427".to_string())).unwrap(),
             Some(15_427)
         );
+    }
+
+    /// Issue #524: the restore fee accepts the same two encodings as the
+    /// resource fee — plain decimal stroops (modern) and base64 XDR int64
+    /// (legacy).
+    #[test]
+    fn test_parse_restore_fee_both_encodings() {
+        assert_eq!(
+            parse_restore_fee(&Some("230".to_string())).unwrap(),
+            Some(230)
+        );
+
+        let fee: i64 = 98_765;
+        let xdr = fee.to_xdr(stellar_xdr::Limits::none()).expect("XDR encode");
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &xdr);
+        assert_eq!(parse_restore_fee(&Some(b64)).unwrap(), Some(98_765));
+    }
+
+    /// Absence is unknown, not zero: no `restoreFee` in the response must
+    /// stay `None` through parse.
+    #[test]
+    fn test_parse_restore_fee_absent_is_none() {
+        assert_eq!(parse_restore_fee(&None).unwrap(), None);
+    }
+
+    /// A reported zero is an explicit zero, distinct from absence.
+    #[test]
+    fn test_parse_restore_fee_zero() {
+        assert_eq!(parse_restore_fee(&Some("0".to_string())).unwrap(), Some(0));
+    }
+
+    /// Malformed values return an error instead of silently decoding to a
+    /// fee — or panicking on a short base64 payload.
+    #[test]
+    fn test_parse_restore_fee_malformed_is_err() {
+        assert!(parse_restore_fee(&Some("not-base64!".to_string())).is_err());
+        assert!(parse_restore_fee(&Some("AAAA".to_string())).is_err());
+        assert!(parse_restore_fee(&Some("   x ".to_string())).is_err());
+    }
+
+    /// The camelCase `restoreFee` JSON field must deserialize.
+    #[test]
+    fn test_simulate_response_deserializes_restore_fee() {
+        let resp: SimulateTransactionResponse =
+            serde_json::from_str(r#"{ "latestLedger": 7, "restoreFee": "230" }"#)
+                .expect("response should parse");
+        assert_eq!(resp.restore_fee.as_deref(), Some("230"));
+
+        let absent: SimulateTransactionResponse =
+            serde_json::from_str(r#"{ "latestLedger": 7 }"#).expect("response should parse");
+        assert_eq!(absent.restore_fee, None);
     }
 
     /// Regression: modern Soroban RPC responses no longer include a `cost`
