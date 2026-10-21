@@ -1,6 +1,6 @@
 use comfy_table::{Cell, CellAlignment, Color, Table};
 
-use crate::report::fee_calc::{FeeBreakdown, FeeRates};
+use crate::report::fee_calc::{FeeBreakdown, FeeConsistencyWarning, FeeRates};
 use crate::wasm::parser::{ContractMeta, SectionSize, format_contract_meta};
 
 // fee_percentage removed since we now use the precalculated exact percentages
@@ -348,6 +348,24 @@ pub fn format_resource_warnings(warnings: &[ResourceWarning]) -> String {
     out
 }
 
+/// Render fee consistency warnings (#528) as a human-readable banner.
+///
+/// Each entry already carries the relevant stroop values and a neutral
+/// explanation, so this only provides the section header. Returns an empty
+/// string when there is nothing to warn about, so callers can append the
+/// result unconditionally without leaving a stray section header.
+#[must_use]
+pub fn format_fee_warnings(warnings: &[FeeConsistencyWarning]) -> String {
+    if warnings.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\nFee consistency warnings:\n");
+    for warning in warnings {
+        out.push_str(&format!("  - {}\n", warning.message));
+    }
+    out
+}
+
 /// Direction of a historical fee change relative to the current run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -544,6 +562,14 @@ pub struct CostReport {
     /// limit).
     #[serde(default)]
     pub warnings: Vec<ResourceWarning>,
+    /// Fee consistency warnings for this run (#528): populated when the
+    /// locally derived non-refundable components exceed the authoritative
+    /// simulation resource fee (see
+    /// [`crate::report::fee_calc::check_fee_consistency`]). Omitted from
+    /// serialized output while empty, so a consistent breakdown keeps the
+    /// JSON shape it had before the field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fee_warnings: Vec<FeeConsistencyWarning>,
     /// Historical trend entries (#321). `None` unless the caller requested
     /// history (via `--history`); when requested it is always an array in JSON
     /// output, possibly empty when there are no previous runs to compare.
@@ -1470,6 +1496,10 @@ pub fn format_report_table(report: &CostReport) -> String {
     // Resource-limit warnings (#322) — only when something nears a ceiling.
     output.push_str(&format_resource_warnings(&report.warnings));
 
+    // Fee consistency warnings (#528) — only when derived components exceed
+    // the authoritative simulation resource fee.
+    output.push_str(&format_fee_warnings(&report.fee_warnings));
+
     // Historical trend table (#321) — only populated with `--history`.
     if let Some(history) = &report.history {
         output.push_str(&format_cost_history(history));
@@ -2147,6 +2177,7 @@ mod tests {
             rpc_latency_ms: 87,
             rates: Some(rates),
             warnings: Vec::new(),
+            fee_warnings: Vec::new(),
             history: None,
             projections: None,
             contract_meta: ContractMeta::default(),
@@ -2218,6 +2249,92 @@ mod tests {
     }
 
     #[test]
+    fn test_format_fee_warnings_empty_is_empty_string() {
+        // Callers append unconditionally — no stray section header.
+        assert_eq!(format_fee_warnings(&[]), "");
+    }
+
+    #[test]
+    fn test_format_fee_warnings_renders_header_and_message() {
+        let fee = crate::report::fee_calc::compute_fee_breakdown(
+            5_000,
+            100_000,
+            0,
+            0,
+            0,
+            1024,
+            FeeRates {
+                fee_per_10k_insns: 1024,
+                fee_per_read_entry: 0,
+                fee_per_write_entry: 0,
+                fee_per_read_1kb: 0,
+                fee_per_1kb: 10,
+            },
+            crate::report::fee_calc::DEFAULT_PRECISION,
+        );
+        let warnings: Vec<_> = crate::report::fee_calc::check_fee_consistency(&fee)
+            .into_iter()
+            .collect();
+        let out = format_fee_warnings(&warnings);
+        assert!(out.contains("Fee consistency warnings:"));
+        assert!(out.contains("- locally derived non-refundable fee components"));
+        assert!(out.contains("10250") && out.contains("5000") && out.contains("5250"));
+    }
+
+    /// Issue #528 — the structured warning reaches JSON output with every
+    /// value intact, and a consistent report keeps the field absent so the
+    /// serialized shape is unchanged.
+    #[test]
+    fn test_fee_consistency_warning_reaches_json_and_table() {
+        let mut report = report_with_rates(sample_rates());
+        assert!(report.fee_warnings.is_empty());
+        let clean_json: serde_json::Value =
+            serde_json::from_str(&format_report_json(&report)).expect("valid json");
+        assert!(
+            clean_json.get("fee_warnings").is_none(),
+            "consistent reports keep their original shape"
+        );
+        assert!(!format_fee_warnings(&report.fee_warnings).contains("consistency"));
+
+        let fee = crate::report::fee_calc::compute_fee_breakdown(
+            5_000,
+            100_000,
+            0,
+            0,
+            0,
+            1024,
+            FeeRates {
+                fee_per_10k_insns: 1024,
+                fee_per_read_entry: 0,
+                fee_per_write_entry: 0,
+                fee_per_read_1kb: 0,
+                fee_per_1kb: 10,
+            },
+            crate::report::fee_calc::DEFAULT_PRECISION,
+        );
+        report.fee = fee;
+        report.fee_warnings = crate::report::fee_calc::check_fee_consistency(&report.fee)
+            .into_iter()
+            .collect();
+        assert_eq!(report.fee_warnings.len(), 1);
+
+        let json: serde_json::Value =
+            serde_json::from_str(&format_report_json(&report)).expect("valid json");
+        assert_eq!(json["fee_warnings"][0]["rpc_total_stroops"], 5_000);
+        assert_eq!(
+            json["fee_warnings"][0]["derived_non_refundable_stroops"],
+            10_250
+        );
+        assert_eq!(json["fee_warnings"][0]["excess_stroops"], 5_250);
+        assert!(json["fee_warnings"][0]["message"].is_string());
+        // The authoritative total in the report itself is untouched.
+        assert_eq!(json["fee"]["total_stroops"], 5_100);
+
+        let table_out = format_report_table(&report);
+        assert!(table_out.contains("Fee consistency warnings:"));
+    }
+
+    #[test]
     fn test_format_report_table_and_json_populated_footprint() {
         let report = report_with_rates(sample_rates());
 
@@ -2268,6 +2385,7 @@ mod tests {
             rpc_latency_ms: 0,
             rates: None,
             warnings: Vec::new(),
+            fee_warnings: Vec::new(),
             history: None,
             projections: None,
             contract_meta: ContractMeta::default(),

@@ -229,6 +229,12 @@ impl TableFormatter {
             &report.warnings,
         ));
 
+        // Fee consistency warnings (#528) — only when the derived components
+        // exceed the authoritative simulation resource fee.
+        output.push_str(&crate::report::cost_report::format_fee_warnings(
+            &report.fee_warnings,
+        ));
+
         // Historical trend table (#321) — only populated with `--history`.
         if let Some(history) = &report.history {
             output.push_str(&crate::report::cost_report::format_cost_history(history));
@@ -453,6 +459,14 @@ impl ReportFormatter for MarkdownFormatter {
             }
         }
 
+        // Fee consistency warnings (#528) as a GitHub callout.
+        if !report.fee_warnings.is_empty() {
+            output.push_str("\n### Fee Consistency Warnings\n\n");
+            for warning in &report.fee_warnings {
+                output.push_str(&format!("> **Warning:** {}\n\n", warning.message));
+            }
+        }
+
         // Fee breakdown, nested in a collapsible section so long reports stay
         // compact when posted as a GitHub PR comment (#325).
         output.push_str("\n<details>\n<summary>Fee breakdown</summary>\n\n");
@@ -626,6 +640,7 @@ mod tests {
             rpc_latency_ms: 87,
             rates: None,
             warnings: Vec::new(),
+            fee_warnings: Vec::new(),
             history: None,
             projections: None,
             contract_meta: crate::wasm::parser::ContractMeta::default(),
@@ -661,6 +676,7 @@ mod tests {
             rpc_latency_ms: 0,
             rates: None,
             warnings: Vec::new(),
+            fee_warnings: Vec::new(),
             history: None,
             projections: None,
             contract_meta: crate::wasm::parser::ContractMeta::default(),
@@ -1045,6 +1061,15 @@ mod tests {
         }
     }
 
+    fn sample_fee_warning() -> crate::report::fee_calc::FeeConsistencyWarning {
+        crate::report::fee_calc::FeeConsistencyWarning {
+            rpc_total_stroops: 5_000,
+            derived_non_refundable_stroops: 10_250,
+            excess_stroops: 5_250,
+            message: "locally derived non-refundable fee components (10250 stroops) exceed the authoritative simulation resource fee (5000 stroops) by 5250 stroops; the report keeps the authoritative total unchanged. This may indicate stale fee rates, a change in RPC response semantics, or an accounting assumption that needs review.".to_string(),
+        }
+    }
+
     // ── Optimization tips (#323) ──────────────────────────────────────
 
     /// A report whose fee is dominated by ledger writes must surface the
@@ -1207,6 +1232,20 @@ mod tests {
         assert!(!output.contains("Resource limit warnings:"));
     }
 
+    /// Issue #528: the fee consistency warning renders as its own section and
+    /// a consistent report renders nothing.
+    #[test]
+    fn test_table_formatter_renders_fee_consistency_warnings() {
+        let mut report = sample_report();
+        report.fee_warnings = vec![sample_fee_warning()];
+        let output = TableFormatter.format(&report);
+        assert!(output.contains("Fee consistency warnings:"));
+        assert!(output.contains("exceed the authoritative simulation resource fee"));
+
+        let clean = TableFormatter.format(&sample_report());
+        assert!(!clean.contains("Fee consistency warnings:"));
+    }
+
     #[test]
     fn test_table_formatter_renders_history() {
         let mut report = sample_report();
@@ -1245,6 +1284,16 @@ mod tests {
         let output = MarkdownFormatter.format(&report);
         assert!(output.contains("### Resource Limit Warnings"));
         assert!(output.contains("> **Warning:** CPU instructions at 90%"));
+    }
+
+    /// Issue #528: the fee consistency warning renders as a GitHub callout.
+    #[test]
+    fn test_markdown_formatter_renders_fee_consistency_warnings() {
+        let mut report = sample_report();
+        report.fee_warnings = vec![sample_fee_warning()];
+        let output = MarkdownFormatter.format(&report);
+        assert!(output.contains("### Fee Consistency Warnings"));
+        assert!(output.contains("> **Warning:** locally derived non-refundable fee components"));
     }
 
     #[test]

@@ -76,6 +76,12 @@ pub struct EstimateAllResult {
     /// JSON output (an empty array when nothing is near a protocol limit).
     #[serde(default)]
     pub warnings: Vec<report::cost_report::ResourceWarning>,
+    /// Fee consistency warnings for this function (#528): populated when the
+    /// locally derived non-refundable components exceed the authoritative
+    /// simulation resource fee. Omitted from JSON output while empty, so a
+    /// consistent breakdown keeps the shape it had before the field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fee_warnings: Vec<report::fee_calc::FeeConsistencyWarning>,
     /// Contract metadata parsed from the WASM `contractmeta` custom section
     /// of the binary being estimated. Omitted when the binary carries no
     /// decodable section.
@@ -103,6 +109,7 @@ impl EstimateAllResult {
             tx_size: None,
             fee: None,
             warnings: Vec::new(),
+            fee_warnings: Vec::new(),
             contract_meta: wasm::parser::ContractMeta::default(),
         }
     }
@@ -126,6 +133,7 @@ impl EstimateAllResult {
             tx_size: None,
             fee: None,
             warnings: Vec::new(),
+            fee_warnings: Vec::new(),
             contract_meta: wasm::parser::ContractMeta::default(),
         }
     }
@@ -882,6 +890,18 @@ struct SimulationRequest<'a> {
     verbose: bool,
 }
 
+/// Structured fee consistency warnings (#528) for a computed breakdown —
+/// empty when the locally derived non-refundable components do not exceed
+/// the authoritative simulation resource fee. Detection only: the
+/// breakdown itself is never modified.
+fn fee_consistency_warnings(
+    fee: &report::fee_calc::FeeBreakdown,
+) -> Vec<report::fee_calc::FeeConsistencyWarning> {
+    report::fee_calc::check_fee_consistency(fee)
+        .into_iter()
+        .collect()
+}
+
 /// Simulate one WASM artifact and build its [`report::cost_report::CostReport`].
 ///
 /// Shared core of `estimate` and `estimate --diff`: build the transaction
@@ -992,6 +1012,9 @@ async fn simulate_report(
         &network_config,
     );
 
+    // Fee consistency warning (#528): detection only — no change to the breakdown.
+    let fee_warnings = fee_consistency_warnings(&fee);
+
     Ok(report::cost_report::CostReport {
         function: req.fn_name.unwrap_or("(wasm upload)").to_string(),
         wasm_hash: req.wasm_hash.to_string(),
@@ -1010,6 +1033,7 @@ async fn simulate_report(
         rpc_latency_ms,
         rates: Some(fee_rates),
         warnings,
+        fee_warnings,
         history: None,
         projections: None,
         contract_meta: req.contract_meta.clone(),
@@ -1567,6 +1591,9 @@ async fn cmd_estimate_repeat(
                 }
                 info!(total_stroops = fee.total_stroops, total_xlm = %fee.total_xlm, "estimate complete");
 
+                // Fee consistency warning (#528): detection only.
+                let fee_warnings = fee_consistency_warnings(&fee);
+
                 first_report = Some(report::cost_report::CostReport {
                     function: function_name.to_string(),
                     wasm_hash: wasm_hash.clone(),
@@ -1585,6 +1612,7 @@ async fn cmd_estimate_repeat(
                     rpc_latency_ms,
                     rates: Some(fee_rates),
                     warnings: Vec::new(),
+                    fee_warnings,
                     history: None,
                     projections: None,
                     contract_meta: wasm_info.contract_meta.clone(),
@@ -2604,6 +2632,12 @@ pub fn format_estimate_all_markdown(results: &[EstimateAllResult]) -> String {
                         out.push_str(&format!("> - {}\n", warning.message));
                     }
                 }
+                if !result.fee_warnings.is_empty() {
+                    out.push_str("\n> **Fee consistency warnings**\n");
+                    for warning in &result.fee_warnings {
+                        out.push_str(&format!("> - {}\n", warning.message));
+                    }
+                }
             }
             EstimateAllStatus::Skipped => {
                 if let Some(reason) = &result.reason {
@@ -3287,6 +3321,10 @@ async fn estimate_all_function(
                     network_config,
                 );
 
+                // Fee consistency warning (#528): detection only — the fee
+                // breakdown above keeps the authoritative RPC total as-is.
+                let fee_warnings = fee_consistency_warnings(&fee);
+
                 Ok(EstimateAllResult {
                     function: fn_info.name.clone(),
                     status: EstimateAllStatus::Ok,
@@ -3304,6 +3342,7 @@ async fn estimate_all_function(
                     tx_size: Some(tx_xdr.len() as u32),
                     fee: Some(fee),
                     warnings,
+                    fee_warnings,
                     contract_meta: wasm_info.contract_meta.clone(),
                 })
             }
@@ -5757,6 +5796,7 @@ mod tests {
                     fee_percentages: std::collections::BTreeMap::new(),
                 }),
                 warnings: Vec::new(),
+                fee_warnings: Vec::new(),
                 contract_meta: ContractMeta {
                     name: Some("MetaContract".to_string()),
                     version: Some("9.9.9".to_string()),
@@ -5834,6 +5874,7 @@ mod tests {
                 fee_percentages: std::collections::BTreeMap::new(),
             }),
             warnings: Vec::new(),
+            fee_warnings: Vec::new(),
             contract_meta: ContractMeta::default(),
         }];
         let distribution =
@@ -5973,6 +6014,7 @@ mod tests {
             rpc_latency_ms: 87,
             rates: None,
             warnings: Vec::new(),
+            fee_warnings: Vec::new(),
             history: None,
             projections: None,
             contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),

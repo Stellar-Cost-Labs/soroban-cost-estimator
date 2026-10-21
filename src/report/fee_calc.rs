@@ -214,6 +214,70 @@ pub fn compute_fee_breakdown(
     }
 }
 
+/// A structured consistency warning raised when the locally derived
+/// non-refundable fee components exceed the authoritative resource fee
+/// reported by `simulateTransaction` (issue #528).
+///
+/// The warning only *reports* the mismatch: neither the authoritative total
+/// nor the component arithmetic is changed or clamped. The values are integer
+/// stroops, and the explanation is deliberately neutral — a mismatch can
+/// reflect stale fee rates, a change in RPC response semantics, or an
+/// accounting assumption that needs review; it is not asserted to be a
+/// network bug.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeeConsistencyWarning {
+    /// The authoritative simulation resource fee from the RPC response, in
+    /// stroops (the total passed to [`compute_fee_breakdown`]).
+    pub rpc_total_stroops: i64,
+    /// Locally derived non-refundable components (CPU + storage I/O +
+    /// bandwidth), in stroops.
+    pub derived_non_refundable_stroops: i64,
+    /// `derived_non_refundable_stroops - rpc_total_stroops`, in stroops.
+    pub excess_stroops: i64,
+    /// Neutral human-readable explanation containing the values above.
+    pub message: String,
+}
+
+/// Detect when the locally derived non-refundable components exceed the
+/// authoritative simulation resource fee.
+///
+/// The comparison is integer-only and strictly `>`: an exact match (and any
+/// value below it, including results that only reach the total after
+/// `scaled_fee`'s floor division) is consistent and returns `None`. On a
+/// mismatch the warning carries the authoritative total, the derived
+/// components, their integer difference, and a neutral explanation — the
+/// breakdown itself is never modified.
+///
+/// The authoritative total is recovered from the breakdown as
+/// `total_stroops - base_fee_stroops`, undoing only the fixed base-inclusion
+/// fee that [`compute_fee_breakdown`] adds on top of the RPC value; both
+/// operands stay in stroops (`i64`) and the subtraction saturates so a
+/// pathological total can never wrap.
+///
+/// # Network calls
+/// None — pure computation over an existing [`FeeBreakdown`].
+#[must_use]
+pub fn check_fee_consistency(fee: &FeeBreakdown) -> Option<FeeConsistencyWarning> {
+    let rpc_total_stroops = fee.total_stroops.saturating_sub(fee.base_fee_stroops);
+    let derived_non_refundable_stroops = fee.non_refundable_stroops;
+
+    if derived_non_refundable_stroops <= rpc_total_stroops {
+        return None;
+    }
+
+    let excess_stroops = derived_non_refundable_stroops.saturating_sub(rpc_total_stroops);
+    let message = format!(
+        "locally derived non-refundable fee components ({derived_non_refundable_stroops} stroops) exceed the authoritative simulation resource fee ({rpc_total_stroops} stroops) by {excess_stroops} stroops; the report keeps the authoritative total unchanged. This may indicate stale fee rates, a change in RPC response semantics, or an accounting assumption that needs review."
+    );
+
+    Some(FeeConsistencyWarning {
+        rpc_total_stroops,
+        derived_non_refundable_stroops,
+        excess_stroops,
+        message,
+    })
+}
+
 /// Calculate `units * rate / divisor` without narrowing the unit count or
 /// overflowing intermediate arithmetic. The final fee is clamped to the
 /// representable stroop range.
