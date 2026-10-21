@@ -1,6 +1,71 @@
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
+use crate::error::{AppError, AppResult};
 use crate::rpc::config::ConfigSettingId;
+
+/// Current schema version of the persisted snapshot file format.
+///
+/// Bump this whenever the JSON shape of [`ConfigSnapshot`] changes. Snapshots
+/// written by an older tool are migrated forward implicitly (see
+/// [`INITIAL_SNAPSHOT_SCHEMA_VERSION`]); snapshots written by a *newer* tool
+/// are rejected by [`ensure_supported_snapshot_schema`] rather than being
+/// silently misread.
+///
+/// Version history:
+/// * `1` — initial version. Also the implicit version of snapshots saved
+///   before the `schema_version` key existed, whose shape is unchanged.
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+
+/// Implicit schema version of snapshots written before the `schema_version`
+/// key existed.
+///
+/// Such files have no `schema_version` field, so serde's `default` fills in
+/// this value via [`initial_snapshot_schema_version`]. They require no
+/// transformation to reach [`SNAPSHOT_SCHEMA_VERSION`] today; a future bump
+/// would add that migration here.
+pub const INITIAL_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+
+/// serde default for the `schema_version` field, applied to unversioned
+/// (legacy) snapshot files.
+fn initial_snapshot_schema_version() -> u32 {
+    INITIAL_SNAPSHOT_SCHEMA_VERSION
+}
+
+/// Rejects a snapshot whose declared schema version cannot be interpreted by
+/// this build.
+///
+/// The check is deliberately explicit instead of relying on serde defaults:
+/// a file written by a newer release may omit fields this build requires, and
+/// failing with the offending file name and a recommended action is much more
+/// useful than a deserialization error.
+///
+/// Reading never rewrites the file, so a snapshot from a newer release is
+/// left exactly as it is for the newer tool to keep using.
+///
+/// # Errors
+/// [`AppError::SnapshotSchemaUnsupported`] when `version` is newer than
+/// [`SNAPSHOT_SCHEMA_VERSION`], and [`AppError::SnapshotParse`] when it is
+/// older than [`INITIAL_SNAPSHOT_SCHEMA_VERSION`] (not a version this format
+/// ever used).
+pub fn ensure_supported_snapshot_schema(file: &Path, version: u32) -> AppResult<()> {
+    if version > SNAPSHOT_SCHEMA_VERSION {
+        return Err(AppError::SnapshotSchemaUnsupported {
+            file: file.display().to_string(),
+            version,
+            supported: SNAPSHOT_SCHEMA_VERSION,
+        });
+    }
+    if version < INITIAL_SNAPSHOT_SCHEMA_VERSION {
+        return Err(AppError::SnapshotParse(format!(
+            "{} declares schema version {version}, but the initial snapshot schema version is \
+             {INITIAL_SNAPSHOT_SCHEMA_VERSION}",
+            file.display()
+        )));
+    }
+    Ok(())
+}
 
 /// Maps a [`ConfigSettingId`] to a friendly, human-readable setting name.
 ///
@@ -45,6 +110,13 @@ pub fn config_setting_id_for_prefix(prefix: &str) -> Option<ConfigSettingId> {
 /// A complete snapshot of the network's Soroban resource-pricing configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigSnapshot {
+    /// Version of the persisted file schema this snapshot was written with.
+    ///
+    /// Serialized first so the version is immediately visible in a snapshot
+    /// file. Unversioned legacy files deserialize to
+    /// [`INITIAL_SNAPSHOT_SCHEMA_VERSION`]; loads never rewrite them.
+    #[serde(default = "initial_snapshot_schema_version")]
+    pub schema_version: u32,
     pub network: String,
     pub timestamp: String,
     pub ledger: u32,
@@ -62,11 +134,41 @@ pub struct ConfigSnapshot {
     pub state_archival: Option<StateArchivalV0>,
 }
 
+impl ConfigSnapshot {
+    /// Whether two snapshots record the *same configuration*.
+    ///
+    /// This compares normalized data fields — the network, the protocol
+    /// version, and all six config settings — rather than serialized JSON, so
+    /// field order and capture metadata never force a spurious difference.
+    ///
+    /// Deliberately ignored:
+    /// * `timestamp` — every capture has a new one, even when nothing changed.
+    /// * `ledger` — snapshots record the ledger at which the entries were last
+    ///   modified, not the current ledger. An entry rewritten with identical
+    ///   values has not changed the configuration.
+    /// * `schema_version` — a file-format detail, not a pricing input.
+    ///
+    /// Used by `config snapshot --skip-unchanged` to avoid writing a duplicate
+    /// file for a network whose pricing is stable.
+    #[must_use]
+    pub fn same_configuration(&self, other: &Self) -> bool {
+        self.network == other.network
+            && self.protocol_version == other.protocol_version
+            && self.contract_compute == other.contract_compute
+            && self.contract_ledger_cost == other.contract_ledger_cost
+            && self.contract_historical_data == other.contract_historical_data
+            && self.contract_events == other.contract_events
+            && self.contract_bandwidth == other.contract_bandwidth
+            && self.state_archival == other.state_archival
+    }
+}
+
 /// Top-level field names of [`ConfigSnapshot`] understood by this build.
 ///
 /// Any other top-level field found in a stored snapshot is reported as an
 /// *unknown* field rather than being silently dropped.
 pub const KNOWN_SNAPSHOT_FIELDS: &[&str] = &[
+    "schema_version",
     "network",
     "timestamp",
     "ledger",
@@ -225,7 +327,7 @@ pub fn setting_unit_description(field_path: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::ConfigSnapshot;
+    use super::*;
 
     const LEGACY: &str = r#"{"network":"testnet","timestamp":"t","ledger":7,
         "contract_compute":null,"contract_ledger_cost":null,
@@ -253,5 +355,103 @@ mod tests {
         let back: ConfigSnapshot =
             serde_json::from_str(&serde_json::to_string(&snap).unwrap()).unwrap();
         assert_eq!(back.protocol_version, Some(23));
+    }
+
+    // ── Schema versioning (#508) ──────────────────────────────────────────
+
+    #[test]
+    fn unversioned_snapshot_is_the_documented_initial_version() {
+        let snap: ConfigSnapshot = serde_json::from_str(LEGACY).unwrap();
+        assert_eq!(snap.schema_version, INITIAL_SNAPSHOT_SCHEMA_VERSION);
+        assert_eq!(INITIAL_SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn serialized_snapshot_declares_the_current_schema_version() {
+        let snap: ConfigSnapshot = serde_json::from_str(LEGACY).unwrap();
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(
+            json.contains(&format!("\"schema_version\":{SNAPSHOT_SCHEMA_VERSION}")),
+            "a new snapshot must carry its schema version: {json}"
+        );
+    }
+
+    #[test]
+    fn schema_version_is_a_known_field_not_an_unknown_one() {
+        let payload = SnapshotPayload::parse(LEGACY).unwrap();
+        assert!(
+            !payload.has_unknown_fields(),
+            "schema_version must be modelled, not reported as unknown: {:?}",
+            payload.unknown_field_names()
+        );
+    }
+
+    #[test]
+    fn current_and_legacy_schema_versions_are_accepted() {
+        for version in [INITIAL_SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_SCHEMA_VERSION] {
+            assert!(
+                ensure_supported_snapshot_schema(Path::new("snapshot.json"), version).is_ok(),
+                "version {version} must be readable"
+            );
+        }
+    }
+
+    #[test]
+    fn future_schema_version_is_rejected_with_the_file_and_upgrade_hint() {
+        let path = Path::new("/tmp/testnet-future.json");
+        let error = ensure_supported_snapshot_schema(path, SNAPSHOT_SCHEMA_VERSION + 1)
+            .expect_err("a newer schema must be rejected");
+        let message = error.to_string();
+        assert!(
+            matches!(error, AppError::SnapshotSchemaUnsupported { .. }),
+            "expected SnapshotSchemaUnsupported, got: {message}"
+        );
+        assert!(message.contains("/tmp/testnet-future.json"), "{message}");
+        assert!(
+            message.contains("upgrade soroban-cost-estimator"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn version_zero_is_rejected_as_invalid() {
+        let error = ensure_supported_snapshot_schema(Path::new("snapshot.json"), 0)
+            .expect_err("version 0 was never a valid snapshot schema");
+        assert!(matches!(error, AppError::SnapshotParse(_)), "{error}");
+        assert!(error.to_string().contains("schema version 0"), "{error}");
+    }
+
+    // ── Change detection for `--skip-unchanged` (#509) ────────────────────
+
+    #[test]
+    fn same_configuration_ignores_capture_metadata() {
+        let a: ConfigSnapshot = serde_json::from_str(LEGACY).unwrap();
+        let mut b = a.clone();
+        b.timestamp = "2026-02-02T00:00:00Z".to_string();
+        b.ledger = 99;
+        b.schema_version = SNAPSHOT_SCHEMA_VERSION;
+        assert!(a.same_configuration(&b));
+    }
+
+    #[test]
+    fn same_configuration_detects_protocol_setting_and_network_changes() {
+        let a: ConfigSnapshot = serde_json::from_str(LEGACY).unwrap();
+
+        let mut protocol = a.clone();
+        protocol.protocol_version = Some(24);
+        assert!(!a.same_configuration(&protocol));
+
+        let mut pricing = a.clone();
+        pricing.contract_compute = Some(ContractComputeV0 {
+            ledger_max_instructions: 1_000_000,
+            tx_max_instructions: 100_000,
+            fee_rate_per_instructions_increment: 25,
+            tx_memory_limit: 1,
+        });
+        assert!(!a.same_configuration(&pricing));
+
+        let mut other_network = a.clone();
+        other_network.network = "mainnet".to_string();
+        assert!(!a.same_configuration(&other_network));
     }
 }

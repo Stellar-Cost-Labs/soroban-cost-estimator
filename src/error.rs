@@ -116,6 +116,21 @@ pub enum AppError {
     #[error("failed to parse snapshot: {0}")]
     SnapshotParse(String),
 
+    /// A snapshot file is written in a schema this build does not understand.
+    ///
+    /// Newer releases may add or reshape fields, so the file is rejected (and
+    /// left untouched) instead of being misread. The message names the file
+    /// and the version to make the upgrade path obvious.
+    #[error(
+        "failed to load snapshot: {file} declares schema version {version}, but this build \
+         supports up to {supported} (upgrade soroban-cost-estimator to read it)"
+    )]
+    SnapshotSchemaUnsupported {
+        file: String,
+        version: u32,
+        supported: u32,
+    },
+
     #[error("failed to load snapshots: none available for network {0}")]
     NoSnapshots(String),
 
@@ -228,6 +243,11 @@ mod tests {
             AppError::TypeValidation("arg 'abc' cannot be used as 'i64'".to_string()),
             AppError::SnapshotNotFound("/tmp/s.json".to_string()),
             AppError::SnapshotParse("invalid bundle".to_string()),
+            AppError::SnapshotSchemaUnsupported {
+                file: "/tmp/snapshot.json".to_string(),
+                version: 9,
+                supported: 1,
+            },
             AppError::NoSnapshots("testnet".to_string()),
             AppError::SimulationFailed("no cost data".to_string()),
             AppError::TxConstruction("contract id required".to_string()),

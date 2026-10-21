@@ -679,6 +679,12 @@ pub enum ConfigAction {
         /// older ones once the new snapshot is safely on disk.
         #[arg(long, value_name = "COUNT")]
         retain: Option<usize>,
+
+        /// Do not write a new snapshot when the fetched configuration matches
+        /// the latest snapshot for the network. The command exits 0 whether a
+        /// snapshot was written or skipped.
+        #[arg(long)]
+        skip_unchanged: bool,
     },
     /// List all saved config snapshots with their timestamp and ledger.
     List {

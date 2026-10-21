@@ -10,6 +10,7 @@ fn make_snapshot(
     bandwidth_fee: i64,
 ) -> ConfigSnapshot {
     ConfigSnapshot {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
         network: "testnet".to_string(),
         timestamp: timestamp.to_string(),
         ledger,
@@ -443,5 +444,257 @@ fn test_missing_snapshots_reports_an_error() {
             error.to_string().contains("testnet"),
             "error should name the network: {error}"
         );
+    });
+}
+
+// ── Snapshot schema versioning (#508) ─────────────────────────────────────
+
+use soroban_cost_estimator::error::AppError;
+
+/// A full snapshot JSON document carrying an explicit schema version.
+fn versioned_snapshot_json(version: u32, fee: i64) -> String {
+    format!(
+        r#"{{
+  "schema_version": {version},
+  "network": "testnet",
+  "timestamp": "2026-01-01T00:00:00Z",
+  "ledger": 100,
+  "contract_compute": {{
+    "ledger_max_instructions": 1000000,
+    "tx_max_instructions": 100000,
+    "fee_rate_per_instructions_increment": {fee},
+    "tx_memory_limit": 100
+  }},
+  "contract_ledger_cost": null,
+  "contract_historical_data": null,
+  "contract_events": null,
+  "contract_bandwidth": null,
+  "state_archival": null
+}}"#
+    )
+}
+
+#[test]
+fn test_legacy_snapshot_loads_as_the_initial_schema_version() {
+    with_temp_home(|home| {
+        let path = write_snapshot(home, "testnet", "2026-01-01T00:00:00Z", 7);
+
+        let loaded = store::load_latest_snapshot("testnet").expect("load legacy snapshot");
+
+        assert_eq!(loaded.schema_version, INITIAL_SNAPSHOT_SCHEMA_VERSION);
+        assert_eq!(loaded.ledger, 7);
+        assert!(path.exists());
+    });
+}
+
+#[test]
+fn test_new_snapshots_are_written_with_the_current_schema_version() {
+    with_temp_home(|_home| {
+        let snapshot = make_snapshot("2026-01-01T00:00:00Z", 100, 100, 5);
+
+        let path = store::save_snapshot(&snapshot, None).expect("save snapshot");
+        let written = std::fs::read_to_string(&path).expect("read saved snapshot");
+
+        assert!(
+            written.contains(&format!("\"schema_version\": {SNAPSHOT_SCHEMA_VERSION}")),
+            "a new snapshot file must declare its schema version: {written}"
+        );
+        let loaded = store::load_snapshot_from_path(&path.to_string_lossy()).expect("load");
+        assert_eq!(loaded.schema_version, SNAPSHOT_SCHEMA_VERSION);
+    });
+}
+
+#[test]
+fn test_current_schema_version_loads_through_every_read_path() {
+    with_temp_home(|home| {
+        let path = write_raw(
+            home,
+            "testnet-2026-01-01T00-00-00Z.json",
+            &versioned_snapshot_json(SNAPSHOT_SCHEMA_VERSION, 100),
+        );
+
+        let latest = store::load_latest_snapshot("testnet").expect("load latest");
+        assert_eq!(latest.schema_version, SNAPSHOT_SCHEMA_VERSION);
+        let explicit = store::load_snapshot_checked(&path).expect("load explicit");
+        assert_eq!(explicit.schema_version, SNAPSHOT_SCHEMA_VERSION);
+        let payload =
+            store::load_snapshot_payload_from_path(&path.to_string_lossy()).expect("load payload");
+        assert_eq!(payload.snapshot.schema_version, SNAPSHOT_SCHEMA_VERSION);
+        let metadata = store::list_snapshots_metadata(Some("testnet")).expect("list metadata");
+        assert_eq!(metadata.len(), 1);
+    });
+}
+
+#[test]
+fn test_future_schema_version_is_rejected_naming_the_file_and_upgrade_hint() {
+    with_temp_home(|home| {
+        let filename = "testnet-2026-01-01T00-00-00Z.json";
+        let path = write_raw(
+            home,
+            filename,
+            &versioned_snapshot_json(SNAPSHOT_SCHEMA_VERSION + 1, 100),
+        );
+
+        let error = store::load_latest_snapshot("testnet").expect_err("future schema is rejected");
+        let message = error.to_string();
+
+        assert!(
+            matches!(error, AppError::SnapshotSchemaUnsupported { .. }),
+            "expected the dedicated error, got: {message}"
+        );
+        assert!(message.contains(filename), "must name the file: {message}");
+        assert!(
+            message.contains("upgrade soroban-cost-estimator"),
+            "must recommend an action: {message}"
+        );
+
+        // Validation reports the same actionable message instead of a generic
+        // parse failure.
+        let validation = store::validate_snapshot_file(&path);
+        assert!(!validation.valid);
+        let validation_error = validation.error.unwrap_or_default();
+        assert!(
+            validation_error.contains("upgrade soroban-cost-estimator"),
+            "{validation_error}"
+        );
+    });
+}
+
+#[test]
+fn test_future_schema_version_fails_the_metadata_listing() {
+    with_temp_home(|home| {
+        let filename = "testnet-2026-01-01T00-00-00Z.json";
+        write_raw(
+            home,
+            filename,
+            &versioned_snapshot_json(SNAPSHOT_SCHEMA_VERSION + 1, 100),
+        );
+
+        let error = store::list_snapshots_metadata(Some("testnet"))
+            .expect_err("listing must not silently skip an unreadable snapshot");
+        assert!(error.to_string().contains(filename), "{error}");
+    });
+}
+
+#[test]
+fn test_reading_a_legacy_snapshot_does_not_rewrite_it() {
+    with_temp_home(|home| {
+        let path = write_snapshot(home, "testnet", "2026-01-01T00:00:00Z", 1);
+        let before = std::fs::read_to_string(&path).expect("read before");
+
+        store::load_latest_snapshot("testnet").expect("load legacy snapshot");
+        store::load_last_two_snapshots("testnet")
+            .expect_err("a single snapshot is not a diff pair");
+
+        let after = std::fs::read_to_string(&path).expect("read after");
+        assert_eq!(
+            before, after,
+            "reading must not rewrite the user's snapshot"
+        );
+        assert!(!after.contains("schema_version"));
+    });
+}
+
+// ── `--skip-unchanged` behaviour (#509) ───────────────────────────────────
+
+#[test]
+fn test_skip_unchanged_always_saves_the_first_snapshot() {
+    with_temp_home(|_home| {
+        let snapshot = make_snapshot("2026-01-01T00:00:00Z", 100, 100, 5);
+
+        let outcome = store::save_snapshot_if_changed(&snapshot, None).expect("first save");
+
+        assert!(
+            matches!(outcome, store::SnapshotSaveOutcome::Saved(_)),
+            "no history means the first capture is written: {outcome:?}"
+        );
+        assert_eq!(store::list_snapshots("testnet").expect("list").len(), 1);
+    });
+}
+
+#[test]
+fn test_skip_unchanged_ignores_timestamp_ledger_and_schema_version() {
+    with_temp_home(|_home| {
+        let first = make_snapshot("2026-01-01T00:00:00Z", 100, 100, 5);
+        store::save_snapshot_if_changed(&first, None).expect("first save");
+
+        // Identical values captured later, at a different ledger, and carrying
+        // an explicit current schema version: none of those are config changes.
+        let mut second = make_snapshot("2026-02-02T00:00:00Z", 250, 100, 5);
+        second.schema_version = SNAPSHOT_SCHEMA_VERSION;
+
+        let outcome = store::save_snapshot_if_changed(&second, None).expect("second save");
+        let latest = match outcome {
+            store::SnapshotSaveOutcome::Unchanged { latest } => latest,
+            store::SnapshotSaveOutcome::Saved(path) => {
+                panic!("expected an unchanged result, wrote {}", path.display())
+            }
+        };
+        assert_eq!(
+            latest
+                .file_name()
+                .expect("latest file name")
+                .to_string_lossy(),
+            "testnet-2026-01-01T00-00-00Z.json"
+        );
+        assert_eq!(
+            store::list_snapshots("testnet").expect("list").len(),
+            1,
+            "no duplicate file may be written"
+        );
+    });
+}
+
+#[test]
+fn test_skip_unchanged_writes_when_pricing_changes() {
+    with_temp_home(|_home| {
+        let first = make_snapshot("2026-01-01T00:00:00Z", 100, 100, 5);
+        store::save_snapshot_if_changed(&first, None).expect("first save");
+
+        let mut changed = make_snapshot("2026-01-02T00:00:00Z", 200, 150, 5);
+        changed.schema_version = SNAPSHOT_SCHEMA_VERSION;
+        let outcome = store::save_snapshot_if_changed(&changed, None).expect("changed save");
+
+        assert!(
+            matches!(outcome, store::SnapshotSaveOutcome::Saved(_)),
+            "a fee change must be recorded: {outcome:?}"
+        );
+        assert_eq!(store::list_snapshots("testnet").expect("list").len(), 2);
+    });
+}
+
+#[test]
+fn test_skip_unchanged_writes_when_the_protocol_version_bumps() {
+    with_temp_home(|_home| {
+        let mut first = make_snapshot("2026-01-01T00:00:00Z", 100, 100, 5);
+        first.protocol_version = Some(23);
+        store::save_snapshot_if_changed(&first, None).expect("first save");
+
+        let mut bumped = make_snapshot("2026-01-02T00:00:00Z", 100, 100, 5);
+        bumped.protocol_version = Some(24);
+        let outcome = store::save_snapshot_if_changed(&bumped, None).expect("protocol save");
+
+        assert!(
+            matches!(outcome, store::SnapshotSaveOutcome::Saved(_)),
+            "a protocol upgrade is metadata worth recording: {outcome:?}"
+        );
+    });
+}
+
+#[test]
+fn test_skip_unchanged_always_honours_an_explicit_out_path() {
+    with_temp_home(|home| {
+        let snapshot = make_snapshot("2026-01-01T00:00:00Z", 100, 100, 5);
+        store::save_snapshot_if_changed(&snapshot, None).expect("first save");
+
+        let out = home.join("explicit.json");
+        let outcome = store::save_snapshot_if_changed(&snapshot, Some(&out.to_string_lossy()))
+            .expect("explicit save");
+
+        assert!(
+            matches!(outcome, store::SnapshotSaveOutcome::Saved(_)),
+            "an explicit --out is an explicit request for a file: {outcome:?}"
+        );
+        assert!(out.exists(), "the explicit output path must be written");
     });
 }

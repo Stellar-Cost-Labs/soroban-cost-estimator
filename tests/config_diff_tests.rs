@@ -5,6 +5,7 @@ use soroban_cost_estimator::config_snapshot::model::*;
 
 fn empty_snapshot() -> ConfigSnapshot {
     ConfigSnapshot {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
         network: "testnet".to_string(),
         timestamp: "2026-01-01T00:00:00Z".to_string(),
         ledger: 100,
@@ -20,6 +21,7 @@ fn empty_snapshot() -> ConfigSnapshot {
 
 fn full_snapshot() -> ConfigSnapshot {
     ConfigSnapshot {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
         network: "testnet".to_string(),
         timestamp: "2026-01-01T00:00:00Z".to_string(),
         ledger: 100,
@@ -84,6 +86,7 @@ fn snapshot_with(
     archival: bool,
 ) -> ConfigSnapshot {
     ConfigSnapshot {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
         network: "testnet".to_string(),
         timestamp: "2026-01-01T00:00:00Z".to_string(),
         ledger: 100,
@@ -166,6 +169,7 @@ fn snapshot_with(
 
 fn make_snapshot(compute_fee: i64, bandwidth_fee: i64) -> ConfigSnapshot {
     ConfigSnapshot {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
         network: "testnet".to_string(),
         timestamp: "2026-01-01T00:00:00Z".to_string(),
         ledger: 100,

@@ -356,6 +356,7 @@ soroban-cost-estimator config snapshot <COMMAND>
 | `--retain <N>` | | — | Automatically delete snapshots older than N days |
 | `--json` | | `false` | Print the snapshot as JSON (still saves it) |
 | `--retain <COUNT>` | | | Keep only the N most recent snapshots, pruning older ones after the save |
+| `--skip-unchanged` | | `false` | Do not write a new snapshot when the fetched configuration matches the latest one |
 | `--help` | `-h` | | Print help |
 
 **Subcommands**
@@ -375,8 +376,17 @@ soroban-cost-estimator config snapshot <COMMAND>
   timestamp makes every snapshot a versioned artifact.
 - `--json` also prints the full snapshot as JSON to stdout.
 - `--out` writes to an explicit path instead of the default directory.
+- New snapshots carry `"schema_version": 1`. Unversioned legacy files are
+  read as that same initial version and are never rewritten by a read. A file
+  declaring a newer version is rejected with its path and an upgrade hint.
+- `--skip-unchanged` compares the fetched network, protocol version and six
+  config settings against the latest snapshot and writes nothing when they
+  match. Capture metadata (timestamp, last-modified ledger, schema version)
+  never forces a new file. The command exits `0` whether it saved or skipped;
+  `--json` reports `"status": "unchanged"` when it skipped.
 - `--retain <COUNT>` runs a retention pass once the new snapshot is safely on
-  disk, and logs how many snapshots it pruned.
+  disk, and logs how many snapshots it pruned. It also runs after an unchanged
+  capture, so an existing directory is still trimmed.
 - `prune` deletes stale files by age. It is pure file I/O — no RPC call — so it
   is safe to schedule offline. It is also mutually exclusive with this
   command's fetching flags (`--out`, `--retain`), so `config snapshot --retain

@@ -273,13 +273,21 @@ Fetch all 6 `ConfigSetting` ledger entries, decode them via XDR, timestamp,
 and save to disk.
 
 ```bash
-soroban-cost-estimator config snapshot --network testnet [--out /custom/path.json] [--json] [--retain <N>]
-soroban-cost-estimator config snapshot --network testnet [--out /custom/path.json] [--json] [--retain N]
+soroban-cost-estimator config snapshot --network testnet [--out /custom/path.json] [--json] [--retain <N>] [--skip-unchanged]
 ```
 
 Saved to `~/.soroban-cost-estimator/snapshots/<network>-<timestamp>.json`.
 `--json` also prints the snapshot as JSON (and still saves it). Each snapshot
-also records the network protocol version from `getLatestLedger`.
+also records the network protocol version from `getLatestLedger`, and starts
+with `"schema_version": 1`. Unversioned files from older releases are read as
+that initial version and are never rewritten just by reading them; a file
+written by a *newer* release is rejected with its path and an upgrade hint.
+
+`--skip-unchanged` is for scheduled collection: after fetching, the network,
+protocol version and all six settings are compared with the latest snapshot,
+and no file is written when they match. Timestamps and ledgers never count as
+changes. The command exits `0` either way, and `--json` reports
+`"status": "unchanged"` when it skipped.
 `--retain N` is a retention policy: snapshots for the network whose files are
 older than N days are deleted after saving, so the snapshots directory doesn't
 grow without bound.
