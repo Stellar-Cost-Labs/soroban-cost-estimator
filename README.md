@@ -22,7 +22,7 @@
 
 # Soroban Cost Estimator
 
-[📚 Documentation](https://soroban-cost-estimator.gitbook.io/soroban-cost_estimator-docs) · [🔄 Migration Guide](docs/migration.md)
+[📚 Documentation](https://soroban-cost-estimator.gitbook.io/soroban-cost_estimator-docs) · [📖 CLI Reference](docs/commands/reference.md) · [🔄 Migration Guide](docs/migration.md)
 
 **Estimate Soroban contract resource costs & track network pricing changes over time.**
 
