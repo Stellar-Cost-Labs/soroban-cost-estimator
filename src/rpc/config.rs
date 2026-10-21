@@ -112,6 +112,10 @@ pub struct ConfigSettingEntryRaw {
     pub id: ConfigSettingId,
     pub config_xdr: String,
     pub last_modified_ledger: u32,
+    /// `latestLedger` as reported by the RPC alongside this entry: the
+    /// ledger sequence the response was served at (issue #527). `None`
+    /// when the RPC omitted it.
+    pub latest_ledger: Option<u64>,
 }
 
 /// Fetches a specific config setting entry from the ledger.
@@ -148,6 +152,7 @@ pub async fn fetch_config_setting(
         id: setting_id,
         config_xdr: entry.xdr,
         last_modified_ledger: entry.last_modified_ledger_seq.unwrap_or(0),
+        latest_ledger: response.latest_ledger,
     })
 }
 
@@ -195,6 +200,7 @@ pub async fn fetch_all_config_settings(
             id: ConfigSettingId::ContractComputeV0, // placeholder; corrected after key matching below
             config_xdr: entry.xdr,
             last_modified_ledger: entry.last_modified_ledger_seq.unwrap_or(0),
+            latest_ledger: response.latest_ledger,
         };
         entry_by_key.insert(entry.key, raw);
     }

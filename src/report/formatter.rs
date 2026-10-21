@@ -189,6 +189,12 @@ impl TableFormatter {
         output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
         output.push_str(&format!("WASM hash: {}\n", report.wasm_hash));
         output.push_str(&format!("WASM size: {} bytes\n", report.wasm_size));
+        // Fee-rate provenance (#527): which ledger and config settings
+        // supplied the rates — explicitly "unknown" when none did.
+        output.push_str(&format!(
+            "Fee rate source: {}\n",
+            crate::report::cost_report::fee_rate_source_summary(&report.fee_rate_source)
+        ));
         output.push('\n');
 
         // Contract metadata from the WASM `contractmeta` section: always
@@ -426,8 +432,14 @@ impl ReportFormatter for MarkdownFormatter {
         output.push_str(&format!("- **WASM hash:** `{}`\n", report.wasm_hash));
         output.push_str(&format!("- **WASM size:** {} bytes\n", report.wasm_size));
         output.push_str(&format!(
-            "- **RPC round-trip:** {} ms\n\n",
+            "- **RPC round-trip:** {} ms\n",
             report.rpc_latency_ms
+        ));
+        // Fee-rate provenance (#527): which ledger and config settings
+        // supplied the rates — explicitly "unknown" when none did.
+        output.push_str(&format!(
+            "- **Fee rate source:** {}\n\n",
+            crate::report::cost_report::fee_rate_source_summary(&report.fee_rate_source)
         ));
 
         // Resource table
@@ -626,6 +638,7 @@ mod tests {
             rpc_latency_ms: 87,
             rates: None,
             warnings: Vec::new(),
+            fee_rate_source: crate::report::cost_report::FeeRateSource::default(),
             history: None,
             projections: None,
             contract_meta: crate::wasm::parser::ContractMeta::default(),
@@ -661,6 +674,7 @@ mod tests {
             rpc_latency_ms: 0,
             rates: None,
             warnings: Vec::new(),
+            fee_rate_source: crate::report::cost_report::FeeRateSource::default(),
             history: None,
             projections: None,
             contract_meta: crate::wasm::parser::ContractMeta::default(),
@@ -1205,6 +1219,51 @@ mod tests {
     fn test_table_formatter_omits_warnings_when_clean() {
         let output = TableFormatter.format(&sample_report());
         assert!(!output.contains("Resource limit warnings:"));
+    }
+
+    /// Issue #527: the table header states where the fee rates came from —
+    /// explicitly `unknown` when no configuration fetch supplied them.
+    #[test]
+    fn test_table_formatter_renders_fee_rate_source() {
+        let output = TableFormatter.format(&sample_report());
+        assert!(
+            output.contains("Fee rate source: ledger unknown"),
+            "{output}"
+        );
+
+        let mut report = sample_report();
+        let mut source = crate::report::cost_report::FeeRateSource::default();
+        source.record_ledger(Some(3_894_195));
+        source.record_setting("ContractComputeV0", true, 3_890_000);
+        report.fee_rate_source = source;
+        let output = TableFormatter.format(&report);
+        assert!(
+            output.contains("Fee rate source: ledger 3,894,195 — ContractComputeV0@3,890,000"),
+            "{output}"
+        );
+    }
+
+    /// Issue #527: the markdown header carries the same provenance line.
+    #[test]
+    fn test_markdown_formatter_renders_fee_rate_source() {
+        let output = MarkdownFormatter.format(&sample_report());
+        assert!(
+            output.contains("- **Fee rate source:** ledger unknown"),
+            "{output}"
+        );
+
+        let mut report = sample_report();
+        let mut source = crate::report::cost_report::FeeRateSource::default();
+        source.record_ledger(Some(3_894_195));
+        source.record_setting("ContractBandwidthV0", false, 0);
+        report.fee_rate_source = source;
+        let output = MarkdownFormatter.format(&report);
+        assert!(
+            output.contains(
+                "- **Fee rate source:** ledger 3,894,195 — ContractBandwidthV0 unavailable"
+            ),
+            "{output}"
+        );
     }
 
     #[test]

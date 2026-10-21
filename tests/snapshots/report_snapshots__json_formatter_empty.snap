@@ -16,6 +16,10 @@ expression: JsonFormatter.format(&empty)
     "total_stroops": 0,
     "total_xlm": "0.0000000"
   },
+  "fee_rate_source": {
+    "settings": [],
+    "source_ledger": null
+  },
   "function": "(wasm upload)",
   "ledger_sequence": 0,
   "memory_bytes": 0,

@@ -555,6 +555,7 @@ mod tests {
             rpc_latency_ms: 42,
             rates: None,
             warnings: Vec::new(),
+            fee_rate_source: crate::report::cost_report::FeeRateSource::default(),
             history: None,
             projections: None,
             contract_meta: crate::wasm::parser::ContractMeta::default(),

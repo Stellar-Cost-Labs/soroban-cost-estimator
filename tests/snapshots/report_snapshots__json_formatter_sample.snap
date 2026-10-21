@@ -16,6 +16,10 @@ expression: JsonFormatter.format(&report)
     "total_stroops": 15427,
     "total_xlm": "0.0015427"
   },
+  "fee_rate_source": {
+    "settings": [],
+    "source_ledger": null
+  },
   "function": "increment",
   "ledger_sequence": 3894195,
   "memory_bytes": 0,

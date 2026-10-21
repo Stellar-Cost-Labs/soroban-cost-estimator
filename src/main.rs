@@ -76,6 +76,13 @@ pub struct EstimateAllResult {
     /// JSON output (an empty array when nothing is near a protocol limit).
     #[serde(default)]
     pub warnings: Vec<report::cost_report::ResourceWarning>,
+    /// Fee-rate provenance for this function (#527): the ledger the rate
+    /// configuration was read at and the settings consulted. Shared across
+    /// every function of one batch (the rates are fetched once per run).
+    /// Always present in JSON output; `source_ledger: null` is the explicit
+    /// "unknown" when no configuration fetch supplied rates.
+    #[serde(default)]
+    pub fee_rate_source: report::cost_report::FeeRateSource,
     /// Contract metadata parsed from the WASM `contractmeta` custom section
     /// of the binary being estimated. Omitted when the binary carries no
     /// decodable section.
@@ -103,6 +110,7 @@ impl EstimateAllResult {
             tx_size: None,
             fee: None,
             warnings: Vec::new(),
+            fee_rate_source: report::cost_report::FeeRateSource::default(),
             contract_meta: wasm::parser::ContractMeta::default(),
         }
     }
@@ -126,6 +134,7 @@ impl EstimateAllResult {
             tx_size: None,
             fee: None,
             warnings: Vec::new(),
+            fee_rate_source: report::cost_report::FeeRateSource::default(),
             contract_meta: wasm::parser::ContractMeta::default(),
         }
     }
@@ -669,6 +678,22 @@ fn response_resources(
     ))
 }
 
+/// Record a rate source that could not supply a rate (issue #527): announce
+/// the degradation and record the setting as unavailable in the provenance.
+///
+/// `last_modified_ledger` is `0` when the fetch itself failed (nothing was
+/// served, so no modification ledger is known).
+fn unavailable_rate_source(
+    source: &mut report::cost_report::FeeRateSource,
+    degraded: &mut Vec<&'static str>,
+    name: &'static str,
+    last_modified_ledger: u32,
+) -> i64 {
+    degraded.push(name);
+    source.record_setting(name, false, last_modified_ledger);
+    0
+}
+
 /// Fetch fee rates from the network config (compute + ledger cost + bandwidth).
 ///
 /// Returns a `FeeRates` struct with raw config rates. These are passed to
@@ -679,65 +704,77 @@ fn response_resources(
 /// decoded, its rate(s) fall back to 0 and a warning is printed to stderr
 /// â€” a silent zero rate would understate the non-refundable fee, so it must
 /// never pass unannounced.
+///
+/// Also returns the rates' provenance (#527): the ledger the rate
+/// configuration was read at and which settings actually supplied a rate.
 async fn fetch_fee_rates(
     client: &rpc::client::RpcClient,
     quiet: bool,
-) -> report::fee_calc::FeeRates {
+) -> (
+    report::fee_calc::FeeRates,
+    report::cost_report::FeeRateSource,
+) {
+    use rpc::config::{ConfigSettingId, fetch_config_setting};
     use tracing::{debug, warn};
 
     let mut degraded: Vec<&'static str> = Vec::new();
+    let mut source = report::cost_report::FeeRateSource::default();
 
-    let raw_compute =
-        rpc::config::fetch_config_setting(client, rpc::config::ConfigSettingId::ContractComputeV0)
-            .await;
-
-    let raw_ledger_cost = rpc::config::fetch_config_setting(
-        client,
-        rpc::config::ConfigSettingId::ContractLedgerCostV0,
-    )
-    .await;
-
-    let raw_bandwidth = rpc::config::fetch_config_setting(
-        client,
-        rpc::config::ConfigSettingId::ContractBandwidthV0,
-    )
-    .await;
+    let raw_compute = fetch_config_setting(client, ConfigSettingId::ContractComputeV0).await;
+    let raw_ledger_cost = fetch_config_setting(client, ConfigSettingId::ContractLedgerCostV0).await;
+    let raw_bandwidth = fetch_config_setting(client, ConfigSettingId::ContractBandwidthV0).await;
 
     // ConfigSettingContractComputeV0.fee_rate_per_instructions_increment
     // is stroops per 10,000 instructions (not per instruction).
     let compute_per_10k = match raw_compute {
-        Ok(raw) => match xdr_helper::decode_config_entry_xdr(&raw.config_xdr, client.verbose) {
-            Ok(stellar_xdr::ConfigSettingEntry::ContractComputeV0(s)) => {
-                s.fee_rate_per_instructions_increment
+        Ok(raw) => {
+            source.record_ledger(raw.latest_ledger);
+            let last_modified = raw.last_modified_ledger;
+            match xdr_helper::decode_config_entry_xdr(&raw.config_xdr, client.verbose) {
+                Ok(stellar_xdr::ConfigSettingEntry::ContractComputeV0(s)) => {
+                    source.record_setting("ContractComputeV0", true, last_modified);
+                    s.fee_rate_per_instructions_increment
+                }
+                _ => unavailable_rate_source(
+                    &mut source,
+                    &mut degraded,
+                    "ContractComputeV0",
+                    last_modified,
+                ),
             }
-            _ => {
-                degraded.push("ContractComputeV0");
-                0
-            }
-        },
-        Err(_) => {
-            degraded.push("ContractComputeV0");
-            0
         }
+        Err(_) => unavailable_rate_source(&mut source, &mut degraded, "ContractComputeV0", 0),
     };
 
     // ConfigSettingContractLedgerCostV0: per-entry read/write fees and the
     // per-KB disk read fee â€” all part of the non-refundable fee in
     // stellar-core's resource fee model.
     let (read_entry, write_entry, read_1kb) = match raw_ledger_cost {
-        Ok(raw) => match xdr_helper::decode_config_entry_xdr(&raw.config_xdr, client.verbose) {
-            Ok(stellar_xdr::ConfigSettingEntry::ContractLedgerCostV0(s)) => (
-                s.fee_disk_read_ledger_entry,
-                s.fee_write_ledger_entry,
-                s.fee_disk_read1_kb,
-            ),
-            _ => {
-                degraded.push("ContractLedgerCostV0");
-                (0, 0, 0)
+        Ok(raw) => {
+            source.record_ledger(raw.latest_ledger);
+            let last_modified = raw.last_modified_ledger;
+            match xdr_helper::decode_config_entry_xdr(&raw.config_xdr, client.verbose) {
+                Ok(stellar_xdr::ConfigSettingEntry::ContractLedgerCostV0(s)) => {
+                    source.record_setting("ContractLedgerCostV0", true, last_modified);
+                    (
+                        s.fee_disk_read_ledger_entry,
+                        s.fee_write_ledger_entry,
+                        s.fee_disk_read1_kb,
+                    )
+                }
+                _ => {
+                    unavailable_rate_source(
+                        &mut source,
+                        &mut degraded,
+                        "ContractLedgerCostV0",
+                        last_modified,
+                    );
+                    (0, 0, 0)
+                }
             }
-        },
+        }
         Err(_) => {
-            degraded.push("ContractLedgerCostV0");
+            unavailable_rate_source(&mut source, &mut degraded, "ContractLedgerCostV0", 0);
             (0, 0, 0)
         }
     };
@@ -745,17 +782,23 @@ async fn fetch_fee_rates(
     // ConfigSettingContractBandwidthV0.fee_tx_size1_kb
     // is stroops per 1KB of tx size (not per byte).
     let bandwidth_per_kb = match raw_bandwidth {
-        Ok(raw) => match xdr_helper::decode_config_entry_xdr(&raw.config_xdr, client.verbose) {
-            Ok(stellar_xdr::ConfigSettingEntry::ContractBandwidthV0(s)) => s.fee_tx_size1_kb,
-            _ => {
-                degraded.push("ContractBandwidthV0");
-                0
+        Ok(raw) => {
+            source.record_ledger(raw.latest_ledger);
+            let last_modified = raw.last_modified_ledger;
+            match xdr_helper::decode_config_entry_xdr(&raw.config_xdr, client.verbose) {
+                Ok(stellar_xdr::ConfigSettingEntry::ContractBandwidthV0(s)) => {
+                    source.record_setting("ContractBandwidthV0", true, last_modified);
+                    s.fee_tx_size1_kb
+                }
+                _ => unavailable_rate_source(
+                    &mut source,
+                    &mut degraded,
+                    "ContractBandwidthV0",
+                    last_modified,
+                ),
             }
-        },
-        Err(_) => {
-            degraded.push("ContractBandwidthV0");
-            0
         }
+        Err(_) => unavailable_rate_source(&mut source, &mut degraded, "ContractBandwidthV0", 0),
     };
 
     if !degraded.is_empty() {
@@ -775,8 +818,8 @@ async fn fetch_fee_rates(
         fee_per_read_1kb: read_1kb,
         fee_per_1kb: bandwidth_per_kb,
     };
-    debug!(?rates, "fetched fee rates");
-    rates
+    debug!(?rates, ?source, "fetched fee rates");
+    (rates, source)
 }
 
 /// Outcome of one `estimate` run, letting the caller decide how to render it.
@@ -966,7 +1009,7 @@ async fn simulate_report(
         memory_bytes, latest_ledger, total_fee_stroops, "simulation complete"
     );
 
-    let fee_rates = fetch_fee_rates(&client, req.quiet).await;
+    let (fee_rates, fee_rate_source) = fetch_fee_rates(&client, req.quiet).await;
 
     let fee = report::fee_calc::compute_fee_breakdown(
         total_fee_stroops,
@@ -1010,6 +1053,7 @@ async fn simulate_report(
         rpc_latency_ms,
         rates: Some(fee_rates),
         warnings,
+        fee_rate_source,
         history: None,
         projections: None,
         contract_meta: req.contract_meta.clone(),
@@ -1539,7 +1583,7 @@ async fn cmd_estimate_repeat(
             );
 
             if iteration == 1 {
-                let fee_rates = fetch_fee_rates(&client, quiet).await;
+                let (fee_rates, fee_rate_source) = fetch_fee_rates(&client, quiet).await;
                 let fee = report::fee_calc::compute_fee_breakdown(
                     total_fee_stroops,
                     cpu_instructions,
@@ -1585,6 +1629,7 @@ async fn cmd_estimate_repeat(
                     rpc_latency_ms,
                     rates: Some(fee_rates),
                     warnings: Vec::new(),
+                    fee_rate_source,
                     history: None,
                     projections: None,
                     contract_meta: wasm_info.contract_meta.clone(),
@@ -2598,6 +2643,12 @@ pub fn format_estimate_all_markdown(results: &[EstimateAllResult]) -> String {
                         fee.refundable_stroops
                     ));
                 }
+                // Fee-rate provenance (#527): which ledger and config
+                // settings supplied the rates for this function.
+                out.push_str(&format!(
+                    "| Fee rate source | {} |\n",
+                    report::cost_report::fee_rate_source_summary(&result.fee_rate_source)
+                ));
                 if !result.warnings.is_empty() {
                     out.push_str("\n> **Resource limit warnings**\n");
                     for warning in &result.warnings {
@@ -3006,10 +3057,11 @@ async fn cmd_estimate_all(
 
         // Fee rates are only needed to itemize the per-function fee breakdown
         // in JSON output; skip the extra RPC calls in table mode.
-        let fee_rates = if json_flag {
-            Some(fetch_fee_rates(&client, quiet).await)
+        let (fee_rates, fee_rate_source) = if json_flag {
+            let (rates, source) = fetch_fee_rates(&client, quiet).await;
+            (Some(rates), source)
         } else {
-            None
+            (None, report::cost_report::FeeRateSource::default())
         };
 
         // Network resource limits for the 80% warnings (#322), fetched once
@@ -3036,6 +3088,7 @@ async fn cmd_estimate_all(
                 json_flag,
                 quiet,
                 fee_rates.as_ref(),
+                &fee_rate_source,
                 &network_config,
                 precision,
             )
@@ -3056,6 +3109,12 @@ async fn cmd_estimate_all(
                         println!("| Fee (XLM) | {} |", fee.total_xlm);
                     }
                     println!("| Ledger | {} |", r.ledger.unwrap_or(0));
+                    // Fee-rate provenance (#527): which ledger and config
+                    // settings supplied the rates for this batch.
+                    println!(
+                        "| Fee rate source | {} |",
+                        report::cost_report::fee_rate_source_summary(&r.fee_rate_source)
+                    );
                 } else {
                     println!("Status: {}", result.status as u8);
                     if let Some(reason) = &result.reason {
@@ -3164,6 +3223,7 @@ async fn estimate_all_function(
     json_flag: bool,
     quiet: bool,
     fee_rates: Option<&report::fee_calc::FeeRates>,
+    fee_rate_source: &report::cost_report::FeeRateSource,
     network_config: &report::cost_report::NetworkConfig,
     precision: u32,
 ) -> error::AppResult<EstimateAllResult> {
@@ -3304,6 +3364,7 @@ async fn estimate_all_function(
                     tx_size: Some(tx_xdr.len() as u32),
                     fee: Some(fee),
                     warnings,
+                    fee_rate_source: fee_rate_source.clone(),
                     contract_meta: wasm_info.contract_meta.clone(),
                 })
             }
@@ -5757,6 +5818,8 @@ mod tests {
                     fee_percentages: std::collections::BTreeMap::new(),
                 }),
                 warnings: Vec::new(),
+                fee_rate_source:
+                    soroban_cost_estimator::report::cost_report::FeeRateSource::default(),
                 contract_meta: ContractMeta {
                     name: Some("MetaContract".to_string()),
                     version: Some("9.9.9".to_string()),
@@ -5834,6 +5897,7 @@ mod tests {
                 fee_percentages: std::collections::BTreeMap::new(),
             }),
             warnings: Vec::new(),
+            fee_rate_source: soroban_cost_estimator::report::cost_report::FeeRateSource::default(),
             contract_meta: ContractMeta::default(),
         }];
         let distribution =
@@ -5973,6 +6037,7 @@ mod tests {
             rpc_latency_ms: 87,
             rates: None,
             warnings: Vec::new(),
+            fee_rate_source: soroban_cost_estimator::report::cost_report::FeeRateSource::default(),
             history: None,
             projections: None,
             contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),

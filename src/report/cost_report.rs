@@ -489,6 +489,123 @@ fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
+/// Provenance of the fee rates applied in an estimate (issue #527).
+///
+/// An estimate's resource consumption and its price rates can be fetched at
+/// different points in a run, so the report records both: [`CostReport::ledger`]
+/// is the simulation ledger, and [`Self::source_ledger`] is the ledger the
+/// rate configuration was read at. The two are separate network reads — they
+/// are *not* an atomic snapshot of the network, and neither field should be
+/// read as implying one.
+///
+/// Every value is explicit: `source_ledger: null` (rendered as `unknown` in
+/// human output) means no configuration fetch supplied a rate, and each
+/// consulted setting carries its own availability so a partial fetch is
+/// visible instead of silently mixed into the rates.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FeeRateSource {
+    /// `latestLedger` reported by the RPC when the first fee-rate config
+    /// entry was served — the read point of the rates. `None` when no
+    /// configuration entry supplied a rate (fetch unavailable or empty).
+    ///
+    /// Only the first known ledger is recorded: the compute, ledger-cost and
+    /// bandwidth settings are fetched in separate `getLedgerEntries` calls,
+    /// and recording one read point keeps the value deterministic rather than
+    /// implying the three reads were one atomic snapshot.
+    pub source_ledger: Option<u32>,
+    /// The configuration settings consulted for the rates, in fetch order
+    /// (compute, ledger cost, bandwidth). Empty when no configuration fetch
+    /// was attempted.
+    pub settings: Vec<FeeRateSourceSetting>,
+}
+
+/// One configuration setting consulted while sourcing the fee rates
+/// (issue #527).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FeeRateSourceSetting {
+    /// Machine-readable setting name (e.g. `"ContractComputeV0"`).
+    pub setting: String,
+    /// Whether the entry was fetched *and* decoded into a rate. A `false`
+    /// here means the corresponding rates fall back to 0 and the report's
+    /// non-refundable fee is understated.
+    pub available: bool,
+    /// Ledger at which this config entry was last modified, as reported by
+    /// the RPC. `None` when unknown (setting unavailable, or the RPC
+    /// omitted `lastModifiedLedgerSeq`).
+    pub last_modified_ledger: Option<u32>,
+}
+
+impl FeeRateSource {
+    /// Record the ledger the RPC reported for a rate-source fetch.
+    ///
+    /// Keeps the first *known* ledger: a failed fetch (or an RPC response
+    /// without `latestLedger`) must not mask a ledger already recorded from
+    /// an earlier successful fetch.
+    pub fn record_ledger(&mut self, ledger: Option<u64>) {
+        if self.source_ledger.is_none() {
+            // Ledger sequences are `u32` in the XDR; anything beyond the
+            // representable range is treated as unknown rather than wrapped.
+            self.source_ledger = ledger.and_then(|l| u32::try_from(l).ok());
+        }
+    }
+
+    /// Record one consulted config setting.
+    ///
+    /// `last_modified_ledger` is passed as the raw RPC value; `0` is the
+    /// "not reported" sentinel and is stored as `None` so the serialized
+    /// form never presents an unknown as a real ledger.
+    pub fn record_setting(
+        &mut self,
+        setting: impl Into<String>,
+        available: bool,
+        last_modified_ledger: u32,
+    ) {
+        self.settings.push(FeeRateSourceSetting {
+            setting: setting.into(),
+            available,
+            last_modified_ledger: (last_modified_ledger > 0).then_some(last_modified_ledger),
+        });
+    }
+}
+
+/// Render fee-rate provenance (#527) as one concise value for human output.
+///
+/// Returns the bare value (no `Fee rate source:` label) so each formatter can
+/// apply its own emphasis:
+///
+/// - no configuration consulted: `ledger unknown` — an explicit unknown,
+///   never a silent omission;
+/// - otherwise `ledger <L> — <setting>@<last modified>, …`, with unavailable
+///   settings named as `<setting> unavailable`.
+///
+/// Uses integer-formatted ledger sequences; no fee arithmetic is involved.
+#[must_use]
+pub fn fee_rate_source_summary(source: &FeeRateSource) -> String {
+    let ledger = match source.source_ledger {
+        Some(seq) => format_ledger_sequence(seq),
+        None => "unknown".to_string(),
+    };
+    if source.settings.is_empty() {
+        return format!("ledger {ledger}");
+    }
+    let settings: Vec<String> = source
+        .settings
+        .iter()
+        .map(|s| {
+            if s.available {
+                let modified = match s.last_modified_ledger {
+                    Some(seq) => format_ledger_sequence(seq),
+                    None => "unknown".to_string(),
+                };
+                format!("{}@{modified}", s.setting)
+            } else {
+                format!("{} unavailable", s.setting)
+            }
+        })
+        .collect();
+    format!("ledger {ledger} — {}", settings.join(", "))
+}
+
 /// A complete cost report for a single contract invocation.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CostReport {
@@ -544,6 +661,15 @@ pub struct CostReport {
     /// limit).
     #[serde(default)]
     pub warnings: Vec<ResourceWarning>,
+    /// Provenance of the fee rates applied to this report (#527): the ledger
+    /// the rate configuration was read at and the settings consulted. Always
+    /// serialized so JSON consumers see a stable `fee_rate_source` object;
+    /// `source_ledger: null` is the explicit "unknown" when no configuration
+    /// fetch supplied rates. Distinct from `ledger` (the simulation
+    /// ledger) — the two are separate network reads, not one atomic
+    /// snapshot.
+    #[serde(default)]
+    pub fee_rate_source: FeeRateSource,
     /// Historical trend entries (#321). `None` unless the caller requested
     /// history (via `--history`); when requested it is always an array in JSON
     /// output, possibly empty when there are no previous runs to compare.
@@ -1368,7 +1494,13 @@ pub fn format_report_table(report: &CostReport) -> String {
     if report.wasm_size > 0 {
         output.push_str(&format!("WASM size: {} bytes\n", report.wasm_size));
     }
-    output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
+    output.push_str(&format!("WASM hash: {}\n", report.wasm_hash));
+    // Fee-rate provenance (#527): which ledger and config settings supplied
+    // the rates — explicitly "unknown" when none did.
+    output.push_str(&format!(
+        "Fee rate source: {}\n\n",
+        fee_rate_source_summary(&report.fee_rate_source)
+    ));
 
     // Contract metadata from the WASM `contractmeta` section: present or
     // absent, always rendered so the reader knows the section was checked.
@@ -2147,6 +2279,7 @@ mod tests {
             rpc_latency_ms: 87,
             rates: Some(rates),
             warnings: Vec::new(),
+            fee_rate_source: crate::report::cost_report::FeeRateSource::default(),
             history: None,
             projections: None,
             contract_meta: ContractMeta::default(),
@@ -2217,6 +2350,142 @@ mod tests {
         assert!(out.contains("2500 stroops"));
     }
 
+    // ── Fee-rate source provenance (#527) ────────────────────────────
+
+    /// Builds the provenance a normal three-source configuration fetch
+    /// produces: every setting available, one shared read point.
+    fn normal_fee_rate_source() -> FeeRateSource {
+        let mut source = FeeRateSource::default();
+        source.record_ledger(Some(3_894_195));
+        source.record_setting("ContractComputeV0", true, 3_890_000);
+        source.record_setting("ContractLedgerCostV0", true, 3_890_000);
+        source.record_setting("ContractBandwidthV0", true, 3_890_000);
+        source
+    }
+
+    /// The unknown case must be explicit: no ledger, no settings consulted,
+    /// and a human summary that says `unknown` instead of omitting itself.
+    #[test]
+    fn test_fee_rate_source_unknown_is_explicit() {
+        let source = FeeRateSource::default();
+        assert_eq!(source.source_ledger, None);
+        assert!(source.settings.is_empty());
+        assert_eq!(fee_rate_source_summary(&source), "ledger unknown");
+
+        // Ledger sequences are u32 in the XDR; a value beyond the
+        // representable range is treated as unknown, never wrapped.
+        let mut weird = FeeRateSource::default();
+        weird.record_ledger(Some(u64::from(u32::MAX) + 1));
+        assert_eq!(weird.source_ledger, None);
+
+        // `lastModifiedLedgerSeq` omitted (0) is stored as unknown too.
+        let mut no_date = FeeRateSource::default();
+        no_date.record_ledger(Some(100));
+        no_date.record_setting("ContractComputeV0", true, 0);
+        assert_eq!(no_date.settings[0].last_modified_ledger, None);
+        assert_eq!(
+            fee_rate_source_summary(&no_date),
+            "ledger 100 — ContractComputeV0@unknown"
+        );
+    }
+
+    /// The first *known* ledger is kept: a later failed fetch must not mask
+    /// an already-recorded read point, and the three config fetches are not
+    /// implied to be one atomic snapshot.
+    #[test]
+    fn test_fee_rate_source_keeps_first_known_ledger() {
+        let mut source = FeeRateSource::default();
+        source.record_ledger(None);
+        source.record_ledger(Some(700));
+        source.record_ledger(Some(800));
+        assert_eq!(source.source_ledger, Some(700));
+    }
+
+    /// The normal configuration-fetch case: every setting available, one
+    /// recorded read point, all values present in the summary.
+    #[test]
+    fn test_fee_rate_source_normal_fetch_summary() {
+        let source = normal_fee_rate_source();
+        assert_eq!(
+            fee_rate_source_summary(&source),
+            "ledger 3,894,195 — ContractComputeV0@3,890,000, \
+             ContractLedgerCostV0@3,890,000, ContractBandwidthV0@3,890,000"
+        );
+    }
+
+    /// A partial configuration fetch: the missing setting is named as
+    /// unavailable instead of being silently mixed into the rates.
+    #[test]
+    fn test_fee_rate_source_partial_fetch_summary() {
+        let mut source = FeeRateSource::default();
+        source.record_ledger(Some(3_894_195));
+        source.record_setting("ContractComputeV0", true, 3_890_000);
+        source.record_setting("ContractLedgerCostV0", true, 3_890_000);
+        source.record_setting("ContractBandwidthV0", false, 0);
+        assert_eq!(
+            fee_rate_source_summary(&source),
+            "ledger 3,894,195 — ContractComputeV0@3,890,000, \
+             ContractLedgerCostV0@3,890,000, ContractBandwidthV0 unavailable"
+        );
+    }
+
+    /// Provenance reaches JSON with an explicit null for the unknown ledger
+    /// and per-setting availability flags (normal and partial).
+    #[test]
+    fn test_fee_rate_source_reaches_json() {
+        let unknown = serde_json::to_value(FeeRateSource::default()).expect("serialize");
+        assert_eq!(unknown["source_ledger"], serde_json::Value::Null);
+        assert_eq!(unknown["settings"], serde_json::json!([]));
+
+        let normal = serde_json::to_value(normal_fee_rate_source()).expect("serialize");
+        assert_eq!(normal["source_ledger"], 3_894_195);
+        assert_eq!(normal["settings"].as_array().map(Vec::len), Some(3));
+        assert_eq!(normal["settings"][0]["setting"], "ContractComputeV0");
+        assert_eq!(normal["settings"][0]["available"], true);
+        assert_eq!(normal["settings"][0]["last_modified_ledger"], 3_890_000);
+
+        let mut partial = normal_fee_rate_source();
+        partial.settings[2].available = false;
+        partial.settings[2].last_modified_ledger = None;
+        let partial = serde_json::to_value(partial).expect("serialize");
+        assert_eq!(partial["settings"][2]["setting"], "ContractBandwidthV0");
+        assert_eq!(partial["settings"][2]["available"], false);
+        assert_eq!(
+            partial["settings"][2]["last_modified_ledger"],
+            serde_json::Value::Null
+        );
+    }
+
+    /// The table output carries the provenance line; an unrated report says
+    /// `unknown` explicitly rather than dropping the line.
+    #[test]
+    fn test_format_report_table_renders_fee_rate_source() {
+        let mut report = report_with_rates(sample_rates());
+        let table_out = format_report_table(&report);
+        assert!(
+            table_out.contains("Fee rate source: ledger unknown"),
+            "{table_out}"
+        );
+
+        report.fee_rate_source = normal_fee_rate_source();
+        let table_out = format_report_table(&report);
+        assert!(
+            table_out.contains("Fee rate source: ledger 3,894,195 — ContractComputeV0@3,890,000"),
+            "{table_out}"
+        );
+
+        // The JSON rendering exposes the same structured provenance.
+        let json_out = format_report_json(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json_out).expect("valid json");
+        assert_eq!(parsed["fee_rate_source"]["source_ledger"], 3_894_195);
+        assert_eq!(
+            parsed["fee_rate_source"]["settings"]
+                .as_array()
+                .map(Vec::len),
+            Some(3)
+        );
+    }
+
     #[test]
     fn test_format_report_table_and_json_populated_footprint() {
         let report = report_with_rates(sample_rates());
@@ -2268,6 +2537,7 @@ mod tests {
             rpc_latency_ms: 0,
             rates: None,
             warnings: Vec::new(),
+            fee_rate_source: crate::report::cost_report::FeeRateSource::default(),
             history: None,
             projections: None,
             contract_meta: ContractMeta::default(),

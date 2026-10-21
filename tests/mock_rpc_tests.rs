@@ -4,6 +4,85 @@ use serde_json::json;
 
 use soroban_cost_estimator::error::AppError;
 use soroban_cost_estimator::rpc::client::RpcClient;
+use soroban_cost_estimator::rpc::config::{self, ConfigSettingId};
+
+/// Base64 `LedgerEntryData::ConfigSetting` XDR for a compute-settings entry
+/// with a known CPU rate — the payload a real `getLedgerEntries` response
+/// carries for `ConfigSettingContractComputeV0`.
+fn compute_config_entry_xdr() -> String {
+    use stellar_xdr::{
+        ConfigSettingContractComputeV0, ConfigSettingEntry, LedgerEntryData, Limits, WriteXdr,
+    };
+
+    let entry = ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
+        ledger_max_instructions: 580_000_000,
+        tx_max_instructions: 400_000_000,
+        fee_rate_per_instructions_increment: 7,
+        tx_memory_limit: 41_943_040,
+    });
+    let bytes = LedgerEntryData::ConfigSetting(entry)
+        .to_xdr(Limits::none())
+        .expect("encode config entry");
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
+}
+
+/// Issue #527, normal case: a served config entry carries the ledger the RPC
+/// answered at (`latestLedger`) and the entry's last-modified ledger — the
+/// values the fee-rate provenance is built from.
+#[tokio::test]
+async fn fetch_config_setting_records_serving_ledger_and_last_modified() {
+    let server = common::start_mock_rpc_server().await;
+
+    common::stub_jsonrpc_success(
+        &server,
+        "getLedgerEntries",
+        json!({
+            "latestLedger": 12_345,
+            "entries": [
+                {
+                    "key": "ignored-by-single-fetch",
+                    "xdr": compute_config_entry_xdr(),
+                    "lastModifiedLedgerSeq": 12_000
+                }
+            ]
+        }),
+    )
+    .await;
+
+    let client = RpcClient::new(server.uri().as_str());
+    let raw = config::fetch_config_setting(&client, ConfigSettingId::ContractComputeV0)
+        .await
+        .expect("config setting should be fetched");
+
+    assert_eq!(raw.latest_ledger, Some(12_345));
+    assert_eq!(raw.last_modified_ledger, 12_000);
+    assert_eq!(raw.id, ConfigSettingId::ContractComputeV0);
+}
+
+/// Issue #527, partial-fetch building block: when the RPC answers but serves
+/// no entry, the fetch fails with "not found" — that is how one missing
+/// setting becomes `available: false` in the fee-rate provenance.
+#[tokio::test]
+async fn fetch_config_setting_missing_entry_is_not_found() {
+    let server = common::start_mock_rpc_server().await;
+
+    common::stub_jsonrpc_success(
+        &server,
+        "getLedgerEntries",
+        json!({ "latestLedger": 7, "entries": [] }),
+    )
+    .await;
+
+    let client = RpcClient::new(server.uri().as_str());
+    let err = config::fetch_config_setting(&client, ConfigSettingId::ContractBandwidthV0)
+        .await
+        .expect_err("an empty entries list must surface as not-found");
+
+    assert!(
+        matches!(err, AppError::ConfigSettingNotFound(_)),
+        "got: {err}"
+    );
+}
 
 #[tokio::test]
 async fn mock_rpc_fixture_handles_simulate_transaction_and_health() {

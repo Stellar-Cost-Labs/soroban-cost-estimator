@@ -9,6 +9,7 @@ expression: MarkdownFormatter.format(&report)
 - **WASM hash:** `abc123def456`
 - **WASM size:** 14432 bytes
 - **RPC round-trip:** 87 ms
+- **Fee rate source:** ledger unknown
 
 ### Resources
 

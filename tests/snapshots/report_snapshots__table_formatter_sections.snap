@@ -8,6 +8,7 @@ Simulated at ledger sequence: 3,894,195
 RPC round-trip: 87 ms
 WASM hash: abc123def456
 WASM size: 4742 bytes
+Fee rate source: ledger unknown
 
 Contract meta: absent
 

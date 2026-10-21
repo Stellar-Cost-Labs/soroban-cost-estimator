@@ -2794,15 +2794,119 @@ fn test_estimate_clear_cache_wipes_network_before_simulation() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Fee-rate source provenance fixtures (Issue #527)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// A config-setting fixture served by [`start_mock_rpc_server_with_config`]:
+/// the base64 ledger key identifying the request, the base64
+/// `LedgerEntryData::ConfigSetting` XDR to serve for it, and the entry's
+/// last-modified ledger (#527).
+#[derive(Clone)]
+struct ConfigFixture {
+    key_b64: String,
+    xdr_b64: String,
+    last_modified: u32,
+}
+
+/// Builds a fixture for `id` from a typed config entry, encoding the same
+/// key and payload the network would serve over `getLedgerEntries`.
+fn config_fixture(
+    id: soroban_cost_estimator::rpc::config::ConfigSettingId,
+    entry: stellar_xdr::ConfigSettingEntry,
+    last_modified: u32,
+) -> ConfigFixture {
+    use stellar_xdr::{LedgerEntryData, Limits, WriteXdr};
+
+    let key_b64 = id.ledger_key_b64().expect("ledger key");
+    let bytes = LedgerEntryData::ConfigSetting(entry)
+        .to_xdr(Limits::none())
+        .expect("config entry XDR");
+    ConfigFixture {
+        key_b64,
+        xdr_b64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes),
+        last_modified,
+    }
+}
+
+/// Testnet-realistic config entries at known rates: CPU 7 per 10k insns,
+/// read 1563 & write 2500 per entry, 447 per 1KB of disk reads, 406 per 1KB
+/// of transaction size. Limits are generous so no resource warning fires.
+fn standard_rate_fixtures(last_modified: u32) -> Vec<ConfigFixture> {
+    use stellar_xdr::{
+        ConfigSettingContractBandwidthV0, ConfigSettingContractComputeV0,
+        ConfigSettingContractLedgerCostV0, ConfigSettingEntry,
+    };
+
+    vec![
+        config_fixture(
+            soroban_cost_estimator::rpc::config::ConfigSettingId::ContractComputeV0,
+            ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
+                ledger_max_instructions: 580_000_000,
+                tx_max_instructions: 400_000_000,
+                fee_rate_per_instructions_increment: 7,
+                tx_memory_limit: 41_943_040,
+            }),
+            last_modified,
+        ),
+        config_fixture(
+            soroban_cost_estimator::rpc::config::ConfigSettingId::ContractLedgerCostV0,
+            ConfigSettingEntry::ContractLedgerCostV0(ConfigSettingContractLedgerCostV0 {
+                ledger_max_disk_read_entries: 10_000,
+                ledger_max_disk_read_bytes: 5_000_000,
+                ledger_max_write_ledger_entries: 1_000,
+                ledger_max_write_bytes: 125_000,
+                tx_max_disk_read_entries: 10_000,
+                tx_max_disk_read_bytes: 5_000_000,
+                tx_max_write_ledger_entries: 1_000,
+                tx_max_write_bytes: 125_000,
+                fee_disk_read_ledger_entry: 1_563,
+                fee_write_ledger_entry: 2_500,
+                fee_disk_read1_kb: 447,
+                soroban_state_target_size_bytes: 30_000_000_000,
+                rent_fee1_kb_soroban_state_size_low: 1_800,
+                rent_fee1_kb_soroban_state_size_high: 7_500,
+                soroban_state_rent_fee_growth_factor: 1_250,
+            }),
+            last_modified,
+        ),
+        config_fixture(
+            soroban_cost_estimator::rpc::config::ConfigSettingId::ContractBandwidthV0,
+            ConfigSettingEntry::ContractBandwidthV0(ConfigSettingContractBandwidthV0 {
+                ledger_max_txs_size_bytes: 266_240,
+                tx_max_size_bytes: 132_096,
+                fee_tx_size1_kb: 406,
+            }),
+            last_modified,
+        ),
+    ]
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Simulation footprint metrics tests (Issue #2)
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Spawns a lightweight local HTTP mock JSON-RPC server on loopback to test
-/// simulation response parsing end-to-end without touching external networks.
+/// Spawns the standard mock server: `getLedgerEntries` answers with an
+/// empty entries list, i.e. every rate source unavailable (issue #527).
 fn start_mock_rpc_server(
     live_tx_data: &'static str,
     min_fee: &'static str,
     ledger: u64,
+) -> (String, std::sync::mpsc::Sender<()>) {
+    start_mock_rpc_server_with_config(live_tx_data, min_fee, ledger, &[])
+}
+
+/// Spawns a lightweight local HTTP mock JSON-RPC server on loopback to test
+/// simulation response parsing end-to-end without touching external networks.
+///
+/// `config` fixtures let `getLedgerEntries` serve real config-setting
+/// entries whose ledger key appears in the request (issue #527); a
+/// requested key without a fixture gets an empty `entries` list, exactly
+/// like a partial configuration fetch.
+fn start_mock_rpc_server_with_config(
+    live_tx_data: &'static str,
+    min_fee: &'static str,
+    ledger: u64,
+    config: &[ConfigFixture],
 ) -> (String, std::sync::mpsc::Sender<()>) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -2813,6 +2917,7 @@ fn start_mock_rpc_server(
 
     let live_tx_data = live_tx_data.to_string();
     let min_fee = min_fee.to_string();
+    let config = config.to_vec();
 
     std::thread::spawn(move || {
         listener.set_nonblocking(true).expect("set nonblocking");
@@ -2878,8 +2983,22 @@ fn start_mock_rpc_server(
                             r#"{{"jsonrpc":"2.0","id":1,"result":{{"status":"healthy","latestLedger":{ledger}}}}}"#
                         )
                     } else if req_str.contains("getLedgerEntries") {
+                        // Serve any config fixtures whose ledger key was
+                        // requested (#527); an unserved key gets an empty
+                        // entries list, like a partial configuration fetch.
+                        let entries: Vec<String> = config
+                            .iter()
+                            .filter(|f| req_str.contains(&f.key_b64))
+                            .map(|f| {
+                                format!(
+                                    r#"{{"key":"{}","xdr":"{}","lastModifiedLedgerSeq":{}}}"#,
+                                    f.key_b64, f.xdr_b64, f.last_modified
+                                )
+                            })
+                            .collect();
                         format!(
-                            r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":{ledger},"entries":[]}}}}"#
+                            r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":{ledger},"entries":[{}]}}}}"#,
+                            entries.join(",")
                         )
                     } else {
                         r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#.to_string()
@@ -4473,5 +4592,179 @@ fn test_config_snapshot_diff_makes_no_network_calls() {
     assert!(
         !stderr.contains("failed to locate RPC endpoint"),
         "offline diff must not resolve a network; got: {stderr}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Fee-rate source provenance tests (Issue #527)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Normal case: all three rate sources are served at a known ledger, so the
+/// JSON report names the source ledger and every consulted setting, and the
+/// served rates are the ones priced into the breakdown (integer math intact).
+#[test]
+fn test_estimate_json_reports_fee_rate_source_provenance() {
+    let (rpc_url, _stop) = start_mock_rpc_server_with_config(
+        LIVE_INCREMENT_TX_DATA,
+        "15427",
+        3_894_195,
+        &standard_rate_fixtures(3_890_000),
+    );
+    let home = temp_home("estimate-fee-rate-source");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+            "--json",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate should succeed; stderr: {stderr}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON; {stdout}");
+
+    // Provenance (#527): the source ledger and the full set of consulted
+    // settings, each with its last-modified ledger.
+    assert_eq!(
+        parsed["fee_rate_source"]["source_ledger"], 3_894_195,
+        "{parsed}"
+    );
+    let settings = parsed["fee_rate_source"]["settings"]
+        .as_array()
+        .expect("settings array");
+    assert_eq!(
+        settings.len(),
+        3,
+        "all three settings consulted: {settings:?}"
+    );
+    assert_eq!(settings[0]["setting"], "ContractComputeV0");
+    assert_eq!(settings[1]["setting"], "ContractLedgerCostV0");
+    assert_eq!(settings[2]["setting"], "ContractBandwidthV0");
+    for setting in settings {
+        assert_eq!(setting["available"], true, "{setting}");
+        assert_eq!(setting["last_modified_ledger"], 3_890_000, "{setting}");
+    }
+
+    // The served rates are the ones applied: CPU (532_502 × 7)/10_000 = 372
+    // + read 1_563 + write 2_500 + tx size (156 × 406)/1_024 = 61 stroops.
+    assert_eq!(parsed["fee"]["non_refundable_stroops"], 4_496, "{parsed}");
+
+    // Concise human output carries the same provenance (issue acceptance:
+    // "JSON and concise human output").
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Fee rate source: ledger 3,894,195 — ContractComputeV0@3,890,000"),
+        "table output must state the fee-rate source; got: {stdout}"
+    );
+}
+
+/// Partial configuration fetch: the bandwidth source is not served, so the
+/// provenance names it as unavailable while the recorded source ledger and
+/// the served settings stay visible — and the degraded rate is announced.
+#[test]
+fn test_estimate_json_partial_config_fetch_marks_source_unavailable() {
+    let all = standard_rate_fixtures(3_890_000);
+    let partial: Vec<ConfigFixture> = all.into_iter().take(2).collect(); // compute + ledger cost
+    let (rpc_url, _stop) =
+        start_mock_rpc_server_with_config(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195, &partial);
+    let home = temp_home("estimate-fee-rate-source-partial");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--fn",
+            "increment",
+            "--arg",
+            "1",
+            "--rpc-url",
+            &rpc_url,
+            "--json",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate should still succeed on a partial fetch; stderr: {stderr}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON; {stdout}");
+
+    // The source ledger of the entries that WERE served stays visible …
+    assert_eq!(
+        parsed["fee_rate_source"]["source_ledger"], 3_894_195,
+        "{parsed}"
+    );
+    let settings = parsed["fee_rate_source"]["settings"]
+        .as_array()
+        .expect("settings array");
+    assert_eq!(
+        settings.len(),
+        3,
+        "all three settings were consulted: {settings:?}"
+    );
+    // … while the missing setting is an explicit `available: false` with an
+    // unknown last-modified ledger — never a silent zero.
+    assert_eq!(settings[2]["setting"], "ContractBandwidthV0");
+    assert_eq!(settings[2]["available"], false, "{settings:?}");
+    assert_eq!(settings[2]["last_modified_ledger"], serde_json::Value::Null);
+    assert_eq!(settings[0]["available"], true, "{settings:?}");
+    assert_eq!(settings[1]["available"], true, "{settings:?}");
+
+    // The bandwidth rate falls back to 0: 372 + 1_563 + 2_500 = 4_435.
+    assert_eq!(parsed["fee"]["non_refundable_stroops"], 4_435, "{parsed}");
+    // …and the degradation is announced, naming the missing source.
+    assert!(
+        stderr.contains("ContractBandwidthV0 unavailable"),
+        "stderr should announce the degraded source; got: {stderr}"
     );
 }
