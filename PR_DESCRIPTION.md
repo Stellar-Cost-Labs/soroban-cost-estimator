@@ -76,7 +76,7 @@ database by hand.
 `clap`'s derive macros build the entire command tree on the stack. In an unoptimized build the
 generated code needs close to a megabyte of it, and the main thread of a Windows process is capped
 at **1 MiB** by the linker. `main` was already within ~100 KiB of that ceiling before this PR —
-and the 19 new arguments of `cache list` / `cache delete` pushed it over, so on
+and the 17 new arguments of `cache list` / `cache delete` pushed it over, so on
 `windows-latest` **every** CLI invocation aborted with a stack overflow before running a single
 command. Section [5.1](#51-the-windows-stack-overflow--a-real-regression-this-pr-caused) has the
 full diagnosis; the fix is to run the CLI on a thread with a real stack.
@@ -385,7 +385,7 @@ Every CLI invocation — even `--help` — aborted before running a command.
 `parse()` short-circuited still overflowed. `clap`'s derive macros build the whole command tree on
 the stack, and in an unoptimized build the generated builder chain copies every `clap::Arg` and
 `clap::Command` (each ~600 bytes) onto the stack once per call. `CacheAction` is part of the
-command tree **twice** (`cache …` and `config cache …`), so the 19 new arguments are built twice.
+command tree **twice** (`cache …` and `config cache …`), so the 17 new arguments are built twice.
 
 The Windows main thread is capped at 1 MiB by the linker; Linux's is 8 MiB. Reproduced locally by
 shrinking the stack limit and bisecting the threshold for the debug binary:
