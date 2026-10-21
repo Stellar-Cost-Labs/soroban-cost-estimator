@@ -256,6 +256,25 @@ impl ConfigDiff {
     }
 }
 
+/// Returns a new `ConfigDiff` containing only the changes where `is_pricing_change` is true.
+pub fn pricing_only(diff: &ConfigDiff) -> ConfigDiff {
+    let changes: Vec<FieldDiff> = diff
+        .changes
+        .iter()
+        .filter(|c| c.is_pricing_change)
+        .cloned()
+        .collect();
+
+    let has_pricing_changes = changes.iter().any(|c| c.is_pricing_change);
+
+    ConfigDiff {
+        old_snapshot: diff.old_snapshot.clone(),
+        new_snapshot: diff.new_snapshot.clone(),
+        changes,
+        has_pricing_changes,
+    }
+}
+
 /// Resolve the process exit code for `config diff` from the diff and the
 /// CI-oriented flags.
 ///
@@ -730,12 +749,20 @@ fn check<T: PartialEq + std::fmt::Display>(
 
 /// Formats a `ConfigDiff` as a single-line summary for CI status lines.
 ///
-/// Example: `2 pricing changes, 1 non-pricing changes` or
-/// `0 pricing changes, 0 non-pricing changes`.
+/// When nothing changed the line simply confirms the network config matches
+/// the stored snapshot: `Network config up to date (ledger 1234)`. When any
+/// field drifted it reports how many of the changes were pricing vs.
+/// non-pricing: `Config drift detected: 2 pricing changes, 1 non-pricing changes`.
 pub fn format_diff_summary(diff: &ConfigDiff) -> String {
+    if diff.changes.is_empty() {
+        return format!(
+            "Network config up to date (ledger {})",
+            diff.new_snapshot.ledger
+        );
+    }
     let pricing = diff.changes.iter().filter(|c| c.is_pricing_change).count();
     let non_pricing = diff.changes.len() - pricing;
-    format!("{pricing} pricing changes, {non_pricing} non-pricing changes")
+    format!("Config drift detected: {pricing} pricing changes, {non_pricing} non-pricing changes")
 }
 
 /// ANSI escape sequences used to color pricing-change indicators by severity.
@@ -1070,7 +1097,7 @@ mod tests {
         let diff = diff_snapshots(&old, &new);
         assert_eq!(
             format_diff_summary(&diff),
-            "2 pricing changes, 1 non-pricing changes"
+            "Config drift detected: 2 pricing changes, 1 non-pricing changes"
         );
     }
 
@@ -1080,7 +1107,7 @@ mod tests {
         let diff = diff_snapshots(&snap, &snap);
         assert_eq!(
             format_diff_summary(&diff),
-            "0 pricing changes, 0 non-pricing changes"
+            "Network config up to date (ledger 100)"
         );
     }
 

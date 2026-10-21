@@ -62,7 +62,7 @@ impl ConfigSettingId {
 
         let xdr_bytes = key
             .to_xdr(stellar_xdr::Limits::none())
-            .map_err(|e| crate::error::AppError::XdrEncode(format!("LedgerKey XDR: {e}")))?;
+            .map_err(|e| crate::error::AppError::XdrEncode(format!("ledger key: {e}")))?;
 
         Ok(base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,

@@ -266,6 +266,7 @@ mod tests {
                 type_name: "i64".to_string(),
                 type_def: stellar_xdr::ScSpecTypeDef::I64,
             }],
+            returns: Vec::new(),
         }
     }
 
@@ -286,6 +287,7 @@ mod tests {
                     type_def: stellar_xdr::ScSpecTypeDef::Bool,
                 },
             ],
+            returns: Vec::new(),
         }
     }
 
@@ -295,6 +297,7 @@ mod tests {
             param_count: 2,
             result_count: 1,
             params: Vec::new(),
+            returns: Vec::new(),
         }
     }
 
@@ -304,6 +307,7 @@ mod tests {
             param_count: 0,
             result_count: 1,
             params: Vec::new(),
+            returns: Vec::new(),
         }
     }
 

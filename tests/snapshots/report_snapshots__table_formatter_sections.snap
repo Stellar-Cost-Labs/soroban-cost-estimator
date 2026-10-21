@@ -1,0 +1,98 @@
+---
+source: tests/report_snapshots.rs
+expression: TableFormatter.format(&section_report())
+---
+Function: increment
+Network: testnet (ledger 3894195)
+Simulated at ledger sequence: 3,894,195
+RPC round-trip: 87 ms
+WASM hash: abc123def456
+WASM size: 4742 bytes
+
+Contract meta: absent
+
++------------------+----------+---------------+
+| Resource         | Consumed | Fee (stroops) |
++=============================================+
+| CPU Instructions | 532502   |               |
+|------------------+----------+---------------|
+| Memory Bytes     | 0        |               |
+|------------------+----------+---------------|
+| Read Entries     | 1        |               |
+|------------------+----------+---------------|
+| Write Entries    | 1        |               |
+|------------------+----------+---------------|
+| Read Bytes       | 0        |               |
+|------------------+----------+---------------|
+| Write Bytes      | 136      |               |
+|------------------+----------+---------------|
+| Transaction Size | 156      |               |
++------------------+----------+---------------+
+WASM sections (4734 bytes of section data, largest first):
++-------------------+-------+-------+
+| Section           | Bytes | Share |
++===================================+
+| name              | 3047  | 64.3% |
+|-------------------+-------+-------|
+| code              | 1021  | 21.5% |
+|-------------------+-------+-------|
+| contractspecv0    | 150   | 3.2%  |
+|-------------------+-------+-------|
+| contractmetav0    | 113   | 2.4%  |
+|-------------------+-------+-------|
+| type              | 83    | 1.8%  |
+|-------------------+-------+-------|
+| producers         | 79    | 1.7%  |
+|-------------------+-------+-------|
+| export            | 55    | 1.2%  |
+|-------------------+-------+-------|
+| target_features   | 36    | 0.8%  |
+|-------------------+-------+-------|
+| global            | 35    | 0.7%  |
+|-------------------+-------+-------|
+| import            | 33    | 0.7%  |
+|-------------------+-------+-------|
+| contractenvmetav0 | 32    | 0.7%  |
+|-------------------+-------+-------|
+| function          | 27    | 0.6%  |
+|-------------------+-------+-------|
+| data              | 11    | 0.2%  |
+|-------------------+-------+-------|
+| module header     | 8     | 0.2%  |
+|-------------------+-------+-------|
+| table             | 7     | 0.1%  |
+|-------------------+-------+-------|
+| memory            | 5     | 0.1%  |
++-------------------+-------+-------+
+  4742 bytes accounted for (100.0% of the file)
+
+Fee Breakdown:
+
++------------------+---------------------------+
+| Component        | Fee                       |
++==============================================+
+| CPU Instructions | 372 stroops ()            |
+|------------------+---------------------------|
+| Storage I/O      | 4063 stroops ()           |
+|------------------+---------------------------|
+| Transaction Size | 61 stroops ()             |
+|------------------+---------------------------|
+| Base Fee         | 100 stroops ()            |
+|------------------+---------------------------|
+| Rent Fee         | 10931 stroops ()          |
+|------------------+---------------------------|
+| Total            | 15427 stroops (0.0015427) |
++------------------+---------------------------+
+
+Fee Distribution:
+
+  CPU         | █░                                                      |   2.4%
+  Storage I/O | ██████████████▒                                         |  26.3%
+  Bandwidth   | ░                                                       |   0.4%
+  Rent        | ███████████████████████████████████████                 |  70.9%
+
+Optimization Tips:
+  Tip: 70% of the total fee is refundable, which comes from ledger rent bumps and contract events. Consider reducing state growth and the number or size of emitted events.
+
+Optimization Suggestions:
+  No cost optimizations identified (fee rates unavailable or no reducible resources).

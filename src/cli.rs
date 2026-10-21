@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::builder::{PossibleValue, TypedValueParser};
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -66,10 +68,14 @@ impl std::fmt::Display for OutputFormat {
 fn build_version() -> &'static str {
     concat!(
         env!("CARGO_PKG_VERSION"),
-        " (",
+        " (commit: ",
         env!("GIT_HASH"),
-        " ",
+        " built: ",
         env!("BUILD_DATE"),
+        " target: ",
+        env!("TARGET"),
+        " rustc: ",
+        env!("RUSTC_VERSION"),
         ")"
     )
 }
@@ -112,9 +118,18 @@ pub struct Cli {
     #[arg(long, short, global = true)]
     pub verbose: bool,
 
+    /// Suppress progress spinners, info banners, and non-error notices.
+    /// Outputs only the final result or error.
+    #[arg(long, short, global = true)]
+    pub quiet: bool,
+
     /// Custom HTTP header to send with every RPC request, e.g.
-    /// `--header "X-API-Key: secret"`. Repeatable for multiple headers.
-    #[arg(long = "header", value_name = "KEY: VALUE", global = true)]
+    /// `--header "Authorization=Bearer <token>"`. Repeatable for multiple
+    /// headers. The `KEY: VALUE` spelling is also accepted.
+    ///
+    /// Sensitive headers (`Authorization`, `x-api-key`, `api-key`, …) are
+    /// redacted in verbose logs.
+    #[arg(long = "header", short = 'H', value_name = "KEY=VALUE", global = true)]
     pub headers: Vec<String>,
 
     /// Fallback RPC URL used when the primary endpoint is unreachable or
@@ -147,10 +162,6 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "N", default_value_t = 10_000)]
     pub max_cache_entries: usize,
 
-    /// Suppress non-essential output, including the fee-distribution chart.
-    #[arg(long, short, global = true)]
-    pub quiet: bool,
-
     /// Number of decimal places shown for XLM fee values (0..=7, default 7).
     ///
     /// Stellar amounts are denominated in stroops (1 XLM = 10,000,000
@@ -165,15 +176,33 @@ pub struct Cli {
     )]
     pub precision: u32,
 
+    /// Maximum WASM file size to read into memory, in bytes (default: 16 MiB).
+    ///
+    /// Prevents unbounded memory allocation when inspecting large or hostile WASM files.
+    #[arg(long, global = true, value_name = "BYTES")]
+    pub max_wasm_size: Option<u64>,
+
     #[command(subcommand)]
     pub command: Command,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Simulate a single contract invocation and print the cost report.
+    ///
+    /// Repeat `--wasm` (or pass `--wasm-dir`) to evaluate several contracts
+    /// in one batch run and print a multi-contract cost summary.
     Estimate {
-        #[arg(long, short)]
-        wasm: String,
+        /// Path to a compiled Soroban contract `.wasm` file. Repeat the flag
+        /// to evaluate multiple contracts in a single batch run.
+        #[arg(long, short, value_name = "PATH", required_unless_present = "wasm_dir")]
+        wasm: Vec<PathBuf>,
+
+        /// Directory of `.wasm` files to evaluate as a batch (non-recursive).
+        #[arg(long, value_name = "DIR")]
+        wasm_dir: Option<PathBuf>,
+
+        /// Network to simulate against.
         #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
         #[arg(long)]
@@ -211,6 +240,12 @@ pub enum Command {
         /// back to disk.
         #[arg(long)]
         no_cache: bool,
+
+        /// Compare against up to 5 previous cached runs of the same function
+        /// and render a cost-trend table (red = regression, green = improvement).
+        /// Adds a `history` array to `--json` output when requested.
+        #[arg(long)]
+        history: bool,
 
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
@@ -251,10 +286,29 @@ pub enum Command {
             default_missing_value = "100,1000,10000"
         )]
         project: Option<String>,
+
+        /// Number of times to repeat the simulation (1..=100, default 1).
+        /// Collects latency statistics (min, max, mean, stddev) and checks
+        /// fee/CPU consistency across runs.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=100))]
+        repeat: u32,
     },
+
+    /// Enumerate all public contract functions and estimate each one.
+    ///
+    /// Repeat `--wasm` (or pass `--wasm-dir`) to estimate several contracts
+    /// in one batch run and print a multi-contract cost summary.
     EstimateAll {
-        #[arg(long, short)]
-        wasm: String,
+        /// Path to a compiled Soroban contract `.wasm` file. Repeat the flag
+        /// to estimate multiple contracts in a single batch run.
+        #[arg(long, short, value_name = "PATH", required_unless_present = "wasm_dir")]
+        wasm: Vec<PathBuf>,
+
+        /// Directory of `.wasm` files to estimate as a batch (non-recursive).
+        #[arg(long, value_name = "DIR")]
+        wasm_dir: Option<PathBuf>,
+
+        /// Network to simulate against.
         #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
 
@@ -290,6 +344,11 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect a compiled Soroban WASM artifact (offline).
+    Wasm {
+        #[command(subcommand)]
+        action: WasmAction,
+    },
     Config {
         #[command(subcommand)]
         action: ConfigAction,
@@ -313,6 +372,20 @@ pub enum Command {
         /// Target shell for completion script generation.
         #[arg(value_enum)]
         shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum WasmAction {
+    /// Print size, SHA-256, exported signatures, embedded metadata, and the
+    /// section size summary for a WASM file. Fully offline: no RPC calls.
+    Info {
+        /// Path to the compiled Soroban contract `.wasm` file.
+        wasm: PathBuf,
+
+        /// Output the full parsed spec/metadata as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -455,6 +528,55 @@ pub enum SnapshotAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Delete a saved snapshot file, or purge every snapshot older than N days.
+    Delete {
+        /// Snapshot filename (or path) to delete.
+        #[arg(value_name = "FILENAME")]
+        filename: Option<String>,
+
+        /// Delete snapshots older than this many days.
+        #[arg(long, value_name = "DAYS")]
+        older_than: Option<u64>,
+
+        /// Show which files would be removed without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip the confirmation prompt (required in non-interactive sessions).
+        #[arg(long, short = 'y')]
+        yes: bool,
+
+        /// Restrict `--older-than` to a single network's snapshots.
+        #[arg(long, value_name = "NETWORK")]
+        network: Option<String>,
+    },
+
+    /// Compare two saved snapshot files offline, without any network calls.
+    Diff {
+        /// First (older) snapshot file to compare.
+        #[arg(value_name = "SNAPSHOT_A")]
+        file_a: PathBuf,
+
+        /// Second (newer) snapshot file to compare.
+        #[arg(value_name = "SNAPSHOT_B")]
+        file_b: PathBuf,
+
+        /// Output as JSON instead of a human-readable diff.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Validate a snapshot file or every stored snapshot.
+    Validate {
+        /// Explicit snapshot file to validate.
+        #[arg(value_name = "PATH", required_unless_present = "all")]
+        path: Option<PathBuf>,
+
+        /// Validate every JSON snapshot in the snapshots directory.
+        #[arg(long, conflicts_with = "path")]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -466,7 +588,9 @@ pub enum ConfigAction {
     /// command's own flags.
     #[command(args_conflicts_with_subcommands = true)]
     Snapshot {
-        #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
+        #[command(subcommand)]
+        action: Option<SnapshotAction>,
+        #[arg(long, default_value = "testnet")]
         network: String,
         #[arg(long)]
         out: Option<String>,
@@ -477,11 +601,7 @@ pub enum ConfigAction {
         /// older ones once the new snapshot is safely on disk.
         #[arg(long, value_name = "COUNT")]
         retain: Option<usize>,
-
-        #[command(subcommand)]
-        action: Option<SnapshotAction>,
     },
-
     /// List all saved config snapshots with their timestamp and ledger.
     List {
         /// Network whose snapshots to list.
