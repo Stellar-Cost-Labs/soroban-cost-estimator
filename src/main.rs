@@ -1524,7 +1524,7 @@ async fn cmd_estimate_repeat(
         let tx_b64 =
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
 
-        client.health_check().await?;
+        let health_metadata = client.health_check().await?;
 
         let mut latencies_ms: Vec<u64> = Vec::with_capacity(repeat as usize);
         let mut first_cpu: Option<u64> = None;
@@ -1606,7 +1606,7 @@ async fn cmd_estimate_repeat(
                 );
 
                 if !no_cache {
-                    let _ = cache::save_estimate(
+                    let _ = cache::save_estimate_with_metadata(
                         &wasm_hash,
                         function_name,
                         args,
@@ -1617,6 +1617,8 @@ async fn cmd_estimate_repeat(
                         memory_bytes,
                         Some(rpc_latency_ms),
                         true,
+                        health_metadata.network_passphrase.as_deref(),
+                        health_metadata.core_version.as_deref(),
                     );
                 }
                 info!(total_stroops = fee.total_stroops, total_xlm = %fee.total_xlm, "estimate complete");
@@ -3056,7 +3058,7 @@ async fn cmd_estimate_all(
         // Validate the RPC endpoint is reachable before running a full batch
         // of simulations (#55): fail fast up front rather than after each
         // function's simulation times out.
-        client.health_check().await?;
+        let health_metadata = client.health_check().await?;
 
         // Fee rates are only needed to itemize the per-function fee breakdown
         // in JSON output; skip the extra RPC calls in table mode.
@@ -3091,6 +3093,7 @@ async fn cmd_estimate_all(
                 quiet,
                 fee_rates.as_ref(),
                 &network_config,
+                &health_metadata,
                 precision,
             )
             .await?;
@@ -3219,6 +3222,7 @@ async fn estimate_all_function(
     quiet: bool,
     fee_rates: Option<&report::fee_calc::FeeRates>,
     network_config: &report::cost_report::NetworkConfig,
+    health_metadata: &rpc::client::HealthMetadata,
     precision: u32,
 ) -> error::AppResult<EstimateAllResult> {
     use tracing::{Instrument, debug, info_span};
@@ -3282,7 +3286,7 @@ async fn estimate_all_function(
                 // `--no-cache` suppresses the write so a bypassed batch run
                 // leaves the local cache untouched.
                 if !no_cache {
-                    let _ = cache::save_estimate(
+                    let _ = cache::save_estimate_with_metadata(
                         wasm_hash,
                         &fn_info.name,
                         &[],
@@ -3293,6 +3297,8 @@ async fn estimate_all_function(
                         mem,
                         duration_ms,
                         true,
+                        health_metadata.network_passphrase.as_deref(),
+                        health_metadata.core_version.as_deref(),
                     );
                 }
 
@@ -4389,6 +4395,9 @@ fn print_cached_estimate(
                 "total_stroops": fresh.total_stroops,
                 "cpu_instructions": fresh.cpu_instructions,
                 "memory_bytes": fresh.memory_bytes,
+                "execution_duration_ms": fresh.execution_duration_ms,
+                "network_passphrase": fresh.network_passphrase,
+                "core_version": fresh.core_version,
                 "timestamp": fresh.timestamp,
             })
         );
