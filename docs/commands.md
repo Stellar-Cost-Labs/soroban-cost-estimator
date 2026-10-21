@@ -16,17 +16,30 @@ management**.
   - [`config history`](#config-history) — chronological change log
   - [`config last-changed`](#config-last-changed) — last-change timestamps
 - [Cache Management](#cache-management)
+  - [`cache stats`](#cache-stats) — cache health overview
   - [`cache verify`](#cache-verify) — check cache integrity
   - [`cache stats`](#cache-stats) — show cache size and quotas
   - [`cache prune`](#cache-prune) — evict least-recently-accessed entries
   - [`cache warm`](#cache-warm) — pre-populate cache
   - [`cache clear`](#cache-clear) — wipe cached estimates for a network
+  - [`cache list`](#cache-list) — inspect cached estimates with filters
+  - [`cache delete`](#cache-delete) — delete cached estimates by filter
+- [WASM Inspection](#wasm-inspection)
+  - [`wasm info`](#wasm-info) — offline contract metadata report
 - [Monitoring](#monitoring)
   - [`watch`](#watch) — poll and diff on interval
 
 ---
 
 ## Estimation
+
+> **Batch mode.** Repeating `--wasm` or passing `--wasm-dir <dir>` to `estimate`
+> or `estimate-all` evaluates every resolved contract in one run and prints an
+> aggregated multi-contract summary (function count, upload cost, and min/max
+> invocation fees per contract) instead of per-invocation output. `--json`
+> emits a structured batch report, and a contract that fails is reported in the
+> summary without aborting the rest of the run. In batch mode the `\*` above
+> marks the two WASM sources: supply at least one.
 
 ### `estimate`
 
@@ -42,7 +55,8 @@ soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
 
 | Flag | Short | Required | Default | Description |
 |------|-------|----------|---------|-------------|
-| `--wasm <WASM>` | `-w` | ✅ | — | Path to the compiled Soroban contract `.wasm` file |
+| `--wasm <PATH>` | `-w` | ✅* | — | Path to a compiled contract `.wasm` file (repeatable) |
+| `--wasm-dir <DIR>` | | ✅* | — | Directory of `.wasm` files to evaluate as a batch (non-recursive) |
 | `--network <NETWORK>` | | | `testnet` | Network to simulate against (`testnet`, `mainnet`, `futurenet`) |
 | `--rpc-url <RPC_URL>` | | | — | Explicit RPC URL (overrides network-based resolution) |
 | `--fn <FN>` | | | — | Contract function name to invoke |
@@ -234,7 +248,8 @@ soroban-cost-estimator estimate-all [OPTIONS] --wasm <WASM>
 
 | Flag | Short | Required | Default | Description |
 |------|-------|----------|---------|-------------|
-| `--wasm <WASM>` | `-w` | ✅ | — | Path to the compiled Soroban contract `.wasm` file |
+| `--wasm <PATH>` | `-w` | ✅* | — | Path to a compiled contract `.wasm` file (repeatable) |
+| `--wasm-dir <DIR>` | | ✅* | — | Directory of `.wasm` files to estimate as a batch (non-recursive) |
 | `--network <NETWORK>` | | | `testnet` | Network to simulate against |
 | `--id <ID>` | | | — | Deployed contract ID (64 hex chars) to invoke each function against |
 | `--no-cache` | | | `false` | Bypass the cache entirely: never read cached estimates, never write fresh results |
@@ -631,6 +646,38 @@ Last-changed timestamps for testnet:
 
 ## Cache Management
 
+### `cache stats`
+
+Show a cache health overview: total entries, disk usage, age of the oldest and
+newest entries, and a per-network breakdown.
+
+**Usage**
+
+```
+soroban-cost-estimator cache stats
+```
+
+**Flags**
+
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--help` | `-h` | | Print help |
+
+**Behavior**
+
+- Purely local SQLite I/O — no network calls.
+- Prints a one-line summary when the cache is empty.
+
+**Example**
+
+```bash
+soroban-cost-estimator cache stats
+# → Total entries: 12
+#   Disk usage:     48.0 KB
+```
+
+---
+
 ### `cache verify`
 
 Check that every cached estimate is readable and not corrupted.
@@ -816,6 +863,108 @@ soroban-cost-estimator cache clear
 
 soroban-cost-estimator cache clear --network mainnet
 # → Cleared 3 cached estimate(s) for mainnet.
+```
+
+---
+
+### `cache list`
+
+Audit the contents of the estimate cache with filters and pagination.
+
+**Usage**
+
+```
+soroban-cost-estimator cache list [OPTIONS]
+```
+
+**Flags**
+
+| Flag | Short | Required | Default | Description |
+|------|-------|----------|---------|-------------|
+| `--network <NETWORK>` | | | — (every network) | Network to filter by |
+| `--fn <FN>` | | | — | Function name (exact match); alias `--function` |
+| `--wasm-hash <WASM_HASH>` | | | — | WASM hash (prefix match, hexadecimal) |
+| `--since <DATE/TIME>` | | | — | Earliest timestamp or date; alias `--from` |
+| `--to <TIMESTAMP>` | | | — | Latest timestamp or date |
+| `--older-than <DURATION>` | | | — | Only entries older than this age (`30d`, `12h`, `3600`) |
+| `--limit <LIMIT>` | | | `50` | Maximum number of entries to return (capped at 1000) |
+| `--offset <OFFSET>` | | | `0` | Number of matching entries to skip |
+| `--json` | | | `false` | Output the full cached-estimate records as a JSON array |
+| `--help` | `-h` | | | Print help |
+
+**Behavior**
+
+- The network filter is optional — without it, entries from every network are
+  listed.
+- Filters are combined with logical AND; an invalid timestamp or a
+  non-hexadecimal hash prefix is rejected with a clear error.
+- Results are newest-first and paginated; the footer reports
+  `Showing X of Y matching estimate(s) (offset Z).`
+- The cache only ever stores a hash of the simulated arguments, never the
+  argument values themselves.
+- No network calls are made — this is pure local cache I/O.
+
+**Examples**
+
+```bash
+soroban-cost-estimator cache list --network testnet
+soroban-cost-estimator cache list --fn transfer --json
+soroban-cost-estimator cache list --older-than 30d --limit 20
+```
+
+---
+
+### `cache delete`
+
+Delete the cached estimates matching a filter — a targeted alternative to
+clearing a whole network.
+
+**Usage**
+
+```
+soroban-cost-estimator cache delete [OPTIONS]
+```
+
+**Flags**
+
+| Flag | Short | Required | Default | Description |
+|------|-------|----------|---------|-------------|
+| `--network <NETWORK>` | | | — (every network) | Network to filter by |
+| `--fn <FN>` | | | — | Function name (exact match); alias `--function` |
+| `--wasm-hash <WASM_HASH>` | | | — | WASM hash (prefix match, hexadecimal) |
+| `--since <DATE/TIME>` | | | — | Earliest timestamp or date; alias `--from` |
+| `--to <TIMESTAMP>` | | | — | Latest timestamp or date |
+| `--older-than <DURATION>` | | | — | Only entries older than this age (`30d`, `12h`, `3600`) |
+| `--all` | | | `false` | Delete every cached estimate, on every network (cannot be combined with a filter) |
+| `--dry-run` | | | `false` | Report the number of matching entries without deleting them |
+| `--yes` | `-y` | | `false` | Skip the confirmation prompt |
+| `--json` | | | `false` | Output as JSON instead of a human-readable summary |
+| `--help` | `-h` | | | Print help |
+
+**Behavior**
+
+- Uses the same matching rules as `cache list` / `cache query`, so
+  `--dry-run` reports exactly what would be removed.
+- At least one filter is required; without one the command is refused
+  unless `--all` is given.
+- `--all` means "every entry on every network" and cannot be combined with a
+  filter; the combination is rejected so a whole-cache deletion is never
+  silently narrowed.
+- Without `--yes` the command asks for confirmation; in a non-interactive
+  session the prompt cannot be answered, so the command aborts without
+  deleting anything.
+- Selection and deletion run in a single transaction, so the reported count
+  always matches the number of removed rows.
+- No network calls are made — this is pure local cache I/O.
+
+**Examples**
+
+```bash
+soroban-cost-estimator cache delete --network testnet --dry-run
+# → Would delete 2 cached estimate(s) — dry run, nothing removed.
+
+soroban-cost-estimator cache delete --network testnet --yes
+# → Deleted 2 cached estimate(s).
 ```
 
 ---

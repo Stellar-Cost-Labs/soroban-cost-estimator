@@ -350,10 +350,10 @@ mainnet = "https://m.example"
     #[test]
     fn network_default_reaches_nested_subcommands() {
         let cfg = parse("default_network = \"mainnet\"");
-        let cli = cli_with(&cfg, &["cache", "list"]);
+        let cli = cli_with(&cfg, &["cache", "clear"]);
         match cli.command {
             Command::Cache {
-                action: crate::cli::CacheAction::List { network, .. },
+                action: crate::cli::CacheAction::Clear { network, .. },
             } => assert_eq!(network, "mainnet"),
             other => panic!("unexpected command {other:?}"),
         }
