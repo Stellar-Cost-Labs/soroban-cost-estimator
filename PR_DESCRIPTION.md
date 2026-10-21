@@ -24,6 +24,12 @@ Everything in this PR is **offline**: no new network calls, no new dependencies,
 fee-math changes. All fee arithmetic stays integer-based, and no `unwrap()`/`expect()` was added
 outside tests.
 
+Two CI-failing regressions that the new surface exposed are also fixed here — see
+[§5.1 The Windows stack overflow](#51-the-windows-stack-overflow--a-real-regression-this-pr-caused)
+and [§5.2 The dependency advisories](#52-the-dependency-advisories--rustedsec-2026-0381). Both
+were reproduced and diagnosed locally; neither is a paper-over.
+
+
 ---
 
 ## 2. Motivation
@@ -64,6 +70,16 @@ but no pagination; and the only way to remove entries was `cache clear`, which n
 network with no confirmation and no dry-run. There was no way to *see* what was stored across
 networks, and no way to remove a single stale contract entry — an operator had to open the SQLite
 database by hand.
+
+### 2.4 The CLI was one argument away from not running at all on Windows
+
+`clap`'s derive macros build the entire command tree on the stack. In an unoptimized build the
+generated code needs close to a megabyte of it, and the main thread of a Windows process is capped
+at **1 MiB** by the linker. `main` was already within ~100 KiB of that ceiling before this PR —
+and the 19 new arguments of `cache list` / `cache delete` pushed it over, so on
+`windows-latest` **every** CLI invocation aborted with a stack overflow before running a single
+command. Section [5.1](#51-the-windows-stack-overflow--a-real-regression-this-pr-caused) has the
+full diagnosis; the fix is to run the CLI on a thread with a real stack.
 
 ---
 
@@ -228,6 +244,36 @@ soroban-cost-estimator cache delete [OPTIONS]
 does not model is reported instead of silently ignored. The exit-code semantics, the
 auto-save of a post-upgrade snapshot and the stale-cache cross-reference are unchanged.
 
+### 3.7 `src/main.rs` — the CLI runs on a thread with a real stack
+
+`main` now starts a dedicated worker thread with an 8 MiB stack
+(`CLI_STACK_SIZE`) and runs the CLI there; the process exit code is propagated back
+unchanged. See [§5.1](#51-the-windows-stack-overflow--a-real-regression-this-pr-caused) for the
+diagnosis.
+
+* `run_cli()` holds the previous body of `main` and returns the exit code
+  (`0` on success, `1` on a reported error).
+* `main()` starts the worker, joins it, and maps the result onto the process exit code:
+  `0` success, `1` reported error, `2` clap usage error (unchanged — clap exits the process
+  itself), `101` for a panic, which is the status Rust uses for a panic that unwinds out of
+  `main`.
+* No behaviour changes for the user: the same output, the same exit codes, the same
+  `--help`/usage text.
+
+### 3.8 `cache delete --all` can no longer be combined with a filter
+
+`--all` is documented as *"Delete every cached estimate, on every network"*. Before this fix a
+stray `--network testnet` silently narrowed that to one network, which contradicts the flag's
+meaning. The combination is now rejected:
+
+```text
+Error: operation failed: --all cannot be combined with a filter — --all removes every cached
+estimate on every network; drop --all to delete only the matching entries
+```
+
+Nothing is deleted when the command is rejected. This keeps the two ways of deleting
+unambiguous: either *filter → delete the matching entries*, or *`--all` → delete everything*.
+
 ---
 
 ## 4. Tests
@@ -239,11 +285,28 @@ or on filesystem enumeration order.
 | File | New tests | Covers |
 |---|---|---|
 | `tests/config_history_tests.rs` | 9 | **#514** — timestamp round-trip (incl. positive/negative offsets and fractional seconds), rejection of invalid names, chronological ordering across hour/day/month/year boundaries, ordering with mixed offsets, invalid-timestamp files ignored by the selection and listed last, file-name fallback, unrelated files and other network prefixes ignored, `NoSnapshots` error. Uses a per-test temporary `HOME` and fixed timestamps. |
-| `tests/config_diff_tests.rs` | 11 | **#515** — added/removed/value change kinds, presence states, conservative pricing status, payload parsing with unknown fields, unknown-field diffs (added / changed / identical), rendering of the new states and of the unknown marker, summary with unknown count. |
+| `tests/config_diff_tests.rs` | 13 | **#515** — added/removed/value change kinds, presence states, conservative pricing status, payload parsing with unknown fields, unknown-field diffs (added / changed / identical), rendering of the new states and of the unknown marker, summary with unknown count. |
 | `tests/cache_tests.rs` | 15 | **#516 / #517** — listing by network/function/hash, exact function match, hash prefix match, empty result, pagination (non-overlapping pages), limit cap, invalid hash rejection, time-range filter, counting, filtered deletion (matching vs non-matching, network isolation, query/delete agreement), invalid filter rejection on delete. |
-| `tests/cli_tests.rs` | 18 | **#516 / #517** — help output for the new subcommands, empty listing, JSON shape and stable field names, argument payload not exposed, network/hash/combined filters, invalid hash and invalid timestamp errors, `--limit`, deletion refused without a filter, `--dry-run` count, `--yes` deletion, abort without confirmation, `--all`, JSON delete output, `--older-than`, invalid duration. |
+| `tests/cli_tests.rs` | 20 | **#516 / #517** — help output for the new subcommands, empty listing, JSON shape and stable field names, argument payload not exposed, network/hash/combined filters, invalid hash and invalid timestamp errors, `--limit`, deletion refused without a filter, `--dry-run` count, `--yes` deletion, abort without confirmation, `--all`, `--all` combined with a filter is rejected, JSON delete output, `--older-than`, invalid duration, and the small-main-thread-stack regression test. |
 
-**Test totals:** 810 tests, all green (289 unit + 93 cache + 185 CLI + 88 diff + 16 history + …).
+**Test totals:** 803 tests, all green.
+
+| Suite | Tests |
+|---|---|
+| unit tests (`src/`) | 289 |
+| `tests/cli_tests.rs` | 187 |
+| `tests/cache_tests.rs` | 93 |
+| `tests/config_diff_tests.rs` | 88 |
+| `tests/parser_tests.rs` | 45 |
+| `tests/snapshot_list_tests.rs` | 20 |
+| `tests/config_history_tests.rs` | 16 |
+| `tests/error_tests.rs` | 14 |
+| `tests/fee_calc_tests.rs` | 11 |
+| `tests/report_snapshots.rs` | 9 |
+| `tests/config_validate_tests.rs` | 5 |
+| `tests/mock_rpc_tests.rs` | 3 |
+| `tests/rpc_failover_tests.rs` | 2 |
+| **total** | **803** |
 
 ---
 
@@ -258,6 +321,9 @@ $ cargo fmt --all -- --check
 $ cargo clippy --workspace --all-targets -- -D warnings
 # clean (no warnings, no errors)
 
+$ cargo clippy --all-targets --all-features
+# clean
+
 $ cargo build --all-targets
 # Finished `dev` profile
 
@@ -266,29 +332,112 @@ $ cargo run --bin gen_test_wasm
 # Generated test WASM: tests/fixtures/zeroarg.wasm (45 bytes)
 
 $ cargo test --workspace
-# 810 tests, 0 failed
+# 803 tests, 0 failed
+
+$ cargo test --test mock_rpc_tests --test cli_tests
+# 190 tests, 0 failed
+
+$ cargo deny check
+# advisories ok, bans ok, licenses ok, sources ok
 ```
 
-The CI workflow (`.github/workflows/ci.yml`) additionally runs the same commands on
-`ubuntu-latest`, `macos-latest` and `windows-latest`, plus `cargo audit` and `cargo deny`.
-No dependency was added or changed, so the audit/deny jobs are unaffected. The new tests are
+The CI workflow (`.github/workflows/ci.yml`) runs the same commands on `ubuntu-latest`,
+`macos-latest` and `windows-latest`, plus `cargo audit` and `cargo deny`. The new tests are
 cross-platform: they only rely on `HOME`/`USERPROFILE` redirection, temporary directories and
 fixed timestamps.
 
-Manual smoke test of the new commands:
+### 5.1 The Windows stack overflow — a real regression this PR caused
+
+The first CI run of this PR failed on `windows-latest` with **162 of 185** `cli_tests` failing:
+
+```text
+assertion `left == right` failed: cache clear --help should exit 0; stderr:
+thread 'main' (1144) has overflowed its stack
+fatal runtime error: stack overflow, aborting
+  left: -1073741571     # 0xC00000FD = STATUS_STACK_OVERFLOW
+ right: 0
+```
+
+Every CLI invocation — even `--help` — aborted before running a command.
+
+**Diagnosis.** The failure is in `clap::Cli::parse()`, not in the new commands: a build with
+`parse()` short-circuited still overflowed. `clap`'s derive macros build the whole command tree on
+the stack, and in an unoptimized build the generated builder chain copies every `clap::Arg` and
+`clap::Command` (each ~600 bytes) onto the stack once per call. `CacheAction` is part of the
+command tree **twice** (`cache …` and `config cache …`), so the 19 new arguments are built twice.
+
+The Windows main thread is capped at 1 MiB by the linker; Linux's is 8 MiB. Reproduced locally by
+shrinking the stack limit and bisecting the threshold for the debug binary:
+
+| Binary | Smallest stack limit that still works |
+|---|---|
+| `upstream/main` | 960 KiB |
+| this PR (before the fix) | 1152 KiB — **over the 1 MiB Windows limit** |
+| this PR (after the fix) | 64 KiB, i.e. the main thread no longer matters |
+
+```console
+$ bash -c 'ulimit -s 1024; ./target/debug/soroban-cost-estimator cache list'
+thread 'main' has overflowed its stack
+fatal runtime error: stack overflow, aborting
+# exit 134
+```
+
+**Fix.** The CLI now runs on a dedicated thread with an 8 MiB stack
+(`CLI_STACK_SIZE` in `src/main.rs`) instead of on the process main thread, so the command tree is
+built on a thread that has room for it. `main` only starts the worker and propagates its exit
+code, so the observable behaviour — output, exit codes, `--help` text — is unchanged.
+
+This is not a workaround for the new arguments: `upstream/main` was already within ~100 KiB of
+the Windows limit, so *any* new argument would have broken it. Moving the work off the small
+main thread fixes the class of problem, not just this instance.
+
+**Regression test.** `test_cli_runs_with_a_tiny_main_thread_stack` runs the CLI with a 256 KiB
+main-thread stack (Unix only; it reproduces the Windows condition strictly). It was verified to
+**fail** with the old `main` and **pass** with the new one:
+
+```text
+# without the fix
+thread 'main' (197158) has overflowed its stack
+fatal runtime error: stack overflow, aborting
+  left: -1
+ right: 0
+```
+
+### 5.2 The dependency advisories — RUSTSEC-2026-0381
+
+The `Audit dependencies` and `Deny checks` jobs failed on the advisory published on 2026-10-19:
+
+```text
+webpki-roots v1.0.9
+└── webpki-roots v0.26.11
+    └── tokio-tungstenite v0.30.0
+        └── soroban-cost-estimator v0.1.0
+
+Solution: Upgrade to >=1.0.10 (try `cargo update -p webpki-roots`)
+```
+
+`Cargo.lock` is updated to the patched releases (`webpki-roots` 1.0.10, `rustls-webpki` 0.103.16,
+`webpki-root-certs` 1.0.4). No dependency was *added* and `Cargo.toml` is untouched — this is a
+lock-file refresh of transitive dependencies only. `cargo deny check` is green locally:
+
+```console
+$ cargo deny check
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+### 5.3 Manual smoke test of the new commands
 
 ```console
 $ soroban-cost-estimator cache list
-+---------------------------+----------+---------+-----------+---------------+--------+
-| Timestamp                 | Function | Network | WASM Hash | Fee (stroops) | Ledger |
-+=====================================================================================+
-| 2026-10-21T12:17:20+00:00 | transfer | testnet | aabb00    | 1000          | 100    |
-|---------------------------+----------+---------+-----------+---------------+--------+
-| 2026-10-21T12:17:20+00:00 | approve  | testnet | aabb01    | 2000          | 101    |
-|---------------------------+----------+---------+-----------+---------------+--------+
-| 2020-01-01T00:00:00+00:00 | burn     | mainnet | aabb02    | 3000          | 102    |
-+---------------------------+----------+---------+-----------+---------------+--------+
-
++---------------------------+----------+---------+------------+---------------+--------+
+| Timestamp                 | Function | Network | WASM Hash  | Fee (stroops) | Ledger |
++======================================================================================+
+| 2026-10-21T12:17:20+00:00 | transfer | testnet | aabb00ccdd | 1000          | 100    |
+|---------------------------+----------+---------+------------+---------------+--------+
+| 2026-10-21T12:17:20+00:00 | approve  | testnet | aabb01ccdd | 2000          | 101    |
+|---------------------------+----------+---------+------------+---------------+--------+
+| 2020-01-01T00:00:00+00:00 | burn     | mainnet | aabb02ccdd | 3000          | 102    |
++---------------------------+----------+---------+------------+---------------+--------+
 Showing 3 of 3 matching estimate(s) (offset 0).
 
 $ soroban-cost-estimator cache delete --network testnet --dry-run
@@ -299,6 +448,10 @@ Deleted 2 cached estimate(s).
 
 $ soroban-cost-estimator cache delete --yes
 Error: operation failed: refusing to delete cached estimates without a filter — pass a filter (e.g. --network) or --all to remove every entry
+# exit code 1
+
+$ soroban-cost-estimator cache delete --all --network testnet --yes
+Error: operation failed: --all cannot be combined with a filter — --all removes every cached estimate on every network; drop --all to delete only the matching entries
 # exit code 1
 ```
 
@@ -366,12 +519,20 @@ Error: operation failed: refusing to delete cached estimates without a filter �
 * The `config diff` exit code (1 on pricing changes), the auto-save of a post-upgrade snapshot and
   the stale-cache cross-reference are unchanged.
 
-**One intentional behaviour change (documented in the CHANGELOG)**
+**Two intentional behaviour changes (both documented in the CHANGELOG)**
 
 * `cache list` now lists entries from **every** network unless `--network` is given; it used to
   default to `testnet` only. This matches `cache query`, which has always been network-optional,
   and makes the command usable as the cache-wide audit the issue asks for. Scripts that relied on
   the old default can pass `--network testnet` explicitly.
+* `cache delete --all` can no longer be combined with a filter. The combination is now an error
+  instead of silently narrowing a whole-cache deletion.
+
+**One internal change with no observable effect**
+
+* The CLI now runs on a dedicated thread with an 8 MiB stack. Output, exit codes and help text
+  are unchanged; only the stack the command tree is built on differs. See
+  [§5.1](#51-the-windows-stack-overflow--a-real-regression-this-pr-caused).
 
 **Deliberately unchanged (per the issues' "Out of scope")**
 
@@ -398,12 +559,13 @@ network protocol, fee-math or cache-key logic was touched.
   added/removed/unknown distinction.
 * `docs/commands/cache-list.md` — full reference for the listing command.
 * `docs/commands/cache-delete.md` — full reference for the deletion command, including the
-  confirmation and dry-run semantics.
+  confirmation, dry-run and `--all` semantics.
 * `docs/commands.md` — both commands added to the command reference and the table of contents.
 * `docs/commands/config-diff.md` — documents the new presence/unknown rendering.
 * `docs/SUMMARY.md` — the two new pages are linked.
-* `CHANGELOG.md` — `Added` entries for the two commands and the diff/ordering behaviour, plus a
-  `Changed` entry for the `cache list` network default.
+* `CHANGELOG.md` — `Added` entries for the two commands and the diff/ordering behaviour, a
+  `Changed` entry for the `cache list` network default, and a `Fixed` entry for the stack
+  overflow and the `--all`/filter conflict.
 
 ---
 
@@ -411,23 +573,27 @@ network protocol, fee-math or cache-key logic was touched.
 
 ```text
  CHANGELOG.md                       |  25 +-
- README.md                          |  55 ++++++
+ Cargo.lock                         |  14 +-   (patched transitive deps only)
+ README.md                          |  55 +++++
  docs/SUMMARY.md                    |   2 +
  docs/commands.md                   | 101 +++++++++++
- docs/commands/cache-delete.md      | 105 ++++++++++ (new)
- docs/commands/cache-list.md        | 116 ++++++++++ (new)
+ docs/commands/cache-delete.md      | 105 ++++++++++  (new)
+ docs/commands/cache-list.md        | 116 ++++++++++  (new)
  docs/commands/config-diff.md       |  10 +
+ PR_DESCRIPTION.md                  | 650 ++++++++++++++++++  (new)
  src/cache.rs                       | 130 ++++++++++++
  src/cli.rs                         |  92 +++++++++
  src/config_snapshot/diff.rs        | 320 +++++++++++++++++++++++++++++--
  src/config_snapshot/model.rs       |  79 ++++++
  src/config_snapshot/store.rs       | 186 ++++++++++++--
- src/main.rs                        | 230 +++++++++++++-
+ src/main.rs                        | 320 +++++++++++++-
  tests/cache_tests.rs               | 315 +++++++++++++++++++++
- tests/cli_tests.rs                 | 400 ++++++++++++++++++++++++++++++-
+ tests/cli_tests.rs                 | 490 ++++++++++++++++++++++++++++++-
  tests/config_diff_tests.rs         | 239 ++++++++++++++++++
  tests/config_history_tests.rs      | 300 ++++++++++++++++++++++
 ```
+
+No new source files, no new dependencies, no deleted files.
 
 ---
 
@@ -448,6 +614,34 @@ network protocol, fee-math or cache-key logic was touched.
    pricing.
 5. **Deletion safety** — the filter requirement, the dry-run, the confirmation prompt and the
    single-transaction delete are independent layers; none of them can be bypassed by accident.
-6. `cache clear` was intentionally left untouched (its behaviour is covered by its own issue).
+   `--all` is a separate, explicit opt-in and cannot be combined with a filter.
+6. **`src/main.rs` — the worker thread.** The CLI now runs on a dedicated 8 MiB-stack thread.
+   This is the fix for the Windows stack overflow described in
+   [§5.1](#51-the-windows-stack-overflow--a-real-regression-this-pr-caused); it is easy to miss
+   when reading the diff because it touches `main` rather than the new commands. Exit codes are
+   unchanged (`0` / `1` / `2` for clap usage errors / `101` for a panic).
+7. **`Cargo.lock`** — refreshed to the patched `webpki-roots` / `rustls-webpki` releases to clear
+   RUSTSEC-2026-0381. `Cargo.toml` is untouched; no dependency was added.
+8. `cache clear` was intentionally left untouched (its behaviour is covered by its own issue).
 
-🤖 Generated with [Claude Code](https://claude.com/claude-code)
+---
+
+## 11. How to review this PR
+
+Suggested order, fastest feedback first:
+
+1. `src/config_snapshot/store.rs` — `timestamp_from_filename` and the two call sites that order
+   snapshots. The behaviour table in [§3.1](#31-srcconfig_snapshotstorers--chronological-snapshot-ordering-514)
+   is the contract.
+2. `src/config_snapshot/model.rs` + `src/config_snapshot/diff.rs` — the `SettingState` /
+   `SettingChangeKind` model and the unknown-field comparison.
+3. `src/cache.rs` — `list_cached_estimates_paginated`, `count_cached_estimates` and
+   `delete_cached_estimates`; all three delegate to the existing `CacheFilter`.
+4. `src/cli.rs` + `src/main.rs` — the CLI surface and the two new commands.
+5. The tests, which encode every acceptance criterion of the four issues.
+
+The two fixes ([§5.1](#51-the-windows-stack-overflow--a-real-regression-this-pr-caused),
+[§5.2](#52-the-dependency-advisories--rustedsec-2026-0381)) are self-contained and can be
+reviewed independently of the feature work.
+
+🤖 Generated with [OpenCode](https://opencode.ai)

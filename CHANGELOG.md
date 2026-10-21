@@ -51,6 +51,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The CLI no longer overflows the stack on Windows. `clap`'s derive macros
+  build the whole command tree on the stack, which needs close to a megabyte
+  in an unoptimized build, while the main thread of a Windows process is
+  capped at 1 MiB by the linker. Every invocation — even `--help` — aborted
+  with a stack overflow. The CLI now runs on a dedicated thread with an 8 MiB
+  stack; output and exit codes are unchanged.
+- `cache delete --all` can no longer be combined with a filter. `--all` means
+  "every cached estimate on every network", and a stray `--network` used to
+  silently narrow it; the combination is now rejected and nothing is deleted.
 - Snapshot retention never deletes the newest snapshot for a network, however
   old it is or however small `--retain` is, so a `config diff` always has a
   pair left to compare.
