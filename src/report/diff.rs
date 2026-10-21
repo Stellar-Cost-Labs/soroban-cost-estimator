@@ -553,6 +553,7 @@ mod tests {
             ledger: 100,
             network: "testnet".to_string(),
             rpc_latency_ms: 42,
+            restore_fee_stroops: None,
             rates: None,
             warnings: Vec::new(),
             history: None,

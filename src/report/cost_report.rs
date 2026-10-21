@@ -523,6 +523,16 @@ pub struct CostReport {
     pub write_bytes: u32,
     /// Fee breakdown.
     pub fee: FeeBreakdown,
+    /// Archival restoration fee reported by the simulation, in stroops
+    /// (issue #524). `None` means the network returned no `restoreFee` —
+    /// unknown, in contrast to an explicit `Some(0)`. The restore fee is a
+    /// separate charge the operator pays on top of the resource fee, so it
+    /// is reported as its own component and deliberately never added into
+    /// `fee.total_stroops`, which stays the authoritative XDR-derived
+    /// total. `#[serde(default)]` keeps payloads serialized before this
+    /// field deserializable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_fee_stroops: Option<i64>,
     /// The ledger sequence the simulation ran against.
     ///
     /// Serialized as `ledger_sequence` in JSON output (issue #329) while the
@@ -1453,6 +1463,14 @@ pub fn format_report_table(report: &CostReport) -> String {
             pct.get("rent").map(String::as_str).unwrap_or("")
         ),
     ]);
+    // Archival restore fee (#524) — only when the network reported one. It
+    // is a separate charge, listed before Total but never folded into it.
+    if let Some(restore_fee) = report.restore_fee_stroops {
+        fee_table.add_row(vec![
+            "Archival Restore",
+            &format!("{restore_fee} stroops (not included in Total)"),
+        ]);
+    }
     fee_table.add_row(vec![
         "Total",
         &format!(
@@ -2145,6 +2163,7 @@ mod tests {
             ledger: 3_894_195,
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
+            restore_fee_stroops: None,
             rates: Some(rates),
             warnings: Vec::new(),
             history: None,
@@ -2161,6 +2180,68 @@ mod tests {
             fee_per_read_1kb: 447,
             fee_per_1kb: 406,
         }
+    }
+
+    // ── Archival restore fee (#524) ──────────────────────────────────
+
+    /// A network-reported restore fee is rendered as its own component,
+    /// next to the total but never folded into it: `fee.total_stroops`
+    /// stays the authoritative `SorobanTransactionData.resource_fee`.
+    #[test]
+    fn test_restore_fee_reported_as_distinct_component() {
+        let mut report = report_with_rates(sample_rates());
+        report.restore_fee_stroops = Some(230);
+
+        let table = format_report_table(&report);
+        assert!(table.contains("Archival Restore"), "{table}");
+        assert!(table.contains("230 stroops (not included in Total)"), "{table}");
+        // 15_527 + 230 = 15_757 must NOT appear: no double counting.
+        assert!(table.contains("15527 stroops (0.0015527)"), "{table}");
+        assert!(!table.contains("15757"), "{table}");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&format_report_json(&report)).expect("report JSON parses");
+        assert_eq!(json["restore_fee_stroops"], 230);
+        assert_eq!(json["fee"]["total_stroops"], 15_527);
+    }
+
+    /// Absence means "unknown — the network did not report one", rendered
+    /// as the row/key simply not being there, never as a zero.
+    #[test]
+    fn test_restore_fee_absent_is_unknown_not_zero() {
+        let report = report_with_rates(sample_rates());
+        assert_eq!(report.restore_fee_stroops, None);
+
+        let table = format_report_table(&report);
+        assert!(!table.contains("Archival Restore"), "{table}");
+
+        let json = format_report_json(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("report JSON parses");
+        assert!(parsed.get("restore_fee_stroops").is_none());
+
+        // A payload serialized without the field still deserializes,
+        // with the restore fee staying unknown.
+        let back: CostReport = serde_json::from_str(&json).expect("report round-trips");
+        assert_eq!(back.restore_fee_stroops, None);
+    }
+
+    /// A reported zero is an explicit zero: distinct from absence in both
+    /// the table and the JSON.
+    #[test]
+    fn test_restore_fee_zero_is_explicit() {
+        let mut report = report_with_rates(sample_rates());
+        report.restore_fee_stroops = Some(0);
+
+        let table = format_report_table(&report);
+        assert!(table.contains("Archival Restore"), "{table}");
+        assert!(table.contains("0 stroops (not included in Total)"), "{table}");
+
+        let json = format_report_json(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("report JSON parses");
+        assert_eq!(parsed["restore_fee_stroops"], 0);
+
+        let back: CostReport = serde_json::from_str(&json).expect("report round-trips");
+        assert_eq!(back.restore_fee_stroops, Some(0));
     }
 
     #[test]
@@ -2266,6 +2347,7 @@ mod tests {
             ledger: 0,
             network: "testnet".to_string(),
             rpc_latency_ms: 0,
+            restore_fee_stroops: None,
             rates: None,
             warnings: Vec::new(),
             history: None,

@@ -146,6 +146,14 @@ fn fee_table(report: &CostReport) -> String {
             pct.get("rent").map(String::as_str).unwrap_or("")
         ),
     ]);
+    // Archival restore fee (#524) — only when the network reported one. It
+    // is a separate charge, listed before Total but never folded into it.
+    if let Some(restore_fee) = report.restore_fee_stroops {
+        fee_table.add_row(vec![
+            "Archival Restore",
+            &format!("{restore_fee} stroops (not included in Total)"),
+        ]);
+    }
     fee_table.add_row(vec![
         "Total",
         &format!(
@@ -624,6 +632,7 @@ mod tests {
             ledger: 3_894_195,
             network: "testnet".to_string(),
             rpc_latency_ms: 87,
+            restore_fee_stroops: None,
             rates: None,
             warnings: Vec::new(),
             history: None,
@@ -659,6 +668,7 @@ mod tests {
             ledger: 0,
             network: "mainnet".to_string(),
             rpc_latency_ms: 0,
+            restore_fee_stroops: None,
             rates: None,
             warnings: Vec::new(),
             history: None,
@@ -1076,6 +1086,54 @@ mod tests {
         // The cost data is untouched.
         assert!(output.contains("15427 stroops (0.0015427)"));
         assert!(output.contains("Write Entries"));
+    }
+
+    // ── Archival restore fee (#524) ──────────────────────────────────
+
+    fn report_with_restore_fee(fee: Option<i64>) -> CostReport {
+        let mut report = sample_report();
+        report.restore_fee_stroops = fee;
+        report
+    }
+
+    /// The restore fee renders as its own row and is never added into the
+    /// authoritative total (15_427 + 230 = 15_657 must not appear).
+    #[test]
+    fn test_table_formatter_shows_restore_fee_row() {
+        let output = TableFormatter.format(&report_with_restore_fee(Some(230)));
+        assert!(output.contains("Archival Restore"), "{output}");
+        assert!(output.contains("230 stroops (not included in Total)"), "{output}");
+        assert!(output.contains("15427 stroops (0.0015427)"), "{output}");
+        assert!(!output.contains("15657"), "{output}");
+    }
+
+    #[test]
+    fn test_table_formatter_omits_restore_fee_row_when_absent() {
+        let output = TableFormatter.format(&sample_report());
+        assert!(!output.contains("Archival Restore"), "{output}");
+    }
+
+    /// A reported zero must render as an explicit zero, not disappear.
+    #[test]
+    fn test_table_formatter_shows_zero_restore_fee() {
+        let output = TableFormatter.format(&report_with_restore_fee(Some(0)));
+        assert!(output.contains("Archival Restore"), "{output}");
+        assert!(output.contains("0 stroops (not included in Total)"), "{output}");
+    }
+
+    #[test]
+    fn test_json_formatter_exposes_restore_fee_without_touching_total() {
+        let output = JsonFormatter.format(&report_with_restore_fee(Some(230)));
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(parsed["restore_fee_stroops"], 230);
+        assert_eq!(parsed["fee"]["total_stroops"], 15_427);
+    }
+
+    #[test]
+    fn test_json_formatter_omits_absent_restore_fee() {
+        let output = JsonFormatter.format(&sample_report());
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert!(parsed.get("restore_fee_stroops").is_none());
     }
 
     #[test]
