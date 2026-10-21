@@ -2,6 +2,11 @@
 
 We welcome contributions! Here's how to get started.
 
+New to the codebase? Read the [architecture overview](docs/architecture.md)
+first. It covers the six core subsystems, how data flows through the
+`estimate` and `config diff` pipelines, and the design invariants reviewers
+check for.
+
 ## Development Setup
 <!-- contibuting -->
 ```bash
@@ -62,6 +67,9 @@ tests/
   parser_tests.rs
   config_diff_tests.rs
 ```
+
+See [`docs/architecture.md`](docs/architecture.md) for what each module owns
+and how they depend on each other.
 
 ## License
 

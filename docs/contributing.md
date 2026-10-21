@@ -25,7 +25,8 @@ are the ones with acceptance criteria ready for pickup.
 
 The full contributing guide — coding standards, the PR process, and the
 project structure — lives in [`CONTRIBUTING.md`](https://github.com/aigbagbobila/soroban-cost-estimator/blob/main/CONTRIBUTING.md).
-In short:
+For how the subsystems fit together, start with the
+[Architecture](architecture.md) overview. In short:
 
 - One commit per logical unit, conventional commit format
   (`feat(rpc): …`, `fix(fee-calc): …`).
