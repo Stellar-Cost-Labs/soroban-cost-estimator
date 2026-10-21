@@ -54,6 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Snapshot retention never deletes the newest snapshot for a network, however
   old it is or however small `--retain` is, so a `config diff` always has a
   pair left to compare.
+- `webpki-roots` bumped to 1.0.10, which drops the distrusted `emSign ECC
+  Root CA - G3` certificate (RUSTSEC-2026-0381) and clears the `cargo deny`
+  advisory check.
 
 ### Added
 
