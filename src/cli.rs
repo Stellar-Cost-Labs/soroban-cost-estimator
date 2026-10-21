@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use clap::builder::{PossibleValue, TypedValueParser};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -365,7 +366,7 @@ pub enum Command {
         #[arg(long, default_value = "1h")]
         interval: String,
         /// Percentage threshold for flagging significant changes (e.g. 10 for 10%).
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", value_parser = parse_threshold_percent)]
         threshold_percent: Option<f64>,
     },
 
@@ -375,6 +376,20 @@ pub enum Command {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+}
+
+/// Parses a finite, non-negative percentage used to flag significant pricing
+/// changes. Values above 100 are valid because callers may intentionally
+/// monitor only very large repricing events.
+fn parse_threshold_percent(value: &str) -> Result<f64, String> {
+    let parsed =
+        f64::from_str(value).map_err(|_| format!("invalid percentage threshold: {value:?}"))?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return Err(format!(
+            "percentage threshold must be finite and non-negative: {value:?}"
+        ));
+    }
+    Ok(parsed)
 }
 
 #[derive(Subcommand, Debug)]
@@ -705,7 +720,7 @@ pub enum ConfigAction {
         pricing_only: bool,
 
         /// Percentage threshold for flagging significant changes (e.g. 10 for 10%).
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", value_parser = parse_threshold_percent)]
         threshold_percent: Option<f64>,
 
         /// Print a single-line summary (counts of pricing/non-pricing changes)
@@ -891,5 +906,14 @@ mod tests {
                 "completion script for {shell:?} should reference {bin_name}"
             );
         }
+    }
+
+    #[test]
+    fn threshold_percent_accepts_finite_non_negative_values() {
+        assert_eq!(parse_threshold_percent("10").unwrap(), 10.0);
+        assert_eq!(parse_threshold_percent("500.5").unwrap(), 500.5);
+        assert!(parse_threshold_percent("-1").is_err());
+        assert!(parse_threshold_percent("NaN").is_err());
+        assert!(parse_threshold_percent("inf").is_err());
     }
 }

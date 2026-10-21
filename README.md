@@ -346,6 +346,12 @@ instead of the full diff, handy for CI status lines:
 soroban-cost-estimator config diff --network testnet --summary
 ```
 
+- Use `--threshold-percent N` with `config diff` or `watch` to treat only
+  pricing changes whose absolute relative change is at least `N` percent as
+  significant. For example, `--threshold-percent 10` flags changes of 10% or
+  more. The threshold accepts finite, non-negative values; values above 100
+  are useful when only unusually large repricing events should be reported.
+
 - Exits **0** if no pricing changes, **1** with a detailed field-by-field
   diff if pricing changed (default behavior)
 - `--ignore-pricing-exit` forces exit **0** even if pricing changed
