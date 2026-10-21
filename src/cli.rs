@@ -506,8 +506,11 @@ pub enum CacheAction {
 
     /// Pre-populate the cache by estimating every exported function.
     Warm {
+        /// Path to the compiled Soroban contract `.wasm` file.
         #[arg(long, short)]
         wasm: String,
+
+        /// Network to simulate against.
         #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
 
@@ -518,6 +521,8 @@ pub enum CacheAction {
         /// Deployed contract ID (64 hex chars) to invoke each function against.
         #[arg(long)]
         id: Option<String>,
+
+        /// Output the warm-up summary as JSON.
         #[arg(long)]
         json: bool,
     },
