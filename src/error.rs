@@ -126,8 +126,18 @@ pub enum AppError {
     NotEnoughSnapshots { network: String, found: usize },
 
     // ── Simulation ──────────────────────────────────────────────────
+    /// A `simulateTransaction` call that the network rejected or that failed
+    /// inside the contract host.
+    ///
+    /// Carries the RPC's machine-readable error code and a bounded copy of its
+    /// structured details (issue #532), so a caller can distinguish an
+    /// authorization failure from missing ledger entries or resource
+    /// exhaustion without parsing the message. `Display` renders only the
+    /// concise human message; the code and details stay available as typed
+    /// fields (and as JSON through
+    /// [`SimulationError::to_json`](crate::rpc::simulate::SimulationError::to_json)).
     #[error("failed to simulate transaction: {0}")]
-    SimulationFailed(String),
+    SimulationFailed(Box<crate::rpc::simulate::SimulationError>),
 
     #[error("failed to construct transaction: {0}")]
     TxConstruction(String),
@@ -151,6 +161,9 @@ pub enum AppError {
     Json(#[from] serde_json::Error),
 
     // ── Cache database ─────────────────────────────────────────────
+    #[error("cache database corrupt: {0}")]
+    CacheCorrupt(String),
+
     #[error("failed to access cache database: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
@@ -229,12 +242,15 @@ mod tests {
             AppError::SnapshotNotFound("/tmp/s.json".to_string()),
             AppError::SnapshotParse("invalid bundle".to_string()),
             AppError::NoSnapshots("testnet".to_string()),
-            AppError::SimulationFailed("no cost data".to_string()),
+            AppError::SimulationFailed(Box::new(crate::rpc::simulate::SimulationError::new(
+                "no cost data",
+            ))),
             AppError::TxConstruction("contract id required".to_string()),
             AppError::FeeCalc("invalid XLM value".to_string()),
             AppError::ConfigFetch("boom".to_string()),
             AppError::ConfigSettingNotFound("CONFIG_SETTING_CONTRACT_COMPUTE_V0".to_string()),
             AppError::Json(serde_json::from_str::<u8>("nope").unwrap_err()),
+            AppError::CacheCorrupt("cache.db: malformed disk image".to_string()),
             AppError::General("could not determine home directory".to_string()),
         ];
 
