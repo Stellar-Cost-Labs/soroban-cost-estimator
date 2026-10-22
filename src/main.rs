@@ -680,11 +680,13 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
         }
         cli::Command::Watch {
             network,
+            rpc_url,
             interval,
             threshold_percent,
         } => {
             cmd_watch(
                 &network,
+                rpc_url.as_deref().or(default_rpc_url.as_deref()),
                 fallback,
                 &interval,
                 threshold_percent,
@@ -1047,7 +1049,7 @@ async fn simulate_report(
     // slow RPC endpoints. Includes any retries performed by the client.
     let rpc_start = std::time::Instant::now();
     let response = rpc::simulate::simulate_transaction(&client, &tx_b64).await?;
-    let rpc_latency_ms = rpc_start.elapsed().as_millis() as u64;
+    let simulation_duration_ms = rpc_start.elapsed().as_millis() as u64;
 
     if missing_simulation_data(&response) {
         return Err(simulation_failed(
@@ -1113,7 +1115,7 @@ async fn simulate_report(
         fee,
         ledger: latest_ledger,
         network: req.network.to_string(),
-        rpc_latency_ms,
+        simulation_duration_ms,
         rates: Some(fee_rates),
         warnings,
         history: None,
@@ -1591,7 +1593,7 @@ async fn cmd_estimate_repeat(
             let rpc_start = std::time::Instant::now();
             let response =
                 rpc::simulate::simulate_transaction_uncached(&client, &tx_b64).await?;
-            let rpc_latency_ms = rpc_start.elapsed().as_millis() as u64;
+            let simulation_duration_ms = rpc_start.elapsed().as_millis() as u64;
 
             if missing_simulation_data(&response) {
                 return Err(simulation_failed(
@@ -1617,7 +1619,7 @@ async fn cmd_estimate_repeat(
                 )?)
                 .unwrap_or(0);
 
-            latencies_ms.push(rpc_latency_ms);
+            latencies_ms.push(simulation_duration_ms);
 
             match first_cpu {
                 Some(prev) if prev != cpu_instructions => cpu_identical = false,
@@ -1640,7 +1642,7 @@ async fn cmd_estimate_repeat(
                 iteration,
                 cpu_instructions,
                 total_fee_stroops,
-                rpc_latency_ms,
+                simulation_duration_ms,
                 "simulation iteration complete"
             );
 
@@ -1667,7 +1669,7 @@ async fn cmd_estimate_repeat(
                         fee.total_stroops,
                         cpu_instructions,
                         memory_bytes,
-                        Some(rpc_latency_ms),
+                        Some(simulation_duration_ms),
                         true,
                         health_metadata.network_passphrase.as_deref(),
                         health_metadata.core_version.as_deref(),
@@ -1690,7 +1692,7 @@ async fn cmd_estimate_repeat(
                     fee,
                     ledger: latest_ledger,
                     network: network.to_string(),
-                    rpc_latency_ms,
+                    simulation_duration_ms,
                     rates: Some(fee_rates),
                     warnings: Vec::new(),
                     history: None,
@@ -2037,7 +2039,7 @@ async fn estimate_once(
                 report.cpu_instructions,
                 report.memory_bytes,
                 io,
-                Some(report.rpc_latency_ms),
+                Some(report.simulation_duration_ms),
                 true,
             );
         }
@@ -3665,10 +3667,14 @@ fn wasm_info_json(
 ///
 /// Shared by `config snapshot`, `config diff`, and `watch`.
 ///
+/// `rpc_url` overrides network-based endpoint resolution (used by `watch`,
+/// which may point at a local or private node).
+///
 /// # Network calls
 /// Makes one batched `getLedgerEntries` RPC call.
 async fn fetch_config_snapshot(
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     rps: Option<u64>,
     timeout: u64,
@@ -3682,7 +3688,7 @@ async fn fetch_config_snapshot(
 
     let span = info_span!("fetch_config_snapshot", network);
     async {
-        let endpoint = rpc::client::resolve_endpoint(network, None)?;
+        let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
         let client = rpc::client::RpcClient::with_fallback_headers_connect_timeout(
             &endpoint,
             rpc_fallback_url,
@@ -3851,6 +3857,7 @@ async fn cmd_config_snapshot(
         info!("taking config snapshot");
         let snapshot = fetch_config_snapshot(
             network,
+            None,
             rpc_fallback_url,
             rps,
             timeout,
@@ -4235,6 +4242,7 @@ async fn cmd_config_diff(
 
         let new_snapshot = fetch_config_snapshot(
             network,
+            None,
             rpc_fallback_url,
             rps,
             timeout,
@@ -4618,6 +4626,7 @@ async fn auto_snapshot_if_changed(
 
     let new_snapshot = fetch_config_snapshot(
         network,
+        None,
         rpc_fallback_url,
         rps,
         timeout,
@@ -4684,10 +4693,14 @@ async fn shutdown_signal() -> error::AppResult<()> {
 /// the previous snapshot, print changes and stale-estimate info, then save
 /// the new snapshot.
 ///
+/// `rpc_url` overrides network-based endpoint resolution so `watch` can be
+/// pointed at the same node it subscribes to.
+///
 /// # Network calls
 /// Makes one batched `getLedgerEntries` RPC call.
 async fn watch_poll_once(
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     first: &mut bool,
     threshold_percent: Option<f64>,
@@ -4703,6 +4716,7 @@ async fn watch_poll_once(
 
     let snapshot_result = fetch_config_snapshot(
         network,
+        rpc_url,
         rpc_fallback_url,
         rps,
         timeout,
@@ -4750,13 +4764,15 @@ async fn watch_poll_once(
     Ok(())
 }
 
-/// `watch` command: poll network config and print diffs.
+/// `watch` command: re-check the network config whenever a ledger closes and
+/// print diffs.
 ///
 /// Polls immediately, then on `interval`, until SIGINT (Ctrl-C) or SIGTERM
 /// is received â€” then exits cleanly with code 0. The in-flight poll is
 /// cancelled rather than writing a partial snapshot.
 async fn cmd_watch(
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     interval: &str,
     threshold_percent: Option<f64>,
@@ -4780,6 +4796,69 @@ async fn cmd_watch(
         );
     }
 
+    // One `--rpc-url` drives both halves: the WebSocket subscription and the
+    // request/response config fetches.
+    let http_rpc_url = rpc_url.map(rpc::client::to_http_url).transpose()?;
+
+    match watch_over_websocket(
+        network,
+        rpc_url,
+        http_rpc_url.as_deref(),
+        rpc_fallback_url,
+        threshold_percent,
+        rps,
+        timeout,
+        connect_timeout,
+        max_retries,
+        extra_headers,
+        quiet,
+        verbose,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            warn!(error = %e, "WebSocket watch unavailable — falling back to HTTP polling");
+            println!("WebSocket watch unavailable ({e}) — polling every {interval_secs}s instead.");
+            poll_watch(
+                network,
+                http_rpc_url.as_deref(),
+                rpc_fallback_url,
+                interval_secs,
+                threshold_percent,
+                rps,
+                timeout,
+                connect_timeout,
+                max_retries,
+                extra_headers,
+                quiet,
+                verbose,
+            )
+            .await
+        }
+    }
+}
+
+/// HTTP polling fallback for `watch`: poll immediately, then every
+/// `interval_secs`, until SIGINT (Ctrl-C) or SIGTERM is received — then exit
+/// cleanly with code 0. The in-flight poll is cancelled rather than writing a
+/// partial snapshot.
+async fn poll_watch(
+    network: &str,
+    rpc_url: Option<&str>,
+    rpc_fallback_url: Option<&str>,
+    interval_secs: u64,
+    threshold_percent: Option<f64>,
+    rps: Option<u64>,
+    timeout: u64,
+    connect_timeout: u64,
+    max_retries: usize,
+    extra_headers: &[String],
+    quiet: bool,
+    verbose: bool,
+) -> error::AppResult<()> {
+    use tracing::info;
+
     let mut first = true;
     loop {
         tokio::select! {
@@ -4794,6 +4873,7 @@ async fn cmd_watch(
             () = async {
                 let _ = watch_poll_once(
                     network,
+                    rpc_url,
                     rpc_fallback_url,
                     &mut first,
                     threshold_percent,
@@ -4810,6 +4890,166 @@ async fn cmd_watch(
             } => {}
         }
     }
+}
+
+/// Number of times a WebSocket RPC endpoint is tried (with exponential backoff
+/// between attempts) before `watch` gives up on it and falls back to HTTP
+/// polling.
+const WS_MAX_ATTEMPTS: u32 = 5;
+
+/// Watches the network config over a WebSocket subscription.
+///
+/// Connects, baselines a snapshot, then re-checks the config on every
+/// ledger-close notification the node pushes. Dropped connections are
+/// re-established — and resubscribed — with exponential backoff. Returns
+/// `Ok(())` once a stop signal arrives, or `Err` when the endpoint could not
+/// be reached at all, so the caller can fall back to HTTP polling.
+async fn watch_over_websocket(
+    network: &str,
+    rpc_url: Option<&str>,
+    http_rpc_url: Option<&str>,
+    rpc_fallback_url: Option<&str>,
+    threshold_percent: Option<f64>,
+    rps: Option<u64>,
+    timeout: u64,
+    connect_timeout: u64,
+    max_retries: usize,
+    extra_headers: &[String],
+    quiet: bool,
+    verbose: bool,
+) -> error::AppResult<()> {
+    use tracing::info;
+
+    let ws_url = rpc::client::resolve_ws_endpoint(network, rpc_url)?;
+    let mut client = connect_ws_endpoint(&ws_url).await?;
+
+    // Baseline the first snapshot before subscribing, so the first diff has
+    // something to compare against.
+    let mut first = true;
+    let _ = watch_poll_once(
+        network,
+        http_rpc_url,
+        rpc_fallback_url,
+        &mut first,
+        threshold_percent,
+        rps,
+        timeout,
+        connect_timeout,
+        max_retries,
+        extra_headers,
+        quiet,
+        verbose,
+    )
+    .await;
+
+    let mut start_ledger =
+        config_snapshot::store::load_latest_snapshot(network).map_or(0, |s| s.ledger);
+    subscribe_ledger_closes(&mut client, start_ledger, quiet).await?;
+
+    loop {
+        let event = tokio::select! {
+            signal = shutdown_signal() => {
+                signal?;
+                info!("received stop signal");
+                if !quiet {
+                    println!("Received stop signal — exiting cleanly.");
+                }
+                return Ok(());
+            }
+            event = client.next_ledger_close() => event,
+        };
+
+        match event {
+            Ok(Some(close)) => {
+                info!(ledger = close.ledger, "ledger closed — re-checking config");
+                if !quiet {
+                    println!("Ledger {} closed — re-checking config.", close.ledger);
+                }
+                start_ledger = start_ledger.max(close.ledger);
+                let _ = watch_poll_once(
+                    network,
+                    http_rpc_url,
+                    rpc_fallback_url,
+                    &mut first,
+                    threshold_percent,
+                    rps,
+                    timeout,
+                    connect_timeout,
+                    max_retries,
+                    extra_headers,
+                    quiet,
+                    verbose,
+                )
+                .await;
+                continue;
+            }
+            Ok(None) => {
+                if !quiet {
+                    println!("WebSocket connection closed by the server — reconnecting...");
+                }
+            }
+            Err(e) => {
+                if !quiet {
+                    println!("WebSocket error ({e}) — reconnecting...");
+                }
+            }
+        }
+
+        client = connect_ws_endpoint(&ws_url).await?;
+        subscribe_ledger_closes(&mut client, start_ledger, quiet).await?;
+    }
+}
+
+/// Opens a WebSocket RPC connection, retrying with exponential backoff.
+///
+/// Tries up to [`WS_MAX_ATTEMPTS`] times, sleeping
+/// [`rpc::ws::reconnect_delay_ms`] (1s, then doubling) between attempts. An
+/// `Err` means the endpoint could not be reached at all.
+async fn connect_ws_endpoint(ws_url: &str) -> error::AppResult<rpc::ws::WsRpcClient> {
+    let mut attempt: u32 = 1;
+    loop {
+        match rpc::ws::WsRpcClient::connect(ws_url).await {
+            Ok(client) => {
+                info!(ws_url, attempt, "connected to WebSocket RPC endpoint");
+                return Ok(client);
+            }
+            Err(e) if attempt >= WS_MAX_ATTEMPTS => {
+                return Err(error::AppError::WsConnect(format!(
+                    "could not connect to {ws_url} after {attempt} attempts: {e}"
+                )));
+            }
+            Err(e) => {
+                let delay_ms = rpc::ws::reconnect_delay_ms(attempt);
+                warn!(ws_url, attempt, delay_ms, error = %e, "WebSocket connect failed — retrying");
+                println!(
+                    "WebSocket connect failed ({e}) — retrying in {}s...",
+                    delay_ms / 1_000
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
+}
+
+/// Subscribes `client` to ledger-close notifications from `start_ledger`.
+async fn subscribe_ledger_closes(
+    client: &mut rpc::ws::WsRpcClient,
+    start_ledger: u32,
+    quiet: bool,
+) -> error::AppResult<()> {
+    let subscription = client.subscribe_ledger_closes(start_ledger).await?;
+    info!(
+        start_ledger = subscription.start_ledger,
+        "subscribed to ledger closes"
+    );
+    if !quiet {
+        println!(
+            "Subscribed to ledger-close notifications from ledger {} — re-checking config on every new ledger.",
+            subscription.start_ledger
+        );
+    }
+    Ok(())
 }
 
 /// `cache stats` command: show cache health overview.
@@ -6422,7 +6662,7 @@ mod tests {
             },
             ledger: 3_894_195,
             network: "testnet".to_string(),
-            rpc_latency_ms: 87,
+            simulation_duration_ms: 87,
             rates: None,
             warnings: Vec::new(),
             history: None,
