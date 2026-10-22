@@ -1052,7 +1052,7 @@ async fn simulate_report(
     // slow RPC endpoints. Includes any retries performed by the client.
     let rpc_start = std::time::Instant::now();
     let response = rpc::simulate::simulate_transaction(&client, &tx_b64).await?;
-    let rpc_latency_ms = rpc_start.elapsed().as_millis() as u64;
+    let simulation_duration_ms = rpc_start.elapsed().as_millis() as u64;
 
     if missing_simulation_data(&response) {
         return Err(simulation_failed(
@@ -1118,7 +1118,7 @@ async fn simulate_report(
         fee,
         ledger: latest_ledger,
         network: req.network.to_string(),
-        rpc_latency_ms,
+        simulation_duration_ms,
         rates: Some(fee_rates),
         warnings,
         history: None,
@@ -1596,7 +1596,7 @@ async fn cmd_estimate_repeat(
             let rpc_start = std::time::Instant::now();
             let response =
                 rpc::simulate::simulate_transaction_uncached(&client, &tx_b64).await?;
-            let rpc_latency_ms = rpc_start.elapsed().as_millis() as u64;
+            let simulation_duration_ms = rpc_start.elapsed().as_millis() as u64;
 
             if missing_simulation_data(&response) {
                 return Err(simulation_failed(
@@ -1622,7 +1622,7 @@ async fn cmd_estimate_repeat(
                 )?)
                 .unwrap_or(0);
 
-            latencies_ms.push(rpc_latency_ms);
+            latencies_ms.push(simulation_duration_ms);
 
             match first_cpu {
                 Some(prev) if prev != cpu_instructions => cpu_identical = false,
@@ -1645,7 +1645,7 @@ async fn cmd_estimate_repeat(
                 iteration,
                 cpu_instructions,
                 total_fee_stroops,
-                rpc_latency_ms,
+                simulation_duration_ms,
                 "simulation iteration complete"
             );
 
@@ -1672,7 +1672,7 @@ async fn cmd_estimate_repeat(
                         fee.total_stroops,
                         cpu_instructions,
                         memory_bytes,
-                        Some(rpc_latency_ms),
+                        Some(simulation_duration_ms),
                         true,
                         health_metadata.network_passphrase.as_deref(),
                         health_metadata.core_version.as_deref(),
@@ -1695,7 +1695,7 @@ async fn cmd_estimate_repeat(
                     fee,
                     ledger: latest_ledger,
                     network: network.to_string(),
-                    rpc_latency_ms,
+                    simulation_duration_ms,
                     rates: Some(fee_rates),
                     warnings: Vec::new(),
                     history: None,
@@ -2042,7 +2042,7 @@ async fn estimate_once(
                 report.cpu_instructions,
                 report.memory_bytes,
                 io,
-                Some(report.rpc_latency_ms),
+                Some(report.simulation_duration_ms),
                 true,
             );
         }
@@ -6437,7 +6437,7 @@ mod tests {
             },
             ledger: 3_894_195,
             network: "testnet".to_string(),
-            rpc_latency_ms: 87,
+            simulation_duration_ms: 87,
             rates: None,
             warnings: Vec::new(),
             history: None,
