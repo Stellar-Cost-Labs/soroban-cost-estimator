@@ -11,6 +11,8 @@
 
 # Command Reference
 
+- [Full CLI Reference](commands/reference.md)
+
 - [`estimate`](commands/estimate.md)
 - [`estimate-all`](commands/estimate-all.md)
 - [`config snapshot`](commands/config-snapshot.md)
