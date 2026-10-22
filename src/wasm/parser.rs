@@ -136,6 +136,7 @@ pub fn load_wasm_with_limit(path: &Path, max_bytes: u64) -> AppResult<WasmInfo> 
     let (spec_entries, has_spec) = parse_contract_spec_entries(&bytes)?;
     let spec_functions = spec_functions_from_entries(&spec_entries);
     let contract_meta = parse_contract_meta(&bytes)?;
+    let spec_diagnostics = validate_spec_exports(&spec_functions, &functions);
 
     if !spec_functions.is_empty() {
         for fn_info in &mut functions {
@@ -174,6 +175,7 @@ pub fn load_wasm_with_limit(path: &Path, max_bytes: u64) -> AppResult<WasmInfo> 
         has_spec,
         spec_entries,
         contract_meta,
+        spec_diagnostics,
         start_function,
         memories,
         imports,
@@ -1043,6 +1045,56 @@ pub struct FunctionInfo {
     pub returns: Vec<TypeInfo>,
 }
 
+/// Diagnostic about a mismatch between the contract spec and WASM exports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpecExportDiagnostic {
+    /// A function declared in the spec is not exported by the WASM module.
+    SpecFunctionNotExported { name: String },
+    /// A function exported by the WASM module has no corresponding spec entry.
+    ExportMissingSpec { name: String },
+}
+
+/// Validates the contract spec against the WASM exports and returns diagnostics.
+///
+/// This function compares the functions declared in the contract spec with the
+/// functions actually exported by the WASM module. It returns two lists:
+/// - Spec functions that have no corresponding export (stale entries)
+/// - Exports that have no matching spec entry (missing spec metadata)
+///
+/// If the WASM has no spec, this returns an empty diagnostics list (no errors).
+#[must_use]
+pub fn validate_spec_exports(
+    spec_functions: &[SpecFunctionInfo],
+    exported_functions: &[FunctionInfo],
+) -> Vec<SpecExportDiagnostic> {
+    let mut diagnostics = Vec::new();
+
+    let spec_names: std::collections::HashSet<&str> =
+        spec_functions.iter().map(|f| f.name.as_str()).collect();
+    let export_names: std::collections::HashSet<&str> =
+        exported_functions.iter().map(|f| f.name.as_str()).collect();
+
+    // Find spec functions not exported (stale entries)
+    for spec_name in &spec_names {
+        if !export_names.contains(*spec_name) {
+            diagnostics.push(SpecExportDiagnostic::SpecFunctionNotExported {
+                name: (*spec_name).to_string(),
+            });
+        }
+    }
+
+    // Find exports not in spec (missing spec metadata)
+    for export_name in &export_names {
+        if !spec_names.contains(*export_name) {
+            diagnostics.push(SpecExportDiagnostic::ExportMissingSpec {
+                name: (*export_name).to_string(),
+            });
+        }
+    }
+
+    diagnostics
+}
+
 /// Renders a spec type definition as JSON, preserving the full type tree
 /// (nested `option`/`result`/`vec`/`map`/`tuple`/`bytes_n`/`udt` types keep
 /// their structure instead of collapsing to a flat name).
@@ -1248,6 +1300,8 @@ pub struct WasmInfo {
     /// Contract metadata parsed from the `contractmeta` custom section,
     /// when present.
     pub contract_meta: ContractMeta,
+    /// Diagnostics about mismatches between the contract spec and WASM exports.
+    pub spec_diagnostics: Vec<SpecExportDiagnostic>,
     /// Index of the module start function, if one is declared.
     pub start_function: Option<u32>,
     /// Linear memories and their limits.
