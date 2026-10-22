@@ -6,6 +6,7 @@
 # Concepts
 
 - [Resource Fees](concepts/resource-fees.md)
+- [Fee Calculation Methodology](concepts/fee-calculation.md)
 - [Config Drift](concepts/config-drift.md)
 - [Caching](concepts/caching.md)
 

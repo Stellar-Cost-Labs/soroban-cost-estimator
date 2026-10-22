@@ -1385,6 +1385,48 @@ fn test_save_estimate_appends_single_history_entry() {
     });
 }
 
+/// The history log records each run's ledger I/O footprint (#530), and a run
+/// saved without one reads back as `None` — unknown, never zero.
+#[test]
+fn test_history_records_io_footprint() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate_with_io(
+            "h",
+            "f",
+            &[],
+            "testnet",
+            1,
+            100,
+            10,
+            5,
+            cache::IoFootprint {
+                read_entries: 3,
+                write_entries: 2,
+                read_bytes: 512,
+                write_bytes: 136,
+            },
+            None,
+            true,
+        )
+        .expect("save with footprint");
+        cache::save_estimate("h", "f", &[], "testnet", 2, 200, 20, 10, None, true)
+            .expect("save without footprint");
+
+        let history = cache::load_estimate_history("h", "f", 5).expect("history");
+        assert_eq!(history.len(), 2);
+        // Newest first: the second save recorded no footprint.
+        assert_eq!(
+            history[0].io, None,
+            "an entry saved without I/O must stay unknown, not zero"
+        );
+        let recorded = history[1].io.expect("footprint should be persisted");
+        assert_eq!(recorded.read_entries, 3);
+        assert_eq!(recorded.write_entries, 2);
+        assert_eq!(recorded.read_bytes, 512);
+        assert_eq!(recorded.write_bytes, 136);
+    });
+}
+
 /// An expired entry is treated as a miss even though the file exists: the
 /// caller must re-simulate.
 #[test]
@@ -2796,6 +2838,53 @@ fn test_legacy_database_without_io_column_still_loads() {
         assert!(
             loaded.io.is_none(),
             "a pre-io_json row has no footprint to report"
+        );
+    });
+}
+
+/// A history log written before the footprint column existed is migrated in
+/// place, and its rows read back with an *unknown* footprint (#530) rather
+/// than a zeroed one.
+#[test]
+fn test_legacy_history_table_without_io_column_still_loads() {
+    with_temp_home(|home| {
+        let dir = home.join(".soroban-cost-estimator");
+        std::fs::create_dir_all(&dir).expect("create data dir");
+        let db = dir.join("cache.db");
+
+        // The history table exactly as it existed before `io_json` was added.
+        {
+            let conn = rusqlite::Connection::open(&db).expect("open cache db");
+            conn.execute_batch(
+                "CREATE TABLE estimate_history (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    wasm_hash        TEXT NOT NULL,
+                    function         TEXT NOT NULL,
+                    network          TEXT NOT NULL,
+                    ledger           INTEGER NOT NULL,
+                    total_stroops    INTEGER NOT NULL,
+                    cpu_instructions INTEGER NOT NULL,
+                    memory_bytes     INTEGER NOT NULL,
+                    timestamp        TEXT NOT NULL
+                );",
+            )
+            .expect("create legacy history schema");
+            conn.execute(
+                "INSERT INTO estimate_history \
+                 (wasm_hash, function, network, ledger, total_stroops, \
+                  cpu_instructions, memory_bytes, timestamp) \
+                 VALUES ('h', 'f', 'testnet', 3, 100, 10, 5, '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert legacy history row");
+        }
+
+        let history = cache::load_estimate_history("h", "f", 5).expect("history");
+        assert_eq!(history.len(), 1, "the legacy row should still be readable");
+        assert_eq!(history[0].total_stroops, 100);
+        assert!(
+            history[0].io.is_none(),
+            "a pre-#530 row has no footprint to report"
         );
     });
 }

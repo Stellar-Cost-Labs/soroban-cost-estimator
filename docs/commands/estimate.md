@@ -8,7 +8,7 @@ Simulate a single contract invocation and print the cost report.
 Usage: soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
 
 Options:
-      --format <FORMAT>    Output format: table, json, csv, or markdown [default: table]
+      --format <FORMAT>    Output format: table, json, csv, markdown, or summary [default: table]
   -w, --wasm <WASM>        Path to the compiled Soroban contract `.wasm` file
       --network <NETWORK>  Network to simulate against [default: testnet]
       --rpc-url <RPC_URL>  Explicit RPC URL (overrides network-based resolution)
@@ -92,7 +92,16 @@ Network: testnet (ledger 3961551)
 Simulated at ledger sequence: 3,961,551
 WASM hash: ea14bca998e98f0ddb338e8e5cef6e19f07378a3b71e8b4f8868cedc857e4ecd
 
-+------------------+----------+---------------+
++------------------+----------+-----------failing checks
+
+    ci / Soroban contracts (pull_request)
+    ci / Soroban contracts (pull_request)Failing after 7m
+    ci / TypeScript build + tests (pull_request)
+    ci / TypeScript build + tests (pull_request)Failing after 38s
+    contracts / Foundry fuzz + invariant tests (pull_request)
+    contracts / Foundry fuzz + invariant tests (pull_request)Failing after 29s
+    Vercel – oversync
+    Vercel – oversync — Authorization required to deploy.----+
 | Resource         | Consumed | Fee (stroops) |
 +=============================================+
 | CPU Instructions | 524389   |               |
@@ -171,71 +180,79 @@ so consumers can tell how fresh an estimate is. The human-readable header
 renders the same value with thousands separators as
 `Simulated at ledger sequence: 3,961,544`.
 
-Use `--format json`, `--format csv`, or `--format markdown` when feeding the result into CI, spreadsheets, or documentation. `--json` remains a backward-compatible alias for `--format json`. The
-result is also written to the estimate cache(see [Caching](../concepts/caching.md)).
+Use `--format json`, `--format csv`, `--format markdown`, or `--format summary`
+when feeding the result into CI, spreadsheets, or documentation. `--json`
+remains a backward-compatible alias for `--format json`. The result is also
+written to the estimate cache (see [Caching](../concepts/caching.md)).
 
-## JSON output compatibility
+## The `summary` format
 
-The JSON emitted by this tool is a public, machine-consumed interface. The
-shapes below are locked by automated schema tests (see the note at the end
-of this section); breaking them requires going through the compatibility
-policy.
+`--format summary` prints **exactly one line per successful estimate**, for
+shell pipelines, batch logs, and repeated runs where the full table is too
+verbose. Nothing else from the report goes to stdout — no header row, no
+labels, no fee chart and no advisory sections. Diagnostics (progress,
+warnings, cache notices) go to **stderr** for this format, so the result line
+can be redirected on its own:
 
-### Documented families
+```sh
+soroban-cost-estimator estimate --wasm contract.wasm --fn increment \
+    --format summary > costs.tsv
+```
 
-| Command | JSON document | Root keys |
-| --- | --- | --- |
-| `estimate --json` | single cost report | `function`, `wasm_hash`, `cpu_instructions`, `memory_bytes`, `tx_size`, `read_entries`, `write_entries`, `read_bytes`, `write_bytes`, `fee`, `ledger_sequence`, `network`, `rpc_latency_ms`, `warnings`, `contract_meta`, plus the derived `suggestions` and `optimization_suggestions` |
-| `estimate-all --json` | batch document | `functions` (array) and `fee_distribution` (integer statistics object) |
-| batch contract summaries | multi-contract report (`estimate` with repeated `--wasm` or `--wasm-dir`) | `network`, `contracts` (array), `total_contracts`, `succeeded`, `failed` |
-| `estimate --diff --json` | side-by-side diff | `identity`, `rows`; optional `abi_diff` |
-| `wasm info --json` | WASM inspection | `path`, `size`, `sha256`, `has_spec`, `sdk_version`, `has_debug_symbols`, `debug_symbol_bytes`, `estimated_size_reduction_percent`, `contract_meta`, `functions`, `spec_entries`, `section_sizes`, `sections`, `imports`, `host_imports`, `module` |
+### Field order
 
-The `fee` object always carries the full breakdown:
-`non_refundable_stroops`, `refundable_stroops`, `cpu_fee_stroops`,
-`storage_fee_stroops`, `bandwidth_fee_stroops`, `base_fee_stroops`,
-`total_stroops` (all integer stroops), `total_xlm` (a string, to avoid
-float precision loss) and `fee_percentages`.
+The line has eleven fields, always in this order and always present (an
+unknown value is `0`, never an omitted column):
 
-### Absent versus null
+| # | Field | Meaning |
+|---|-------|---------|
+| 1 | `function` | Contract function, or `(wasm upload)` |
+| 2 | `network` | Network the simulation ran against |
+| 3 | `ledger` | Ledger sequence simulated against |
+| 4 | `total_stroops` | Total fee in stroops (integer) |
+| 5 | `total_xlm` | Total fee in XLM, at the current `--precision` |
+| 6 | `cpu_instructions` | CPU instructions consumed |
+| 7 | `read_entries` | Ledger entries read |
+| 8 | `write_entries` | Ledger entries written |
+| 9 | `read_bytes` | Ledger bytes read |
+| 10 | `write_bytes` | Ledger bytes written |
+| 11 | `tx_size` | Transaction envelope size, in XDR bytes |
 
-Optional data leaves a document in exactly one of two documented ways:
+Fields are separated by a single **tab**, so `cut` and `awk` work without any
+custom parsing:
 
-* **Omitted.** Fields declared with `skip_serializing_if` disappear from the
-  object when unset — e.g. `wasm_size`, `wasm_sections`, `section_sizes`,
-  `history`, `projections` on a single estimate, the `reason`/`error` and
-  resource blocks on `estimate-all` entries, and empty `abi_diff`
-  collections. Absence means "not measured / not requested", never zero.
-* **Explicit `null`.** Keys built inside `json!` documents (the `wasm info`
-  family) or fields without a skip predicate — e.g.
-  `contract_meta.name`, `module.start_function`, `max_pages` on the WASM
-  structure summary and `rows[].change_percent` in a diff — are always
-  present and carry `null` when there is no value. `change_percent` is
-  `null` when the baseline was zero and the new value is not, i.e. the
-  percentage is mathematically unbounded.
+```console
+$ soroban-cost-estimator estimate --wasm contract.wasm --fn increment --format summary
+increment<TAB>testnet<TAB>3961544<TAB>17122<TAB>0.0017122<TAB>524389<TAB>1<TAB>1<TAB>0<TAB>136<TAB>156
+$ soroban-cost-estimator estimate --wasm contract.wasm --fn increment --format summary | cut -f4
+17122
+```
 
-Consumers should treat both forms as "no value" and must not assume that
-key presence alone distinguishes them beyond what is documented above.
+`<TAB>` marks the delimiter in the transcript above; the tool writes a real
+tab character.
 
-### Compatibility policy
+### Escaping rules
 
-* **Additive, optional keys are non-breaking.** New fields may appear in any
-  JSON document in a minor or patch release. Consumers must ignore unknown
-  keys (parse tolerantly) rather than failing on unexpected members.
-* **Renaming, removing, retyping, or re-semanticizing a documented key is
-  breaking.** That includes flipping a field between "omitted" and "null",
-  changing the string set of a lowercase enum (`status`, `trend`,
-  `direction`), or folding a new fee component into `fee.total_stroops`.
-  Breaking changes land only in a major release and are recorded in
-  [Migration](../migration.md).
-* **Key order is never contractual.** Objects may be emitted in any order;
-  do not snapshot raw text as an API dependency.
-* **Fee math stays integer.** All stroop amounts are JSON integers derived
-  by integer arithmetic; XLM totals are strings. Floats appear only in
-  display-oriented fields such as `change_percent` and `percent`.
-* **The contract is executable.** Structural tests live in
-  `tests/json_schema_tests.rs` (single estimate, batch summaries, diff,
-  WASM structure summary) and in the `src/main.rs` test module
-  (`estimate-all` document and `wasm info` document). Any change that
-  fails one of these tests is, by definition, a compatibility decision —
-  update this document, the tests, and the migration notes together.
+A field value escapes exactly four characters, with a backslash, using the
+C-style convention already used by `ps` and `find -printf`:
+
+| Character in the value | Emitted as |
+|---|---|
+| backslash (`\`) | `\\` |
+| tab (the delimiter) | `\t` |
+| line feed | `\n` |
+| carriage return | `\r` |
+
+Every other character — spaces, commas, pipes, quotes, non-ASCII text — is
+emitted unchanged, so `transfer from` stays readable and a name containing a
+`|` or `,` needs no special handling. The escaping guarantees the fixed
+column count: splitting the line on tabs always yields exactly eleven fields.
+
+The summary never contains ANSI escape sequences, whether or not stdout is a
+terminal, so `> file.tsv` and terminal output are byte-identical. Because the
+summary is already minimal, `--quiet` changes nothing about it.
+
+`summary` describes a **single invocation**. `estimate-all` and multi-contract
+batch runs (`--wasm` repeated, or `--wasm-dir`) only build aggregates, so they
+render their existing **table** output when `summary` is requested; their
+`table`, `json`, `csv`, and `markdown` output is unchanged.

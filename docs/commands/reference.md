@@ -9,7 +9,7 @@ These options are available before or after a subcommand.
 | Flag | Short | Default | Description | Example |
 |---|---|---:|---|---|
 | `--config <PATH>` | — | automatic | Read this configuration file instead of the default locations. Explicit CLI options override file values. | `--config ./estimator.toml` |
-| `--format <FORMAT>` | — | `SOROBAN_JSON`, then config, else `table` | Output format where supported: `table`, `json`, `csv`, or `markdown`. Config and `SOROBAN_JSON` can change the default. | `--format json` |
+| `--format <FORMAT>` | — | `SOROBAN_JSON`, then config, else `table` | Output format where supported: `table`, `json`, `csv`, `markdown`, or `summary`. Config and `SOROBAN_JSON` can change the default. | `--format json` |
 | `--rps <N>` | — | unset | Maximum RPC requests per second; `0` disables the limit. | `--rps 5` |
 | `--timeout <SECS>` | — | `30` | HTTP request timeout in seconds. | `--timeout 60` |
 | `--connect-timeout <SECS>` | — | `5` | TCP connection timeout in seconds; `0` disables this separate limit. | `--connect-timeout 10` |
