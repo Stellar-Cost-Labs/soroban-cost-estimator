@@ -325,6 +325,11 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
         .default_network
         .unwrap_or_else(|| "testnet".to_string());
     let default_rpc_url = file.rpc_url;
+    // Validate an explicit `--rpc-url` before any command parses WASM or
+    // opens the cache, so a typo fails immediately with a clear message.
+    if let Some(url) = args.command.rpc_url() {
+        rpc::client::validate_rpc_url(url)?;
+    }
     match args.command {
         cli::Command::Estimate {
             wasm,
