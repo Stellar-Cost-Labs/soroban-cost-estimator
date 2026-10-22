@@ -2985,7 +2985,7 @@ pub struct EstimateAllReport {
     /// Per-function results, sorted by `function_name`.
     pub functions: Vec<EstimateAllFunction>,
     /// Aggregate totals across all functions.
-    pub total_summary: EstimateAllSummary,
+    pub total_summary: EstimateAllJsonSummary,
 }
 
 impl EstimateAllReport {
@@ -3000,7 +3000,7 @@ impl EstimateAllReport {
         mut functions: Vec<EstimateAllFunction>,
     ) -> Self {
         functions.sort_by(|a, b| a.function_name.cmp(&b.function_name));
-        let total_summary = EstimateAllSummary::from_functions(&functions);
+        let total_summary = EstimateAllJsonSummary::from_functions(&functions);
         Self {
             contract_wasm_hash,
             network,
@@ -3079,7 +3079,7 @@ pub struct FunctionResources {
 
 /// Aggregate totals across all functions in an `estimate-all --json` report.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
-pub struct EstimateAllSummary {
+pub struct EstimateAllJsonSummary {
     /// Total functions considered.
     pub total_functions: u32,
     /// Functions that estimated successfully.
@@ -3094,7 +3094,7 @@ pub struct EstimateAllSummary {
     pub total_fee_stroops: i64,
 }
 
-impl EstimateAllSummary {
+impl EstimateAllJsonSummary {
     /// Compute the aggregate summary from per-function results.
     ///
     /// Resource and fee sums only include successful functions; failed

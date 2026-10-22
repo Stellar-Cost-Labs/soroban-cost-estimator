@@ -5646,7 +5646,6 @@ fn resolve_wasm_paths(
             if path.is_file() && is_wasm {
                 found.push(path);
             }
-            FunctionOutcome::Failed(e.to_string())
         }
         found.sort();
         paths.extend(found);

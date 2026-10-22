@@ -21,8 +21,13 @@ fn success_entry(name: &str) -> EstimateAllFunction {
         FeeBreakdown {
             non_refundable_stroops: 4_496,
             refundable_stroops: 10_931,
+            cpu_fee_stroops: 372,
+            storage_fee_stroops: 4_063,
+            bandwidth_fee_stroops: 61,
+            base_fee_stroops: 100,
             total_stroops: 15_427,
             total_xlm: "0.0015427".to_string(),
+            fee_percentages: std::collections::BTreeMap::new(),
         },
     )
 }
@@ -63,8 +68,13 @@ fn estimate_all_report_json_snapshot() {
       "fee_breakdown": {
         "non_refundable_stroops": 4496,
         "refundable_stroops": 10931,
+        "cpu_fee_stroops": 372,
+        "storage_fee_stroops": 4063,
+        "bandwidth_fee_stroops": 61,
+        "base_fee_stroops": 100,
         "total_stroops": 15427,
-        "total_xlm": "0.0015427"
+        "total_xlm": "0.0015427",
+        "fee_percentages": {}
       }
     },
     {
