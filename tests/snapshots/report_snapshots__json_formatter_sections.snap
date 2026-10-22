@@ -23,7 +23,6 @@ expression: JsonFormatter.format(&section_report())
   "optimization_suggestions": [],
   "read_bytes": 0,
   "read_entries": 1,
-  "rpc_latency_ms": 87,
   "section_sizes": {
     "code": 1021,
     "contractenvmetav0": 32,
@@ -42,6 +41,7 @@ expression: JsonFormatter.format(&section_report())
     "target_features": 36,
     "type": 83
   },
+  "simulation_duration_ms": 87,
   "suggestions": [
     "Tip: 70% of the total fee is refundable, which comes from ledger rent bumps and contract events. Consider reducing state growth and the number or size of emitted events."
   ],

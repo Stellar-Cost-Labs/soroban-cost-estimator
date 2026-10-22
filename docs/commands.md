@@ -22,6 +22,8 @@ management**.
   - [`cache prune`](#cache-prune) — evict least-recently-accessed entries
   - [`cache warm`](#cache-warm) — pre-populate cache
   - [`cache clear`](#cache-clear) — wipe cached estimates for a network
+  - [`cache list`](#cache-list) — inspect cached estimates with filters
+  - [`cache delete`](#cache-delete) — delete cached estimates by filter
 - [WASM Inspection](#wasm-inspection)
   - [`wasm info`](#wasm-info) — offline contract metadata report
 - [Monitoring](#monitoring)
@@ -67,7 +69,7 @@ soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
 | `--diff` | | | `false` | Compare two WASM builds side by side. Requires `--wasm-new` |
 | `--wasm-new <PATH>` | | | — | The "new" WASM build to compare against when `--diff` is set |
 | `--json` | | | `false` | Output as JSON instead of a human-readable table |
-| `--format <FORMAT>` | | | `table` | Output format: `table`, `json`, `csv`, or `markdown` (overrides `--json`) |
+| `--format <FORMAT>` | | | `table` | Output format: `table`, `json`, `csv`, `markdown`, or `summary` (overrides `--json`) |
 | `--precision <N>` | | | `7` | Decimal places for XLM fee values (`0..=18`) |
 | `--help` | `-h` | | | Print help |
 
@@ -469,7 +471,7 @@ soroban-cost-estimator config diff [OPTIONS]
 | `--pricing-only` | | `false` | Hide non-pricing changes and display only fee-rate adjustments |
 | `--threshold-percent <N>` | | none | Percentage threshold for flagging significant changes (e.g. 10 for 10%) |
 | `--summary` | | `false` | Print a single-line count summary instead of the full diff (for CI status lines) |
-| `--format <FORMAT>` | | `table` | Output format: `table`, `json`, `csv`, or `markdown` |
+| `--format <FORMAT>` | | `table` | Output format: `table`, `json`, `csv`, `markdown`, or `summary` |
 | `--json` | | `false` | Legacy alias for `--format json` |
 | `--ignore-pricing-exit` | | `false` | Force exit code 0 even when pricing changes are detected |
 | `--fail-on-any-change` | | `false` | Exit 1 when any setting changed, even non-pricing settings |
@@ -866,6 +868,108 @@ soroban-cost-estimator cache clear --network mainnet
 
 ---
 
+### `cache list`
+
+Audit the contents of the estimate cache with filters and pagination.
+
+**Usage**
+
+```
+soroban-cost-estimator cache list [OPTIONS]
+```
+
+**Flags**
+
+| Flag | Short | Required | Default | Description |
+|------|-------|----------|---------|-------------|
+| `--network <NETWORK>` | | | — (every network) | Network to filter by |
+| `--fn <FN>` | | | — | Function name (exact match); alias `--function` |
+| `--wasm-hash <WASM_HASH>` | | | — | WASM hash (prefix match, hexadecimal) |
+| `--since <DATE/TIME>` | | | — | Earliest timestamp or date; alias `--from` |
+| `--to <TIMESTAMP>` | | | — | Latest timestamp or date |
+| `--older-than <DURATION>` | | | — | Only entries older than this age (`30d`, `12h`, `3600`) |
+| `--limit <LIMIT>` | | | `50` | Maximum number of entries to return (capped at 1000) |
+| `--offset <OFFSET>` | | | `0` | Number of matching entries to skip |
+| `--json` | | | `false` | Output the full cached-estimate records as a JSON array |
+| `--help` | `-h` | | | Print help |
+
+**Behavior**
+
+- The network filter is optional — without it, entries from every network are
+  listed.
+- Filters are combined with logical AND; an invalid timestamp or a
+  non-hexadecimal hash prefix is rejected with a clear error.
+- Results are newest-first and paginated; the footer reports
+  `Showing X of Y matching estimate(s) (offset Z).`
+- The cache only ever stores a hash of the simulated arguments, never the
+  argument values themselves.
+- No network calls are made — this is pure local cache I/O.
+
+**Examples**
+
+```bash
+soroban-cost-estimator cache list --network testnet
+soroban-cost-estimator cache list --fn transfer --json
+soroban-cost-estimator cache list --older-than 30d --limit 20
+```
+
+---
+
+### `cache delete`
+
+Delete the cached estimates matching a filter — a targeted alternative to
+clearing a whole network.
+
+**Usage**
+
+```
+soroban-cost-estimator cache delete [OPTIONS]
+```
+
+**Flags**
+
+| Flag | Short | Required | Default | Description |
+|------|-------|----------|---------|-------------|
+| `--network <NETWORK>` | | | — (every network) | Network to filter by |
+| `--fn <FN>` | | | — | Function name (exact match); alias `--function` |
+| `--wasm-hash <WASM_HASH>` | | | — | WASM hash (prefix match, hexadecimal) |
+| `--since <DATE/TIME>` | | | — | Earliest timestamp or date; alias `--from` |
+| `--to <TIMESTAMP>` | | | — | Latest timestamp or date |
+| `--older-than <DURATION>` | | | — | Only entries older than this age (`30d`, `12h`, `3600`) |
+| `--all` | | | `false` | Delete every cached estimate, on every network (cannot be combined with a filter) |
+| `--dry-run` | | | `false` | Report the number of matching entries without deleting them |
+| `--yes` | `-y` | | `false` | Skip the confirmation prompt |
+| `--json` | | | `false` | Output as JSON instead of a human-readable summary |
+| `--help` | `-h` | | | Print help |
+
+**Behavior**
+
+- Uses the same matching rules as `cache list` / `cache query`, so
+  `--dry-run` reports exactly what would be removed.
+- At least one filter is required; without one the command is refused
+  unless `--all` is given.
+- `--all` means "every entry on every network" and cannot be combined with a
+  filter; the combination is rejected so a whole-cache deletion is never
+  silently narrowed.
+- Without `--yes` the command asks for confirmation; in a non-interactive
+  session the prompt cannot be answered, so the command aborts without
+  deleting anything.
+- Selection and deletion run in a single transaction, so the reported count
+  always matches the number of removed rows.
+- No network calls are made — this is pure local cache I/O.
+
+**Examples**
+
+```bash
+soroban-cost-estimator cache delete --network testnet --dry-run
+# → Would delete 2 cached estimate(s) — dry run, nothing removed.
+
+soroban-cost-estimator cache delete --network testnet --yes
+# → Deleted 2 cached estimate(s).
+```
+
+---
+
 ### `cache export`
 
 Dump cached estimates to a single versioned JSON document for backup,
@@ -912,8 +1016,10 @@ soroban-cost-estimator cache export --network testnet --out testnet-backup.json
 
 ### `watch`
 
-Poll the network's resource-pricing configuration on an interval and print a
-diff whenever something changes.
+Watch the network's resource-pricing configuration and print a diff whenever
+something changes. Subscribes to **ledger-close notifications over a
+WebSocket** so a config change is re-checked the moment its ledger lands, and
+falls back to interval polling when WebSockets are unavailable.
 
 **Usage**
 
@@ -926,12 +1032,19 @@ soroban-cost-estimator watch [OPTIONS]
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
 | `--network <NETWORK>` | | `testnet` | Network to watch |
-| `--interval <INTERVAL>` | | `1h` | Polling interval (accepts `s`/`m`/`h`/`d` suffixes or bare seconds) |
+| `--rpc-url <RPC_URL>` | | | Explicit RPC URL used for both the WebSocket subscription and the config fetches (`wss://`/`ws://` or `https://`/`http://`) |
+| `--interval <INTERVAL>` | | `1h` | Polling interval, used as the fallback when WebSocket notifications are unavailable (accepts `s`/`m`/`h`/`d` suffixes or bare seconds) |
 | `--help` | `-h` | | Print help |
 
 **Behavior**
 
-- Polls **immediately**, then every `--interval`.
+- Connects to the node's WebSocket endpoint (`wss://…/ws`) and re-checks the
+  config **on every ledger close**; the network's HTTP endpoint is derived from
+  `--rpc-url` when one is given.
+- Reconnects with exponential backoff (1s, 2s, 4s, … capped at 30s) after a
+  dropped connection, then resubscribes from the last ledger seen.
+- Falls back to polling **immediately**, then every `--interval`, when the
+  endpoint cannot be reached or does not support WebSocket subscriptions.
 - Intervals accept `s`/`m`/`h`/`d` suffixes or bare seconds:
   `3600`, `3600s`, `30m`, `1h`, `1d`. Unparseable input falls back to
   one hour.
@@ -961,6 +1074,8 @@ soroban-cost-estimator watch --network mainnet --interval 10m
 
 ```text
 Watching testnet for config changes every 3600s... (Ctrl-C to stop)
+Subscribed to ledger-close notifications from ledger 3894195 — re-checking config on every new ledger.
+Ledger 3894196 closed — re-checking config.
 Received stop signal — exiting cleanly.
 ```
 
@@ -976,7 +1091,7 @@ All commands accept:
 |------|-------------|
 | `--rps <N>` | Cap RPC requests at N per second (0 disables) |
 | `--timeout <SECS>` | HTTP request timeout for RPC calls in seconds (default `30`) |
-| `--format <FORMAT>` | Report format for commands that support it: `table`, `json`, `csv`, or `markdown` |
+| `--format <FORMAT>` | Report format for commands that support it: `table`, `json`, `csv`, `markdown`, or `summary` |
 | `--help` / `-h` | Print command-specific help |
 
 `--format` applies to report-producing commands. The legacy `--json` flag remains supported as an alias for `--format json` where it was previously available.
