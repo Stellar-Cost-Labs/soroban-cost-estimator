@@ -51,17 +51,44 @@ fn endpoint_override(network: &str) -> AppResult<Option<String>> {
 /// Resolves a network name to its Soroban RPC endpoint.
 ///
 /// Precedence: `custom_url` (`--rpc-url`), then the network's entry in the
-/// user config's `[rpc_urls]`, then the built-in well-known URL.
+/// user config's `[rpc_urls]`, then the built-in well-known URL. User-supplied
+/// URLs are validated by [`validate_rpc_url`] before they are returned, so a
+/// malformed endpoint fails before any network call is made.
+///
+/// # Errors
+///
+/// Returns [`AppError::InvalidRpcUrl`] when a custom or config-provided URL is
+/// malformed or uses an unsupported scheme, and [`AppError::UnknownNetwork`]
+/// when `network` has no configured or well-known endpoint.
 ///
 /// # Network calls
 /// None — returns configured or hardcoded well-known URLs.
+///
+/// # Examples
+///
+/// ```
+/// use soroban_cost_estimator::error::AppError;
+/// use soroban_cost_estimator::rpc::client::resolve_endpoint;
+///
+/// assert_eq!(
+///     resolve_endpoint("mainnet", None)?,
+///     "https://soroban.stellar.org"
+/// );
+/// assert!(matches!(
+///     resolve_endpoint("testnet", Some("ftp://example.com")),
+///     Err(AppError::InvalidRpcUrl(_))
+/// ));
+/// # Ok::<(), AppError>(())
+/// ```
 pub fn resolve_endpoint(network: &str, custom_url: Option<&str>) -> AppResult<String> {
     if let Some(url) = custom_url {
+        validate_rpc_url(url)?;
         debug!(url, "using custom RPC endpoint");
         return Ok(url.to_string());
     }
 
     if let Some(url) = endpoint_override(network)? {
+        validate_rpc_url(&url)?;
         debug!(network, url, "using RPC endpoint from config file");
         return Ok(url);
     }
@@ -167,6 +194,65 @@ fn with_ws_path(rest: &str) -> String {
     } else {
         format!("{}/ws", path_part.trim_end_matches('/'))
     }
+}
+
+/// Validates a user-supplied RPC endpoint before any network work begins.
+///
+/// Accepts only absolute URLs with an `http`, `https`, `ws`, or `wss` scheme
+/// and a non-empty host: the four schemes this tool can actually speak. A URL
+/// without a scheme, a host, or with a malformed/out-of-range port is rejected
+/// with [`AppError::InvalidRpcUrl`], as are unrelated schemes such as `ftp://`
+/// or `file://`.
+///
+/// Calling this up front means a typo in `--rpc-url` is reported immediately,
+/// instead of surfacing as a confusing JSON-deserialization or XDR-decoding
+/// failure halfway through a simulation.
+///
+/// # Errors
+///
+/// Returns [`AppError::InvalidRpcUrl`] when `url` is not a usable endpoint, with
+/// the offending value and the reason in the message.
+///
+/// # Examples
+///
+/// ```
+/// use soroban_cost_estimator::error::AppError;
+/// use soroban_cost_estimator::rpc::client::validate_rpc_url;
+///
+/// assert!(validate_rpc_url("https://soroban-testnet.stellar.org").is_ok());
+/// assert!(validate_rpc_url("http://localhost:8000").is_ok());
+/// assert!(matches!(
+///     validate_rpc_url("ftp://example.com"),
+///     Err(AppError::InvalidRpcUrl(_))
+/// ));
+/// # Ok::<(), AppError>(())
+/// ```
+pub fn validate_rpc_url(url: &str) -> AppResult<()> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| AppError::InvalidRpcUrl(format!("`{url}` is not a valid URL: {e}")))?;
+
+    match parsed.scheme() {
+        "http" | "https" | "ws" | "wss" => {}
+        scheme => {
+            return Err(AppError::InvalidRpcUrl(format!(
+                "`{url}` uses unsupported scheme `{scheme}`; expected http://, https://, ws://, or wss://"
+            )));
+        }
+    }
+
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return Err(AppError::InvalidRpcUrl(format!(
+            "`{url}` is missing a host"
+        )));
+    }
+
+    if parsed.port() == Some(0) {
+        return Err(AppError::InvalidRpcUrl(format!(
+            "`{url}` has an invalid port 0"
+        )));
+    }
+
+    Ok(())
 }
 
 /// Error for a URL whose scheme this tool cannot speak.
@@ -453,7 +539,7 @@ impl RpcClient {
     ///
     /// Behaves exactly like [`Self::with_fallback_headers_connect_timeout`] and
     /// additionally attaches the parsed `KEY=VALUE` / `KEY: VALUE` headers to
-    /// every outbound request. Uses the [`DEFAULT_CONNECT_TIMEOUT`] default.
+    /// every outbound request. Uses the default connect timeout.
     ///
     /// # Errors
     /// Returns [`AppError::InvalidHeader`] when any supplied header is
@@ -628,7 +714,7 @@ impl RpcClient {
     /// * a request identical to one that already **completed** returns the
     ///   cached result without sending anything;
     /// * a request identical to one currently **in flight** attaches to that
-    ///   request's [`SharedFuture`] and awaits it, so concurrent duplicates
+    ///   request's `SharedFuture` and awaits it, so concurrent duplicates
     ///   share a single underlying future and a single HTTP POST.
     ///
     /// A failed leader publishes no outcome, so its followers loop back and
@@ -1132,7 +1218,7 @@ mod tests {
 
     use super::{
         RpcClient, resolve_endpoint, resolve_ws_endpoint, set_endpoint_overrides, to_http_url,
-        to_websocket_url,
+        to_websocket_url, validate_rpc_url,
     };
 
     /// Spawns a tiny HTTP server that answers JSON-RPC
@@ -2081,6 +2167,59 @@ mod tests {
         assert_eq!(
             resolve_ws_endpoint("testnet", Some("https://soroban-testnet.stellar.org/")).unwrap(),
             "wss://soroban-testnet.stellar.org/ws"
+        );
+    }
+
+    #[test]
+    fn test_validate_rpc_url_accepts_supported_schemes() {
+        for url in [
+            "https://soroban-testnet.stellar.org",
+            "https://soroban-testnet.stellar.org/soroban/rpc",
+            "http://localhost:8000",
+            "ws://127.0.0.1:8000/ws",
+            "wss://example.org/ws",
+        ] {
+            assert!(validate_rpc_url(url).is_ok(), "{url} should be accepted");
+        }
+    }
+
+    #[test]
+    fn test_validate_rpc_url_rejects_other_schemes() {
+        for url in [
+            "ftp://example.org/rpc",
+            "file:///etc/passwd",
+            "soroban-testnet.stellar.org",
+        ] {
+            let err = validate_rpc_url(url).expect_err("{url} should be rejected");
+            assert!(matches!(err, AppError::InvalidRpcUrl(_)), "got: {err:?}");
+            assert!(
+                err.to_string().contains(url),
+                "message should name the URL: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_rpc_url_rejects_missing_host_and_bad_ports() {
+        for url in [
+            "https://",
+            "https://host:99999",
+            "https://host:not-a-port",
+            "http://host:0",
+        ] {
+            let err = validate_rpc_url(url).expect_err("{url} should be rejected");
+            assert!(matches!(err, AppError::InvalidRpcUrl(_)), "got: {err:?}");
+        }
+    }
+
+    #[test]
+    fn test_resolve_endpoint_validates_custom_url_before_use() {
+        let err = resolve_endpoint("testnet", Some("ftp://example.org/rpc"))
+            .expect_err("non-HTTP schemes must be rejected up front");
+        assert!(matches!(err, AppError::InvalidRpcUrl(_)), "got: {err:?}");
+        assert!(
+            err.to_string().contains("ftp"),
+            "message should name the offending scheme: {err}"
         );
     }
 
