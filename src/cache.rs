@@ -47,6 +47,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use rusqlite::Connection;
+use rusqlite::OptionalExtension;
 use rusqlite::Transaction;
 use rusqlite::TransactionBehavior;
 use serde::Deserialize;
@@ -2066,6 +2067,10 @@ pub struct CacheExport {
     pub network: Option<String>,
     /// The exported estimates in deterministic
     /// `(wasm_hash, function, args_hash)` order.
+    ///
+    /// `entries` is accepted as an alias so export files written by older
+    /// releases (which used that key) can still be imported.
+    #[serde(alias = "entries")]
     pub estimates: Vec<CachedEstimate>,
 }
 
@@ -2098,6 +2103,159 @@ pub fn export_cache(network: Option<&str>) -> AppResult<CacheExport> {
         network: network.map(str::to_string),
         estimates,
     })
+}
+
+/// Outcome summary of a `config cache import` run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportSummary {
+    /// Entries written to the cache (newly created or replaced).
+    pub imported: usize,
+    /// Entries left untouched because an existing entry was kept.
+    pub skipped: usize,
+}
+
+/// Import cached estimates from an export JSON file into the local cache.
+///
+/// Reads the export file, validates its schema version, and upserts each
+/// entry under its `(wasm_hash, function, args_hash)` key. In merge mode
+/// (`overwrite == false`) an existing entry is only replaced when the
+/// imported entry carries a strictly newer timestamp; in overwrite mode
+/// (`overwrite == true`) existing entries are always replaced.
+///
+/// # Arguments
+/// * `file` - Path to the cache export JSON file.
+/// * `overwrite` - `true` to replace existing entries unconditionally;
+///   `false` to merge, keeping the newer of each pair.
+///
+/// # Network calls
+/// None — pure file and SQLite I/O.
+pub fn import_cache(file: &Path, overwrite: bool) -> AppResult<ImportSummary> {
+    let content = std::fs::read_to_string(file).map_err(|e| {
+        AppError::CacheImport(format!(
+            "could not read export file {}: {e}",
+            file.display()
+        ))
+    })?;
+
+    let export: CacheExport = serde_json::from_str(&content).map_err(|e| {
+        AppError::CacheImport(format!(
+            "corrupted cache export file {}: {e}",
+            file.display()
+        ))
+    })?;
+
+    if export.schema_version != CACHE_EXPORT_SCHEMA_VERSION {
+        return Err(AppError::CacheImport(format!(
+            "unsupported schema version {} in {} (expected {CACHE_EXPORT_SCHEMA_VERSION})",
+            export.schema_version,
+            file.display()
+        )));
+    }
+
+    let _guard = WRITE_LOCK
+        .lock()
+        .map_err(|e| AppError::General(format!("cache write lock poisoned: {e}")))?;
+    let mut conn = open_db()?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+
+    for entry in export.estimates {
+        let entry = migrate_to_latest(entry)?;
+
+        if !overwrite {
+            let existing_timestamp: Option<String> = tx
+                .query_row(
+                    "SELECT timestamp FROM estimates \
+                     WHERE wasm_hash = ?1 AND function = ?2 AND args_hash = ?3",
+                    rusqlite::params![entry.wasm_hash, entry.function, entry.args_hash],
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            if let Some(existing) = existing_timestamp {
+                if !timestamp_is_newer(&entry.timestamp, &existing) {
+                    skipped += 1;
+                    continue;
+                }
+            }
+        }
+
+        let io_json = match &entry.io {
+            Some(io) => Some(serde_json::to_string(io)?),
+            None => None,
+        };
+
+        tx.execute(
+            "INSERT INTO estimates \
+             (version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
+              cpu_instructions, memory_bytes, timestamp, duration_ms, execution_duration_ms, \
+              network_passphrase, core_version, success, last_accessed, io_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
+             ON CONFLICT(wasm_hash, function, args_hash) DO UPDATE SET \
+                version = excluded.version, \
+                network = excluded.network, \
+                ledger = excluded.ledger, \
+                total_stroops = excluded.total_stroops, \
+                cpu_instructions = excluded.cpu_instructions, \
+                memory_bytes = excluded.memory_bytes, \
+                timestamp = excluded.timestamp, \
+                duration_ms = excluded.duration_ms, \
+                execution_duration_ms = excluded.execution_duration_ms, \
+                network_passphrase = excluded.network_passphrase, \
+                core_version = excluded.core_version, \
+                success = excluded.success, \
+                last_accessed = excluded.last_accessed, \
+                io_json = excluded.io_json",
+            rusqlite::params![
+                entry.version as i64,
+                entry.wasm_hash,
+                entry.function,
+                entry.args_hash,
+                entry.network,
+                entry.ledger as i64,
+                entry.total_stroops,
+                entry.cpu_instructions as i64,
+                entry.memory_bytes as i64,
+                entry.timestamp,
+                Option::<i64>::None,
+                entry.execution_duration_ms as i64,
+                entry.network_passphrase,
+                entry.core_version,
+                entry.success as i64,
+                now,
+                io_json,
+            ],
+        )?;
+        imported += 1;
+    }
+
+    let evicted = enforce_limits_in_tx(&tx, cache_limits())?;
+    tx.commit()?;
+
+    if evicted > 0 {
+        info_eviction(evicted, cache_limits());
+    }
+
+    debug!(imported, skipped, "imported cached estimates");
+    Ok(ImportSummary { imported, skipped })
+}
+
+/// Compare two RFC-3339 timestamps: is `incoming` strictly newer than
+/// `existing`?
+///
+/// Falls back to lexicographic comparison when either string cannot be
+/// parsed (RFC-3339 strings with the same format sort correctly as text).
+fn timestamp_is_newer(incoming: &str, existing: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(incoming),
+        chrono::DateTime::parse_from_rfc3339(existing),
+    ) {
+        (Ok(a), Ok(b)) => a > b,
+        _ => incoming > existing,
+    }
 }
 
 /// Integrity status of a single cache entry file.

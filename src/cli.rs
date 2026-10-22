@@ -425,6 +425,21 @@ pub enum CacheAction {
         network: Option<String>,
     },
 
+    /// Restore cached estimates from an export JSON file.
+    Import {
+        /// Path to the cache export JSON file.
+        file: PathBuf,
+
+        /// Merge with existing entries, keeping the newer of each pair
+        /// (default).
+        #[arg(long, conflicts_with = "overwrite")]
+        merge: bool,
+
+        /// Replace existing cache entries unconditionally.
+        #[arg(long)]
+        overwrite: bool,
+    },
+
     /// List cached estimates with optional filters (newest first).
     ///
     /// Without `--network`, entries from every network are listed.

@@ -156,6 +156,10 @@ pub enum AppError {
     #[error("failed to retrieve config setting: {0} not found")]
     ConfigSettingNotFound(String),
 
+    // ── Cache ──────────────────────────────────────────────────────
+    #[error("Cache import error: {0}")]
+    CacheImport(String),
+
     // ── Serialization ──────────────────────────────────────────────
     #[error("failed to process JSON: {0}")]
     Json(#[from] serde_json::Error),
