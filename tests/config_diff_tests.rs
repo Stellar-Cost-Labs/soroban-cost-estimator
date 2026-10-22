@@ -1264,8 +1264,12 @@ fn single_change_diff() -> diff::ConfigDiff {
             new_value: "25".to_string(),
             is_pricing_change: true,
             explanation: None,
+            change_kind: diff::SettingChangeKind::Value,
+            old_state: diff::SettingState::Present("10".to_string()),
+            new_state: diff::SettingState::Present("25".to_string()),
         }],
         has_pricing_changes: true,
+        has_unknown_changes: false,
     }
 }
 
@@ -1344,4 +1348,243 @@ fn test_format_diff_markdown_no_changes() {
     let md = diff::format_diff_markdown(&diff);
     assert!(md.contains("✅ No changes detected."));
     assert!(!md.contains("| Setting |"));
+}
+
+// ── Presence and unknown states (#515) ─────────────────────────────────────
+
+/// Builds a snapshot JSON document, optionally carrying extra top-level
+/// fields this build does not model.
+fn snapshot_json_with_extras(extras: &str) -> String {
+    format!(
+        r#"{{
+  "network": "testnet",
+  "timestamp": "2026-01-01T00:00:00Z",
+  "ledger": 100,
+  "contract_compute": {{
+    "ledger_max_instructions": 1000000,
+    "tx_max_instructions": 100000,
+    "fee_rate_per_instructions_increment": 10,
+    "tx_memory_limit": 100
+  }},
+  "contract_ledger_cost": null,
+  "contract_historical_data": null,
+  "contract_events": null,
+  "contract_bandwidth": null,
+  "state_archival": null{extras}
+}}"#
+    )
+}
+
+#[test]
+fn test_added_section_is_reported_as_an_added_state() {
+    let old = snapshot_with(false, false, false, false, false, false);
+    let new = snapshot_with(true, false, false, false, false, false);
+    let d = diff::diff_snapshots(&old, &new);
+
+    assert_eq!(d.changes.len(), 1);
+    let change = &d.changes[0];
+    assert_eq!(change.change_kind, diff::SettingChangeKind::Added);
+    assert_eq!(change.old_state, diff::SettingState::Missing);
+    assert_eq!(
+        change.new_state,
+        diff::SettingState::Present("(present)".to_string())
+    );
+    // Absence is not the same as a zero value.
+    assert_eq!(change.old_value, "(missing)");
+    assert_eq!(change.new_value, "(present)");
+}
+
+#[test]
+fn test_removed_section_is_reported_as_a_removed_state() {
+    let old = snapshot_with(true, false, false, false, false, false);
+    let new = snapshot_with(false, false, false, false, false, false);
+    let d = diff::diff_snapshots(&old, &new);
+
+    assert_eq!(d.changes.len(), 1);
+    let change = &d.changes[0];
+    assert_eq!(change.change_kind, diff::SettingChangeKind::Removed);
+    assert_eq!(
+        change.old_state,
+        diff::SettingState::Present("(present)".to_string())
+    );
+    assert_eq!(change.new_state, diff::SettingState::Missing);
+    assert_eq!(change.old_value, "(present)");
+    assert_eq!(change.new_value, "(missing)");
+}
+
+#[test]
+fn test_value_changes_are_distinct_from_presence_changes() {
+    let old = snapshot_with(true, false, false, false, false, false);
+    let mut new = snapshot_with(true, false, false, false, false, false);
+    new.contract_compute
+        .as_mut()
+        .unwrap()
+        .fee_rate_per_instructions_increment = 20;
+    let d = diff::diff_snapshots(&old, &new);
+
+    assert_eq!(d.changes.len(), 1);
+    let change = &d.changes[0];
+    assert_eq!(change.change_kind, diff::SettingChangeKind::Value);
+    assert_eq!(
+        change.old_state,
+        diff::SettingState::Present("10".to_string())
+    );
+    assert_eq!(
+        change.new_state,
+        diff::SettingState::Present("20".to_string())
+    );
+}
+
+#[test]
+fn test_presence_change_keeps_a_conservative_pricing_status() {
+    // One side lacks a value: the diff must not pretend the fee went to
+    // zero, so the transition stays flagged as pricing-relevant.
+    let old = snapshot_with(false, false, false, false, false, false);
+    let new = snapshot_with(true, false, false, false, false, false);
+    let d = diff::diff_snapshots(&old, &new);
+
+    assert!(d.changes[0].is_pricing_change);
+    assert!(d.has_pricing_changes);
+}
+
+#[test]
+fn test_snapshot_payload_keeps_known_fields_and_captures_unknown_ones() {
+    let json = snapshot_json_with_extras(",\n  \"contract_compute_v1\": {\"fee\": 7}");
+    let payload = SnapshotPayload::parse(&json).expect("parse payload");
+
+    assert_eq!(payload.snapshot.network, "testnet");
+    assert_eq!(payload.snapshot.ledger, 100);
+    assert!(payload.snapshot.contract_compute.is_some());
+    assert!(payload.has_unknown_fields());
+    assert_eq!(
+        payload.unknown_field_names(),
+        vec!["contract_compute_v1".to_string()]
+    );
+}
+
+#[test]
+fn test_snapshot_payload_without_unknown_fields_is_empty() {
+    let json = snapshot_json_with_extras("");
+    let payload = SnapshotPayload::parse(&json).expect("parse payload");
+    assert!(!payload.has_unknown_fields());
+    assert!(payload.unknown_field_names().is_empty());
+}
+
+#[test]
+fn test_snapshot_payload_still_parses_an_unknown_only_document() {
+    // Forward compatibility: an unknown field never breaks the load.
+    let json = r#"{"network":"testnet","timestamp":"2026-01-01T00:00:00Z","ledger":1,"brand_new_setting":42}"#;
+    let payload = SnapshotPayload::parse(json).expect("parse payload");
+    assert_eq!(payload.snapshot.ledger, 1);
+    assert_eq!(
+        payload.unknown_field_names(),
+        vec!["brand_new_setting".to_string()]
+    );
+}
+
+#[test]
+fn test_diff_payloads_reports_unknown_stored_fields() {
+    let old = SnapshotPayload::parse(&snapshot_json_with_extras(
+        ",\n  \"contract_compute_v1\": {\"fee\": 7}",
+    ))
+    .expect("parse old");
+    let new = SnapshotPayload::parse(&snapshot_json_with_extras("")).expect("parse new");
+
+    let d = diff::diff_payloads(&old, &new);
+
+    assert!(d.has_unknown_changes);
+    let unknown: Vec<&diff::FieldDiff> = d
+        .changes
+        .iter()
+        .filter(|c| c.change_kind == diff::SettingChangeKind::Unknown)
+        .collect();
+    assert_eq!(unknown.len(), 1);
+    assert_eq!(unknown[0].field_path, "contract_compute_v1");
+    assert_eq!(
+        unknown[0].old_state,
+        diff::SettingState::Unknown("{\"fee\":7}".to_string())
+    );
+    assert_eq!(unknown[0].new_state, diff::SettingState::Missing);
+    // An unrecognized field may carry pricing information, so the diff stays
+    // conservative about it.
+    assert!(unknown[0].is_pricing_change);
+    assert!(d.has_pricing_changes);
+}
+
+#[test]
+fn test_diff_payloads_ignores_identical_unknown_fields() {
+    let json = snapshot_json_with_extras(",\n  \"contract_compute_v1\": {\"fee\": 7}");
+    let old = SnapshotPayload::parse(&json).expect("parse old");
+    let new = SnapshotPayload::parse(&json).expect("parse new");
+
+    let d = diff::diff_payloads(&old, &new);
+
+    assert!(d.changes.is_empty());
+    assert!(!d.has_unknown_changes);
+    assert!(!d.has_pricing_changes);
+}
+
+#[test]
+fn test_diff_payloads_reports_changed_unknown_fields() {
+    let old = SnapshotPayload::parse(&snapshot_json_with_extras(
+        ",\n  \"contract_compute_v1\": 7",
+    ))
+    .expect("parse old");
+    let new = SnapshotPayload::parse(&snapshot_json_with_extras(
+        ",\n  \"contract_compute_v1\": 9",
+    ))
+    .expect("parse new");
+
+    let d = diff::diff_payloads(&old, &new);
+
+    assert_eq!(d.changes.len(), 1);
+    assert_eq!(d.changes[0].change_kind, diff::SettingChangeKind::Unknown);
+    assert_eq!(d.changes[0].old_value, "7");
+    assert_eq!(d.changes[0].new_value, "9");
+}
+
+#[test]
+fn test_format_diff_renders_presence_states() {
+    let old = snapshot_with(false, false, false, false, false, false);
+    let new = snapshot_with(true, false, false, false, false, false);
+    let d = diff::diff_snapshots(&old, &new);
+    let output = diff::format_diff(&d, false, false, None);
+
+    assert!(
+        output.contains("State: missing → present"),
+        "presence change should render its states: {output}"
+    );
+    assert!(output.contains("Contract Compute V0"));
+}
+
+#[test]
+fn test_format_diff_renders_unknown_settings() {
+    let old = SnapshotPayload::parse(&snapshot_json_with_extras(
+        ",\n  \"contract_compute_v1\": {\"fee\": 7}",
+    ))
+    .expect("parse old");
+    let new = SnapshotPayload::parse(&snapshot_json_with_extras("")).expect("parse new");
+    let d = diff::diff_payloads(&old, &new);
+    let output = diff::format_diff(&d, false, false, None);
+
+    assert!(
+        output.contains("not recognized by this build"),
+        "unknown settings should be called out: {output}"
+    );
+    assert!(output.contains("Unrecognized settings detected"));
+}
+
+#[test]
+fn test_diff_summary_mentions_unknown_changes() {
+    let old = SnapshotPayload::parse(&snapshot_json_with_extras(
+        ",\n  \"contract_compute_v1\": {\"fee\": 7}",
+    ))
+    .expect("parse old");
+    let new = SnapshotPayload::parse(&snapshot_json_with_extras("")).expect("parse new");
+    let d = diff::diff_payloads(&old, &new);
+
+    assert_eq!(
+        diff::format_diff_summary(&d),
+        "Config drift detected: 1 pricing changes, 0 non-pricing changes, 1 unknown"
+    );
 }
