@@ -516,6 +516,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
             cli::ConfigAction::Snapshot {
                 action,
                 network,
+                rpc_url,
                 out,
                 json,
                 retain,
@@ -565,6 +566,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
                     };
                     cmd_config_snapshot(
                         &env_string(network, &default_network, "SOROBAN_NETWORK"),
+                        rpc_url.as_deref(),
                         fallback,
                         out.as_deref(),
                         format,
@@ -615,6 +617,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
                 } else {
                     cmd_config_diff(
                         &env_string(network, &default_network, "SOROBAN_NETWORK"),
+                        rpc_url.as_deref(),
                         fallback,
                         against.as_deref(),
                         pricing_only,
@@ -682,6 +685,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
             network,
             rpc_url,
             interval,
+            threshold_percent,
         } => {
             cmd_watch(
                 &network,
@@ -3684,7 +3688,7 @@ async fn fetch_config_snapshot(
 
     let span = info_span!("fetch_config_snapshot", network);
     async {
-        let endpoint = rpc::client::resolve_endpoint(network, None)?;
+        let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
         let client = rpc::client::RpcClient::with_fallback_headers_connect_timeout(
             &endpoint,
             rpc_fallback_url,
@@ -4624,6 +4628,7 @@ async fn auto_snapshot_if_changed(
 
     let new_snapshot = fetch_config_snapshot(
         network,
+        None,
         rpc_fallback_url,
         rps,
         timeout,
