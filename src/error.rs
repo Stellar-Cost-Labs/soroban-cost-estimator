@@ -70,6 +70,19 @@ pub enum AppError {
         source: reqwest::Error,
     },
 
+    /// The RPC response body exceeded the maximum allowed size.
+    ///
+    /// This bounds memory usage before JSON deserialization, preventing an
+    /// unexpectedly large response from consuming excessive memory.
+    #[error(
+        "RPC response body too large: {observed_size} bytes exceeds maximum of {max_size} bytes for endpoint {endpoint}"
+    )]
+    ResponseTooLarge {
+        endpoint: String,
+        observed_size: u64,
+        max_size: u64,
+    },
+
     // ── WebSocket ────────────────────────────────────────────────
     #[error("failed to open WebSocket connection: {0}")]
     WsConnect(String),
@@ -237,6 +250,11 @@ mod tests {
                 path: "contract.wasm".to_string(),
                 size: 20_000_000,
                 max_size: 16_777_216,
+            },
+            AppError::ResponseTooLarge {
+                endpoint: "https://soroban-testnet.stellar.org".to_string(),
+                observed_size: 100_000_000,
+                max_size: 10_000_000,
             },
             AppError::TypeValidation("arg 'abc' cannot be used as 'i64'".to_string()),
             AppError::SnapshotNotFound("/tmp/s.json".to_string()),

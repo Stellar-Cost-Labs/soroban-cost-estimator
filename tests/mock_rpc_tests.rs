@@ -4,7 +4,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::json;
 
 use soroban_cost_estimator::error::AppError;
-use soroban_cost_estimator::rpc::client::{is_sensitive_header, redact_sensitive, RpcClient};
+use soroban_cost_estimator::rpc::client::{RpcClient, is_sensitive_header, redact_sensitive};
 
 #[tokio::test]
 async fn mock_rpc_fixture_handles_simulate_transaction_and_health() {
@@ -238,7 +238,10 @@ fn redaction_identifies_non_sensitive_headers() {
 #[test]
 fn redaction_replaces_sensitive_values_with_placeholder() {
     let mut headers = HeaderMap::new();
-    headers.insert("authorization", HeaderValue::from_static("Bearer secret-token"));
+    headers.insert(
+        "authorization",
+        HeaderValue::from_static("Bearer secret-token"),
+    );
     headers.insert("x-api-key", HeaderValue::from_static("my-api-key"));
     headers.insert("content-type", HeaderValue::from_static("application/json"));
 
