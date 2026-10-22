@@ -771,7 +771,7 @@ fn response_resources(
 /// # Network calls
 /// Makes 1 `getLedgerEntries` RPC call (all 6 settings batched) on the first
 /// call for the returned cache; zero on any later call sharing that cache.
-async fn fetch_network_config(client: &rpc::client::RpcClient) -> rpc::config::ConfigCache {
+async fn fetch_config_cache(client: &rpc::client::RpcClient) -> rpc::config::ConfigCache {
     let cache = rpc::config::ConfigCache::new();
     if let Err(e) = cache.get_or_fetch(client).await {
         // Not fatal: callers fall back to zero rates with a warning, exactly
@@ -784,7 +784,7 @@ async fn fetch_network_config(client: &rpc::client::RpcClient) -> rpc::config::C
 /// Fee rates derived from an already-fetched [`rpc::config::NetworkConfig`].
 ///
 /// Pure CPU work — the config settings were fetched once for the whole command
-/// run (see [`fetch_network_config`]), so pricing every function against them
+/// run (see [`fetch_config_cache`]), so pricing every function against them
 /// costs no additional network round trips. This is what takes `estimate-all`
 /// from `2 * N` round trips down to `N + 1`.
 ///
@@ -792,12 +792,14 @@ async fn fetch_network_config(client: &rpc::client::RpcClient) -> rpc::config::C
 /// `compute_fee_breakdown` which does the proper `(units * rate) / scale`
 /// math to preserve precision.
 ///
-/// If any of the three `ConfigSetting*` sources cannot be fetched or
-/// decoded, its rate(s) fall back to 0 and a warning is printed to stderr
-/// â€” a silent zero rate would understate the non-refundable fee, so it must
-/// never pass unannounced.
-async fn fetch_fee_rates(
-    client: &rpc::client::RpcClient,
+/// `config` is `None` when the batched fetch failed. Any of the three
+/// `ConfigSetting*` sources that is missing or cannot be decoded falls back
+/// to 0, with a warning printed to stderr unless `quiet` is set — a silent
+/// zero rate would understate the non-refundable fee, so it must never pass
+/// unannounced.
+fn fee_rates_from_config(
+    config: Option<&rpc::config::NetworkConfig>,
+    verbose: bool,
     quiet: bool,
 ) -> report::fee_calc::FeeRates {
     use tracing::{debug, warn};
@@ -1077,7 +1079,10 @@ async fn simulate_report(
         memory_bytes, latest_ledger, total_fee_stroops, "simulation complete"
     );
 
-    let fee_rates = fetch_fee_rates(&client, req.quiet).await;
+    // One batched config fetch for the whole run, reused by every fee
+    // evaluation below.
+    let config_cache = fetch_config_cache(&client).await;
+    let fee_rates = fee_rates_from_config(config_cache.peek(), req.verbose, req.quiet);
 
     let fee = report::fee_calc::compute_fee_breakdown(
         total_fee_stroops,
@@ -1650,7 +1655,8 @@ async fn cmd_estimate_repeat(
             );
 
             if iteration == 1 {
-                let fee_rates = fetch_fee_rates(&client, quiet).await;
+                let config_cache = fetch_config_cache(&client).await;
+                let fee_rates = fee_rates_from_config(config_cache.peek(), verbose, quiet);
                 let fee = report::fee_calc::compute_fee_breakdown(
                     total_fee_stroops,
                     cpu_instructions,
@@ -3138,14 +3144,14 @@ async fn cmd_estimate_all(
 
         // Fee rates are only needed to itemize the per-function fee breakdown
         // in JSON output; skip the extra RPC calls in table mode.
-        let fee_rates = if json_flag {
-            Some(fetch_fee_rates(&client, quiet).await)
+        let config_cache = if json_flag {
+            Some(fetch_config_cache(&client).await)
         } else {
             None
         };
         let fee_rates = config_cache
             .as_ref()
-            .map(|cache| fee_rates_from_config(cache.peek(), verbose));
+            .map(|cache| fee_rates_from_config(cache.peek(), verbose, quiet));
 
         // Network resource limits for the 80% warnings (#322), fetched once
         // for the whole batch.

@@ -3031,6 +3031,7 @@ fn start_counting_mock_rpc_server() -> (String, std::sync::mpsc::Sender<()>, Arc
 
     let counts = Arc::new(Counts {
         get_ledger_entries: AtomicUsize::new(0),
+        batched_config_fetches: AtomicUsize::new(0),
         simulate_transaction: AtomicUsize::new(0),
     });
     let server_counts = Arc::clone(&counts);
@@ -3093,6 +3094,18 @@ fn start_counting_mock_rpc_server() -> (String, std::sync::mpsc::Sender<()>, Arc
                         server_counts
                             .get_ledger_entries
                             .fetch_add(1, Ordering::SeqCst);
+                        // A call carrying every config setting's key is the
+                        // batched config fetch; the protocol-limit lookups
+                        // (#322) carry a single key and do not count as one.
+                        let key_count = serde_json::from_str::<serde_json::Value>(&body)
+                            .ok()
+                            .and_then(|v| v["params"]["keys"].as_array().map(|k| k.len()))
+                            .unwrap_or(0);
+                        if key_count >= BATCHED_CONFIG_KEY_COUNT {
+                            server_counts
+                                .batched_config_fetches
+                                .fetch_add(1, Ordering::SeqCst);
+                        }
                         // Echo every requested key back with a dummy payload so
                         // the client can complete its key→setting-ID matching.
                         let entries: Vec<String> = serde_json::from_str::<serde_json::Value>(&body)
@@ -3138,8 +3151,14 @@ fn start_counting_mock_rpc_server() -> (String, std::sync::mpsc::Sender<()>, Arc
 /// Per-method request tallies from `start_counting_mock_rpc_server`.
 struct Counts {
     get_ledger_entries: std::sync::atomic::AtomicUsize,
+    batched_config_fetches: std::sync::atomic::AtomicUsize,
     simulate_transaction: std::sync::atomic::AtomicUsize,
 }
+
+/// Number of `ConfigSetting*` keys the batched config fetch sends in a single
+/// `getLedgerEntries` call. The protocol-limit lookups (#322) request one
+/// key per call, so the key count is what separates the two shapes.
+const BATCHED_CONFIG_KEY_COUNT: usize = 6;
 
 /// Writes LEB128-encoded `value` into `wasm`.
 fn write_leb_u32(wasm: &mut Vec<u8>, mut value: u32) {
@@ -3270,8 +3289,8 @@ fn test_estimate_all_fetches_config_settings_exactly_once() {
         "estimate-all should succeed; stderr: {stderr}"
     );
 
-    let config_fetches = counts
-        .get_ledger_entries
+    let batched_config_fetches = counts
+        .batched_config_fetches
         .load(std::sync::atomic::Ordering::SeqCst);
     let simulations = counts
         .simulate_transaction
@@ -3281,13 +3300,17 @@ fn test_estimate_all_fetches_config_settings_exactly_once() {
         simulations, FUNCTIONS,
         "every exported function should be simulated"
     );
+    // Only the batched six-key call counts here: `estimate-all` also makes
+    // three single-key `getLedgerEntries` lookups for the protocol-limit
+    // warnings (#322), which are unrelated to the fee-rate config cache.
     assert_eq!(
-        config_fetches, 1,
-        "config settings must be fetched exactly once per command run, not once per function \
-         (got {config_fetches} fetch(es) for {simulations} function(s))"
+        batched_config_fetches, 1,
+        "config settings must be fetched in exactly one batched call per command run, not \
+         once per function (got {batched_config_fetches} batched fetch(es) for \
+         {simulations} function(s))"
     );
     assert_eq!(
-        config_fetches + simulations,
+        batched_config_fetches + simulations,
         simulations + 1,
         "an estimate-all run should cost N simulations + 1 config fetch, not 2 * N round trips"
     );
@@ -3305,9 +3328,11 @@ fn test_estimate_all_fetches_config_settings_exactly_once() {
 }
 
 #[test]
-fn test_estimate_all_table_mode_skips_config_fetch_entirely() {
-    // Table output does not itemize fees, so it needs no config settings at
-    // all — and must not pay for them.
+fn test_estimate_all_table_mode_skips_fee_rate_config_fetch() {
+    // Table output does not itemize fees, so it needs no fee-rate config
+    // settings and must not pay for the batched fetch. (The protocol-limit
+    // warnings (#322) still make their own single-key lookups, which this
+    // test deliberately does not count.)
     let (rpc_url, _stop, counts) = start_counting_mock_rpc_server();
     let home = temp_home("estimate-all-no-config");
     let wasm = write_multi_function_wasm(&home, 3);
@@ -3336,10 +3361,10 @@ fn test_estimate_all_table_mode_skips_config_fetch_entirely() {
     );
     assert_eq!(
         counts
-            .get_ledger_entries
+            .batched_config_fetches
             .load(std::sync::atomic::Ordering::SeqCst),
         0,
-        "table mode needs no fee rates, so it should send no getLedgerEntries call"
+        "table mode needs no fee rates, so it should send no batched config fetch"
     );
 }
 
