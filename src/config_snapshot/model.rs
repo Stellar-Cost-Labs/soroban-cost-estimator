@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -119,7 +119,22 @@ pub struct ConfigSnapshot {
     pub schema_version: u32,
     pub network: String,
     pub timestamp: String,
+    /// The network's **current** ledger when the snapshot was taken, as
+    /// reported by the node's `latestLedger`.
+    ///
+    /// This is deliberately *not* the newest `last_modified_ledger` across the
+    /// config settings. Those settings only change on protocol-governance
+    /// events, so that value is frozen between upgrades and would leave every
+    /// snapshot reporting the same long-stale ledger.
     pub ledger: u32,
+    /// Per-setting provenance: for each config setting, the ledger in which
+    /// that setting last changed (the entry's `lastModifiedLedgerSeq`).
+    ///
+    /// Kept so the "when did this price last move?" question stays answerable
+    /// from a snapshot. Defaults to empty when absent, which keeps snapshots
+    /// written by earlier versions loadable.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub settings_last_modified: BTreeMap<String, u32>,
     /// Network protocol version reported by `getLatestLedger` when the
     /// snapshot was taken. `None` for snapshots saved before it was recorded
     /// or when the RPC call failed; omitted from JSON in that case so older

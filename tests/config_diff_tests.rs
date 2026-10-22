@@ -9,6 +9,7 @@ fn empty_snapshot() -> ConfigSnapshot {
         network: "testnet".to_string(),
         timestamp: "2026-01-01T00:00:00Z".to_string(),
         ledger: 100,
+        settings_last_modified: std::collections::BTreeMap::new(),
         protocol_version: None,
         contract_compute: None,
         contract_ledger_cost: None,
@@ -25,6 +26,7 @@ fn full_snapshot() -> ConfigSnapshot {
         network: "testnet".to_string(),
         timestamp: "2026-01-01T00:00:00Z".to_string(),
         ledger: 100,
+        settings_last_modified: std::collections::BTreeMap::new(),
         protocol_version: None,
         contract_compute: Some(ContractComputeV0 {
             ledger_max_instructions: 1_000_000,
@@ -90,6 +92,7 @@ fn snapshot_with(
         network: "testnet".to_string(),
         timestamp: "2026-01-01T00:00:00Z".to_string(),
         ledger: 100,
+        settings_last_modified: std::collections::BTreeMap::new(),
         protocol_version: None,
         contract_compute: if compute {
             Some(ContractComputeV0 {
@@ -173,6 +176,7 @@ fn make_snapshot(compute_fee: i64, bandwidth_fee: i64) -> ConfigSnapshot {
         network: "testnet".to_string(),
         timestamp: "2026-01-01T00:00:00Z".to_string(),
         ledger: 100,
+        settings_last_modified: std::collections::BTreeMap::new(),
         protocol_version: None,
         contract_compute: Some(ContractComputeV0 {
             ledger_max_instructions: 1_000_000,
