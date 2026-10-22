@@ -144,13 +144,27 @@ soroban-cost-estimator estimate \
   "fee": {
     "non_refundable_stroops": 4491,
     "refundable_stroops": 12631,
+    "cpu_fee_stroops": 360,
+    "storage_fee_stroops": 4020,
+    "bandwidth_fee_stroops": 11,
+    "base_fee_stroops": 100,
     "total_stroops": 17122,
-    "total_xlm": "0.0017122"
+    "total_xlm": "0.0017122",
+    "fee_percentages": {}
   },
   "ledger_sequence": 3961544,
-  "network": "testnet"
+  "network": "testnet",
+  "rpc_latency_ms": 84,
+  "warnings": [],
+  "contract_meta": {},
+  "suggestions": [],
+  "optimization_suggestions": []
 }
 ```
+
+(The example above is elided: real output also includes `wasm_size`, and
+optional keys like `history` appear when requested. The key sets and their
+compatibility guarantees are specified in the next section.)
 
 The `ledger_sequence` field records the ledger the simulation ran against,
 so consumers can tell how fresh an estimate is. The human-readable header
@@ -159,3 +173,69 @@ renders the same value with thousands separators as
 
 Use `--format json`, `--format csv`, or `--format markdown` when feeding the result into CI, spreadsheets, or documentation. `--json` remains a backward-compatible alias for `--format json`. The
 result is also written to the estimate cache(see [Caching](../concepts/caching.md)).
+
+## JSON output compatibility
+
+The JSON emitted by this tool is a public, machine-consumed interface. The
+shapes below are locked by automated schema tests (see the note at the end
+of this section); breaking them requires going through the compatibility
+policy.
+
+### Documented families
+
+| Command | JSON document | Root keys |
+| --- | --- | --- |
+| `estimate --json` | single cost report | `function`, `wasm_hash`, `cpu_instructions`, `memory_bytes`, `tx_size`, `read_entries`, `write_entries`, `read_bytes`, `write_bytes`, `fee`, `ledger_sequence`, `network`, `rpc_latency_ms`, `warnings`, `contract_meta`, plus the derived `suggestions` and `optimization_suggestions` |
+| `estimate-all --json` | batch document | `functions` (array) and `fee_distribution` (integer statistics object) |
+| batch contract summaries | multi-contract report (`estimate` with repeated `--wasm` or `--wasm-dir`) | `network`, `contracts` (array), `total_contracts`, `succeeded`, `failed` |
+| `estimate --diff --json` | side-by-side diff | `identity`, `rows`; optional `abi_diff` |
+| `wasm info --json` | WASM inspection | `path`, `size`, `sha256`, `has_spec`, `sdk_version`, `has_debug_symbols`, `debug_symbol_bytes`, `estimated_size_reduction_percent`, `contract_meta`, `functions`, `spec_entries`, `section_sizes`, `sections`, `imports`, `host_imports`, `module` |
+
+The `fee` object always carries the full breakdown:
+`non_refundable_stroops`, `refundable_stroops`, `cpu_fee_stroops`,
+`storage_fee_stroops`, `bandwidth_fee_stroops`, `base_fee_stroops`,
+`total_stroops` (all integer stroops), `total_xlm` (a string, to avoid
+float precision loss) and `fee_percentages`.
+
+### Absent versus null
+
+Optional data leaves a document in exactly one of two documented ways:
+
+* **Omitted.** Fields declared with `skip_serializing_if` disappear from the
+  object when unset — e.g. `wasm_size`, `wasm_sections`, `section_sizes`,
+  `history`, `projections` on a single estimate, the `reason`/`error` and
+  resource blocks on `estimate-all` entries, and empty `abi_diff`
+  collections. Absence means "not measured / not requested", never zero.
+* **Explicit `null`.** Keys built inside `json!` documents (the `wasm info`
+  family) or fields without a skip predicate — e.g.
+  `contract_meta.name`, `module.start_function`, `max_pages` on the WASM
+  structure summary and `rows[].change_percent` in a diff — are always
+  present and carry `null` when there is no value. `change_percent` is
+  `null` when the baseline was zero and the new value is not, i.e. the
+  percentage is mathematically unbounded.
+
+Consumers should treat both forms as "no value" and must not assume that
+key presence alone distinguishes them beyond what is documented above.
+
+### Compatibility policy
+
+* **Additive, optional keys are non-breaking.** New fields may appear in any
+  JSON document in a minor or patch release. Consumers must ignore unknown
+  keys (parse tolerantly) rather than failing on unexpected members.
+* **Renaming, removing, retyping, or re-semanticizing a documented key is
+  breaking.** That includes flipping a field between "omitted" and "null",
+  changing the string set of a lowercase enum (`status`, `trend`,
+  `direction`), or folding a new fee component into `fee.total_stroops`.
+  Breaking changes land only in a major release and are recorded in
+  [Migration](../migration.md).
+* **Key order is never contractual.** Objects may be emitted in any order;
+  do not snapshot raw text as an API dependency.
+* **Fee math stays integer.** All stroop amounts are JSON integers derived
+  by integer arithmetic; XLM totals are strings. Floats appear only in
+  display-oriented fields such as `change_percent` and `percent`.
+* **The contract is executable.** Structural tests live in
+  `tests/json_schema_tests.rs` (single estimate, batch summaries, diff,
+  WASM structure summary) and in the `src/main.rs` test module
+  (`estimate-all` document and `wasm info` document). Any change that
+  fails one of these tests is, by definition, a compatibility decision —
+  update this document, the tests, and the migration notes together.
