@@ -1,4 +1,5 @@
-//! Integration tests for RPC endpoint failover (`--rpc-fallback-url`, #306).
+//! Integration tests for RPC endpoint failover (`--rpc-fallback-url`, #306)
+//! and endpoint provenance metadata (`rpc_endpoint`, `rpc_role`, #501).
 //!
 //! These drive the crate's public [`RpcClient`] and the built CLI binary
 //! against a primary endpoint that cannot be reached, proving the client
@@ -119,5 +120,164 @@ fn cli_announces_failover_on_stderr() {
     assert!(
         served.load(Ordering::SeqCst) >= 1,
         "the fallback endpoint must have been contacted"
+    );
+}
+
+// ── Endpoint provenance tests (#501) ────────────────────────────────────────
+
+/// When the primary endpoint serves the request successfully, `served_role`
+/// must return `"primary"` and `sanitized_host` must return its host:port.
+#[tokio::test]
+async fn primary_serves_request_role_is_primary() {
+    let (primary_url, _) = spawn_rpc_stub();
+    let client = RpcClient::with_fallback(
+        &primary_url,
+        None,
+        None,
+        Duration::from_secs(10),
+        0,
+        false,
+    );
+
+    let result: AppResult<Value> = client.call("getHealth", serde_json::json!({})).await;
+    assert!(result.is_ok(), "primary must serve the request: {result:?}");
+
+    assert_eq!(
+        client.served_role(),
+        "primary",
+        "role must be 'primary' when primary endpoint serves the request"
+    );
+    let host = client.sanitized_host();
+    assert!(
+        !host.is_empty(),
+        "sanitized host must not be empty for a primary request"
+    );
+    // The sanitized host must not contain the scheme or any credentials.
+    assert!(
+        !host.starts_with("http"),
+        "sanitized host must not contain the URL scheme; got: {host}"
+    );
+    assert!(
+        !host.contains('@'),
+        "sanitized host must not contain user-info (credentials); got: {host}"
+    );
+    assert!(
+        !host.contains('?'),
+        "sanitized host must not contain query parameters; got: {host}"
+    );
+}
+
+/// When the primary is unreachable and the fallback serves the request,
+/// `served_role` must return `"fallback"` and `sanitized_host` must
+/// return the fallback's host:port, not the primary's.
+#[tokio::test]
+async fn fallback_serves_request_role_is_fallback() {
+    let (fallback_url, _) = spawn_rpc_stub();
+    let client = RpcClient::with_fallback(
+        INVALID_PRIMARY,
+        Some(&fallback_url),
+        None,
+        Duration::from_secs(10),
+        0,
+        false,
+    );
+
+    let result: AppResult<Value> = client.call("getHealth", serde_json::json!({})).await;
+    assert!(
+        result.is_ok(),
+        "fallback must serve the request: {result:?}"
+    );
+
+    assert_eq!(
+        client.served_role(),
+        "fallback",
+        "role must be 'fallback' when the fallback endpoint serves the request"
+    );
+
+    // The sanitized host must identify the fallback (loopback), not the
+    // invalid primary.
+    let host = client.sanitized_host();
+    assert!(
+        host.starts_with("127.0.0.1"),
+        "sanitized host must be the fallback's loopback address; got: {host}"
+    );
+    assert!(
+        !host.contains("primary.invalid"),
+        "sanitized host must not expose the primary hostname; got: {host}"
+    );
+}
+
+/// `sanitized_host` must strip URL credentials (user:password@) so they are
+/// never rendered in human or structured reports. This is a security-critical
+/// requirement from the issue acceptance criteria.
+#[test]
+fn sanitized_host_strips_url_credentials() {
+    // Build a client whose URL embeds credentials in the userinfo component.
+    // We do not actually connect here — we are only testing the sanitization
+    // function, not the network path.
+    let client = RpcClient::with_fallback(
+        "http://user:secret@192.0.2.1:8080/rpc?apikey=tok",
+        None,
+        None,
+        Duration::from_secs(5),
+        0,
+        false,
+    );
+
+    let host = client.sanitized_host();
+
+    // Must not expose credentials or query parameters.
+    assert!(
+        !host.contains("secret"),
+        "sanitized host must not contain the password; got: {host}"
+    );
+    assert!(
+        !host.contains("user"),
+        "sanitized host must not contain the username; got: {host}"
+    );
+    assert!(
+        !host.contains("apikey"),
+        "sanitized host must not contain query parameters; got: {host}"
+    );
+    assert!(
+        !host.contains("tok"),
+        "sanitized host must not contain query parameter values; got: {host}"
+    );
+    // Must keep the useful host:port identifier.
+    assert!(
+        host.contains("192.0.2.1"),
+        "sanitized host must preserve the IP address; got: {host}"
+    );
+}
+
+/// Authorization headers are never exposed through `sanitized_host` because
+/// it only returns the URL's host component — header contents are a separate
+/// concern handled by `redact_sensitive`. This test documents that the two
+/// mechanisms are complementary: URL credentials are stripped by
+/// `sanitized_host`, and header credentials are stripped by `redact_sensitive`.
+#[test]
+fn sanitized_host_does_not_expose_authorization_headers() {
+    // A client with a bearer token in the Authorization header.
+    let client = RpcClient::with_headers(
+        "http://rpc.example.com:8080",
+        &["Authorization=Bearer super-secret-token".to_string()],
+        false,
+    )
+    .expect("valid headers");
+
+    let host = client.sanitized_host();
+
+    // The host must only contain the domain, not anything from headers.
+    assert!(
+        !host.contains("super-secret-token"),
+        "sanitized host must not expose Authorization header values; got: {host}"
+    );
+    assert!(
+        !host.contains("Bearer"),
+        "sanitized host must not expose Authorization header values; got: {host}"
+    );
+    assert_eq!(
+        host, "rpc.example.com:8080",
+        "sanitized host must be exactly the host:port; got: {host}"
     );
 }
