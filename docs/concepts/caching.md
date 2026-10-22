@@ -84,6 +84,23 @@ imports every file into `cache.db` (existing rows win), deletes the imported
 files, and removes the directory. Unparseable files are renamed to
 `*.json.rejected` instead of being deleted so nothing is lost.
 
+## Estimate history
+
+Every save also appends to an `estimate_history` log — the `estimates` table
+upserts on its primary key, so it cannot answer "what did this function cost
+last build?", while the log keeps one row per run. `estimate --history` reads
+back the newest five runs of the same `(wasm_hash, function)` and renders a
+trend table against the current run.
+
+Each row records the run's ledger I/O footprint (read/write entries and
+bytes) alongside its fee, so the trend table also states *why* a fee moved: a
+second table shows the per-resource deltas, and `--json` output carries the
+same numbers as a `footprint_delta` object on each history entry. A row
+written before footprints were recorded (or by a command that does not
+capture one, such as `estimate-all`) has no footprint; that is reported as
+`unavailable` — and the JSON key is omitted — never as zero usage, because
+"unknown" and "no ledger access" are different answers.
+
 ## Size limits and LRU eviction
 
 Cache growth is bounded by two global quotas — `--max-cache-size-mb`

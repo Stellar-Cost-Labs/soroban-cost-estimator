@@ -44,6 +44,9 @@ pub enum OutputFormat {
     Json,
     Csv,
     Markdown,
+    /// One tab-delimited result line per estimate, for shell pipelines and
+    /// batch logs (see [`crate::report::formatter::SummaryFormatter`]).
+    Summary,
 }
 
 impl OutputFormat {
@@ -54,6 +57,7 @@ impl OutputFormat {
             Self::Json => "json",
             Self::Csv => "csv",
             Self::Markdown => "markdown",
+            Self::Summary => "summary",
         }
     }
 }
@@ -95,7 +99,12 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<String>,
 
-    /// Select output format for commands that produce structured output (table, json, csv, markdown).
+    /// Select output format for commands that produce structured output
+    /// (table, json, csv, markdown, summary).
+    ///
+    /// `summary` prints exactly one tab-delimited line per successful
+    /// estimate — see the `summary` section of `docs/commands/estimate.md`
+    /// for the field order and escaping rules.
     #[arg(long, global = true, value_enum)]
     pub format: Option<OutputFormat>,
 

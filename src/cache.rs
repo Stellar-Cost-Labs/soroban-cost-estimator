@@ -176,22 +176,11 @@ where
     Ok(value.unwrap_or_default())
 }
 
-/// Ledger I/O footprint of a simulated invocation.
-///
-/// Recorded alongside an estimate so a later run can diff I/O against it.
-/// Only runs that captured the footprint store this (older entries leave it
-/// absent), which is why it lives behind [`CachedEstimate::io`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct IoFootprint {
-    /// Ledger entries read.
-    pub read_entries: u32,
-    /// Ledger entries written.
-    pub write_entries: u32,
-    /// Bytes read from the ledger.
-    pub read_bytes: u32,
-    /// Bytes written to the ledger.
-    pub write_bytes: u32,
-}
+// The ledger I/O footprint type lives with the report it describes (it is
+// what a cost report and an estimate-history entry record); the cache only
+// persists it. Re-exported so `cache::IoFootprint` keeps working as the name
+// existing callers use.
+pub use crate::report::cost_report::IoFootprint;
 
 /// A cached estimate result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -428,6 +417,10 @@ impl From<QueryFilter> for CacheFilter {
 /// writes are serialized at the application level.
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
+/// Serialize cache initialization so concurrent first opens cannot race while
+/// creating or migrating the SQLite schema.
+static OPEN_LOCK: Mutex<()> = Mutex::new(());
+
 /// Default on-disk cache byte quota (50 MB).
 const DEFAULT_MAX_CACHE_BYTES: u64 = 50 * 1024 * 1024;
 
@@ -623,11 +616,17 @@ pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
             total_stroops    INTEGER NOT NULL,
             cpu_instructions INTEGER NOT NULL,
             memory_bytes     INTEGER NOT NULL,
-            timestamp        TEXT NOT NULL
+            timestamp        TEXT NOT NULL,
+            io_json          TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_estimate_history_lookup
             ON estimate_history (wasm_hash, function, timestamp DESC);",
     )?;
+    // The history log records the ledger I/O footprint of each run too, so a
+    // later trend table can explain a fee change by the I/O it came from
+    // (#530). Nullable and additive: rows written before this column existed
+    // keep a NULL footprint, which reads back as "unavailable", never as zero.
+    ensure_table_column(conn, "estimate_history", "io_json", "TEXT")?;
     // Migrate a pre-v3 table (created before LRU access tracking) in place.
     ensure_column(conn, "last_accessed", "TEXT NOT NULL DEFAULT ''")?;
     // The ledger I/O footprint is additive and nullable, so adding it in
@@ -654,9 +653,9 @@ pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
-/// Whether `estimates` already has a column named `name`.
-fn column_exists(conn: &Connection, name: &str) -> AppResult<bool> {
-    let mut stmt = conn.prepare("PRAGMA table_info(estimates)")?;
+/// Whether `table` already has a column named `name`.
+fn column_exists(conn: &Connection, table: &str, name: &str) -> AppResult<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let column: String = row.get(1)?;
@@ -670,13 +669,26 @@ fn column_exists(conn: &Connection, name: &str) -> AppResult<bool> {
 /// Add `name` to the `estimates` table when a pre-migration database lacks
 /// it. A no-op on up-to-date databases.
 fn ensure_column(conn: &Connection, name: &str, definition: &str) -> AppResult<()> {
-    if column_exists(conn, name)? {
+    ensure_table_column(conn, "estimates", name, definition)
+}
+
+/// Add `name` to `table` when a pre-migration database lacks it.
+///
+/// A no-op on up-to-date databases. `table` and `name` are compile-time
+/// constants at every call site, never user input.
+fn ensure_table_column(
+    conn: &Connection,
+    table: &str,
+    name: &str,
+    definition: &str,
+) -> AppResult<()> {
+    if column_exists(conn, table, name)? {
         return Ok(());
     }
     conn.execute_batch(&format!(
-        "ALTER TABLE estimates ADD COLUMN {name} {definition};"
+        "ALTER TABLE {table} ADD COLUMN {name} {definition};"
     ))?;
-    debug!(column = name, "added missing cache column");
+    debug!(table, column = name, "added missing cache column");
     Ok(())
 }
 
@@ -718,6 +730,9 @@ fn enable_wal_if_possible(conn: &Connection) {
 /// permissions. Corruption errors are converted to [`AppError::CacheCorrupt`] with guidance
 /// on using the non-destructive recovery command.
 fn open_db() -> AppResult<Connection> {
+    let _open_guard = OPEN_LOCK
+        .lock()
+        .map_err(|e| AppError::General(format!("cache open lock poisoned: {e}")))?;
     let path = db_path()?;
     let newly_created = create_user_only_db_file(&path)?;
 
@@ -1253,12 +1268,13 @@ pub fn save_estimate_with_limits_and_metadata(
     )?;
 
     // Append to the unbounded history log so `estimate --history` can show
-    // how this function's cost evolved across runs (#321). Unlike the
-    // `estimates` upsert above, every call adds a row here.
+    // how this function's cost evolved across runs (#321), including the
+    // ledger I/O each run consumed (#530). Unlike the `estimates` upsert
+    // above, every call adds a row here.
     tx.execute(
         "INSERT INTO estimate_history \
-         (wasm_hash, function, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         (wasm_hash, function, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, io_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         rusqlite::params![
             wasm_hash,
             function,
@@ -1268,6 +1284,7 @@ pub fn save_estimate_with_limits_and_metadata(
             cpu_instructions as i64,
             memory_bytes as i64,
             now,
+            io_json,
         ],
     )?;
 
@@ -1304,6 +1321,14 @@ pub struct EstimateHistoryEntry {
     pub memory_bytes: u64,
     /// ISO-8601 timestamp of when the estimate was made.
     pub timestamp: String,
+    /// Ledger I/O footprint recorded with the run, if it was captured.
+    ///
+    /// `None` for entries written before footprints were recorded (or by a
+    /// call that used [`save_estimate`], which has no footprint to store). A
+    /// missing footprint means "unknown", never "no ledger access", so
+    /// consumers must not render it as zero (#530).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io: Option<IoFootprint>,
 }
 
 /// Load up to `limit` previous estimates for the same `(wasm_hash,
@@ -1323,7 +1348,7 @@ pub fn load_estimate_history(
     let conn = open_db()?;
     let mut stmt = conn.prepare(
         "SELECT wasm_hash, function, network, ledger, total_stroops, \
-         cpu_instructions, memory_bytes, timestamp \
+         cpu_instructions, memory_bytes, timestamp, io_json \
          FROM estimate_history WHERE wasm_hash = ?1 AND function = ?2 \
          ORDER BY timestamp DESC, id DESC LIMIT ?3",
     )?;
@@ -1340,6 +1365,12 @@ pub fn load_estimate_history(
                 cpu_instructions: row.get::<_, i64>(5)? as u64,
                 memory_bytes: row.get::<_, i64>(6)? as u64,
                 timestamp: row.get(7)?,
+                // An undecodable footprint is treated as absent, matching
+                // `estimate_from_row`: better to omit I/O from a comparison
+                // than to fail the whole read.
+                io: row
+                    .get::<_, Option<String>>(8)?
+                    .and_then(|raw| serde_json::from_str(&raw).ok()),
             })
         },
     )?;
