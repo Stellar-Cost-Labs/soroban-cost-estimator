@@ -616,8 +616,8 @@ fn test_json_flag_accepted() {
 #[test]
 fn test_format_flag_accepted() {
     // Verify --format is a recognized argument for estimate, including the
-    // new markdown variant (#80).
-    for fmt in ["table", "json", "csv", "markdown"] {
+    // markdown variant (#80) and the summary variant (#533).
+    for fmt in ["table", "json", "csv", "markdown", "summary"] {
         let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--format", fmt]);
         // Should fail because the file doesn't exist, NOT because --format is
         // unknown or the value is invalid.
