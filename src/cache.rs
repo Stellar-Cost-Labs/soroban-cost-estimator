@@ -364,6 +364,10 @@ impl From<QueryFilter> for CacheFilter {
 /// writes are serialized at the application level.
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
+/// Serialize cache initialization so concurrent first opens cannot race while
+/// creating or migrating the SQLite schema.
+static OPEN_LOCK: Mutex<()> = Mutex::new(());
+
 /// Default on-disk cache byte quota (50 MB).
 const DEFAULT_MAX_CACHE_BYTES: u64 = 50 * 1024 * 1024;
 
@@ -600,6 +604,9 @@ fn enable_wal_if_possible(conn: &Connection) {
 /// Open a connection to the cache database, ensure the schema exists, and
 /// import any pre-SQLite JSON cache files left behind by older releases.
 fn open_db() -> AppResult<Connection> {
+    let _open_guard = OPEN_LOCK
+        .lock()
+        .map_err(|e| AppError::General(format!("cache open lock poisoned: {e}")))?;
     let path = db_path()?;
     let conn = Connection::open(&path)?;
     ensure_cache_schema(&conn)?;
