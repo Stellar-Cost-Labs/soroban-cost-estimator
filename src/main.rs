@@ -4223,6 +4223,20 @@ fn upgrade_detected(diff: &config_snapshot::diff::ConfigDiff) -> bool {
     diff.has_pricing_changes
 }
 
+/// Returns whether a diff contains a change that should be reported for the
+/// requested pricing threshold. Non-pricing changes are always reportable.
+fn has_reportable_config_changes(
+    diff: &config_snapshot::diff::ConfigDiff,
+    threshold_percent: Option<f64>,
+) -> bool {
+    let has_non_pricing_changes = diff.changes.iter().any(|change| !change.is_pricing_change);
+    let has_pricing_changes = match threshold_percent {
+        Some(threshold) => diff.has_significant_pricing_changes(threshold),
+        None => diff.has_pricing_changes(),
+    };
+    has_non_pricing_changes || has_pricing_changes
+}
+
 /// Cached estimates recorded before `ledger`, shaped for the
 /// `config diff --json` payload.
 ///
@@ -4326,11 +4340,15 @@ async fn cmd_config_diff(
         debug!(
             change_count = diff.changes.len(),
             has_pricing = diff.has_pricing_changes,
+            significant_pricing = ?threshold_percent
+                .map(|threshold| diff.has_significant_pricing_changes(threshold)),
             "diff computed"
         );
         if json_flag {
             let json_output = serde_json::json!({
                 "diff": diff,
+                "significant_pricing_changes": threshold_percent
+                    .map(|threshold| diff.has_significant_pricing_changes(threshold)),
                 "stale_estimates": stale_estimates_for(network, new_snapshot.ledger),
             });
             println!("{}", serde_json::to_string_pretty(&json_output)?);
@@ -4428,12 +4446,16 @@ fn cmd_config_diff_against_previous(
     debug!(
         change_count = diff.changes.len(),
         has_pricing = diff.has_pricing_changes,
+        significant_pricing = ?threshold_percent
+            .map(|threshold| diff.has_significant_pricing_changes(threshold)),
         "diff computed"
     );
 
     if json_flag {
         let json_output = serde_json::json!({
             "diff": diff,
+            "significant_pricing_changes": threshold_percent
+                .map(|threshold| diff.has_significant_pricing_changes(threshold)),
             "stale_estimates": stale_estimates_for(network, new_ledger),
         });
         println!("{}", serde_json::to_string_pretty(&json_output)?);
@@ -4796,7 +4818,9 @@ async fn watch_poll_once(
             if !*first {
                 if let Ok(old_snapshot) = config_snapshot::store::load_latest_snapshot(network) {
                     let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &snapshot);
-                    if !diff.changes.is_empty() {
+                    let reportable_changes =
+                        has_reportable_config_changes(&diff, threshold_percent);
+                    if reportable_changes {
                         debug!(change_count = diff.changes.len(), "config changes detected");
                         if !quiet {
                             println!(
@@ -4809,9 +4833,9 @@ async fn watch_poll_once(
                                 )
                             );
                         }
-                    }
 
-                    print_stale_estimates(network, snapshot.ledger, quiet);
+                        print_stale_estimates(network, snapshot.ledger, quiet);
+                    }
                 }
             }
 

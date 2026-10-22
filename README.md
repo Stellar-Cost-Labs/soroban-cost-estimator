@@ -351,6 +351,9 @@ soroban-cost-estimator config diff --network testnet --summary
   significant. For example, `--threshold-percent 10` flags changes of 10% or
   more. The threshold accepts finite, non-negative values; values above 100
   are useful when only unusually large repricing events should be reported.
+  In `watch`, pricing changes below the threshold are not printed, while
+  non-pricing changes continue to be reported. JSON config diffs include a
+  `significant_pricing_changes` field when a threshold is supplied.
 
 - Exits **0** if no pricing changes, **1** with a detailed field-by-field
   diff if pricing changed (default behavior)
