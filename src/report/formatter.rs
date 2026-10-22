@@ -257,6 +257,22 @@ impl TableFormatter {
 
         output
     }
+
+    /// Format a report with an archival restoration fee section (#524) without
+    /// altering or double-counting [`FeeBreakdown::total_stroops`].
+    #[must_use]
+    pub fn format_with_restore_fee(
+        &self,
+        report: &CostReport,
+        restore_fee: &crate::report::cost_report::ArchivalRestoreFee,
+        options: ReportOptions,
+    ) -> String {
+        let mut output = self.format_with(report, options);
+        output.push_str(&crate::report::cost_report::format_restore_fee_section(
+            restore_fee,
+        ));
+        output
+    }
 }
 
 impl ReportFormatter for TableFormatter {
@@ -321,6 +337,29 @@ impl ReportFormatter for JsonFormatter {
 
     fn name(&self) -> &'static str {
         "json"
+    }
+}
+
+impl JsonFormatter {
+    /// Format a report as JSON including the distinct `archival_restore_fee`
+    /// object (#524) without double-counting it in `fee.total_stroops`.
+    #[must_use]
+    pub fn format_with_restore_fee(
+        &self,
+        report: &CostReport,
+        restore_fee: &crate::report::cost_report::ArchivalRestoreFee,
+        options: ReportOptions,
+    ) -> String {
+        let base = self.format_with(report, options);
+        let mut value: serde_json::Value =
+            serde_json::from_str(&base).unwrap_or(serde_json::Value::Null);
+        if let serde_json::Value::Object(ref mut map) = value {
+            map.insert(
+                "archival_restore_fee".to_string(),
+                serde_json::to_value(restore_fee).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        serde_json::to_string_pretty(&value).unwrap_or(base)
     }
 }
 
