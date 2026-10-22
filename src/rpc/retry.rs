@@ -34,7 +34,16 @@ const TRANSIENT_STATUSES: [u16; 5] = [429, 500, 502, 503, 504];
 ///
 /// Retry attempts are logged to stderr when debug logging is enabled (i.e.
 /// when the CLI is run with `--verbose`).
-pub async fn with_retry<F, Fut, T>(
+pub async fn with_retry<F, Fut, T>(max_retries: usize, operation: F) -> AppResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = AppResult<T>>,
+{
+    with_retry_counted(max_retries, operation, None).await
+}
+
+/// Executes [`with_retry`] while recording the total number of attempts.
+pub async fn with_retry_counted<F, Fut, T>(
     max_retries: usize,
     mut operation: F,
     attempt_counter: Option<&std::sync::atomic::AtomicU8>,
@@ -52,14 +61,20 @@ where
         match operation().await {
             Ok(value) => {
                 if let Some(counter) = attempt_counter {
-                    *counter = attempts + 1;
+                    counter.store(
+                        (attempts + 1).min(u8::MAX as usize) as u8,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
                 return Ok(value);
             }
             Err(error) => {
                 if attempts >= max_retries || !is_retryable(&error) {
                     if let Some(counter) = attempt_counter {
-                        *counter = attempts + 1;
+                        counter.store(
+                            (attempts + 1).min(u8::MAX as usize) as u8,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                     }
                     return Err(error);
                 }

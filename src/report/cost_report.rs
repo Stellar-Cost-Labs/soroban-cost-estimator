@@ -2206,7 +2206,7 @@ pub struct PricingSensitivityReport {
 pub fn pricing_sensitivity_report(
     footprint_fee_stroops: i64,
     snapshots: &[crate::config_snapshot::model::ConfigSnapshot],
-    precision: u32,
+    _precision: u32,
 ) -> PricingSensitivityReport {
     let mut snapshot_fees = Vec::with_capacity(snapshots.len());
     let mut has_missing_rates = false;
@@ -2268,7 +2268,11 @@ pub fn format_pricing_sensitivity_table(report: &PricingSensitivityReport) -> St
 /// Formats a pricing sensitivity report as JSON.
 #[must_use]
 pub fn format_pricing_sensitivity_json(report: &PricingSensitivityReport) -> String {
-    let json: Vec<(&str, i64)> = report.snapshot_fees.iter().map(|(s, f)| (*s, *f)).collect();
+    let json: Vec<(&str, i64)> = report
+        .snapshot_fees
+        .iter()
+        .map(|(snapshot, fee)| (snapshot.as_str(), *fee))
+        .collect();
     serde_json::to_string(&json).unwrap_or_else(|_| "[]".to_string())
 }
 
