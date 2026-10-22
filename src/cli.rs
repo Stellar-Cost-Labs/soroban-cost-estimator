@@ -44,6 +44,9 @@ pub enum OutputFormat {
     Json,
     Csv,
     Markdown,
+    /// One tab-delimited result line per estimate, for shell pipelines and
+    /// batch logs (see [`crate::report::formatter::SummaryFormatter`]).
+    Summary,
 }
 
 impl OutputFormat {
@@ -54,6 +57,7 @@ impl OutputFormat {
             Self::Json => "json",
             Self::Csv => "csv",
             Self::Markdown => "markdown",
+            Self::Summary => "summary",
         }
     }
 }
@@ -95,7 +99,12 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<String>,
 
-    /// Select output format for commands that produce structured output (table, json, csv, markdown).
+    /// Select output format for commands that produce structured output
+    /// (table, json, csv, markdown, summary).
+    ///
+    /// `summary` prints exactly one tab-delimited line per successful
+    /// estimate — see the `summary` section of `docs/commands/estimate.md`
+    /// for the field order and escaping rules.
     #[arg(long, global = true, value_enum)]
     pub format: Option<OutputFormat>,
 
@@ -236,6 +245,11 @@ pub enum Command {
         /// simulation (e.g. after upgrading the tool or a network upgrade).
         #[arg(long)]
         clear_cache: bool,
+
+        /// Automatically quarantine a corrupt cache database to a timestamped
+        /// backup and initialize a clean cache if corruption is detected.
+        #[arg(long)]
+        recover_cache: bool,
 
         /// Bypass the estimate cache entirely: never read a cached estimate
         /// (including under `--cache-ttl`) and never write the fresh result
@@ -566,6 +580,17 @@ pub enum CacheAction {
     /// Show cache health overview: total entries, disk usage, and age.
     Stats {
         /// Output as JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Recover safely from a corrupt SQLite cache database by quarantining it to a timestamped backup and initializing a new cache.
+    Recover {
+        /// Force recovery even if corruption is not automatically detected.
+        #[arg(long)]
+        force: bool,
+
+        /// Output the recovery report as JSON.
         #[arg(long)]
         json: bool,
     },
