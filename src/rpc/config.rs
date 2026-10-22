@@ -62,7 +62,7 @@ impl ConfigSettingId {
 
         let xdr_bytes = key
             .to_xdr(stellar_xdr::Limits::none())
-            .map_err(|e| crate::error::AppError::XdrEncode(format!("LedgerKey XDR: {e}")))?;
+            .map_err(|e| crate::error::AppError::XdrEncode(format!("ledger key: {e}")))?;
 
         Ok(base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
@@ -214,8 +214,50 @@ pub async fn fetch_all_config_settings(
     Ok(results)
 }
 
+/// Response from `getLatestLedger`.
+///
+/// The Soroban RPC returns JSON fields in camelCase.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetLatestLedgerResponse {
+    pub sequence: u32,
+    pub protocol_version: u32,
+}
+
+/// Fetches the protocol version the network is currently running.
+///
+/// # Network calls
+/// Makes 1 `getLatestLedger` RPC call.
+pub async fn fetch_protocol_version(client: &RpcClient) -> AppResult<u32> {
+    let response: GetLatestLedgerResponse = client
+        .call("getLatestLedger", serde_json::json!({}))
+        .await?;
+    debug!(
+        protocol_version = response.protocol_version,
+        sequence = response.sequence,
+        "fetched latest ledger"
+    );
+    Ok(response.protocol_version)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::GetLatestLedgerResponse;
+
+    #[test]
+    fn test_get_latest_ledger_response_parses_protocol_version() {
+        // Shape returned by Stellar RPC's `getLatestLedger`.
+        let body = r#"{"id":"c73c5eac58a441d4eb733c35253ae85f783e018f7be5ef974258fed067aabb36","protocolVersion":22,"sequence":2539605}"#;
+        let resp: GetLatestLedgerResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(resp.protocol_version, 22);
+        assert_eq!(resp.sequence, 2_539_605);
+    }
+
+    #[test]
+    fn test_get_latest_ledger_response_requires_protocol_version() {
+        assert!(serde_json::from_str::<GetLatestLedgerResponse>(r#"{"sequence":1}"#).is_err());
+    }
+
     use super::*;
 
     /// Verify that the XDR key encoding produces the expected base64 output
