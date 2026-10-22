@@ -1130,7 +1130,10 @@ mod tests {
     use crate::error::{AppError, AppResult};
     use crate::rpc::retry::DEFAULT_MAX_RETRIES;
 
-    use super::{RpcClient, resolve_endpoint, resolve_ws_endpoint, set_endpoint_overrides};
+    use super::{
+        RpcClient, resolve_endpoint, resolve_ws_endpoint, set_endpoint_overrides, to_http_url,
+        to_websocket_url,
+    };
 
     /// Spawns a tiny HTTP server that answers JSON-RPC
     /// `simulateTransaction`-style calls with `{"result":{"pong":true}}`,
