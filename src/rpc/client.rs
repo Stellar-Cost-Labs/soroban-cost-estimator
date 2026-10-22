@@ -248,7 +248,7 @@ pub struct RpcClient {
     last_attempt_count: AtomicU8,
     /// Whether a fallback RPC endpoint was used during the last call.
     fallback_used: AtomicBool,
-}}
+}
 
 impl RpcClient {
     /// Create a new RPC client pointing at the given URL, without rate

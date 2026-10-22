@@ -34,7 +34,11 @@ const TRANSIENT_STATUSES: [u16; 5] = [429, 500, 502, 503, 504];
 ///
 /// Retry attempts are logged to stderr when debug logging is enabled (i.e.
 /// when the CLI is run with `--verbose`).
-pub async fn with_retry<F, Fut, T>(max_retries: usize, mut operation: F, attempt_counter: Option<&std::sync::atomic::AtomicU8>) -> AppResult<T>
+pub async fn with_retry<F, Fut, T>(
+    max_retries: usize,
+    mut operation: F,
+    attempt_counter: Option<&std::sync::atomic::AtomicU8>,
+) -> AppResult<T>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = AppResult<T>>,

@@ -2228,7 +2228,9 @@ pub fn pricing_sensitivity_report(
         // Integer-only fee math: total_fee = footprint_fee * rate
         // This isolates the pricing component from resource usage changes.
         let total_fee_stroops = if compute_rate > 0 {
-            footprint_fee_stroops.saturating_mul(compute_rate).saturating_div(1_000_000_000)
+            footprint_fee_stroops
+                .saturating_mul(compute_rate)
+                .saturating_div(1_000_000_000)
         } else {
             // If rate is 0 or missing, return the footprint fee as-is but
             // mark that rates are missing so callers know this is an
@@ -2236,10 +2238,7 @@ pub fn pricing_sensitivity_report(
             footprint_fee_stroops
         };
 
-        let snapshot_name = format!(
-            "{}-{}",
-            snapshot.network, snapshot.timestamp
-        );
+        let snapshot_name = format!("{}-{}", snapshot.network, snapshot.timestamp);
         snapshot_fees.push((snapshot_name, total_fee_stroops));
     }
 
@@ -2251,30 +2250,25 @@ pub fn pricing_sensitivity_report(
 
 /// Formats a pricing sensitivity report into a human-readable table.
 #[must_use]
-pub fn format_pricing_sensitivity_table(
-    report: &PricingSensitivityReport,
-) -> String {
+pub fn format_pricing_sensitivity_table(report: &PricingSensitivityReport) -> String {
     let mut output = String::from("\nPricing Sensitivity Report\n\n");
-    output.push_str(&format!(
-        "{:<30} {}\n", "Snapshot", "Total Fee (stroops)"
-    ));
+    output.push_str(&format!("{:<30} {}\n", "Snapshot", "Total Fee (stroops)"));
     output.push_str(&format!("{:<30} {}\n", "---", "-------------------"));
     for (snapshot, fee) in &report.snapshot_fees {
         output.push_str(&format!("{:<30} {}\n", snapshot, fee));
     }
     if report.has_missing_rates {
-        output.push_str("\n⚠ Some snapshots are missing contract compute rates; fees may be underestimates.\n");
+        output.push_str(
+            "\n⚠ Some snapshots are missing contract compute rates; fees may be underestimates.\n",
+        );
     }
     output
 }
 
 /// Formats a pricing sensitivity report as JSON.
 #[must_use]
-pub fn format_pricing_sensitivity_json(
-    report: &PricingSensitivityReport,
-) -> String {
-    let json: Vec<(&str, i64)> =
-        report.snapshot_fees.iter().map(|(s, f)| (*s, *f)).collect();
+pub fn format_pricing_sensitivity_json(report: &PricingSensitivityReport) -> String {
+    let json: Vec<(&str, i64)> = report.snapshot_fees.iter().map(|(s, f)| (*s, *f)).collect();
     serde_json::to_string(&json).unwrap_or_else(|_| "[]".to_string())
 }
 
