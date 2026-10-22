@@ -28,6 +28,11 @@ Options:
 - Without `--id`, simulations run against a zeroed contract ID and will
   almost certainly fail the "no cost data / no latest ledger" guard; the tool
   prints a note telling you to pass `--id` for real numbers.
+- Prints a **fee distribution box** after the per-function results summarising
+  the cost profile of the contract: min, max, mean, median, and standard
+  deviation of the fees (in stroops) and min, max, and mean CPU instruction
+  counts across every successfully estimated function. The same statistics are
+  emitted as the `fee_distribution` object in `--json` mode.
 
 ## Example
 
@@ -49,6 +54,27 @@ Enumerated 1 function(s) in WASM:
 Contract spec: present (typed params decoded from contractspecv0)
 [1/1] increment
 ── Estimating 'increment' ── Skipped: needs --fn/--arg (1 param(s))
+
+No functions estimated; no fee distribution to report.
+```
+
+When at least one function is estimated, the distribution box shows the
+contract's cost profile:
+
+```text
+Fee distribution across 2 function(s):
+
+  Fees (stroops):
+    min     : 5,000
+    max     : 500,000
+    mean    : 252,500 (0.0252500)
+    median  : 252,500
+    std dev : 247,500
+
+  CPU instructions:
+    min     : 100,000
+    max     : 5,000,000
+    mean    : 2,550,000
 ```
 
 To estimate that function, use the single-invocation
@@ -63,79 +89,28 @@ soroban-cost-estimator estimate-all \
   --network testnet --json
 ```
 
-`--json` emits a single JSON object with the contract identity, the
-per-function results, and an aggregate summary. The `functions` array is
-**deterministically sorted by `function_name`**, and the command exits
-**non-zero if any function failed** — after printing the full JSON, so
-automation always receives valid output on stdout.
-
-### Schema
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `contract_wasm_hash` | string | SHA-256 of the contract WASM bytes (hex) |
-| `network` | string | Network the simulations ran against |
-| `functions` | array | Per-function results, sorted by `function_name` |
-| `total_summary` | object | Aggregate counts and totals (see below) |
-
-Each entry in `functions`:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `function_name` | string | Exported function name |
-| `status` | `"success"` \| `"failed"` | Outcome of the estimate |
-| `resources` | object \| null | CPU, memory, and read/write bytes — `null` when failed |
-| `fee_breakdown` | object \| null | Same shape as [`estimate --json`](estimate.md)'s `fee` — `null` when failed |
-| `error_message` | string | Present **only** when `status` is `"failed"` |
-
-`resources` on success:
+Skipped and successful functions are reported as JSON records under the
+`functions` key, alongside the aggregate `fee_distribution` object:
 
 ```json
 {
-  "cpu_instructions": 524389,
-  "memory_bytes": 0,
-  "read_bytes": 0,
-  "write_bytes": 136
-}
-```
-
-`total_summary`:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `total_functions` | number | Functions considered |
-| `successful` | number | Functions that estimated successfully |
-| `failed` | number | Functions that failed (including those needing arguments) |
-| `total_cpu_instructions` | number | Sum of CPU instructions across successful functions |
-| `total_memory_bytes` | number | Sum of memory bytes across successful functions |
-| `total_fee_stroops` | number | Sum of total fees across successful functions (stroops) |
-
-### Example output
-
-The fixture contract exports one function, `increment(step: i64)`, which
-needs an argument — so it is reported as `failed` with an explanatory
-`error_message` (use [`estimate`](estimate.md) with `--fn`/`--arg` for it):
-
-```json
-{
-  "contract_wasm_hash": "ea14bca998e98f0ddb338e8e5cef6e19f07378a3b71e8b4f8868cedc857e4ecd",
-  "network": "testnet",
   "functions": [
     {
-      "function_name": "increment",
-      "status": "failed",
-      "resources": null,
-      "fee_breakdown": null,
-      "error_message": "needs --fn/--arg (1 param(s))"
+      "function": "increment",
+      "status": "skipped",
+      "reason": "needs --fn/--arg (1 param(s))"
     }
   ],
-  "total_summary": {
-    "total_functions": 1,
-    "successful": 0,
-    "failed": 1,
-    "total_cpu_instructions": 0,
-    "total_memory_bytes": 0,
-    "total_fee_stroops": 0
+  "fee_distribution": {
+    "function_count": 0,
+    "min_fee_stroops": 0,
+    "max_fee_stroops": 0,
+    "mean_fee_stroops": 0,
+    "median_fee_stroops": 0,
+    "std_dev_fee_stroops": 0,
+    "min_cpu_instructions": 0,
+    "max_cpu_instructions": 0,
+    "mean_cpu_instructions": 0
   }
 }
 ```

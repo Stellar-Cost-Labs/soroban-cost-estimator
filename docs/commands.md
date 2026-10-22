@@ -1,0 +1,1114 @@
+# Command Reference
+
+Every `soroban-cost-estimator` command is documented below with its full flag
+table, behavioral notes, and runnable examples. Commands are grouped by
+functionality: **estimation**, **network config management**, and **cache
+management**.
+
+## Table of Contents
+
+- [Estimation](#estimation)
+  - [`estimate`](#estimate) — simulate a single invocation
+  - [`estimate-all`](#estimate-all) — enumerate and estimate every function
+- [Network Config](#network-config)
+  - [`config snapshot`](#config-snapshot) — fetch, save, and validate config settings
+  - [`config diff`](#config-diff) — compare config against a snapshot
+  - [`config history`](#config-history) — chronological change log
+  - [`config last-changed`](#config-last-changed) — last-change timestamps
+- [Cache Management](#cache-management)
+  - [`cache stats`](#cache-stats) — cache health overview
+  - [`cache verify`](#cache-verify) — check cache integrity
+  - [`cache stats`](#cache-stats) — show cache size and quotas
+  - [`cache prune`](#cache-prune) — evict least-recently-accessed entries
+  - [`cache warm`](#cache-warm) — pre-populate cache
+  - [`cache clear`](#cache-clear) — wipe cached estimates for a network
+  - [`cache list`](#cache-list) — inspect cached estimates with filters
+  - [`cache delete`](#cache-delete) — delete cached estimates by filter
+- [WASM Inspection](#wasm-inspection)
+  - [`wasm info`](#wasm-info) — offline contract metadata report
+- [Monitoring](#monitoring)
+  - [`watch`](#watch) — poll and diff on interval
+
+---
+
+## Estimation
+
+> **Batch mode.** Repeating `--wasm` or passing `--wasm-dir <dir>` to `estimate`
+> or `estimate-all` evaluates every resolved contract in one run and prints an
+> aggregated multi-contract summary (function count, upload cost, and min/max
+> invocation fees per contract) instead of per-invocation output. `--json`
+> emits a structured batch report, and a contract that fails is reported in the
+> summary without aborting the rest of the run. In batch mode the `\*` above
+> marks the two WASM sources: supply at least one.
+
+### `estimate`
+
+Simulate a single contract invocation and print the cost report.
+
+**Usage**
+
+```
+soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
+```
+
+**Flags**
+
+| Flag | Short | Required | Default | Description |
+|------|-------|----------|---------|-------------|
+| `--wasm <PATH>` | `-w` | ✅* | — | Path to a compiled contract `.wasm` file (repeatable) |
+| `--wasm-dir <DIR>` | | ✅* | — | Directory of `.wasm` files to evaluate as a batch (non-recursive) |
+| `--network <NETWORK>` | | | `testnet` | Network to simulate against (`testnet`, `mainnet`, `futurenet`) |
+| `--rpc-url <RPC_URL>` | | | — | Explicit RPC URL (overrides network-based resolution) |
+| `--fn <FN>` | | | — | Contract function name to invoke |
+| `--id <ID>` | | | — | Deployed contract ID (64 hex chars). Required when `--fn` is used |
+| `--arg <KEY=VAL>` | | | — | Function arguments as `key=value` pairs (value is type-inferred; repeatable) |
+| `--interactive` | `-i` | | `false` | Prompt for the function and its arguments using the contract spec (explicit `--fn`/`--arg`/`--id` take precedence) |
+| `--cache-ttl <DURATION>` | | | — | Skip re-simulation when a cached estimate is still fresh (e.g. `30m`, `1h`, `7d`) |
+| `--compare` | | | `false` | Show the cost delta against the previous cached estimate for the same function and arguments |
+| `--clear-cache` | | | `false` | Wipe every cached estimate for `--network` before running the simulation |
+| `--diff` | | | `false` | Compare two WASM builds side by side. Requires `--wasm-new` |
+| `--wasm-new <PATH>` | | | — | The "new" WASM build to compare against when `--diff` is set |
+| `--json` | | | `false` | Output as JSON instead of a human-readable table |
+| `--format <FORMAT>` | | | `table` | Output format: `table`, `json`, `csv`, `markdown`, or `summary` (overrides `--json`) |
+| `--precision <N>` | | | `7` | Decimal places for XLM fee values (`0..=18`) |
+| `--help` | `-h` | | | Print help |
+
+**Behavior**
+
+- **Without `--fn`** — simulates *uploading* the contract WASM to the network.
+  The report's function is `(wasm upload)`.
+- **With `--fn`** — simulates invoking a specific contract function against a
+  **deployed** contract. `--id <64-hex>` is required because
+  `simulateTransaction` loads the contract instance from the ledger; it cannot
+  simulate against a zeroed ID.
+- **`--arg` values are type-inferred**: `true`/`false` → bool, integers →
+  `i64`/`u64`, everything else → string. This is enough for cost estimation.
+- **`--interactive` / `-i`** prompts for the function (when `--fn` is absent)
+  and each parameter with its spec name and type (`Enter step (i64): `),
+  validating every answer before proceeding. Explicit flags win; the prompt
+  only fills gaps. EOF aborts cleanly; Ctrl-C aborts without panicking.
+- The read/write entry counts and byte sizes are decoded from the simulation
+  response's resource **footprint** — real values from the ledger footprint, not
+  zero-filled placeholders.
+- If a fee-rate source (`ConfigSetting*`) can't be fetched, a warning naming
+  the source is printed and only the affected rate is zeroed, so the
+  non-refundable fee is visibly understated rather than silently wrong.
+- A simulation that returns no cost data and no latest ledger fails loudly
+  with an error naming `--id`, `--fn`, and the RPC endpoint.
+- **Caching**: The result is written to the SQLite estimate cache, keyed by
+  `wasm_hash + function_name + args_hash`. Use `--cache-ttl` to skip
+  re-simulation when the cached entry is still fresh. Writes also enforce the
+  cache quotas (`--max-cache-size-mb` / `--max-cache-entries`), evicting
+  least-recently-accessed entries when needed.
+- **`--diff`** simulates `--wasm` (the baseline, "old") and `--wasm-new` (the
+  comparison, "new") with identical `--fn`/`--arg`/`--id`/`--network`, then
+  prints a 4-column table — `Resource | Old | New | Change (+/- %)` — covering
+  WASM Size, CPU Instructions, RAM Bytes, Read Entry/Write Entries, Read/Write
+  Bytes, and Total Fee. Increases are red, decreases green. The cache is not
+  read or written in diff mode, and `--wasm-new` without `--diff` is an error.
+  When `--fn` is given, its signature must exist in both WASM files; a
+  missing signature fails before any RPC call, naming the offending
+  `--wasm`/`--wasm-new` file.
+  With `--json`, the output carries three structures — `wasm_a` (the full
+  baseline report), `wasm_b` (the full comparison report), and `diff` — where
+  `diff` holds `identity`, plus `rows` whose entries carry `resource`, `old`,
+  `new`, `delta`, `change_percent`, and `direction` (`increase` / `decrease` /
+  `unchanged`).
+- **`--clear-cache`** wipes every cached estimate for `--network` (default
+  `testnet`) *before* the simulation runs, printing
+  `Cleared N cached estimate(s) for <network>.` It can be combined with any
+  other flag — including `--cache-ttl`, which then starts from an empty
+  cache. Useful after upgrading the tool, after a network upgrade, or after
+  debugging a bad estimate.
+- **`--no-cache`** bypasses the cache on both sides: the `--cache-ttl` lookup
+  never short-circuits the run (a live RPC simulation always executes) and the
+  fresh result is **not** written back to disk, so the run leaves no trace in
+  the cache. Unlike `--clear-cache`, it deletes nothing — use it to benchmark
+  network changes or debug transient state differences without disturbing the
+  entries you already have.
+- **Exit codes**: 0 on success, 1 on any error (simulation failure, missing
+  WASM file, network error, etc.).
+
+**Examples**
+
+Upload simulation (no function invocation):
+
+```bash
+soroban-cost-estimator estimate \
+  --wasm tests/fixtures/contract.wasm \
+  --network testnet
+```
+
+Invoke a function against a deployed contract:
+
+```bash
+soroban-cost-estimator estimate \
+  --wasm tests/fixtures/contract.wasm \
+  --id CC4WIEYYSCFGDJXMLZ73FKUUJNDEOJRNOOBZHI55QR27NW4RCNTHAQ5T \
+  --network testnet \
+  --fn increment \
+  --arg step=5
+```
+
+Machine-readable JSON output (useful for CI pipelines):
+
+```bash
+soroban-cost-estimator estimate \
+  --wasm tests/fixtures/contract.wasm \
+  --id CC4WIEYYSCFGDJXMLZ73FKUUJNDEOJRNOOBZHI55QR27NW4RCNTHAQ5T \
+  --network testnet \
+  --fn increment \
+  --arg step=5 \
+  --json
+```
+
+Skip re-simulation if a cached estimate is fresh enough:
+
+```bash
+soroban-cost-estimator estimate \
+  --wasm tests/fixtures/contract.wasm \
+  --id CC4WIEYYSCFGDJXMLZ73FKUUJNDEOJRNOOBZHI55QR27NW4RCNTHAQ5T \
+  --network testnet \
+  --fn increment \
+  --arg step=5 \
+  --cache-ttl 1h
+```
+
+**Sample table output**
+
+```text
+Function: increment
+Network: testnet (ledger 3961551)
+Simulated at ledger sequence: 3,961,551
+WASM hash: ea14bca998e98f0ddb338e8e5cef6e19f07378a3b71e8b4f8868cedc857e4ecd
+
++------------------+----------+---------------+
+| Resource         | Consumed | Fee (stroops) |
++=============================================+
+| CPU Instructions | 524389   |               |
+|------------------+----------+---------------+
+| Memory Bytes     | 0        |               |
+|------------------+----------+---------------+
+| Read Entries     | 1        |               |
+|------------------+----------+---------------+
+| Write Entries    | 1        |               |
+|------------------+----------+---------------+
+| Read Bytes       | 0        |               |
+|------------------+----------+---------------+
+| Write Bytes      | 136      |               |
+|------------------+----------+---------------+
+| Transaction Size | 156      |               |
++------------------+----------+---------------+
+
+Fee Breakdown:
+  Non-refundable: 4491 stroops
+  Refundable:     12631 stroops
+  Total:          17122 stroops (0.0017122)
+```
+
+**Sample JSON output**
+
+```json
+{
+  "function": "increment",
+  "wasm_hash": "ea14bca998e98f0ddb338e8e5cef6e19f07378a3b71e8b4f8868cedc857e4ecd",
+  "cpu_instructions": 524389,
+  "memory_bytes": 0,
+  "tx_size": 156,
+  "read_entries": 1,
+  "write_entries": 1,
+  "read_bytes": 0,
+  "write_bytes": 136,
+  "fee": {
+    "non_refundable_stroops": 4491,
+    "refundable_stroops": 12631,
+    "total_stroops": 17122,
+    "total_xlm": "0.0017122"
+  },
+  "ledger_sequence": 3961544,
+  "network": "testnet"
+}
+```
+
+See [Resource Fees](concepts/resource-fees.md) for the fee-breakdown math.
+
+---
+
+### `estimate-all`
+
+Enumerate every public contract function and estimate each zero-argument one.
+
+**Usage**
+
+```
+soroban-cost-estimator estimate-all [OPTIONS] --wasm <WASM>
+```
+
+**Flags**
+
+| Flag | Short | Required | Default | Description |
+|------|-------|----------|---------|-------------|
+| `--wasm <PATH>` | `-w` | ✅* | — | Path to a compiled contract `.wasm` file (repeatable) |
+| `--wasm-dir <DIR>` | | ✅* | — | Directory of `.wasm` files to estimate as a batch (non-recursive) |
+| `--network <NETWORK>` | | | `testnet` | Network to simulate against |
+| `--id <ID>` | | | — | Deployed contract ID (64 hex chars) to invoke each function against |
+| `--no-cache` | | | `false` | Bypass the cache entirely: never read cached estimates, never write fresh results |
+| `--json` | | | `false` | Output as JSON instead of a human-readable list |
+| `--help` | `-h` | | | Print help |
+
+**Behavior**
+
+- Enumerates the contract's public functions from the WASM, decoding **typed
+  parameter lists** from the `contractspecv0` section when present.
+- Estimates each **zero-argument** function and prints a `[i/N]` progress
+  line before every simulation, so you can watch progress on contracts with
+  many functions.
+- Functions requiring arguments are reported as
+  `Skipped — needs --fn/--arg (N param(s))`, prompting you to specify them
+  manually — they are **not** silently skipped.
+- Without `--id`, simulations run against a zeroed contract ID and will
+  almost certainly fail; the tool prints a note telling you to pass `--id`
+  for real numbers.
+- All zero-argument function results are cached, just like `estimate`.
+- Prints a **fee distribution box** after the per-function results: min/max/
+  mean/median/standard deviation of the fees (stroops) and min/max/mean of the
+  CPU instruction counts across every successfully estimated function.
+- **Exit codes**: 0 on success, 1 on error.
+
+**Examples**
+
+```bash
+soroban-cost-estimator estimate-all \
+  --wasm tests/fixtures/contract.wasm \
+  --id CC4WIEYYSCFGDJXMLZ73FKUUJNDEOJRNOOBZHI55QR27NW4RCNTHAQ5T \
+  --network testnet
+```
+
+**Sample output**
+
+```text
+Enumerated 1 function(s) in WASM:
+  1. increment(step: i64)
+
+Contract spec: present (typed params decoded from contractspecv0)
+[1/1] increment
+── Estimating 'increment' ── Skipped: needs --fn/--arg (1 param(s))
+```
+
+JSON mode:
+
+```bash
+soroban-cost-estimator estimate-all \
+  --wasm tests/fixtures/contract.wasm \
+  --id CC4WIEYYSCFGDJXMLZ73FKUUJNDEOJRNOOBZHI55QR27NW4RCNTHAQ5T \
+  --network testnet \
+  --json
+```
+
+```json
+{
+  "functions": [
+    {
+      "function": "increment",
+      "status": "skipped",
+      "reason": "needs --fn/--arg (1 param(s))"
+    }
+  ],
+  "fee_distribution": {
+    "function_count": 0,
+    "min_fee_stroops": 0,
+    "max_fee_stroops": 0,
+    "mean_fee_stroops": 0,
+    "median_fee_stroops": 0,
+    "std_dev_fee_stroops": 0,
+    "min_cpu_instructions": 0,
+    "max_cpu_instructions": 0,
+    "mean_cpu_instructions": 0
+  }
+}
+```
+
+The per-function records now live under the `functions` key, alongside the
+aggregate `fee_distribution` statistics object (issue #328).
+
+---
+
+## Network Config
+
+### `config snapshot`
+
+Fetch all six `ConfigSetting` ledger entries, decode them via XDR, timestamp
+them, and save to disk.
+
+**Usage**
+
+```
+soroban-cost-estimator config snapshot [OPTIONS]
+soroban-cost-estimator config snapshot <COMMAND>
+```
+
+**Flags**
+
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--network <NETWORK>` | | `testnet` | Network to fetch config from (`testnet`, `mainnet`, `futurenet`) |
+| `--out <OUT>` | | `~/.soroban-cost-estimator/snapshots/` | Explicit output path |
+| `--retain <N>` | | — | Automatically delete snapshots older than N days |
+| `--json` | | `false` | Print the snapshot as JSON (still saves it) |
+| `--retain <COUNT>` | | | Keep only the N most recent snapshots, pruning older ones after the save |
+| `--help` | `-h` | | Print help |
+
+**Subcommands**
+
+| Subcommand | Description |
+|------------|-------------|
+| `prune --older-than <DAYS>` | Delete snapshots recorded more than D days ago (never the newest one) |
+
+**Behavior**
+
+- Fetches all six `ConfigSetting*` entries in **one batched**
+  `getLedgerEntries` RPC call.
+- Decodes each entry's XDR (`stellar-xdr` 27.x, big-endian) into a typed
+  snapshot model.
+- Saves the snapshot as
+  `~/.soroban-cost-estimator/snapshots/{network}-{timestamp}.json` — the
+  timestamp makes every snapshot a versioned artifact.
+- `--json` also prints the full snapshot as JSON to stdout.
+- `--out` writes to an explicit path instead of the default directory.
+- `--retain <COUNT>` runs a retention pass once the new snapshot is safely on
+  disk, and logs how many snapshots it pruned.
+- `prune` deletes stale files by age. It is pure file I/O — no RPC call — so it
+  is safe to schedule offline. It is also mutually exclusive with this
+  command's fetching flags (`--out`, `--retain`), so `config snapshot --retain
+  3 prune ...` is rejected rather than silently ignoring `--retain`.
+- `--retain <N>` is a retention policy: after saving, any snapshot for this
+  network whose **file modification time** is older than N days is deleted.
+  Useful for long-running `watch`/cron setups where the snapshots directory
+  would otherwise grow without bound. `--retain 0` is rejected, since it
+  would delete every snapshot.
+
+**Examples**
+
+```bash
+soroban-cost-estimator config snapshot --network testnet
+```
+
+Delete testnet snapshots older than 30 days:
+
+```bash
+soroban-cost-estimator config snapshot --network testnet --retain 30
+```
+
+**What you get**
+
+The snapshot JSON contains decoded values for all six settings:
+
+| Setting | Key fields |
+|---------|------------|
+| `contract_compute` | `fee_rate_per_instructions_increment`, memory limits |
+| `contract_ledger_cost` | Read/write entry fees, per-KB disk fees, rent rates |
+| `contract_historical_data` | `fee_historical1_kb` |
+| `contract_events` | `fee_contract_events1_kb` |
+| `contract_bandwidth` | `fee_tx_size1_kb` |
+| `state_archival` | TTLs, rent-rate denominators, eviction policy |
+
+Take a fresh snapshot after every protocol vote and keep them around:
+[`config diff`](#config-diff) compares the current configuration against your
+most recent snapshot.
+
+**Examples**
+
+```bash
+soroban-cost-estimator config snapshot --network testnet
+```
+
+Keep only the ten most recent snapshots:
+
+```bash
+soroban-cost-estimator config snapshot --network testnet --retain 10
+```
+
+Drop everything older than 30 days (the newest snapshot is always kept):
+
+```bash
+soroban-cost-estimator config snapshot prune --network testnet --older-than 30
+```
+
+**Sample output**
+
+```text
+Config snapshot saved to: /home/you/.soroban-cost-estimator/snapshots/testnet-2026-08-04T07-15-38.487702259+00-00.json
+Network: testnet
+Ledger:  3470630
+Time:    2026-08-04T07:15:38.487702259+00:00
+```
+
+The printed `Ledger` is the last ledger at which the config entries were
+modified on-chain — it is *not* the network's current ledger, and that is
+intentional: it is the ledger against which stale-cache checks are made.
+
+---
+
+### `config diff`
+
+Compare the network's current resource-pricing configuration against the most
+recent snapshot.
+
+**Usage**
+
+```
+soroban-cost-estimator config diff [OPTIONS]
+```
+
+**Flags**
+
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--network <NETWORK>` | | `testnet` | Network to compare against |
+| `--against <AGAINST>` | | latest snapshot | Explicit snapshot path to compare against |
+| `--against-previous` | | `false` | Diff the two most recent on-disk snapshots against each other instead of the live network (conflicts with `--against`) |
+| `--pricing-only` | | `false` | Hide non-pricing changes and display only fee-rate adjustments |
+| `--threshold-percent <N>` | | none | Percentage threshold for flagging significant changes (e.g. 10 for 10%) |
+| `--summary` | | `false` | Print a single-line count summary instead of the full diff (for CI status lines) |
+| `--format <FORMAT>` | | `table` | Output format: `table`, `json`, `csv`, `markdown`, or `summary` |
+| `--json` | | `false` | Legacy alias for `--format json` |
+| `--ignore-pricing-exit` | | `false` | Force exit code 0 even when pricing changes are detected |
+| `--fail-on-any-change` | | `false` | Exit 1 when any setting changed, even non-pricing settings |
+| `--help` `-h` | | | Print help |
+
+**Behavior**
+
+- Fetches the current config, then compares it **field by field** against the
+  latest snapshot for the network (or the snapshot at `--against`).
+- `💰` marks a **pricing** change — a rate that feeds the fee math; `📋`
+  marks a non-pricing change (a cap, limit, or window size).
+- Always cross-references the estimate cache and reports cached estimates
+  recorded at an earlier ledger as potentially stale.
+- **Exit code 0** when no pricing changes; **exit code 1** when a pricing
+  change was detected — scripts and CI can branch on it.
+- **CI exit code semantics:** `--ignore-pricing-exit` forces exit 0 even when
+  pricing changed (informative reports); `--fail-on-any-change` exits 1 when
+  *any* setting changed, even non-pricing caps/limits. `--ignore-pricing-exit`
+  takes precedence when both are passed. When `--threshold-percent <N>` is
+  given, only pricing changes of at least `N` percent count toward the default
+  exit-1 decision.
+- When a pricing change (protocol/config upgrade) is detected, the new config
+  is **automatically saved** as a snapshot, so it becomes the baseline for the
+  next diff. A failed save is reported as a warning and does not change the
+  exit code.
+
+**Examples**
+
+Basic diff against the latest snapshot:
+
+```bash
+soroban-cost-estimator config diff --network testnet
+```
+
+Diff against an explicit snapshot:
+
+```bash
+soroban-cost-estimator config diff --network testnet \
+  --against ~/.soroban-cost-estimator/snapshots/testnet-2026-08-04T07-15-38.487702259+00-00.json
+```
+
+Diff the two most recent snapshots on disk against each other, without
+contacting the network at all:
+
+```bash
+soroban-cost-estimator config diff --network testnet --against-previous
+```
+
+**Sample output (no changes)**
+
+```text
+Config diff: 2026-08-04T07:15:38.487702259+00:00 (ledger 3470630) → 2026-08-04T07:15:39.237129507+00:00 (ledger 3470630)
+Network: testnet
+
+✅ No changes detected.
+
+  1 cached estimate(s) from earlier ledger(s) — may be stale:
+    - (wasm upload) @ ledger 0 (current: 3470630)
+```
+
+**Sample output (pricing change)**
+
+```text
+Config diff: 2026-07-31T13-14-29.307394561+00:00 (ledger 3470630) → 2026-08-04T07:15:39.237129507+00:00 (ledger 3470630)
+Network: testnet
+
+Found 1 field change(s):
+
+  💰 contract_compute.fee_rate_per_instructions_increment
+      Old: 5
+      New: 7
+
+⚠️  Pricing changes detected! Your cached estimates may be stale.
+  Protocol upgrade detected — new config auto-saved to ~/.soroban-cost-estimator/snapshots/testnet-<timestamp>.json
+```
+
+See [Config Drift](concepts/config-drift.md) for the workflow this enables.
+
+---
+
+### `config history`
+
+Show the full chronological change log across all stored snapshots for a
+network.
+
+**Usage**
+
+```
+soroban-cost-estimator config history [OPTIONS]
+```
+
+**Flags**
+
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--network <NETWORK>` | | `testnet` | Network whose snapshot history to inspect |
+| `--help` | `-h` | | Print help |
+
+**Behavior**
+
+- Loads all stored snapshots for the given network from
+  `~/.soroban-cost-estimator/snapshots/`.
+- Orders them chronologically and prints a field-by-field change log showing
+  what changed between consecutive snapshots.
+- Useful for understanding the full history of network pricing changes over
+  time — not just the most recent diff.
+
+**Examples**
+
+```bash
+soroban-cost-estimator config history --network testnet
+```
+
+**Sample output**
+
+```text
+Config change history for testnet (3 snapshots):
+
+Snapshot 1 → 2 (2026-08-01 → 2026-08-03, ledger 3400000 → 3450000):
+  💰 contract_compute.fee_rate_per_instructions_increment: 5 → 7
+
+Snapshot 2 → 3 (2026-08-03 → 2026-08-04, ledger 3450000 → 3470630):
+  ✅ No changes detected.
+```
+
+---
+
+### `config last-changed`
+
+Show when each config setting last changed, across all stored snapshots.
+
+**Usage**
+
+```
+soroban-cost-estimator config last-changed [OPTIONS]
+```
+
+**Flags**
+
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--network <NETWORK>` | | `testnet` | Network whose snapshot history to inspect |
+| `--help` | `-h` | | Print help |
+
+**Behavior**
+
+- Loads all stored snapshots for the given network and determines the last
+  point at which each individual setting changed.
+- Prints a per-setting timestamp and snapshot reference.
+- Helpful for identifying which settings have been stable for a long time
+  versus which changed recently.
+
+**Examples**
+
+```bash
+soroban-cost-estimator config last-changed --network testnet
+```
+
+**Sample output**
+
+```text
+Last-changed timestamps for testnet:
+
+  contract_compute:                  2026-08-01 (snapshot testnet-2026-08-01T...)
+  contract_ledger_cost:              2026-08-01 (snapshot testnet-2026-08-01T...)
+  contract_historical_data:          never changed
+  contract_events:                   never changed
+  contract_bandwidth:                never changed
+  state_archival:                    never changed
+```
+
+---
+
+## Cache Management
+
+### `cache stats`
+
+Show a cache health overview: total entries, disk usage, age of the oldest and
+newest entries, and a per-network breakdown.
+
+**Usage**
+
+```
+soroban-cost-estimator cache stats
+```
+
+**Flags**
+
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--help` | `-h` | | Print help |
+
+**Behavior**
+
+- Purely local SQLite I/O — no network calls.
+- Prints a one-line summary when the cache is empty.
+
+**Example**
+
+```bash
+soroban-cost-estimator cache stats
+# → Total entries: 12
+#   Disk usage:     48.0 KB
+```
+
+---
+
+### `cache verify`
+
+Check that every cached estimate is readable and not corrupted.
+
+**Usage**
+
+```
+soroban-cost-estimator cache verify [OPTIONS]
+```
+
+**Flags**
+
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--help` | `-h` | | Print help |
+
+**Behavior**
+
+- Reads every row of the SQLite cache database
+  (`~/.soroban-cost-estimator/cache.db`) and checks it parses as a valid
+  `CachedEstimate` with a schema version this tool can read.
+- Prints a summary line per unreadable entry.
+- **Exit code 0** if the cache is empty or every entry is valid.
+- **Exit code 1** and lists the failing entries if any fail.
+- Scripts and CI can treat a corrupt cache as an error condition.
+- No network calls are made — this is pure local I/O.
+
+---
+
+### `cache stats`
+
+Show cache size and composition against the configured quotas.
+
+**Usage**
+
+```
+soroban-cost-estimator cache stats [OPTIONS]
+```
+
+**Behavior**
+
+- Reports total entries, file size, live size, oldest/newest entry timestamps,
+  the configured byte and entry quotas, and a per-network breakdown.
+- Reports `Cache is empty — no cached estimates.` on a pristine cache, still
+  showing the quotas in effect.
+- Quotas come from the global `--max-cache-size-mb` / `--max-cache-entries`
+  flags.
+
+**Examples**
+
+```bash
+soroban-cost-estimator cache stats
+soroban-cost-estimator --max-cache-size-mb 10 cache stats
+```
+
+---
+
+### `cache prune`
+
+Evict least-recently-accessed entries until the cache fits its quota.
+
+**Usage**
+
+```
+soroban-cost-estimator cache prune [OPTIONS]
+```
+
+**Behavior**
+
+- Runs the same LRU eviction pass that `estimate` applies on every save, so it
+  is useful after lowering the quota (or to reclaim space without waiting for
+  the next estimate).
+- Prints `Evicted N cached estimate(s).` plus the before/after entry count and
+  size.
+- Entries are removed oldest-`last_accessed` first, down to 90% of the quota;
+  reading an entry with `estimate --cache-ttl` refreshes its recency.
+- No network calls are made.
+
+**Examples**
+
+```bash
+soroban-cost-estimator cache prune
+soroban-cost-estimator --max-cache-entries 100 cache prune
+```
+
+**Examples**
+
+```bash
+soroban-cost-estimator cache verify
+```
+
+**Sample output (healthy cache)**
+
+```text
+Checked 5 cache entries.
+All cache entries are valid.
+```
+
+**Sample output (corrupt cache)**
+
+```text
+Checked 5 cache entries.
+2 of 5 cache entries failed verification:
+  - abc123_increment_step5.json
+  - def456_upload_.json
+```
+
+---
+
+### `cache warm`
+
+Pre-populate the cache by estimating every exported function (equivalent to
+running [`estimate-all`](#estimate-all)).
+
+**Usage**
+
+```
+soroban-cost-estimator cache warm [OPTIONS] --wasm <WASM>
+```
+
+**Flags**
+
+| Flag | Short | Required | Default | Description |
+|------|-------|----------|---------|-------------|
+| `--wasm <WASM>` | `-w` | ✅ | — | Path to the compiled Soroban contract `.wasm` file |
+| `--network <NETWORK>` | | | `testnet` | Network to simulate against |
+| `--id <ID>` | | | — | Deployed contract ID (64 hex chars) to invoke each function against |
+| `--json` | | | `false` | Output as JSON instead of a human-readable list |
+| `--help` | `-h` | | | Print help |
+
+**Behavior**
+
+- Internally delegates to `estimate-all` — enumerates all exported functions
+  and simulates each zero-argument one against the network.
+- Each successful simulation is saved to the cache, keyed by
+  `wasm_hash + function_name + args_hash`.
+- Useful for warming the cache before running `estimate` with `--cache-ttl`,
+  so the first call in a CI pipeline hits the cache instead of triggering a
+  fresh simulation.
+
+**Examples**
+
+```bash
+soroban-cost-estimator cache warm \
+  --wasm tests/fixtures/contract.wasm \
+  --id CC4WIEYYSCFGDJXMLZ73FKUUJNDEOJRNOOBZHI55QR27NW4RCNTHAQ5T \
+  --network testnet
+```
+
+---
+
+### `cache clear`
+
+Delete every cached estimate recorded for a network.
+
+**Usage**
+
+```
+soroban-cost-estimator cache clear [OPTIONS]
+```
+
+**Flags**
+
+| Flag | Short | Required | Default | Description |
+|------|-------|----------|---------|-------------|
+| `--network <NETWORK>` | | | `testnet` | Network whose cached estimates to delete |
+| `--help` | `-h` | | | Print help |
+
+**Behavior**
+
+- Deletes every cached estimate whose `network` field matches the requested
+  network; entries for other networks are left untouched.
+- Prints `Cleared N cached estimate(s) for <network>.`
+- No network calls are made — this is pure local cache I/O.
+- Backed by the same function as `estimate --clear-cache`, so the two paths
+  behave identically.
+
+**Examples**
+
+```bash
+soroban-cost-estimator cache clear
+# → Cleared 12 cached estimate(s) for testnet.
+
+soroban-cost-estimator cache clear --network mainnet
+# → Cleared 3 cached estimate(s) for mainnet.
+```
+
+---
+
+### `cache list`
+
+Audit the contents of the estimate cache with filters and pagination.
+
+**Usage**
+
+```
+soroban-cost-estimator cache list [OPTIONS]
+```
+
+**Flags**
+
+| Flag | Short | Required | Default | Description |
+|------|-------|----------|---------|-------------|
+| `--network <NETWORK>` | | | — (every network) | Network to filter by |
+| `--fn <FN>` | | | — | Function name (exact match); alias `--function` |
+| `--wasm-hash <WASM_HASH>` | | | — | WASM hash (prefix match, hexadecimal) |
+| `--since <DATE/TIME>` | | | — | Earliest timestamp or date; alias `--from` |
+| `--to <TIMESTAMP>` | | | — | Latest timestamp or date |
+| `--older-than <DURATION>` | | | — | Only entries older than this age (`30d`, `12h`, `3600`) |
+| `--limit <LIMIT>` | | | `50` | Maximum number of entries to return (capped at 1000) |
+| `--offset <OFFSET>` | | | `0` | Number of matching entries to skip |
+| `--json` | | | `false` | Output the full cached-estimate records as a JSON array |
+| `--help` | `-h` | | | Print help |
+
+**Behavior**
+
+- The network filter is optional — without it, entries from every network are
+  listed.
+- Filters are combined with logical AND; an invalid timestamp or a
+  non-hexadecimal hash prefix is rejected with a clear error.
+- Results are newest-first and paginated; the footer reports
+  `Showing X of Y matching estimate(s) (offset Z).`
+- The cache only ever stores a hash of the simulated arguments, never the
+  argument values themselves.
+- No network calls are made — this is pure local cache I/O.
+
+**Examples**
+
+```bash
+soroban-cost-estimator cache list --network testnet
+soroban-cost-estimator cache list --fn transfer --json
+soroban-cost-estimator cache list --older-than 30d --limit 20
+```
+
+---
+
+### `cache delete`
+
+Delete the cached estimates matching a filter — a targeted alternative to
+clearing a whole network.
+
+**Usage**
+
+```
+soroban-cost-estimator cache delete [OPTIONS]
+```
+
+**Flags**
+
+| Flag | Short | Required | Default | Description |
+|------|-------|----------|---------|-------------|
+| `--network <NETWORK>` | | | — (every network) | Network to filter by |
+| `--fn <FN>` | | | — | Function name (exact match); alias `--function` |
+| `--wasm-hash <WASM_HASH>` | | | — | WASM hash (prefix match, hexadecimal) |
+| `--since <DATE/TIME>` | | | — | Earliest timestamp or date; alias `--from` |
+| `--to <TIMESTAMP>` | | | — | Latest timestamp or date |
+| `--older-than <DURATION>` | | | — | Only entries older than this age (`30d`, `12h`, `3600`) |
+| `--all` | | | `false` | Delete every cached estimate, on every network (cannot be combined with a filter) |
+| `--dry-run` | | | `false` | Report the number of matching entries without deleting them |
+| `--yes` | `-y` | | `false` | Skip the confirmation prompt |
+| `--json` | | | `false` | Output as JSON instead of a human-readable summary |
+| `--help` | `-h` | | | Print help |
+
+**Behavior**
+
+- Uses the same matching rules as `cache list` / `cache query`, so
+  `--dry-run` reports exactly what would be removed.
+- At least one filter is required; without one the command is refused
+  unless `--all` is given.
+- `--all` means "every entry on every network" and cannot be combined with a
+  filter; the combination is rejected so a whole-cache deletion is never
+  silently narrowed.
+- Without `--yes` the command asks for confirmation; in a non-interactive
+  session the prompt cannot be answered, so the command aborts without
+  deleting anything.
+- Selection and deletion run in a single transaction, so the reported count
+  always matches the number of removed rows.
+- No network calls are made — this is pure local cache I/O.
+
+**Examples**
+
+```bash
+soroban-cost-estimator cache delete --network testnet --dry-run
+# → Would delete 2 cached estimate(s) — dry run, nothing removed.
+
+soroban-cost-estimator cache delete --network testnet --yes
+# → Deleted 2 cached estimate(s).
+```
+
+---
+
+### `cache export`
+
+Dump cached estimates to a single versioned JSON document for backup,
+sharing across workstations, or archiving.
+
+**Usage**
+
+```
+soroban-cost-estimator cache export [OPTIONS]
+```
+
+**Flags**
+
+| Flag | Short | Required | Default | Description |
+|------|-------|----------|---------|-------------|
+| `--out <OUT>` | `-o` | | — | Write the export to a file instead of standard output |
+| `--network <NETWORK>` | | | — | Only export estimates recorded for this network (default: all networks) |
+| `--help` | `-h` | | | Print help |
+
+**Behavior**
+
+- The export envelope carries a `schema_version`, an `exported_at`
+  (RFC-3339) timestamp, the `network` filter when one was given, and the
+  `estimates` records in deterministic order.
+- With `--out`, the file is written and a confirmation prints the entry
+  count and path (`Exported N cache entr(y|ies) to <path>.`); an unwritable
+  destination fails with an error naming the path.
+- Without `--out`, the envelope is printed to standard output.
+- No network calls are made — this is pure local cache I/O.
+
+**Examples**
+
+```bash
+soroban-cost-estimator cache export --out backup.json
+# → Exported 12 cache entries to backup.json.
+
+soroban-cost-estimator cache export --network testnet --out testnet-backup.json
+# → Exported 9 cache entries to testnet-backup.json.
+```
+
+---
+
+## Monitoring
+
+### `watch`
+
+Poll the network's resource-pricing configuration on an interval and print a
+diff whenever something changes.
+
+**Usage**
+
+```
+soroban-cost-estimator watch [OPTIONS]
+```
+
+**Flags**
+
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--network <NETWORK>` | | `testnet` | Network to watch |
+| `--interval <INTERVAL>` | | `1h` | Polling interval (accepts `s`/`m`/`h`/`d` suffixes or bare seconds) |
+| `--help` | `-h` | | Print help |
+
+**Behavior**
+
+- Polls **immediately**, then every `--interval`.
+- Intervals accept `s`/`m`/`h`/`d` suffixes or bare seconds:
+  `3600`, `3600s`, `30m`, `1h`, `1d`. Unparseable input falls back to
+  one hour.
+- Each poll fetches the config, diffs it against the previous snapshot, and
+  prints the diff **only when something changed**, plus the same stale-cache
+  cross-reference as `config diff`.
+- **SIGINT (Ctrl-C) and SIGTERM shut it down cleanly** (exit code 0): the
+  in-flight poll is cancelled rather than writing a partial snapshot.
+- Each poll also saves a snapshot, so you always have a recent baseline for
+  manual `config diff` runs.
+
+**Examples**
+
+Watch testnet every 30 minutes:
+
+```bash
+soroban-cost-estimator watch --network testnet --interval 30m
+```
+
+Watch mainnet every 10 minutes (useful in CI or cron):
+
+```bash
+soroban-cost-estimator watch --network mainnet --interval 10m
+```
+
+**Sample output**
+
+```text
+Watching testnet for config changes every 3600s... (Ctrl-C to stop)
+Received stop signal — exiting cleanly.
+```
+
+(The interval prints in seconds: `--interval 1h` → `every 3600s`.)
+
+---
+
+## Global Options
+
+All commands accept:
+
+| Flag | Description |
+|------|-------------|
+| `--rps <N>` | Cap RPC requests at N per second (0 disables) |
+| `--timeout <SECS>` | HTTP request timeout for RPC calls in seconds (default `30`) |
+| `--format <FORMAT>` | Report format for commands that support it: `table`, `json`, `csv`, `markdown`, or `summary` |
+| `--help` / `-h` | Print command-specific help |
+
+`--format` applies to report-producing commands. The legacy `--json` flag remains supported as an alias for `--format json` where it was previously available.
+
+## Network Resolution
+
+By default, commands use these RPC endpoints:
+
+| Network | Endpoint |
+|---------|----------|
+| `testnet` | `https://soroban-testnet.stellar.org` |
+| `mainnet` | `https://soroban.stellar.org` |
+| `futurenet` | `https://rpc-futurenet.stellar.org` |
+
+Override with `--rpc-url` on the `estimate` command for custom endpoints.
+
+## Storage Locations
+
+All data is stored locally under `~/.soroban-cost-estimator/`:
+
+| Directory | Contents |
+|-----------|----------|
+| `snapshots/` | Timestamped config snapshots (JSON) |
+| `cache/` | Past estimate results, keyed by wasm hash + function + args hash |
+
+## Related Pages
+
+- [Resource Fees](concepts/resource-fees.md) — how fees are calculated
+- [Config Drift](concepts/config-drift.md) — the drift-tracking workflow
+- [Caching](concepts/caching.md) — how the estimate cache works
+- [Migration](migration.md) — migrating from the Stellar CLI
+- [FAQ](faq.md) — frequently asked questions
