@@ -1343,6 +1343,38 @@ fn test_config_snapshot_retain_flag_accepted() {
     );
 }
 
+#[test]
+fn test_config_snapshot_skip_unchanged_flag_accepted() {
+    // `--skip-unchanged` must be a recognized argument: the run fails on the
+    // unknown network (before any RPC), not on the flag itself.
+    let (_, stderr, code) = run_cli(&[
+        "config",
+        "snapshot",
+        "--network",
+        "not-a-network",
+        "--skip-unchanged",
+    ]);
+    assert_eq!(code, 1, "an unknown network should exit 1");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--skip-unchanged should be a recognized argument; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("failed to locate RPC endpoint"),
+        "the failure should come from the network, not the flag; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_help_documents_skip_unchanged() {
+    let (stdout, stderr, code) = run_cli(&["config", "snapshot", "--help"]);
+    assert_eq!(code, 0, "snapshot --help should exit 0: {stderr}");
+    assert!(
+        stdout.contains("--skip-unchanged"),
+        "snapshot help should document --skip-unchanged; got: {stdout}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // `config snapshot` retention
 // ─────────────────────────────────────────────────────────────────────────
