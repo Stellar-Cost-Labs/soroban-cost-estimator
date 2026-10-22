@@ -338,6 +338,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
             cache_ttl,
             compare,
             clear_cache,
+            recover_cache,
             no_cache,
             history,
             json,
@@ -349,6 +350,17 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
             project,
             repeat,
         } => {
+            if recover_cache {
+                if let Ok(false) = cache::check_cache_health() {
+                    let rep = cache::recover_cache(true)?;
+                    if !args.quiet {
+                        eprintln!(
+                            "Quarantined corrupt cache database to {} and initialized fresh cache.",
+                            rep.backup_path.display()
+                        );
+                    }
+                }
+            }
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
             let format = match (args.format, json) {
@@ -694,9 +706,21 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
 
 /// `completions` command: generate shell completion script to stdout.
 fn cmd_completions(shell: clap_complete::Shell) {
-    let mut cmd = cli::Cli::command();
-    let bin_name = cmd.get_name().to_string();
-    clap_complete::generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
+    // Windows default main-thread stack size is 1MB, which can overflow when generating completions
+    // for deep Clap command trees in debug/unoptimized mode. Run with an 8MB stack to ensure safety across platforms.
+    let builder = std::thread::Builder::new().stack_size(8 * 1024 * 1024);
+    let handler = builder.spawn(move || {
+        let mut cmd = cli::Cli::command();
+        let bin_name = cmd.get_name().to_string();
+        clap_complete::generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
+    });
+    if let Ok(handle) = handler {
+        let _ = handle.join();
+    } else {
+        let mut cmd = cli::Cli::command();
+        let bin_name = cmd.get_name().to_string();
+        clap_complete::generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
+    }
 }
 
 /// True when a simulation response carried neither cost data, nor
@@ -5115,7 +5139,34 @@ async fn handle_cache_action(
             quiet,
         ),
         cli::CacheAction::Stats { json } => cmd_cache_stats(json, quiet),
+        cli::CacheAction::Recover { force, json } => cmd_cache_recover(force, json, quiet),
     }
+}
+
+/// `cache recover` command: quarantine a corrupt SQLite cache database to a timestamped backup and initialize a fresh cache.
+fn cmd_cache_recover(force: bool, json: bool, quiet: bool) -> error::AppResult<()> {
+    // Perform non-destructive cache recovery, preserving corrupt files for inspection.
+    let report = cache::recover_cache(force)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if !quiet {
+        println!("Cache recovery complete:");
+        println!(
+            "  Quarantined corrupt database: {}",
+            report.backup_path.display()
+        );
+        for sidecar in &report.sidecars_quarantined {
+            println!("  Quarantined sidecar:          {}", sidecar.display());
+        }
+        println!(
+            "  Initialized fresh cache database: {}",
+            report.new_path.display()
+        );
+        println!(
+            "Notice: Previously cached estimates have been reset; the original file has been preserved for inspection."
+        );
+    }
+    Ok(())
 }
 
 /// Builds a cache filter from the CLI flags shared by `cache list` and

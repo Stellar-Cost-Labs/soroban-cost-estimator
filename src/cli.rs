@@ -246,6 +246,11 @@ pub enum Command {
         #[arg(long)]
         clear_cache: bool,
 
+        /// Automatically quarantine a corrupt cache database to a timestamped
+        /// backup and initialize a clean cache if corruption is detected.
+        #[arg(long)]
+        recover_cache: bool,
+
         /// Bypass the estimate cache entirely: never read a cached estimate
         /// (including under `--cache-ttl`) and never write the fresh result
         /// back to disk.
@@ -575,6 +580,17 @@ pub enum CacheAction {
     /// Show cache health overview: total entries, disk usage, and age.
     Stats {
         /// Output as JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Recover safely from a corrupt SQLite cache database by quarantining it to a timestamped backup and initializing a new cache.
+    Recover {
+        /// Force recovery even if corruption is not automatically detected.
+        #[arg(long)]
+        force: bool,
+
+        /// Output the recovery report as JSON.
         #[arg(long)]
         json: bool,
     },
