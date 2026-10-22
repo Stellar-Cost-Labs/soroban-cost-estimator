@@ -38,11 +38,19 @@ use crate::error::{AppError, AppResult};
 pub enum WsMessage {
     /// A response to one of our requests (carries either `result` or
     /// `error`). `id` is the request id the server echoed back.
-    Response { id: Value, body: Value },
+    Response {
+        /// Request id echoed back by the server.
+        id: Value,
+        /// Full JSON-RPC response body (contains `result` or `error`).
+        body: Value,
+    },
     /// A server-initiated push notification (no `id`).
     Notification {
+        /// Subscription method name (e.g. `subscribe`).
         method: String,
+        /// Parameters attached to the notification.
         params: Value,
+        /// Full JSON-RPC notification body.
         body: Value,
     },
     /// The server closed the connection cleanly.
