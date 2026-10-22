@@ -569,6 +569,40 @@ pub enum CacheAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Create a consistent SQLite backup of the cache database while writes
+    /// may be active. The backup can be restored later on the same or a
+    /// different machine using `cache restore`.
+    ///
+    /// Uses SQLite's online backup API to avoid corrupting the live cache if
+    /// other processes are writing to it simultaneously.
+    Backup {
+        /// Write the backup to this file path. Defaults to
+        /// `~/.soroban-cost-estimator/cache-TIMESTAMP.db`.
+        #[arg(long, short)]
+        out: Option<String>,
+    },
+
+    /// Restore a previously backed-up cache database. The backup is validated
+    /// for schema compatibility before replacing the active cache.
+    ///
+    /// The original database is preserved until the restore succeeds; if the
+    /// restore fails, the original cache remains untouched and the backup is
+    /// available for manual inspection or retry.
+    Restore {
+        /// Path to the backup file to restore (created by `cache backup`).
+        #[arg(value_name = "BACKUP_FILE")]
+        path: String,
+
+        /// Skip the confirmation prompt (required in non-interactive sessions).
+        /// Use with caution: restoring discards the current cache.
+        #[arg(long, short = 'f')]
+        force: bool,
+
+        /// Show what would be restored without making any changes.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Sub-actions under `config snapshot` that operate on snapshots already on

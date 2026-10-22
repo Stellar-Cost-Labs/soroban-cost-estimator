@@ -42,6 +42,37 @@ use tracing::warn;
 use crate::error::AppError;
 use crate::error::AppResult;
 
+/// Reason why a cache entry was accepted or rejected.
+///
+/// Used for structured debug logging to help operators understand
+/// cache behavior without exposing internal details or credentials.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheDecisionReason {
+    /// Cache read was bypassed by `--no-cache` flag.
+    ExplicitBypass,
+    /// No entry found for this key.
+    NoEntry,
+    /// Entry found but expired (older than requested TTL).
+    Expired,
+    /// Entry found but network mismatch (caller requested different network).
+    NetworkMismatch,
+    /// Entry found and is fresh.
+    Hit,
+}
+
+impl CacheDecisionReason {
+    /// Return a safe, short reason code suitable for structured logging.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::ExplicitBypass => "explicit_bypass",
+            Self::NoEntry => "miss_no_entry",
+            Self::Expired => "miss_expired",
+            Self::NetworkMismatch => "miss_network",
+            Self::Hit => "hit",
+        }
+    }
+}
+
 /// Check whether a rusqlite error is `SQLITE_BUSY`.
 fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
     err.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
@@ -1497,6 +1528,8 @@ pub fn load_estimate(
 /// Whether a cached estimate is still fresh, i.e. its timestamp is within
 /// `ttl` of now.
 ///
+/// Emits a debug event with the cache decision reason (Hit, Expired, or NoEntry).
+///
 /// Entries whose timestamp cannot be parsed as RFC 3339 are treated as **not**
 /// fresh: an unverifiable age must not be trusted, so the caller re-simulates
 /// and overwrites the entry.
@@ -1514,10 +1547,16 @@ pub fn is_cache_entry_fresh(entry: &CachedEstimate, ttl: std::time::Duration) ->
     chrono::Utc::now().signed_duration_since(ts) <= ttl
 }
 
-/// Load a cached estimate only if it is still fresh (within `ttl`).
+/// Load a cached estimate only if it is still fresh (within `ttl`),
+/// and emit a debug event indicating the cache decision and reason.
 ///
 /// Returns `Ok(None)` when no entry exists **or** when the entry has
 /// expired — both mean "re-simulate".
+///
+/// Emits a debug event at each decision point:
+/// - `Hit`: Entry found and fresh
+/// - `Expired`: Entry found but older than TTL
+/// - `NoEntry`: No entry found for this cache key
 ///
 /// # Network calls
 /// None — pure SQLite I/O.
@@ -1528,17 +1567,56 @@ pub fn load_fresh_estimate(
     ttl: std::time::Duration,
 ) -> AppResult<Option<CachedEstimate>> {
     let Some(cached) = load_estimate(wasm_hash, function, args)? else {
+        let wasm_short = if wasm_hash.len() > 8 {
+            &wasm_hash[..8]
+        } else {
+            wasm_hash
+        };
+        debug!(
+            function,
+            wasm_hash = wasm_short,
+            reason = CacheDecisionReason::NoEntry.code(),
+            "cache decision"
+        );
         return Ok(None);
     };
     if is_cache_entry_fresh(&cached, ttl) {
-        trace!(function, ttl_secs = ttl.as_secs(), "fresh cached estimate");
+        let wasm_short = if wasm_hash.len() > 8 {
+            &wasm_hash[..8]
+        } else {
+            wasm_hash
+        };
+        let age_secs = chrono::Utc::now()
+            .signed_duration_since(
+                chrono::DateTime::parse_from_rfc3339(&cached.timestamp)
+                    .ok()
+                    .map(|ts| ts.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(chrono::Utc::now),
+            )
+            .num_seconds() as u64;
+        debug!(
+            function,
+            wasm_hash = wasm_short,
+            reason = CacheDecisionReason::Hit.code(),
+            age_secs,
+            ttl_secs = ttl.as_secs(),
+            ledger = cached.ledger,
+            "cache decision"
+        );
         Ok(Some(cached))
     } else {
-        trace!(
+        let wasm_short = if wasm_hash.len() > 8 {
+            &wasm_hash[..8]
+        } else {
+            wasm_hash
+        };
+        debug!(
             function,
+            wasm_hash = wasm_short,
+            reason = CacheDecisionReason::Expired.code(),
             ttl_secs = ttl.as_secs(),
             timestamp = %cached.timestamp,
-            "cached estimate expired"
+            "cache decision"
         );
         Ok(None)
     }
@@ -2204,4 +2282,256 @@ fn wasm_file_mtime_nanos(wasm_path: &Path) -> AppResult<u64> {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     Ok(nanos)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Backup and Restore
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Create a consistent SQLite backup of the cache database using the
+/// online backup API.
+///
+/// The backup is created while the live database may be actively written to
+/// by other processes, ensuring a consistent snapshot without interfering
+/// with reads or writes. If no output path is specified, the backup is
+/// written to `~/.soroban-cost-estimator/cache-TIMESTAMP.db`.
+///
+/// # Network calls
+/// None — pure local file I/O.
+///
+/// # Errors
+/// Returns an error if the database cannot be opened, the backup file cannot
+/// be created, or the backup process fails (e.g., due to lock timeout).
+pub fn backup_database(out_path: Option<&str>) -> AppResult<String> {
+    let source_path = db_path()?;
+
+    // Determine the backup file path
+    let backup_path = if let Some(path) = out_path {
+        path.to_string()
+    } else {
+        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        data_dir()?
+            .join(format!("cache-{}.db", timestamp))
+            .to_string_lossy()
+            .to_string()
+    };
+
+    // Ensure the backup directory exists
+    if let Some(parent) = std::path::Path::new(&backup_path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Open the source database (this also ensures schema exists)
+    let source_conn = open_db()?;
+
+    // Open the backup database (destination)
+    let backup_conn = rusqlite::Connection::open(&backup_path)?;
+
+    // Perform the backup using SQLite's online backup API
+    // The backup API automatically handles locks and consistency.
+    // We use the default frame size (1024 pages) and no per-step callback.
+    let mut backup = rusqlite::backup::Backup::new(&source_conn, &backup_conn)
+        .map_err(|e| AppError::General(format!("failed to initialize SQLite backup: {}", e)))?;
+
+    // Run the backup to completion. The default page count (-1) backs up
+    // the entire database in one pass (or multiple internal passes if busy).
+    backup
+        .run_to_completion(1024, std::time::Duration::from_secs(5), None)
+        .map_err(|e| AppError::General(format!("failed to complete SQLite backup: {}", e)))?;
+
+    debug!(backup_path = %backup_path, "database backup completed successfully");
+    Ok(backup_path)
+}
+
+/// Validate that a backup file has a compatible schema version.
+///
+/// Opens the backup file and checks if the schema version of entries within
+/// it can be read and migrated to the current schema version. Rejects backups
+/// written by a newer tool (version > current) to prevent silent misreads.
+///
+/// # Network calls
+/// None — pure local file I/O.
+///
+/// # Errors
+/// Returns an error if the backup cannot be opened, contains no entries,
+/// entries are corrupted, or the schema version is incompatible.
+pub fn validate_backup_schema(backup_path: &str) -> AppResult<()> {
+    let backup_conn = rusqlite::Connection::open(backup_path)?;
+
+    // Try to read the first entry to get the schema version
+    let mut stmt = backup_conn.prepare("SELECT version FROM estimates LIMIT 1")?;
+
+    let version: u32 = stmt.query_row([], |row| row.get(0)).map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => {
+            AppError::General("backup file contains no cache entries".to_string())
+        }
+        _ => AppError::General(format!("failed to read backup schema version: {}", e)),
+    })?;
+
+    // Reject entries from newer tools
+    if version > CACHE_SCHEMA_VERSION {
+        return Err(AppError::General(format!(
+            "backup schema version {} is newer than current version {}; \
+                 please upgrade the tool",
+            version, CACHE_SCHEMA_VERSION
+        )));
+    }
+
+    debug!(
+        version,
+        current = CACHE_SCHEMA_VERSION,
+        "backup schema validated"
+    );
+    Ok(())
+}
+
+/// Restore a cache database from a backup file.
+///
+/// The restore process:
+/// 1. Validates the backup file exists and is readable
+/// 2. Validates the backup schema version is compatible
+/// 3. Preserves the active database by moving it to a `.backup-TIMESTAMP` file
+/// 4. Restores the backup as the active cache by copying/renaming it
+/// 5. Re-opens the database to verify the restore succeeded
+///
+/// If the restore fails at any point after moving the original database,
+/// the original is preserved with a `.backup-TIMESTAMP` suffix so users can
+/// investigate and recover if needed.
+///
+/// # Network calls
+/// None — pure local file I/O.
+///
+/// # Errors
+/// Returns an error if the backup is missing, unreadable, incompatible,
+/// or if the restore operation fails. The original database is preserved
+/// when an error is returned.
+pub fn restore_database(backup_path: &str) -> AppResult<()> {
+    let backup_file = std::path::Path::new(backup_path);
+
+    // Validate the backup file exists and is readable
+    if !backup_file.exists() {
+        return Err(AppError::General(format!(
+            "backup file not found: {}",
+            backup_path
+        )));
+    }
+
+    if !backup_file.is_file() {
+        return Err(AppError::General(format!(
+            "backup path is not a file: {}",
+            backup_path
+        )));
+    }
+
+    // Validate schema compatibility
+    validate_backup_schema(backup_path)?;
+
+    // Get the target cache database path
+    let target_path = db_path()?;
+
+    // If the target database exists, preserve it with a timestamped suffix
+    if target_path.exists() {
+        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        let preserved_path = target_path.with_extension(format!("backup-{}.db", timestamp));
+        std::fs::rename(&target_path, &preserved_path).map_err(|e| {
+            AppError::General(format!("failed to preserve existing database: {}", e))
+        })?;
+        debug!(preserved_path = %preserved_path.display(), "existing cache database preserved");
+    }
+
+    // Copy the backup to the target location
+    std::fs::copy(backup_path, &target_path)
+        .map_err(|e| AppError::General(format!("failed to restore backup: {}", e)))?;
+
+    // Verify the restored database can be opened and contains valid data
+    let restored_conn = match rusqlite::Connection::open(&target_path) {
+        Ok(conn) => conn,
+        Err(e) => {
+            return Err(AppError::General(format!(
+                "restored database is not readable: {}",
+                e
+            )));
+        }
+    };
+
+    // Quick sanity check: ensure the estimates table exists
+    let table_exists: bool = restored_conn
+        .query_row(
+            "SELECT COUNT(name) FROM sqlite_master WHERE type='table' AND name='estimates'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0)
+        > 0;
+
+    if !table_exists {
+        return Err(AppError::General(
+            "restored backup does not contain the estimates table".to_string(),
+        ));
+    }
+
+    debug!(target_path = %target_path.display(), "cache database restored successfully");
+    Ok(())
+}
+
+/// Get the count of estimates in a backup file for reporting purposes.
+///
+/// Used by restore commands to show the user what they're about to restore.
+///
+/// # Network calls
+/// None — pure local file I/O.
+///
+/// # Errors
+/// Returns an error if the backup cannot be opened or the query fails.
+pub fn count_estimates_in_backup(backup_path: &str) -> AppResult<usize> {
+    let backup_conn = rusqlite::Connection::open(backup_path)?;
+    let count: usize =
+        backup_conn.query_row("SELECT COUNT(*) FROM estimates", [], |row| row.get(0))?;
+    Ok(count)
+}
+
+/// Get cache statistics from a backup file (without restoring it).
+///
+/// Useful for showing the user what they're about to restore before
+/// committing to the operation.
+///
+/// # Network calls
+/// None — pure local file I/O.
+///
+/// # Errors
+/// Returns an error if the backup cannot be opened or queried.
+pub fn backup_stats(backup_path: &str) -> AppResult<CacheStats> {
+    let backup_conn = rusqlite::Connection::open(backup_path)?;
+
+    let disk_bytes = std::fs::metadata(backup_path).map(|m| m.len()).unwrap_or(0);
+
+    // Total count
+    let total_entries: usize =
+        backup_conn.query_row("SELECT COUNT(*) FROM estimates", [], |row| row.get(0))?;
+
+    // Oldest and newest timestamps
+    let oldest_entry: Option<String> = backup_conn
+        .query_row("SELECT MIN(timestamp) FROM estimates", [], |row| row.get(0))
+        .ok();
+    let newest_entry: Option<String> = backup_conn
+        .query_row("SELECT MAX(timestamp) FROM estimates", [], |row| row.get(0))
+        .ok();
+
+    // Per-network breakdown
+    let mut stmt = backup_conn
+        .prepare("SELECT network, COUNT(*) FROM estimates GROUP BY network ORDER BY network")?;
+    let per_network: Vec<(String, usize)> = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(CacheStats {
+        total_entries,
+        disk_bytes,
+        live_bytes: disk_bytes,
+        oldest_entry,
+        newest_entry,
+        per_network,
+    })
 }

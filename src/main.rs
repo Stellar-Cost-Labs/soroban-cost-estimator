@@ -1437,6 +1437,7 @@ async fn cmd_estimate_repeat(
 
         let ttl_secs = cache_ttl.map(parse_interval_secs);
         let fresh = if no_cache {
+            emit_cache_bypass_event(&wasm_hash, function_name);
             None
         } else {
             fresh_cached_estimate(&wasm_hash, function_name, args, ttl_secs)?
@@ -1830,6 +1831,7 @@ async fn estimate_once(
         let ttl_secs = cache_ttl.map(parse_interval_secs);
         let fresh = if no_cache {
             // Bypass every cache read, even under `--cache-ttl`.
+            emit_cache_bypass_event(&wasm_hash, function_name);
             None
         } else {
             fresh_cached_estimate(&wasm_hash, &function_name, args, ttl_secs)?
@@ -1969,6 +1971,18 @@ async fn estimate_once(
                 report.memory_bytes,
                 Some(report.rpc_latency_ms),
                 true,
+            );
+            let wasm_short = if wasm_hash.len() > 8 {
+                &wasm_hash[..8]
+            } else {
+                &wasm_hash
+            };
+            debug!(
+                function = function_name,
+                wasm_hash = wasm_short,
+                reason = "save",
+                ledger = report.ledger,
+                "cache decision"
             );
         }
         info!(
@@ -4371,6 +4385,22 @@ fn fresh_cached_estimate(
     )
 }
 
+/// Emit a debug event for explicit cache bypass.
+fn emit_cache_bypass_event(wasm_hash: &str, function: &str) {
+    use tracing::debug;
+    let wasm_short = if wasm_hash.len() > 8 {
+        &wasm_hash[..8]
+    } else {
+        wasm_hash
+    };
+    debug!(
+        function,
+        wasm_hash = wasm_short,
+        reason = "explicit_bypass",
+        "cache decision"
+    );
+}
+
 /// Print a fresh cached estimate that `estimate` is reusing instead of
 /// re-simulating.
 ///
@@ -5056,6 +5086,12 @@ async fn handle_cache_action(
             quiet,
         ),
         cli::CacheAction::Stats { json } => cmd_cache_stats(json, quiet),
+        cli::CacheAction::Backup { out } => cmd_cache_backup(out.as_deref(), quiet),
+        cli::CacheAction::Restore {
+            path,
+            force,
+            dry_run,
+        } => cmd_cache_restore(&path, force, dry_run, quiet),
     }
 }
 
@@ -5432,6 +5468,78 @@ fn cmd_cache_export(
         }
     } else {
         println!("{json}");
+    }
+
+    Ok(())
+}
+
+/// `cache backup` command: create a consistent backup of the cache database.
+fn cmd_cache_backup(out_path: Option<&str>, quiet: bool) -> error::AppResult<()> {
+    let backup_path = cache::backup_database(out_path)?;
+    if !quiet {
+        println!("Cache backup created: {}", backup_path);
+    }
+    Ok(())
+}
+
+/// `cache restore` command: restore a cache database from a backup.
+fn cmd_cache_restore(
+    backup_path: &str,
+    force: bool,
+    dry_run: bool,
+    quiet: bool,
+) -> error::AppResult<()> {
+    // Validate backup file first
+    let backup_file = std::path::Path::new(backup_path);
+    if !backup_file.exists() {
+        return Err(error::AppError::General(format!(
+            "backup file not found: {}",
+            backup_path
+        )));
+    }
+
+    // Show what would be restored
+    let stats = cache::backup_stats(backup_path)?;
+    if !quiet {
+        println!("Backup file: {}", backup_path);
+        println!("  Entries: {}", stats.total_entries);
+        println!("  Size: {}", format_bytes(stats.disk_bytes));
+        if let Some(oldest) = &stats.oldest_entry {
+            println!("  Oldest: {}", oldest);
+        }
+        if let Some(newest) = &stats.newest_entry {
+            println!("  Newest: {}", newest);
+        }
+        if !stats.per_network.is_empty() {
+            print!("  Networks: ");
+            let networks: Vec<String> = stats
+                .per_network
+                .iter()
+                .map(|(n, c)| format!("{} ({})", n, c))
+                .collect();
+            println!("{}", networks.join(", "));
+        }
+    }
+
+    if dry_run {
+        if !quiet {
+            println!("\nDry run: no changes made.");
+        }
+        return Ok(());
+    }
+
+    // Confirm before restoring (unless --force)
+    if !force && !quiet {
+        if !confirm("This will replace the current cache. Do you want to continue?") {
+            println!("Restore cancelled.");
+            return Ok(());
+        }
+    }
+
+    // Perform the restore
+    cache::restore_database(backup_path)?;
+    if !quiet {
+        println!("Cache restored successfully from: {}", backup_path);
     }
 
     Ok(())

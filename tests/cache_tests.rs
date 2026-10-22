@@ -3229,3 +3229,196 @@ fn test_cached_estimate_backward_compatible_deserialization() {
     );
     assert_eq!(parsed_new.core_version.as_deref(), Some("v21.2.0"));
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Concurrent access with SQLITE_BUSY backoff (issue #523)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Test that demonstrates bounded backoff retry on SQLITE_BUSY errors.
+///
+/// This test spawns multiple concurrent writers that try to save cache
+/// entries simultaneously. The retry logic with bounded exponential backoff
+/// should prevent benign contention from turning into a failed estimate.
+/// Even though SQLite can only have one writer at a time (or brief contention),
+/// the retry mechanism with backoff should allow operations to eventually
+/// succeed rather than fail immediately.
+///
+/// The test verifies:
+/// 1. Multiple concurrent writers all successfully save estimates
+/// 2. No writes are lost due to SQLITE_BUSY transient failures
+/// 3. The cache remains in a valid state afterward
+#[test]
+fn test_concurrent_writes_with_sqlite_busy_backoff() {
+    with_temp_home(|_tmp| {
+        let num_threads = 10;
+        let writes_per_thread = 5;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|thread_id| {
+                std::thread::spawn(move || {
+                    for write_id in 0..writes_per_thread {
+                        let wasm_hash = format!("hash-{thread_id}");
+                        let function = format!("func-{thread_id}-{write_id}");
+                        let args = vec![format!("arg-{thread_id}-{write_id}")];
+
+                        // All threads attempt to write to the same cache simultaneously,
+                        // which creates contention that can trigger SQLITE_BUSY on some
+                        // operations. The retry logic should handle this gracefully.
+                        let result = cache::save_estimate(
+                            &wasm_hash,
+                            &function,
+                            &args,
+                            "testnet",
+                            (thread_id * 100 + write_id) as u32,
+                            1_000_000 + write_id as i64,
+                            200_000 + write_id as u64,
+                            50_000 + write_id as u64,
+                            Some(100 + write_id as u64),
+                            true,
+                        );
+
+                        if let Err(e) = result {
+                            eprintln!(
+                                "Thread {thread_id} failed on write {write_id}: {e}. \
+                                 This should not happen with proper SQLITE_BUSY retry logic."
+                            );
+                            panic!(
+                                "concurrent write failed; SQLITE_BUSY retry should have prevented this"
+                            );
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        // Wait for all threads to complete
+        for handle in handles {
+            handle.join().expect("concurrent write thread panicked");
+        }
+
+        // Verify all writes succeeded by counting the total entries
+        let all_estimates = cache::list_cached_estimates("testnet")
+            .expect("list estimates after concurrent writes");
+        let expected_count = num_threads * writes_per_thread;
+        assert_eq!(
+            all_estimates.len(),
+            expected_count,
+            "all {expected_count} concurrent writes should have succeeded; \
+             found {} in cache",
+            all_estimates.len()
+        );
+
+        // Verify every entry is valid (no corruption from contention)
+        let statuses = cache::verify_cache().expect("verify cache after concurrent writes");
+        assert_eq!(
+            statuses.len(),
+            expected_count,
+            "every concurrent write should produce a valid entry"
+        );
+        assert!(
+            statuses.iter().all(|s| s.valid),
+            "all concurrent writes must be valid; corrupt entries: {:?}",
+            statuses.iter().filter(|s| !s.valid).collect::<Vec<_>>()
+        );
+    });
+}
+
+/// Test that reads and writes can coexist under concurrent load without
+/// SQLITE_BUSY failures due to the retry logic.
+///
+/// This test mixes concurrent reads and writes on the same cache to ensure
+/// that:
+/// 1. The retry mechanism handles read-write contention
+/// 2. Reads don't fail when a write holds a lock briefly
+/// 3. The overall operation count is preserved (no lost writes/reads)
+#[test]
+fn test_concurrent_mixed_read_write_with_sqlite_busy_backoff() {
+    with_temp_home(|_tmp| {
+        // Seed the cache with initial entries to read from
+        for i in 0..5 {
+            cache::save_estimate(
+                &format!("hash-seed-{i}"),
+                &format!("func-seed-{i}"),
+                &[],
+                "testnet",
+                i,
+                100_000 + i as i64,
+                10_000 + i as u64,
+                1_000 + i as u64,
+                None,
+                true,
+            )
+            .expect("seed estimate");
+        }
+
+        let num_threads = 8;
+        let ops_per_thread = 10;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|thread_id| {
+                std::thread::spawn(move || {
+                    for op_id in 0..ops_per_thread {
+                        if op_id % 2 == 0 {
+                            // Even operations: write
+                            let wasm_hash = format!("hash-{thread_id}-{op_id}");
+                            let function = format!("func-{thread_id}-{op_id}");
+                            let args = vec![format!("arg-{thread_id}-{op_id}")];
+                            cache::save_estimate(
+                                &wasm_hash,
+                                &function,
+                                &args,
+                                "testnet",
+                                thread_id as u32 * 100 + op_id as u32,
+                                2_000_000,
+                                300_000,
+                                60_000,
+                                Some(50),
+                                true,
+                            )
+                            .expect("concurrent write in mixed test");
+                        } else {
+                            // Odd operations: read
+                            let seed_id = op_id % 5;
+                            let result = cache::load_estimate(
+                                &format!("hash-seed-{seed_id}"),
+                                &format!("func-seed-{seed_id}"),
+                                &[],
+                            )
+                            .expect("concurrent read in mixed test");
+                            assert!(
+                                result.is_some(),
+                                "seeded estimate should be readable despite concurrent writes"
+                            );
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle
+                .join()
+                .expect("concurrent mixed operation thread panicked");
+        }
+
+        // Verify the final cache state
+        let all_estimates =
+            cache::list_cached_estimates("testnet").expect("list after mixed operations");
+
+        // We should have the 5 seed entries plus all the writes
+        let expected_min = 5 + (num_threads * ops_per_thread / 2);
+        assert!(
+            all_estimates.len() >= expected_min,
+            "expected at least {} entries after mixed read/write; found {}",
+            expected_min,
+            all_estimates.len()
+        );
+
+        // Verify no corruption
+        let statuses = cache::verify_cache().expect("verify after mixed operations");
+        assert!(
+            statuses.iter().all(|s| s.valid),
+            "all entries must be valid after mixed operations"
+        );
+    });
+}
