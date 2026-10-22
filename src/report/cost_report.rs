@@ -670,9 +670,13 @@ pub struct CostReport {
     pub ledger: u32,
     /// Network the simulation ran on.
     pub network: String,
-    /// RPC round-trip time of the `simulateTransaction` call, in
-    /// milliseconds. Helps identify slow or overloaded RPC endpoints.
-    pub rpc_latency_ms: u64,
+    /// Wall-clock duration of the `simulateTransaction` round-trip, in
+    /// milliseconds, measured around the RPC call itself. Serialized as
+    /// `simulation_duration_ms` so CI logs can separate time spent waiting on
+    /// the network from local computation and decoding, and rendered as
+    /// `Simulation latency: X ms` in the table footer. Also helps identify
+    /// slow or overloaded RPC endpoints.
+    pub simulation_duration_ms: u64,
     /// Sanitized host identifier of the RPC endpoint that served the estimate.
     #[serde(default)]
     pub rpc_endpoint: String,
@@ -1509,7 +1513,10 @@ pub fn format_report_table(report: &CostReport) -> String {
         "Simulated at ledger sequence: {}\n",
         format_ledger_sequence(report.ledger)
     ));
-    output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
+    output.push_str(&format!(
+        "RPC round-trip: {} ms\n",
+        report.simulation_duration_ms
+    ));
     if report.wasm_size > 0 {
         output.push_str(&format!("WASM size: {} bytes\n", report.wasm_size));
     }
@@ -2289,7 +2296,7 @@ mod tests {
             },
             ledger: 3_894_195,
             network: "testnet".to_string(),
-            rpc_latency_ms: 87,
+            simulation_duration_ms: 87,
             rpc_endpoint: String::new(),
             rpc_role: String::new(),
             rates: Some(rates),
@@ -2412,7 +2419,7 @@ mod tests {
             },
             ledger: 0,
             network: "testnet".to_string(),
-            rpc_latency_ms: 0,
+            simulation_duration_ms: 0,
             rpc_endpoint: String::new(),
             rpc_role: String::new(),
             rates: None,
