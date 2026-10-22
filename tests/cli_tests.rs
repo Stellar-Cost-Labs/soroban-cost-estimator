@@ -599,20 +599,15 @@ fn test_cache_import_prints_summary() {
     )
     .expect("write export");
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
-        .args([
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
             "config",
             "cache",
             "import",
             export_path.to_str().expect("utf8 path"),
-        ])
-        .env("HOME", &tmp)
-        .output()
-        .expect("run CLI import");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let code = output.status.code().unwrap_or(-1);
+        ],
+        Some(&tmp),
+    );
     assert_eq!(code, 0, "import should exit 0; stderr: {stderr}");
     assert_eq!(
         stdout.trim(),
@@ -639,19 +634,15 @@ fn test_cache_import_corrupted_file_exits_nonzero() {
     let export_path = tmp.join("corrupt.json");
     std::fs::write(&export_path, "not json at all").expect("write corrupt");
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
-        .args([
+    let (_stdout, stderr, code) = run_cli_quiet(
+        &[
             "config",
             "cache",
             "import",
             export_path.to_str().expect("utf8 path"),
-        ])
-        .env("HOME", &tmp)
-        .output()
-        .expect("run CLI import");
-
-    let code = output.status.code().unwrap_or(-1);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+        ],
+        Some(&tmp),
+    );
     assert_ne!(code, 0, "corrupt import should exit non-zero");
     assert!(
         stderr.contains("corrupted"),

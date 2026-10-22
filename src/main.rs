@@ -658,13 +658,6 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
                 )
                 .await
             }
-            cli::ConfigAction::Cache { action } => match action {
-                cli::CacheAction::Import {
-                    file,
-                    merge: _,
-                    overwrite,
-                } => cmd_cache_import(&file, overwrite),
-            },
         },
         cli::Command::Cache { action } => {
             handle_cache_action(
@@ -5046,6 +5039,11 @@ async fn handle_cache_action(
     verbose: bool,
 ) -> error::AppResult<()> {
     match action {
+        cli::CacheAction::Import {
+            file,
+            merge: _,
+            overwrite,
+        } => cmd_cache_import(&file, overwrite, quiet),
         cli::CacheAction::Export { out, network } => {
             cmd_cache_export(out.as_deref(), network.as_deref(), quiet)
         }
@@ -5551,6 +5549,24 @@ fn cmd_cache_export(
         println!("{json}");
     }
 
+    Ok(())
+}
+
+/// `cache import` command: restore cached estimates from an export file.
+///
+/// Merge mode (the default, and `--merge`) keeps the newer of each pair;
+/// `--overwrite` replaces existing entries unconditionally.
+///
+/// # Network calls
+/// None â€” pure file and SQLite I/O.
+fn cmd_cache_import(file: &std::path::Path, overwrite: bool, quiet: bool) -> error::AppResult<()> {
+    let summary = cache::import_cache(file, overwrite)?;
+    if !quiet {
+        println!(
+            "Imported {} new entries, skipped {} existing entries",
+            summary.imported, summary.skipped
+        );
+    }
     Ok(())
 }
 
