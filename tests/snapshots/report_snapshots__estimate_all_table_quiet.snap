@@ -1,0 +1,10 @@
+---
+source: tests/report_snapshots.rs
+assertion_line: 168
+expression: "format_estimate_all_table(&reports, None)"
+---
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Function    CPU insns   Fee (stroops)   Fee (XLM)   Ledger    Write entries │
+╞═══════════╪═══════════╪═══════════════╪═══════════╪═════════╪═══════════════╡
+│ increment   532502      15427           0.0015427   3894195   1             │
+└───────────┴───────────┴───────────────┴───────────┴─────────┴───────────────┘

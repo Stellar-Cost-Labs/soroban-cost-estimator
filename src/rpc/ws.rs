@@ -198,7 +198,7 @@ impl WsRpcClient {
         debug!(url, "connecting to WebSocket RPC endpoint");
         let (stream, _) = tokio_tungstenite::connect_async(url)
             .await
-            .map_err(|e| AppError::WsConnect(format!("{url}: {e}")))?;
+            .map_err(|e| AppError::WsConnect(format!("connect to {url}: {e}")))?;
         trace!(url, "WebSocket RPC connection established");
         Ok(Self { stream, next_id: 1 })
     }
