@@ -50,24 +50,68 @@ pub fn wasm_sha256_hex(bytes: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
-/// Loads a compiled Soroban contract `.wasm` file from disk.
+/// Default upper bound on WASM file size before reading into memory (16 MiB).
 ///
-/// Reads the file bytes, performs basic structural validation via
-/// `wasmparser`, enumerates exported functions, and — when the WASM carries
-/// a Soroban contract spec (`contractspecv0` custom section) — decodes the
-/// typed parameter information from it.
-///
-/// # Network calls
-/// None — pure file I/O + parsing.
+/// Prevents denial-of-service via memory exhaustion when handling accidental or
+/// hostile oversized user-supplied binaries. Even unoptimized debug builds of
+/// large Soroban contracts rarely exceed 5-10 MiB, and deployed on-chain
+/// contracts are capped at protocol-level limits far below this.
+pub const DEFAULT_MAX_WASM_FILE_SIZE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Loads a compiled Soroban contract `.wasm` file from disk using the default
+/// maximum file size limit ([`DEFAULT_MAX_WASM_FILE_SIZE_BYTES`]).
 pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
-    debug!(path = %path.display(), "loading WASM file");
-    let bytes = std::fs::read(path).map_err(|e| {
+    load_wasm_with_limit(path, DEFAULT_MAX_WASM_FILE_SIZE_BYTES)
+}
+
+/// Loads a compiled Soroban contract `.wasm` file from disk, enforcing a maximum
+/// size limit before and during file reading to avoid unbounded memory allocations.
+///
+/// Checks file metadata before allocation and reads with a bounded stream reader,
+/// returning [`AppError::WasmFileTooLarge`] if the file is oversized or grows during read.
+pub fn load_wasm_with_limit(path: &Path, max_bytes: u64) -> AppResult<WasmInfo> {
+    debug!(path = %path.display(), max_bytes, "loading WASM file with size limit");
+
+    let metadata = std::fs::metadata(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             AppError::FileNotFound(path.display().to_string())
         } else {
             AppError::Io(e)
         }
     })?;
+
+    let file_len = metadata.len();
+    if file_len > max_bytes {
+        return Err(AppError::WasmFileTooLarge {
+            path: path.display().to_string(),
+            size: file_len,
+            max_size: max_bytes,
+        });
+    }
+
+    // Guard against files that grow between metadata inspection and reading
+    // by bounding the read operation to `max_bytes + 1`.
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            AppError::FileNotFound(path.display().to_string())
+        } else {
+            AppError::Io(e)
+        }
+    })?;
+
+    let mut bytes = Vec::with_capacity(file_len.min(max_bytes) as usize);
+    file.by_ref()
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+
+    if bytes.len() as u64 > max_bytes {
+        return Err(AppError::WasmFileTooLarge {
+            path: path.display().to_string(),
+            size: bytes.len() as u64,
+            max_size: max_bytes,
+        });
+    }
     debug!(bytes = bytes.len(), "WASM bytes read");
 
     validate_wasm(&bytes)?;
@@ -560,6 +604,7 @@ pub fn parse_contract_spec_entries(
         let data = section.data();
         let mut cursor = Cursor::new(data);
         while (cursor.position() as usize) < data.len() {
+            let prev_pos = cursor.position();
             let mut limited = stellar_xdr::Limited::new(&mut cursor, stellar_xdr::Limits::none());
             let entry = stellar_xdr::ScSpecEntry::read_xdr(&mut limited).map_err(|e| {
                 AppError::WasmParse(format!(
@@ -567,6 +612,11 @@ pub fn parse_contract_spec_entries(
                     entries.len()
                 ))
             })?;
+            if cursor.position() <= prev_pos {
+                return Err(AppError::WasmParse(
+                    "zero-byte progress while decoding contractspecv0 entry".to_string(),
+                ));
+            }
             entries.push(entry);
         }
     }
@@ -932,13 +982,17 @@ pub struct MemoryInfo {
 }
 
 /// Information about an import declared by a WASM module.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Records the origin module (e.g. `"env"` for Soroban host functions), the symbol
+/// name, and the imported entity kind (`function`, `memory`, `table`, `global`, `tag`).
+/// Preserves deterministic declaration ordering from the binary's import section.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ImportInfo {
-    /// Module name the import is pulled from.
+    /// Module name the import is pulled from (e.g. `"env"` for Soroban host functions).
     pub module: String,
     /// Name of the imported item.
     pub name: String,
-    /// Human-readable kind, e.g. `function`, `memory`, `global`.
+    /// Human-readable kind, e.g. `function`, `memory`, `table`, `global`, `tag`.
     pub kind: String,
 }
 
@@ -1209,6 +1263,13 @@ pub struct WasmInfo {
 }
 
 impl WasmInfo {
+    /// Returns an iterator over imports from the Soroban host module ([`HOST_IMPORT_MODULE`]).
+    pub fn host_imports(&self) -> impl Iterator<Item = &ImportInfo> {
+        self.imports
+            .iter()
+            .filter(|imp| imp.module == HOST_IMPORT_MODULE)
+    }
+
     /// Size accounting for the whole file: the module header plus one entry
     /// per section, each with its share of the file.
     #[must_use]
