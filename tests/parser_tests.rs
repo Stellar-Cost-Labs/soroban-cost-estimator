@@ -1028,3 +1028,297 @@ fn test_load_wasm_detects_synthetic_debug_section() {
 
     let _ = std::fs::remove_file(&temp);
 }
+
+#[test]
+fn test_load_wasm_rejects_oversized_file() {
+    let temp = std::env::temp_dir().join(format!("sce-oversized-{}.wasm", std::process::id()));
+    std::fs::write(&temp, vec![0u8; 1000]).expect("write temp file");
+
+    let err = soroban_cost_estimator::wasm::parser::load_wasm_with_limit(&temp, 500)
+        .expect_err("should reject oversized file");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exceeds maximum allowed size"),
+        "error should indicate size exceeded: {msg}"
+    );
+    assert!(
+        msg.contains("limit is 500 bytes"),
+        "error should include configured maximum: {msg}"
+    );
+    assert!(
+        msg.contains(&temp.display().to_string()),
+        "error should contain file path: {msg}"
+    );
+
+    let _ = std::fs::remove_file(&temp);
+}
+
+#[test]
+fn test_load_wasm_accepts_file_within_limit() {
+    let path = Path::new("tests/fixtures/minimal.wasm");
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm_with_limit(path, 1024)
+        .expect("minimal.wasm (44 bytes) should load fine with 1024 limit");
+    assert_eq!(wasm_info.bytes.len(), 44);
+}
+
+#[test]
+fn test_contract_imports_reported_in_metadata() {
+    let path = Path::new("tests/fixtures/contract.wasm");
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(path)
+        .expect("failed to load contract fixture");
+
+    assert!(
+        !wasm_info.imports.is_empty(),
+        "contract should declare imports"
+    );
+    for imp in &wasm_info.imports {
+        assert!(!imp.module.is_empty(), "module name should not be empty");
+        assert!(!imp.name.is_empty(), "import name should not be empty");
+        assert!(!imp.kind.is_empty(), "import kind should not be empty");
+    }
+
+    let host_imps: Vec<_> = wasm_info.host_imports().collect();
+    assert_eq!(
+        host_imps.len(),
+        wasm_info
+            .imports
+            .iter()
+            .filter(|i| i.module == "env")
+            .count()
+    );
+    for imp in host_imps {
+        assert_eq!(imp.module, "env");
+    }
+}
+
+#[test]
+fn test_synthetic_imports_function_and_memory_kinds() {
+    let mut wasm = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+    wasm.extend_from_slice(&[0x01, 0x04, 0x01, 0x60, 0x00, 0x00]);
+
+    let mut import_data = Vec::new();
+    import_data.push(0x02);
+    import_data.extend_from_slice(&[0x03, b'e', b'n', b'v']);
+    import_data.extend_from_slice(&[0x07, b'h', b'o', b's', b't', b'_', b'f', b'n']);
+    import_data.extend_from_slice(&[0x00, 0x00]);
+
+    import_data.extend_from_slice(&[0x03, b'e', b'n', b'v']);
+    import_data.extend_from_slice(&[0x06, b'm', b'e', b'm', b'o', b'r', b'y']);
+    import_data.extend_from_slice(&[0x02, 0x00, 0x01]);
+
+    wasm.push(0x02);
+    wasm.push(import_data.len() as u8);
+    wasm.extend_from_slice(&import_data);
+
+    let mut export_data = Vec::new();
+    export_data.push(0x01);
+    export_data.extend_from_slice(&[0x08, b'e', b'x', b'p', b'o', b'r', b't', b'e', b'd']);
+    export_data.extend_from_slice(&[0x00, 0x00]);
+    wasm.push(0x07);
+    wasm.push(export_data.len() as u8);
+    wasm.extend_from_slice(&export_data);
+
+    let meta = soroban_cost_estimator::wasm::parser::enumerate_module_metadata(&wasm)
+        .expect("should enumerate metadata for valid wasm");
+
+    assert_eq!(meta.imports.len(), 2);
+    assert_eq!(meta.imports[0].module, "env");
+    assert_eq!(meta.imports[0].name, "host_fn");
+    assert_eq!(meta.imports[0].kind, "function");
+
+    assert_eq!(meta.imports[1].module, "env");
+    assert_eq!(meta.imports[1].name, "memory");
+    assert_eq!(meta.imports[1].kind, "memory");
+
+    let json_val = serde_json::to_value(&meta.imports).expect("serialize ImportInfo");
+    assert_eq!(json_val[0]["kind"], "function");
+    assert_eq!(json_val[1]["kind"], "memory");
+}
+
+#[test]
+fn test_contract_abi_diff_fixtures_and_scenarios() {
+    let contract_path = Path::new("tests/fixtures/contract.wasm");
+    let minimal_path = Path::new("tests/fixtures/minimal.wasm");
+
+    let contract_info =
+        soroban_cost_estimator::wasm::parser::load_wasm(contract_path).expect("load contract.wasm");
+    let minimal_info =
+        soroban_cost_estimator::wasm::parser::load_wasm(minimal_path).expect("load minimal.wasm");
+
+    assert!(contract_info.has_spec, "contract.wasm should have spec");
+    assert!(!minimal_info.has_spec, "minimal.wasm should not have spec");
+
+    // 1. Missing spec handling: if either or both have no spec, ABI diff is None
+    let diff_none1 = if contract_info.has_spec && minimal_info.has_spec {
+        Some(soroban_cost_estimator::report::diff::compare_contract_abi(
+            &contract_info.functions,
+            &minimal_info.functions,
+        ))
+    } else {
+        None
+    };
+    assert!(
+        diff_none1.is_none(),
+        "missing spec should yield None for abi_diff"
+    );
+
+    let diff_none2 = if minimal_info.has_spec {
+        Some(soroban_cost_estimator::report::diff::compare_contract_abi(
+            &minimal_info.functions,
+            &minimal_info.functions,
+        ))
+    } else {
+        None
+    };
+    assert!(
+        diff_none2.is_none(),
+        "missing spec on both should yield None for abi_diff"
+    );
+
+    // 2. Identical specs: diff is empty
+    let diff_identical = soroban_cost_estimator::report::diff::compare_contract_abi(
+        &contract_info.functions,
+        &contract_info.functions,
+    );
+    assert!(diff_identical.is_empty());
+    let formatted_identical =
+        soroban_cost_estimator::report::diff::format_abi_diff(&diff_identical);
+    assert!(formatted_identical.contains("unchanged"));
+
+    // 3. Added function
+    let mut added_fns = contract_info.functions.clone();
+    added_fns.push(soroban_cost_estimator::wasm::parser::FunctionInfo {
+        name: "reset".to_string(),
+        param_count: 0,
+        result_count: 0,
+        params: Vec::new(),
+        returns: Vec::new(),
+    });
+    let diff_added = soroban_cost_estimator::report::diff::compare_contract_abi(
+        &contract_info.functions,
+        &added_fns,
+    );
+    assert_eq!(diff_added.added_functions, vec!["reset()"]);
+    assert!(diff_added.removed_functions.is_empty());
+    assert!(diff_added.modified_functions.is_empty());
+
+    // 4. Removed function
+    let diff_removed = soroban_cost_estimator::report::diff::compare_contract_abi(
+        &added_fns,
+        &contract_info.functions,
+    );
+    assert_eq!(diff_removed.removed_functions, vec!["reset()"]);
+    assert!(diff_removed.added_functions.is_empty());
+    assert!(diff_removed.modified_functions.is_empty());
+
+    // 5. Parameter and return type changes
+    let mut modified_fns = contract_info.functions.clone();
+    for f in &mut modified_fns {
+        if f.name == "increment" {
+            f.params[0].type_name = "u64".to_string();
+            f.returns[0].type_name = "u64".to_string();
+        }
+    }
+    let diff_mod = soroban_cost_estimator::report::diff::compare_contract_abi(
+        &contract_info.functions,
+        &modified_fns,
+    );
+    assert_eq!(diff_mod.modified_functions.len(), 1);
+    let m = &diff_mod.modified_functions[0];
+    assert_eq!(m.name, "increment");
+    assert_eq!(m.param_changes.len(), 1);
+    assert_eq!(m.param_changes[0].name, "step");
+    assert_eq!(m.param_changes[0].old_type.as_deref(), Some("i64"));
+    assert_eq!(m.param_changes[0].new_type.as_deref(), Some("u64"));
+    assert_eq!(m.old_return.as_deref(), Some("i64"));
+    assert_eq!(m.new_return.as_deref(), Some("u64"));
+
+    let formatted_mod = soroban_cost_estimator::report::diff::format_abi_diff(&diff_mod);
+    assert!(formatted_mod.contains("Modified functions:"));
+    assert!(formatted_mod.contains("increment:"));
+}
+
+#[test]
+fn test_fuzz_boundaries_malformed_wasm_inputs() {
+    use soroban_cost_estimator::wasm::parser::{
+        enumerate_module_metadata, parse_contract_spec_entries, validate_wasm,
+        validate_wasm_memory_limits,
+    };
+
+    // 1. Empty input
+    assert!(validate_wasm(&[]).is_err());
+    assert!(enumerate_module_metadata(&[]).is_err());
+    assert!(parse_contract_spec_entries(&[]).is_err());
+    assert_eq!(validate_wasm_memory_limits(&[]), None);
+
+    // 2. Corrupted magic header
+    let bad_magic = [0x00, 0x61, 0x73, 0x00, 0x01, 0x00, 0x00, 0x00];
+    assert!(validate_wasm(&bad_magic).is_err());
+    assert!(enumerate_module_metadata(&bad_magic).is_err());
+    assert!(parse_contract_spec_entries(&bad_magic).is_err());
+
+    // 3. Truncated section header
+    let truncated_section = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01];
+    assert!(validate_wasm(&truncated_section).is_err());
+    assert!(enumerate_module_metadata(&truncated_section).is_err());
+    assert!(parse_contract_spec_entries(&truncated_section).is_err());
+
+    // 4. Custom section claiming huge length
+    let mut bad_custom = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+    bad_custom.push(0x00); // custom section id
+    bad_custom.extend_from_slice(&[0x80, 0x80, 0x04]); // LEB128 huge length
+    bad_custom.extend_from_slice(b"short");
+    assert!(validate_wasm(&bad_custom).is_err());
+    assert!(enumerate_module_metadata(&bad_custom).is_err());
+    assert!(parse_contract_spec_entries(&bad_custom).is_err());
+
+    // 5. contractspecv0 with malformed XDR payload
+    let mut malformed_spec = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+    let mut custom_payload = Vec::new();
+    let name = "contractspecv0";
+    custom_payload.push(name.len() as u8);
+    custom_payload.extend_from_slice(name.as_bytes());
+    // Invalid XDR bytes (e.g. invalid discriminant or truncated data)
+    custom_payload.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x01, 0x02]);
+    malformed_spec.push(0x00);
+    malformed_spec.push(custom_payload.len() as u8);
+    malformed_spec.extend_from_slice(&custom_payload);
+
+    let spec_res = parse_contract_spec_entries(&malformed_spec);
+    assert!(
+        spec_res.is_err(),
+        "malformed XDR payload in contractspecv0 must fail gracefully"
+    );
+}
+
+#[test]
+fn test_fuzz_seed_corpus_fixtures_succeed() {
+    use soroban_cost_estimator::wasm::parser::{
+        enumerate_module_metadata, parse_contract_spec_entries, validate_wasm,
+        validate_wasm_memory_limits,
+    };
+
+    let fixtures = [
+        "tests/fixtures/minimal.wasm",
+        "tests/fixtures/zeroarg.wasm",
+        "tests/fixtures/contract.wasm",
+    ];
+
+    for path_str in fixtures {
+        let bytes = std::fs::read(path_str)
+            .unwrap_or_else(|e| panic!("failed to read seed fixture {path_str}: {e}"));
+
+        // All seed corpus files must be valid WASM
+        assert!(validate_wasm(&bytes).is_ok(), "valid wasm: {path_str}");
+        assert!(
+            enumerate_module_metadata(&bytes).is_ok(),
+            "metadata enumeration: {path_str}"
+        );
+        let _ = validate_wasm_memory_limits(&bytes);
+        assert!(
+            parse_contract_spec_entries(&bytes).is_ok(),
+            "spec entries: {path_str}"
+        );
+    }
+}
