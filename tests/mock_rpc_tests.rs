@@ -4,6 +4,7 @@ use serde_json::json;
 
 use soroban_cost_estimator::error::AppError;
 use soroban_cost_estimator::rpc::client::RpcClient;
+use soroban_cost_estimator::rpc::simulate::{SimulateTransactionResponse, parse_restore_fee};
 
 #[tokio::test]
 async fn mock_rpc_fixture_handles_simulate_transaction_and_health() {
@@ -104,4 +105,61 @@ async fn mock_rpc_fixture_surfaces_rpc_errors_from_the_server() {
         .expect_err("mocked JSON-RPC errors should propagate as AppError::Rpc");
 
     assert!(matches!(err, AppError::Rpc { status: -32602, .. }));
+}
+
+/// Issue #524: a `restoreFee` in the live RPC response shape must
+/// deserialize, decode to stroops, and stay a distinct component (it does
+/// not alter `minResourceFee`).
+#[tokio::test]
+async fn mock_rpc_fixture_returns_restore_fee_when_present() {
+    let server = common::start_mock_rpc_server().await;
+
+    common::stub_jsonrpc_success(
+        &server,
+        "simulateTransaction",
+        json!({
+            "latestLedger": 42,
+            "minResourceFee": "15427",
+            "restoreFee": "230"
+        }),
+    )
+    .await;
+
+    let client = RpcClient::new(server.uri().as_str());
+    let response: SimulateTransactionResponse = client
+        .call("simulateTransaction", json!({ "transaction": "abc" }))
+        .await
+        .expect("simulateTransaction should succeed against the mock server");
+
+    assert_eq!(response.restore_fee.as_deref(), Some("230"));
+    assert_eq!(parse_restore_fee(&response.restore_fee).unwrap(), Some(230));
+    // The authoritative total is untouched by the restore fee.
+    assert_eq!(response.min_resource_fee.as_deref(), Some("15427"));
+}
+
+/// Issue #524: responses without a `restoreFee` (the common case) keep the
+/// restore fee unknown — `None` — rather than zero.
+#[tokio::test]
+async fn mock_rpc_fixture_keeps_restore_fee_absent_as_unknown() {
+    let server = common::start_mock_rpc_server().await;
+
+    common::stub_jsonrpc_success(
+        &server,
+        "simulateTransaction",
+        json!({
+            "latestLedger": 42,
+            "minResourceFee": "15427",
+            "restoreFee": null
+        }),
+    )
+    .await;
+
+    let client = RpcClient::new(server.uri().as_str());
+    let response: SimulateTransactionResponse = client
+        .call("simulateTransaction", json!({ "transaction": "abc" }))
+        .await
+        .expect("simulateTransaction should succeed against the mock server");
+
+    assert_eq!(response.restore_fee, None);
+    assert_eq!(parse_restore_fee(&response.restore_fee).unwrap(), None);
 }
