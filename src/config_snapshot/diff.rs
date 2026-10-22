@@ -220,15 +220,20 @@ pub enum SettingChangeKind {
 /// A single changed field between two snapshots.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct FieldDiff {
+    /// Dotted path of the changed field (e.g. `contract_compute.tx_max_instructions`).
     pub field_path: String,
     /// Raw `ConfigSettingId` number (e.g. `0` for contract compute), or
     /// `None` when the path's setting prefix is unknown.
     pub setting_id: Option<u32>,
     /// Friendly setting name (e.g. `Contract Compute V0`) for `field_path`.
     pub setting_name: String,
+    /// Value in the older snapshot, rendered for display.
     pub old_value: String,
+    /// Value in the newer snapshot, rendered for display.
     pub new_value: String,
+    /// Whether the field affects what a contract invocation costs.
     pub is_pricing_change: bool,
+    /// Optional short explanation of what the setting controls.
     pub explanation: Option<&'static str>,
     /// How the setting changed: a numeric value change, an added/removed
     /// section, or a field this build does not recognize.
@@ -305,9 +310,13 @@ impl FieldDiff {
 /// The result of comparing two config snapshots.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConfigDiff {
+    /// Identity of the older snapshot in the comparison.
     pub old_snapshot: SnapshotInfo,
+    /// Identity of the newer snapshot in the comparison.
     pub new_snapshot: SnapshotInfo,
+    /// Every field-level change, in discovery order.
     pub changes: Vec<FieldDiff>,
+    /// Whether at least one change affects pricing.
     pub has_pricing_changes: bool,
     /// Whether any change involves a setting this build does not recognize.
     pub has_unknown_changes: bool,
@@ -404,10 +413,14 @@ pub fn resolve_exit_code(
     i32::from(pricing_changed)
 }
 
+/// Identity of one snapshot inside a [`ConfigDiff`].
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SnapshotInfo {
+    /// Network the snapshot was captured from.
     pub network: String,
+    /// RFC 3339 timestamp of when the snapshot was taken.
     pub timestamp: String,
+    /// Ledger sequence at capture time.
     pub ledger: u32,
 }
 
@@ -1195,6 +1208,7 @@ mod tests {
             network: "testnet".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             ledger: 100,
+            settings_last_modified: std::collections::BTreeMap::new(),
             protocol_version: None,
             contract_compute: Some(ContractComputeV0 {
                 ledger_max_instructions: 1_000_000,
