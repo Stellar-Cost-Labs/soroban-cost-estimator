@@ -144,6 +144,13 @@ cargo audit        # dependency advisories
 cargo deny check   # licenses, sources, bans, advisories
 ```
 
+### If CI cannot reach crates.io
+
+A job that fails before compiling with repeated
+`Couldn't resolve host name (Could not resolve host: index.crates.io)` errors
+hit a GitHub runner DNS failure, not a problem with your change. Re-run the
+failed jobs from the PR's **Checks** tab (or `gh run rerun <run-id> --failed`).
+
 ## Benchmarks
 
 Criterion benchmarks are not pass/fail gates, but they must compile:
@@ -232,6 +239,9 @@ green.
       passes.
 - [ ] `cargo build --all-targets` passes.
 - [ ] `cargo run --bin gen_test_wasm` then `cargo test --workspace` passes.
+- [ ] Any job that failed on `Couldn't resolve host: index.crates.io` has been
+      re-run, since that is a runner network failure rather than a code
+      failure.
 - [ ] `cargo test --test mock_rpc_tests --test cli_tests` passes.
 - [ ] Tests added or updated; bug fix includes a regression test.
 - [ ] No new `unwrap()`/`expect()` outside test code.
