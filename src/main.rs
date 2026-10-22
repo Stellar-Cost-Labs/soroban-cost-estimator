@@ -3861,7 +3861,7 @@ async fn cmd_config_snapshot(
         info!("taking config snapshot");
         let snapshot = fetch_config_snapshot(
             network,
-            None,
+            rpc_url,
             rpc_fallback_url,
             rps,
             timeout,
@@ -4247,7 +4247,7 @@ async fn cmd_config_diff(
 
         let new_snapshot = fetch_config_snapshot(
             network,
-            None,
+            rpc_url,
             rpc_fallback_url,
             rps,
             timeout,
