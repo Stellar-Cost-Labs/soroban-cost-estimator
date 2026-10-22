@@ -1,0 +1,42 @@
+name: Code Coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin
+
+      - name: Generate test WASM fixture
+        run: cargo run --bin gen_test_wasm
+
+      - name: Run coverage
+        run: >
+          cargo tarpaulin
+          --workspace
+          --all-features
+          --out lcov
+          --output-dir coverage
+          --skip-clean
+          --engine llvm
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/lcov.info
+          retention-days: 30

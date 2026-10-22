@@ -5,18 +5,39 @@ use stellar_xdr::WriteXdr;
 
 use crate::config_snapshot::model::ConfigSnapshot;
 use crate::error::{AppError, AppResult};
+use crate::wasm::parser::FunctionInfo;
 
 /// Decode a base64-encoded XDR `LedgerEntryData` and extract a typed `ConfigSettingEntry`.
 ///
 /// The Soroban RPC `getLedgerEntries` returns the entry data as a `LedgerEntryData`
 /// XDR (not the full `LedgerEntry` which includes `lastModifiedLedgerSeq` and `ext`
 /// fields that are returned as separate JSON fields).
-pub fn decode_config_entry_xdr(xdr_b64: &str) -> AppResult<stellar_xdr::ConfigSettingEntry> {
+pub fn decode_config_entry_xdr(
+    xdr_b64: &str,
+    verbose: bool,
+) -> AppResult<stellar_xdr::ConfigSettingEntry> {
+    if verbose {
+        eprintln!(
+            "[XDR] Decoding config entry from base64 ({} chars)",
+            xdr_b64.len()
+        );
+    }
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, xdr_b64)
-        .map_err(|e| AppError::XdrDecode(format!("base64 decode: {e}")))?;
+        .map_err(|e| AppError::XdrDecode(format!("invalid base64: {e}")))?;
+
+    if verbose {
+        eprintln!("[XDR] -> Decoded to {} bytes", bytes.len());
+    }
 
     let entry_data = stellar_xdr::LedgerEntryData::from_xdr(&bytes, stellar_xdr::Limits::none())
-        .map_err(|e| AppError::XdrDecode(format!("LedgerEntryData from_xdr: {e}")))?;
+        .map_err(|e| AppError::XdrDecode(format!("ledger entry data: {e}")))?;
+
+    if verbose {
+        eprintln!(
+            "[XDR] -> Parsed LedgerEntryData variant: {}",
+            entry_data.name()
+        );
+    }
 
     match entry_data {
         stellar_xdr::LedgerEntryData::ConfigSetting(config_entry) => Ok(config_entry),
@@ -29,12 +50,14 @@ pub fn decode_config_entry_xdr(xdr_b64: &str) -> AppResult<stellar_xdr::ConfigSe
 
 /// Initialize a snapshot with the network, timestamp, and ledger set; all
 /// config entries start empty.
+#[must_use]
 pub fn begin_snapshot(network: &str, ledger: u32) -> ConfigSnapshot {
     use chrono::Utc;
     ConfigSnapshot {
         network: network.to_string(),
         timestamp: Utc::now().to_rfc3339(),
         ledger,
+        protocol_version: None,
         contract_compute: None,
         contract_ledger_cost: None,
         contract_historical_data: None,
@@ -149,7 +172,9 @@ pub fn build_simulation_tx_envelope(
 
             let fn_name_bytes: Vec<u8> = fn_name.as_bytes().to_vec();
             let sc_symbol = stellar_xdr::ScSymbol::try_from(fn_name_bytes).map_err(
-                |e: stellar_xdr::Error| AppError::TxConstruction(format!("ScSymbol: {e}")),
+                |e: stellar_xdr::Error| {
+                    AppError::TxConstruction(format!("invalid function symbol '{fn_name}': {e}"))
+                },
             )?;
 
             let contract_id = stellar_xdr::ContractId(stellar_xdr::Hash(id_bytes));
@@ -158,7 +183,7 @@ pub fn build_simulation_tx_envelope(
             let args_m: VecM<stellar_xdr::ScVal> = args
                 .to_vec()
                 .try_into()
-                .map_err(|e| AppError::TxConstruction(format!("ScVal args: {e}")))?;
+                .map_err(|e| AppError::TxConstruction(format!("invalid argument list: {e}")))?;
 
             stellar_xdr::HostFunction::InvokeContract(stellar_xdr::InvokeContractArgs {
                 contract_address: sc_address,
@@ -170,7 +195,7 @@ pub fn build_simulation_tx_envelope(
             let wasm_vec: Vec<u8> = wasm_bytes.to_vec();
             let bytes_m: stellar_xdr::BytesM =
                 wasm_vec.try_into().map_err(|e: stellar_xdr::Error| {
-                    AppError::TxConstruction(format!("BytesM: {e}"))
+                    AppError::TxConstruction(format!("invalid WASM upload payload: {e}"))
                 })?;
             stellar_xdr::HostFunction::UploadContractWasm(bytes_m)
         }
@@ -190,7 +215,7 @@ pub fn build_simulation_tx_envelope(
         vec![operation]
             .try_into()
             .map_err(|e: stellar_xdr::Error| {
-                AppError::TxConstruction(format!("VecM operations: {e}"))
+                AppError::TxConstruction(format!("invalid operation list: {e}"))
             })?;
 
     let tx = stellar_xdr::Transaction {
@@ -210,9 +235,57 @@ pub fn build_simulation_tx_envelope(
 
     let xdr_bytes = tx_env
         .to_xdr(stellar_xdr::Limits::none())
-        .map_err(|e| AppError::TxConstruction(format!("XDR encode: {e}")))?;
+        .map_err(|e| AppError::XdrEncode(format!("transaction envelope: {e}")))?;
 
     Ok(xdr_bytes)
+}
+
+/// Validates `--arg` values against the contract-spec types for the function
+/// being simulated, before any RPC call is made.
+///
+/// When the WASM carries a `contractspecv0` and a matching function is found
+/// with typed parameters, each `--arg` value must match the declared type
+/// (e.g. `abc` is rejected for `i64`). Mismatches fail fast so a bad argument
+/// never reaches the network. Only the target function's declared parameters
+/// are checked: extra or missing arguments are a mismatch as well.
+///
+/// * `function_name` - `None` (WASM upload) or a function with no spec params
+///   skips validation entirely.
+/// * `args` - Raw `--arg KEY=VAL` entries as passed on the CLI.
+/// * `functions` - Enumerated functions with spec-derived params.
+pub fn validate_args_against_spec(
+    function_name: Option<&str>,
+    args: &[String],
+    functions: &[FunctionInfo],
+) -> AppResult<()> {
+    let Some(fn_name) = function_name else {
+        return Ok(());
+    };
+    let Some(fn_info) = functions.iter().find(|f| f.name == fn_name) else {
+        return Ok(());
+    };
+    if fn_info.params.is_empty() {
+        return Ok(());
+    }
+
+    if args.len() != fn_info.params.len() {
+        let decl = fn_info
+            .params
+            .iter()
+            .map(|p| format!("{}: {}", p.name, p.type_name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(AppError::TypeValidation(format!(
+            "function '{fn_name}' expects {} argument(s) ({decl}), but {} were provided",
+            fn_info.params.len(),
+            args.len()
+        )));
+    }
+
+    for (arg, param) in args.iter().zip(&fn_info.params) {
+        crate::wasm::parser::validate_arg_value(&param.type_def, arg)?;
+    }
+    Ok(())
 }
 
 /// Parse a contract ID into a 32-byte array.
@@ -245,6 +318,7 @@ pub fn parse_contract_id(id: &str) -> AppResult<[u8; 32]> {
 /// non-negative integer that overflows `i64` → `U64`, anything else →
 /// `String`. The inferred type drives the simulation's serialization size,
 /// which is what the fee math actually depends on.
+#[must_use]
 pub fn parse_arg_scval(arg: &str) -> stellar_xdr::ScVal {
     let value = arg.split_once('=').map(|(_, v)| v).unwrap_or(arg);
 
@@ -277,6 +351,27 @@ mod tests {
         ConfigSettingContractEventsV0, ConfigSettingContractHistoricalDataV0,
         ConfigSettingContractLedgerCostV0, StateArchivalSettings,
     };
+
+    fn increment_function() -> FunctionInfo {
+        FunctionInfo {
+            name: "increment".to_string(),
+            param_count: 2,
+            result_count: 1,
+            params: vec![
+                crate::wasm::parser::ParamInfo {
+                    name: "step".to_string(),
+                    type_name: "i64".to_string(),
+                    type_def: stellar_xdr::ScSpecTypeDef::I64,
+                },
+                crate::wasm::parser::ParamInfo {
+                    name: "label".to_string(),
+                    type_name: "symbol".to_string(),
+                    type_def: stellar_xdr::ScSpecTypeDef::Symbol,
+                },
+            ],
+            returns: Vec::new(),
+        }
+    }
 
     #[test]
     fn test_begin_snapshot_defaults() {
@@ -441,5 +536,54 @@ mod tests {
         assert!(snap.contract_events.is_some());
         assert!(snap.contract_bandwidth.is_some());
         assert!(snap.state_archival.is_some());
+    }
+
+    #[test]
+    fn test_validate_args_against_spec_ok() {
+        let functions = vec![increment_function()];
+        let args = vec!["step=3".to_string(), "player_1".to_string()];
+        let result = validate_args_against_spec(Some("increment"), &args, &functions);
+        assert!(result.is_ok(), "expected valid args to pass: {result:?}");
+    }
+
+    #[test]
+    fn test_validate_args_against_spec_type_mismatch() {
+        let functions = vec![increment_function()];
+        let args = vec!["step=abc".to_string(), "player_1".to_string()];
+        let err = validate_args_against_spec(Some("increment"), &args, &functions)
+            .expect_err("abc for i64 must fail");
+        assert!(err.to_string().contains("i64"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_args_against_spec_arity_mismatch() {
+        let functions = vec![increment_function()];
+        let args = vec!["step=3".to_string()];
+        let err = validate_args_against_spec(Some("increment"), &args, &functions)
+            .expect_err("arity mismatch must fail");
+        assert!(
+            err.to_string().contains("expects 2 argument(s)"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_args_skipped_without_spec() {
+        let no_spec = FunctionInfo {
+            name: "plain".to_string(),
+            param_count: 1,
+            result_count: 1,
+            params: vec![],
+            returns: vec![],
+        };
+        let result =
+            validate_args_against_spec(Some("plain"), &["anything".to_string()], &[no_spec]);
+        assert!(result.is_ok(), "no spec params means nothing to validate");
+    }
+
+    #[test]
+    fn test_validate_args_skipped_for_uploads() {
+        let result = validate_args_against_spec(None, &[], &[]);
+        assert!(result.is_ok(), "upload path skips validation");
     }
 }
