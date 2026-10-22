@@ -348,6 +348,20 @@ pub fn format_resource_warnings(warnings: &[ResourceWarning]) -> String {
     out
 }
 
+/// Render a fee consistency warning as a human-readable banner when locally
+/// derived non-refundable components exceed the authoritative RPC resource fee.
+///
+/// Returns an empty string when there is no mismatch.
+#[must_use]
+pub fn format_fee_consistency_warning(
+    warning: Option<&crate::report::fee_calc::FeeConsistencyWarning>,
+) -> String {
+    let Some(w) = warning else {
+        return String::new();
+    };
+    format!("\nFee consistency warning:\n  - {}\n", w.message)
+}
+
 /// Direction of a historical fee change relative to the current run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -801,6 +815,15 @@ impl CostReport {
                 .cmp(&a.potential_savings_stroops)
         });
         suggestions
+    }
+
+    /// Structured consistency warning when locally derived non-refundable fee
+    /// components exceed the authoritative simulation resource fee.
+    #[must_use]
+    pub fn fee_consistency_warning(
+        &self,
+    ) -> Option<crate::report::fee_calc::FeeConsistencyWarning> {
+        self.fee.consistency_warning()
     }
 }
 
@@ -1615,6 +1638,11 @@ pub fn format_report_table(report: &CostReport) -> String {
 
     // Resource-limit warnings (#322) — only when something nears a ceiling.
     output.push_str(&format_resource_warnings(&report.warnings));
+
+    // Fee consistency warning (#528) — only when derived components exceed RPC total.
+    output.push_str(&format_fee_consistency_warning(
+        report.fee_consistency_warning().as_ref(),
+    ));
 
     // Historical trend table (#321) — only populated with `--history`.
     if let Some(history) = &report.history {
