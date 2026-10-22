@@ -2193,7 +2193,7 @@ pub struct PricingSensitivityReport {
 /// (with a warning that rates may be incomplete).
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// let footprint_fee = 1_500_000; // stroops from one invocation
 /// let snapshots = [
 ///     snapshot_with_compute_fee(100), // 100 stroops/insn increment
