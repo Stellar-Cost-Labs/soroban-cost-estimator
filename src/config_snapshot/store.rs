@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
+use std::{fs, io::Write};
 
 use chrono::{DateTime, TimeDelta, Utc};
+use tempfile::NamedTempFile;
 use tracing::{debug, trace, warn};
 
 use crate::config_snapshot::model::{ConfigSnapshot, SnapshotPayload};
@@ -21,6 +23,47 @@ fn snapshots_dir() -> AppResult<PathBuf> {
     let dir = snapshots_path()?;
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+/// Writes snapshot bytes to a sibling temporary file and atomically replaces
+/// the destination only after the complete file has been flushed and synced.
+/// Existing destination permissions are preserved.
+pub fn write_snapshot_atomically(dest: &Path, contents: &[u8]) -> AppResult<()> {
+    write_snapshot_atomically_with(dest, |file| {
+        file.write_all(contents)?;
+        file.flush()
+    })
+}
+
+/// Testable form of [`write_snapshot_atomically`] that lets callers simulate
+/// failures while writing the temporary file.
+pub fn write_snapshot_atomically_with<F>(dest: &Path, writer: F) -> AppResult<()>
+where
+    F: FnOnce(&mut fs::File) -> std::io::Result<()>,
+{
+    let parent = dest
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = NamedTempFile::new_in(parent)?;
+
+    match fs::metadata(dest) {
+        Ok(metadata) if metadata.is_file() => {
+            temporary
+                .as_file()
+                .set_permissions(metadata.permissions())?;
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    writer(temporary.as_file_mut())?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(dest)
+        .map_err(|error| AppError::Io(error.error))?;
+    Ok(())
 }
 
 /// Extracts the timestamp encoded in a snapshot file name.
@@ -107,7 +150,7 @@ pub fn save_snapshot(snapshot: &ConfigSnapshot, out_path: Option<&str>) -> AppRe
     };
 
     let json = serde_json::to_string_pretty(snapshot)?;
-    std::fs::write(&path, json)?;
+    write_snapshot_atomically(&path, json.as_bytes())?;
     debug!(path = %path.display(), network = snapshot.network, ledger = snapshot.ledger, "snapshot saved");
     Ok(path)
 }
