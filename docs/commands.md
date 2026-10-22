@@ -69,7 +69,7 @@ soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
 | `--diff` | | | `false` | Compare two WASM builds side by side. Requires `--wasm-new` |
 | `--wasm-new <PATH>` | | | — | The "new" WASM build to compare against when `--diff` is set |
 | `--json` | | | `false` | Output as JSON instead of a human-readable table |
-| `--format <FORMAT>` | | | `table` | Output format: `table`, `json`, `csv`, or `markdown` (overrides `--json`) |
+| `--format <FORMAT>` | | | `table` | Output format: `table`, `json`, `csv`, `markdown`, or `summary` (overrides `--json`) |
 | `--precision <N>` | | | `7` | Decimal places for XLM fee values (`0..=18`) |
 | `--help` | `-h` | | | Print help |
 
@@ -470,7 +470,7 @@ soroban-cost-estimator config diff [OPTIONS]
 | `--pricing-only` | | `false` | Hide non-pricing changes and display only fee-rate adjustments |
 | `--threshold-percent <N>` | | none | Percentage threshold for flagging significant changes (e.g. 10 for 10%) |
 | `--summary` | | `false` | Print a single-line count summary instead of the full diff (for CI status lines) |
-| `--format <FORMAT>` | | `table` | Output format: `table`, `json`, `csv`, or `markdown` |
+| `--format <FORMAT>` | | `table` | Output format: `table`, `json`, `csv`, `markdown`, or `summary` |
 | `--json` | | `false` | Legacy alias for `--format json` |
 | `--ignore-pricing-exit` | | `false` | Force exit code 0 even when pricing changes are detected |
 | `--fail-on-any-change` | | `false` | Exit 1 when any setting changed, even non-pricing settings |
@@ -1079,7 +1079,7 @@ All commands accept:
 |------|-------------|
 | `--rps <N>` | Cap RPC requests at N per second (0 disables) |
 | `--timeout <SECS>` | HTTP request timeout for RPC calls in seconds (default `30`) |
-| `--format <FORMAT>` | Report format for commands that support it: `table`, `json`, `csv`, or `markdown` |
+| `--format <FORMAT>` | Report format for commands that support it: `table`, `json`, `csv`, `markdown`, or `summary` |
 | `--help` / `-h` | Print command-specific help |
 
 `--format` applies to report-producing commands. The legacy `--json` flag remains supported as an alias for `--format json` where it was previously available.
