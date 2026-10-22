@@ -13,11 +13,17 @@ use crate::rpc::client::RpcClient;
 /// resource pricing on the network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConfigSettingId {
+    /// CPU instruction limits and their fees.
     ContractComputeV0 = 0,
+    /// Disk read/write limits, fees, and state rent parameters.
     ContractLedgerCostV0 = 1,
+    /// Historical-data fees.
     ContractHistoricalDataV0 = 2,
+    /// Contract-event size limits and fees.
     ContractEventsV0 = 3,
+    /// Transaction bandwidth limits and fees.
     ContractBandwidthV0 = 4,
+    /// Entry TTLs, rent rates, and eviction scan settings.
     StateArchival = 5,
 }
 
@@ -77,6 +83,7 @@ impl ConfigSettingId {
 /// Request payload for `getLedgerEntries`.
 #[derive(Debug, Serialize)]
 pub struct GetLedgerEntriesParams {
+    /// Base64-encoded XDR ledger keys to fetch.
     pub keys: Vec<String>,
 }
 
@@ -86,11 +93,15 @@ pub struct GetLedgerEntriesParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LedgerEntryResult {
+    /// Base64-encoded XDR of the ledger key, echoed by the RPC.
     #[serde(default)]
     pub key: String,
+    /// Base64-encoded XDR of the entry's `LedgerEntryData`.
     pub xdr: String,
+    /// Ledger in which the entry last changed.
     #[serde(default)]
     pub last_modified_ledger_seq: Option<u32>,
+    /// Ledger at which the entry expires (TTL entries only).
     #[serde(default)]
     pub live_until_ledger_seq: Option<u32>,
 }
@@ -102,7 +113,9 @@ pub struct LedgerEntryResult {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetLedgerEntriesResponse {
+    /// Entries returned, in the order they were requested.
     pub entries: Vec<LedgerEntryResult>,
+    /// Latest ledger known to the node when it answered.
     #[serde(default)]
     pub latest_ledger: Option<u64>,
 }
@@ -112,8 +125,11 @@ pub struct GetLedgerEntriesResponse {
 /// The XDR bytes are decoded from the base64 `xdr` field of the ledger entry.
 #[derive(Debug, Clone)]
 pub struct ConfigSettingEntryRaw {
+    /// Which configuration setting this entry holds.
     pub id: ConfigSettingId,
+    /// Base64-encoded XDR of the setting's value.
     pub config_xdr: String,
+    /// Ledger in which the setting last changed.
     pub last_modified_ledger: u32,
 }
 
@@ -417,7 +433,9 @@ pub async fn fetch_all_config_settings(client: &RpcClient) -> AppResult<ConfigSe
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetLatestLedgerResponse {
+    /// Sequence number of the latest closed ledger.
     pub sequence: u32,
+    /// Protocol version the network is running.
     pub protocol_version: u32,
 }
 

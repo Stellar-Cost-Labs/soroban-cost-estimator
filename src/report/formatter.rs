@@ -5,11 +5,11 @@
 //!
 //! # Implementations
 //!
-//! - [`TableFormatter`] — human-readable table with fee breakdown
-//! - [`JsonFormatter`] — pretty-printed JSON
-//! - [`CsvFormatter`] — comma-separated values
-//! - [`MarkdownFormatter`] — GitHub-flavored Markdown table
-//! - [`SummaryFormatter`] — one pipe-delimited line per report (#533)
+//! - [`crate::report::formatter::TableFormatter`] — human-readable table with fee breakdown
+//! - [`crate::report::formatter::JsonFormatter`] — pretty-printed JSON
+//! - [`crate::report::formatter::CsvFormatter`] — comma-separated values
+//! - [`crate::report::formatter::MarkdownFormatter`] — GitHub-flavored Markdown table
+//! - [`crate::report::formatter::SummaryFormatter`] — one pipe-delimited line per report (#533)
 
 use std::fmt;
 
@@ -21,7 +21,7 @@ use crate::report::cost_report::CostReport;
 /// `--quiet` flag, which drops every *advisory* section (optimization tips and
 /// the quantified savings breakdown) while leaving the measured cost data
 /// untouched. Machine consumers that already read the JSON keys are
-/// unaffected — see [`JsonFormatter`] — so a caller can always ask for the
+/// unaffected — see [`crate::report::formatter::JsonFormatter`] — so a caller can always ask for the
 /// structured data explicitly.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReportOptions {
