@@ -78,6 +78,63 @@ pub struct DiffRow {
     pub direction: ChangeDirection,
 }
 
+/// Describes changes to a function parameter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParamTypeChange {
+    /// Parameter name.
+    pub name: String,
+    /// Old parameter type (or `None` if added).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_type: Option<String>,
+    /// New parameter type (or `None` if removed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_type: Option<String>,
+}
+
+/// Describes changes to a modified function's signature.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionAbiChange {
+    /// Function name.
+    pub name: String,
+    /// Formatted signature in the baseline ("old") build.
+    pub old_signature: String,
+    /// Formatted signature in the comparison ("new") build.
+    pub new_signature: String,
+    /// Parameter changes between the two signatures.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub param_changes: Vec<ParamTypeChange>,
+    /// Return type in the old build.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_return: Option<String>,
+    /// Return type in the new build.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_return: Option<String>,
+}
+
+/// A comparison of contract ABIs across two builds.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ContractAbiDiff {
+    /// Functions present in the new build but absent in the old build.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub added_functions: Vec<String>,
+    /// Functions present in the old build but absent in the new build.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_functions: Vec<String>,
+    /// Functions present in both builds whose parameter or return types changed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modified_functions: Vec<FunctionAbiChange>,
+}
+
+impl ContractAbiDiff {
+    /// Returns true if no functions were added, removed, or modified.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.added_functions.is_empty()
+            && self.removed_functions.is_empty()
+            && self.modified_functions.is_empty()
+    }
+}
+
 /// A complete side-by-side diff between two cost reports.
 ///
 /// This is the JSON structure emitted by `estimate --diff --json`.
@@ -87,6 +144,9 @@ pub struct CostReportDiff {
     pub identity: ReportIdentity,
     /// One row per compared resource, in report order.
     pub rows: Vec<DiffRow>,
+    /// Optional ABI comparison between contract specs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abi_diff: Option<ContractAbiDiff>,
 }
 
 /// Compute the percentage change from `old` to `new`.
@@ -168,7 +228,168 @@ pub fn build_cost_report_diff(old: &CostReport, new: &CostReport) -> CostReportD
             new_ledger: new.ledger,
         },
         rows,
+        abi_diff: None,
     }
+}
+
+/// Builds a side-by-side diff including an optional contract ABI comparison.
+#[must_use]
+pub fn build_cost_report_diff_with_abi(
+    old: &CostReport,
+    new: &CostReport,
+    abi_diff: Option<ContractAbiDiff>,
+) -> CostReportDiff {
+    let mut diff = build_cost_report_diff(old, new);
+    diff.abi_diff = abi_diff;
+    diff
+}
+
+/// Compares two sets of contract spec functions to identify additions, removals,
+/// and signature modifications (parameter or return type changes).
+///
+/// Ignores documentation strings and compares normalized function and type names.
+#[must_use]
+pub fn compare_contract_abi(
+    old_functions: &[crate::wasm::parser::FunctionInfo],
+    new_functions: &[crate::wasm::parser::FunctionInfo],
+) -> ContractAbiDiff {
+    let mut added_functions = Vec::new();
+    let mut removed_functions = Vec::new();
+    let mut modified_functions = Vec::new();
+
+    let old_map: std::collections::BTreeMap<&str, &crate::wasm::parser::FunctionInfo> =
+        old_functions.iter().map(|f| (f.name.as_str(), f)).collect();
+    let new_map: std::collections::BTreeMap<&str, &crate::wasm::parser::FunctionInfo> =
+        new_functions.iter().map(|f| (f.name.as_str(), f)).collect();
+
+    for (name, new_fn) in &new_map {
+        match old_map.get(name) {
+            None => {
+                added_functions.push(crate::wasm::parser::format_function(new_fn));
+            }
+            Some(old_fn) => {
+                let mut param_changes = Vec::new();
+                let max_params = old_fn.params.len().max(new_fn.params.len());
+                let mut params_changed = false;
+
+                for i in 0..max_params {
+                    match (old_fn.params.get(i), new_fn.params.get(i)) {
+                        (Some(old_p), Some(new_p)) => {
+                            if old_p.name != new_p.name || old_p.type_name != new_p.type_name {
+                                params_changed = true;
+                                param_changes.push(ParamTypeChange {
+                                    name: if old_p.name == new_p.name {
+                                        new_p.name.clone()
+                                    } else {
+                                        format!("{} -> {}", old_p.name, new_p.name)
+                                    },
+                                    old_type: Some(old_p.type_name.clone()),
+                                    new_type: Some(new_p.type_name.clone()),
+                                });
+                            }
+                        }
+                        (Some(old_p), None) => {
+                            params_changed = true;
+                            param_changes.push(ParamTypeChange {
+                                name: old_p.name.clone(),
+                                old_type: Some(old_p.type_name.clone()),
+                                new_type: None,
+                            });
+                        }
+                        (None, Some(new_p)) => {
+                            params_changed = true;
+                            param_changes.push(ParamTypeChange {
+                                name: new_p.name.clone(),
+                                old_type: None,
+                                new_type: Some(new_p.type_name.clone()),
+                            });
+                        }
+                        (None, None) => {}
+                    }
+                }
+
+                let old_ret = if old_fn.returns.is_empty() {
+                    None
+                } else {
+                    Some(
+                        old_fn
+                            .returns
+                            .iter()
+                            .map(|r| r.type_name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    )
+                };
+                let new_ret = if new_fn.returns.is_empty() {
+                    None
+                } else {
+                    Some(
+                        new_fn
+                            .returns
+                            .iter()
+                            .map(|r| r.type_name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    )
+                };
+                let return_changed = old_ret != new_ret;
+
+                if params_changed || return_changed {
+                    modified_functions.push(FunctionAbiChange {
+                        name: (*name).to_string(),
+                        old_signature: crate::wasm::parser::format_function(old_fn),
+                        new_signature: crate::wasm::parser::format_function(new_fn),
+                        param_changes,
+                        old_return: old_ret,
+                        new_return: new_ret,
+                    });
+                }
+            }
+        }
+    }
+
+    for (name, old_fn) in &old_map {
+        if !new_map.contains_key(name) {
+            removed_functions.push(crate::wasm::parser::format_function(old_fn));
+        }
+    }
+
+    ContractAbiDiff {
+        added_functions,
+        removed_functions,
+        modified_functions,
+    }
+}
+
+/// Formats a human-readable summary of the contract ABI comparison.
+#[must_use]
+pub fn format_abi_diff(abi_diff: &ContractAbiDiff) -> String {
+    if abi_diff.is_empty() {
+        return "Contract ABI: unchanged (all functions and signatures match)".to_string();
+    }
+
+    let mut lines = vec!["Contract ABI changes:".to_string()];
+    if !abi_diff.added_functions.is_empty() {
+        lines.push("  Added functions:".to_string());
+        for f in &abi_diff.added_functions {
+            lines.push(format!("    + {f}"));
+        }
+    }
+    if !abi_diff.removed_functions.is_empty() {
+        lines.push("  Removed functions:".to_string());
+        for f in &abi_diff.removed_functions {
+            lines.push(format!("    - {f}"));
+        }
+    }
+    if !abi_diff.modified_functions.is_empty() {
+        lines.push("  Modified functions:".to_string());
+        for f in &abi_diff.modified_functions {
+            lines.push(format!("    ~ {}:", f.name));
+            lines.push(format!("      old: {}", f.old_signature));
+            lines.push(format!("      new: {}", f.new_signature));
+        }
+    }
+    lines.join("\n")
 }
 
 /// Render the `Change` column text for a row, without color.
@@ -263,6 +484,40 @@ pub fn format_cost_report_diff_sized(
     output.push('\n');
     output.push_str("\nLegend: red = increased cost, green = decreased cost.\n");
 
+    output
+}
+
+/// Format a diff with an optional ABI diff, choosing color based on whether stdout is a terminal.
+#[must_use]
+pub fn format_cost_report_diff_with_abi(
+    old: &CostReport,
+    new: &CostReport,
+    abi_diff: Option<&ContractAbiDiff>,
+) -> String {
+    format_cost_report_diff_with_abi_sized(
+        old,
+        new,
+        abi_diff,
+        None,
+        std::io::stdout().is_terminal(),
+    )
+}
+
+/// Format a diff as a table with an optional maximum width, explicit color flag, and optional ABI diff.
+#[must_use]
+pub fn format_cost_report_diff_with_abi_sized(
+    old: &CostReport,
+    new: &CostReport,
+    abi_diff: Option<&ContractAbiDiff>,
+    width: Option<u16>,
+    color: bool,
+) -> String {
+    let mut output = format_cost_report_diff_sized(old, new, width, color);
+    if let Some(abi) = abi_diff {
+        output.push('\n');
+        output.push_str(&format_abi_diff(abi));
+        output.push('\n');
+    }
     output
 }
 
@@ -498,5 +753,105 @@ mod tests {
         assert_eq!(value["rows"][1]["resource"], "CPU Instructions");
         assert_eq!(value["rows"][1]["delta"], 50);
         assert_eq!(value["rows"][1]["direction"], "increase");
+        assert!(value.get("abi_diff").is_none());
+    }
+
+    fn make_fn(
+        name: &str,
+        params: &[(&str, &str)],
+        returns: &[&str],
+    ) -> crate::wasm::parser::FunctionInfo {
+        crate::wasm::parser::FunctionInfo {
+            name: name.to_string(),
+            param_count: params.len() as u32,
+            result_count: returns.len() as u32,
+            params: params
+                .iter()
+                .map(|(pname, ptype)| crate::wasm::parser::ParamInfo {
+                    name: (*pname).to_string(),
+                    type_name: (*ptype).to_string(),
+                    type_def: stellar_xdr::ScSpecTypeDef::I64,
+                })
+                .collect(),
+            returns: returns
+                .iter()
+                .map(|rtype| crate::wasm::parser::TypeInfo {
+                    type_name: (*rtype).to_string(),
+                    type_def: stellar_xdr::ScSpecTypeDef::I64,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn abi_diff_empty_when_signatures_match() {
+        let fns1 = vec![make_fn("foo", &[("a", "i64")], &["i64"])];
+        let fns2 = vec![make_fn("foo", &[("a", "i64")], &["i64"])];
+        let diff = compare_contract_abi(&fns1, &fns2);
+        assert!(diff.is_empty());
+        let formatted = format_abi_diff(&diff);
+        assert!(formatted.contains("unchanged"));
+    }
+
+    #[test]
+    fn abi_diff_detects_added_and_removed_functions() {
+        let old_fns = vec![make_fn("old_fn", &[("x", "u32")], &[])];
+        let new_fns = vec![make_fn("new_fn", &[("y", "string")], &["bool"])];
+        let diff = compare_contract_abi(&old_fns, &new_fns);
+        assert!(!diff.is_empty());
+        assert_eq!(diff.added_functions, vec!["new_fn(y: string) -> bool"]);
+        assert_eq!(diff.removed_functions, vec!["old_fn(x: u32)"]);
+        assert!(diff.modified_functions.is_empty());
+
+        let formatted = format_abi_diff(&diff);
+        assert!(formatted.contains("Added functions:"));
+        assert!(formatted.contains("+ new_fn(y: string) -> bool"));
+        assert!(formatted.contains("Removed functions:"));
+        assert!(formatted.contains("- old_fn(x: u32)"));
+    }
+
+    #[test]
+    fn abi_diff_detects_param_and_return_changes() {
+        let old_fns = vec![make_fn(
+            "transfer",
+            &[("to", "address"), ("amount", "i64")],
+            &["i64"],
+        )];
+        let new_fns = vec![make_fn(
+            "transfer",
+            &[("to", "address"), ("amount", "i128")],
+            &["bool"],
+        )];
+        let diff = compare_contract_abi(&old_fns, &new_fns);
+        assert!(!diff.is_empty());
+        assert_eq!(diff.modified_functions.len(), 1);
+        let m = &diff.modified_functions[0];
+        assert_eq!(m.name, "transfer");
+        assert_eq!(m.old_return, Some("i64".to_string()));
+        assert_eq!(m.new_return, Some("bool".to_string()));
+        assert_eq!(m.param_changes.len(), 1);
+        assert_eq!(m.param_changes[0].name, "amount");
+        assert_eq!(m.param_changes[0].old_type, Some("i64".to_string()));
+        assert_eq!(m.param_changes[0].new_type, Some("i128".to_string()));
+
+        let formatted = format_abi_diff(&diff);
+        assert!(formatted.contains("Modified functions:"));
+        assert!(formatted.contains("transfer:"));
+        assert!(formatted.contains("old: transfer(to: address, amount: i64) -> i64"));
+        assert!(formatted.contains("new: transfer(to: address, amount: i128) -> bool"));
+    }
+
+    #[test]
+    fn build_cost_report_diff_with_abi_serializes_correctly() {
+        let old = report(100, 1, 1_000, 4_096);
+        let new = report(150, 2, 1_200, 4_096);
+        let abi = ContractAbiDiff {
+            added_functions: vec!["foo()".to_string()],
+            removed_functions: vec![],
+            modified_functions: vec![],
+        };
+        let diff = build_cost_report_diff_with_abi(&old, &new, Some(abi));
+        let val = serde_json::to_value(&diff).expect("serialize diff with abi");
+        assert_eq!(val["abi_diff"]["added_functions"][0], "foo()");
     }
 }

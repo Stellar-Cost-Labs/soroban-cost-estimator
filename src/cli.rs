@@ -44,6 +44,9 @@ pub enum OutputFormat {
     Json,
     Csv,
     Markdown,
+    /// One tab-delimited result line per estimate, for shell pipelines and
+    /// batch logs (see [`crate::report::formatter::SummaryFormatter`]).
+    Summary,
 }
 
 impl OutputFormat {
@@ -54,6 +57,7 @@ impl OutputFormat {
             Self::Json => "json",
             Self::Csv => "csv",
             Self::Markdown => "markdown",
+            Self::Summary => "summary",
         }
     }
 }
@@ -89,11 +93,18 @@ fn build_version() -> &'static str {
 #[command(version = build_version())]
 #[command(about = "Estimate Soroban contract costs & track network pricing changes", long_about = None)]
 pub struct Cli {
-    /// Optional TOML config file path. Defaults to ~/.config/soroban-cost-estimator/config.toml.
+    /// Config file to read instead of the default locations
+    /// ($XDG_CONFIG_HOME or ~/.config, then ~/.soroban-cost-estimator; see
+    /// README "Configuration file"). Explicit flags override its values.
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<String>,
 
-    /// Select output format for commands that produce structured output (table, json, csv, markdown).
+    /// Select output format for commands that produce structured output
+    /// (table, json, csv, markdown, summary).
+    ///
+    /// `summary` prints exactly one tab-delimited line per successful
+    /// estimate — see the `summary` section of `docs/commands/estimate.md`
+    /// for the field order and escaping rules.
     #[arg(long, global = true, value_enum)]
     pub format: Option<OutputFormat>,
 
@@ -176,6 +187,12 @@ pub struct Cli {
     )]
     pub precision: u32,
 
+    /// Maximum WASM file size to read into memory, in bytes (default: 16 MiB).
+    ///
+    /// Prevents unbounded memory allocation when inspecting large or hostile WASM files.
+    #[arg(long, global = true, value_name = "BYTES")]
+    pub max_wasm_size: Option<u64>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -228,6 +245,11 @@ pub enum Command {
         /// simulation (e.g. after upgrading the tool or a network upgrade).
         #[arg(long)]
         clear_cache: bool,
+
+        /// Automatically quarantine a corrupt cache database to a timestamped
+        /// backup and initialize a clean cache if corruption is detected.
+        #[arg(long)]
+        recover_cache: bool,
 
         /// Bypass the estimate cache entirely: never read a cached estimate
         /// (including under `--cache-ttl`) and never write the fresh result
@@ -405,13 +427,91 @@ pub enum CacheAction {
         network: Option<String>,
     },
 
-    /// List every cached estimate for a network (newest first).
+    /// List cached estimates with optional filters (newest first).
+    ///
+    /// Without `--network`, entries from every network are listed.
     List {
-        /// Network whose cached estimates to list.
-        #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
-        network: String,
+        /// Network to filter by (omit to list every network).
+        #[arg(long, value_parser = NetworkValueParser)]
+        network: Option<String>,
+
+        /// Filter by function name (exact match).
+        #[arg(long = "fn", visible_alias = "function")]
+        r#fn: Option<String>,
+
+        /// Filter by WASM hash (prefix match, hexadecimal).
+        #[arg(long)]
+        wasm_hash: Option<String>,
+
+        /// Earliest timestamp or date.
+        #[arg(long = "since", visible_alias = "from", value_name = "DATE/TIME")]
+        since: Option<String>,
+
+        /// Latest timestamp or date.
+        #[arg(long, value_name = "TIMESTAMP")]
+        to: Option<String>,
+
+        /// Only entries older than this age (e.g. "30d", "12h", "3600").
+        #[arg(long, value_name = "DURATION")]
+        older_than: Option<String>,
+
+        /// Maximum number of entries to return.
+        #[arg(long, default_value_t = crate::cache::DEFAULT_LIST_LIMIT)]
+        limit: usize,
+
+        /// Number of matching entries to skip before listing.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
 
         /// Output the full cached-estimate records as a JSON array.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Delete the cached estimates matching the given filters.
+    ///
+    /// Requires at least one filter (or `--all`), and asks for confirmation
+    /// before removing anything unless `--yes` is given.
+    Delete {
+        /// Network to filter by (omit to match every network).
+        #[arg(long, value_parser = NetworkValueParser)]
+        network: Option<String>,
+
+        /// Filter by function name (exact match).
+        #[arg(long = "fn", visible_alias = "function")]
+        r#fn: Option<String>,
+
+        /// Filter by WASM hash (prefix match, hexadecimal).
+        #[arg(long)]
+        wasm_hash: Option<String>,
+
+        /// Earliest timestamp or date.
+        #[arg(long = "since", visible_alias = "from", value_name = "DATE/TIME")]
+        since: Option<String>,
+
+        /// Latest timestamp or date.
+        #[arg(long, value_name = "TIMESTAMP")]
+        to: Option<String>,
+
+        /// Only entries older than this age (e.g. "30d", "12h", "3600").
+        #[arg(long, value_name = "DURATION")]
+        older_than: Option<String>,
+
+        /// Delete every cached estimate, on every network.
+        ///
+        /// Cannot be combined with a filter.
+        #[arg(long)]
+        all: bool,
+
+        /// Report how many entries would be removed without deleting them.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip the confirmation prompt (required in non-interactive sessions).
+        #[arg(long, short = 'y')]
+        yes: bool,
+
+        /// Output as JSON instead of a human-readable summary.
         #[arg(long)]
         json: bool,
     },
@@ -486,6 +586,17 @@ pub enum CacheAction {
     /// Show cache health overview: total entries, disk usage, and age.
     Stats {
         /// Output as JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Recover safely from a corrupt SQLite cache database by quarantining it to a timestamped backup and initializing a new cache.
+    Recover {
+        /// Force recovery even if corruption is not automatically detected.
+        #[arg(long)]
+        force: bool,
+
+        /// Output the recovery report as JSON.
         #[arg(long)]
         json: bool,
     },
