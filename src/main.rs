@@ -3647,9 +3647,8 @@ async fn fetch_config_snapshot(
             let config_entry = xdr_helper::decode_config_entry_xdr(&raw.config_xdr, verbose)?;
             xdr_helper::apply_config_entry(&mut snapshot, config_entry);
         }
-        if let Some(latest) = raw_entries.iter().map(|e| e.last_modified_ledger).max() {
-            snapshot.ledger = latest;
-        }
+        snapshot.settings_last_modified = settings_last_modified;
+        snapshot.ledger = ledger;
         // The protocol version is informational (shown by `config snapshot
         // list`), so a failure here must not lose the snapshot itself.
         match rpc::config::fetch_protocol_version(&client).await {
@@ -5569,6 +5568,9 @@ mod tests {
     use soroban_cost_estimator::config_snapshot::model::{
         ConfigSnapshot, ContractComputeV0, ContractLedgerCostV0,
     };
+    use soroban_cost_estimator::rpc::config::{
+        ConfigSettingEntryRaw, ConfigSettingId, ConfigSettingsFetch,
+    };
     use soroban_cost_estimator::wasm::parser::{
         ContractMeta, FunctionInfo, ParamInfo, SectionInfo, WasmInfo,
     };
@@ -5731,6 +5733,7 @@ mod tests {
             network: "testnet".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             ledger: 100,
+            settings_last_modified: std::collections::BTreeMap::new(),
             protocol_version: None,
             contract_compute: Some(ContractComputeV0 {
                 ledger_max_instructions: 1_000_000,
