@@ -372,8 +372,66 @@ impl CostTrend {
     }
 }
 
+/// Ledger I/O footprint of a simulated invocation.
+///
+/// Recorded with an estimate so a later run can explain a fee change by the
+/// ledger access that caused it, rather than by the fee delta alone (#530).
+/// Only runs that captured the footprint carry one; entries written before it
+/// was recorded leave it absent, and callers must treat that as *unknown*
+/// rather than as zero usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct IoFootprint {
+    /// Ledger entries read.
+    pub read_entries: u32,
+    /// Ledger entries written.
+    pub write_entries: u32,
+    /// Bytes read from the ledger.
+    pub read_bytes: u32,
+    /// Bytes written to the ledger.
+    pub write_bytes: u32,
+}
+
+/// Per-resource ledger I/O deltas between a historical run and the current
+/// one.
+///
+/// Every field is `historical - current`, the same sign convention as
+/// [`HistoryEntry::delta_stroops`]: positive means the historical run
+/// consumed **more** than the current run. The values are signed because a
+/// footprint can shrink (an entry no longer written, fewer bytes read).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct FootprintDelta {
+    /// Ledger read-entry delta (`historical - current`).
+    pub read_entries: i64,
+    /// Ledger write-entry delta (`historical - current`).
+    pub write_entries: i64,
+    /// Ledger read-byte delta (`historical - current`).
+    pub read_bytes: i64,
+    /// Ledger write-byte delta (`historical - current`).
+    pub write_bytes: i64,
+}
+
+impl FootprintDelta {
+    /// The delta between a historical and the current footprint, or `None`
+    /// when either side is unknown.
+    ///
+    /// A missing footprint is "not recorded", not "no ledger access":
+    /// subtracting a zero would invent a delta out of absent data, so the
+    /// pair is reported as unavailable instead.
+    #[must_use]
+    pub fn between(previous: Option<IoFootprint>, current: Option<IoFootprint>) -> Option<Self> {
+        let (previous, current) = (previous?, current?);
+        Some(Self {
+            read_entries: i64::from(previous.read_entries) - i64::from(current.read_entries),
+            write_entries: i64::from(previous.write_entries) - i64::from(current.write_entries),
+            read_bytes: i64::from(previous.read_bytes) - i64::from(current.read_bytes),
+            write_bytes: i64::from(previous.write_bytes) - i64::from(current.write_bytes),
+        })
+    }
+}
+
 /// One previous run of the same contract function, alongside its fee delta
-/// against the current run.
+/// and (when both runs recorded one) its ledger I/O delta against the current
+/// run.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HistoryEntry {
     /// ISO-8601 timestamp of the historical estimate.
@@ -390,17 +448,26 @@ pub struct HistoryEntry {
     pub delta_stroops: i64,
     /// Trend classification derived from `delta_stroops`.
     pub trend: CostTrend,
+    /// Ledger I/O deltas (`historical - current`), present only when this run
+    /// *and* the current run both recorded a footprint (#530).
+    ///
+    /// `None` marks a legacy (or uncaptured) entry whose I/O usage is
+    /// unknown; consumers render that as "unavailable" rather than as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footprint_delta: Option<FootprintDelta>,
 }
 
 /// Build [`HistoryEntry`] records from previous runs, computing each one's
-/// delta against the current run's total fee.
+/// deltas against the current run.
 ///
 /// Entries are returned in the order supplied (callers pass them
-/// newest-first) with `delta_stroops = entry_fee - current_fee`.
+/// newest-first) with `delta_stroops = entry_fee - current_fee` and, when
+/// both runs recorded one, `footprint_delta = entry_io - current_io`.
 #[must_use]
 pub fn build_history_entries(
     current_total_stroops: i64,
     current_xlm_precision: u32,
+    current_io: Option<IoFootprint>,
     runs: &[HistoricalRun],
 ) -> Vec<HistoryEntry> {
     runs.iter()
@@ -417,6 +484,7 @@ pub fn build_history_entries(
                 ),
                 delta_stroops,
                 trend: CostTrend::for_delta(delta_stroops),
+                footprint_delta: FootprintDelta::between(run.io, current_io),
             }
         })
         .collect()
@@ -436,6 +504,28 @@ pub struct HistoricalRun {
     pub cpu_instructions: u64,
     /// Total fee in stroops.
     pub total_stroops: i64,
+    /// Ledger I/O footprint recorded for the run, when it was captured.
+    pub io: Option<IoFootprint>,
+}
+
+/// Text shown in the I/O table for an entry whose footprint was never
+/// recorded.
+///
+/// Deliberately a word, not `0`: absent I/O data means "unknown", and a zero
+/// would read as "this run touched no ledger entries".
+pub const FOOTPRINT_UNAVAILABLE: &str = "unavailable";
+
+/// Render one signed footprint delta as a table cell.
+///
+/// Mirrors the fee delta's presentation: a `+` prefix for growth, a bare
+/// negative number for a shrink, and `0` for no change. Growth is red (more
+/// ledger access), a shrink green, and no change yellow.
+fn footprint_delta_cell(delta: i64) -> Cell {
+    match delta.cmp(&0) {
+        std::cmp::Ordering::Greater => Cell::new(format!("+{delta}")).fg(Color::Red),
+        std::cmp::Ordering::Less => Cell::new(delta).fg(Color::Green),
+        std::cmp::Ordering::Equal => Cell::new("0").fg(Color::Yellow),
+    }
 }
 
 /// Render the historical cost trend table.
@@ -444,6 +534,12 @@ pub struct HistoricalRun {
 /// improvements (cost reductions) in green, and unchanged runs in yellow.
 /// Returns an empty string when there is no history, so callers can append the
 /// result unconditionally.
+///
+/// When at least one entry carries a ledger I/O delta (#530), a second table
+/// follows with the per-resource deltas. Entries without a recorded footprint
+/// appear there as [`FOOTPRINT_UNAVAILABLE`] so a legacy run is never
+/// misreported as zero usage; the table is omitted entirely when no entry has
+/// I/O data, keeping pre-#530 output unchanged.
 #[must_use]
 pub fn format_cost_history(entries: &[HistoryEntry]) -> String {
     if entries.is_empty() {
@@ -477,7 +573,50 @@ pub fn format_cost_history(entries: &[HistoryEntry]) -> String {
     let mut out = String::from("\nCost history (previous runs, newest first):\n");
     out.push_str(&table.to_string());
     out.push('\n');
+
+    if entries.iter().any(|entry| entry.footprint_delta.is_some()) {
+        out.push_str(&format_cost_history_footprints(entries));
+    }
+
     out
+}
+
+/// Render the per-resource I/O delta table that follows the fee history.
+///
+/// Split from [`format_cost_history`] so the wide I/O table only appears when
+/// there is data for it, and so its rendering is testable on its own.
+#[must_use]
+pub fn format_cost_history_footprints(entries: &[HistoryEntry]) -> String {
+    let mut table = Table::new();
+    table.set_header(vec![
+        "Timestamp",
+        "Read Entries",
+        "Write Entries",
+        "Read Bytes",
+        "Write Bytes",
+    ]);
+
+    for entry in entries {
+        let row = match entry.footprint_delta {
+            Some(delta) => vec![
+                Cell::new(&entry.timestamp),
+                footprint_delta_cell(delta.read_entries),
+                footprint_delta_cell(delta.write_entries),
+                footprint_delta_cell(delta.read_bytes),
+                footprint_delta_cell(delta.write_bytes),
+            ],
+            None => vec![
+                Cell::new(&entry.timestamp),
+                Cell::new(FOOTPRINT_UNAVAILABLE),
+                Cell::new(FOOTPRINT_UNAVAILABLE),
+                Cell::new(FOOTPRINT_UNAVAILABLE),
+                Cell::new(FOOTPRINT_UNAVAILABLE),
+            ],
+        };
+        table.add_row(row);
+    }
+
+    format!("\nI/O footprint change (historical - current):\n{table}\n")
 }
 
 /// Serde helper: `wasm_size` is omitted when `0` so a report built without a
@@ -523,16 +662,6 @@ pub struct CostReport {
     pub write_bytes: u32,
     /// Fee breakdown.
     pub fee: FeeBreakdown,
-    /// Archival restoration fee reported by the simulation, in stroops
-    /// (issue #524). `None` means the network returned no `restoreFee` —
-    /// unknown, in contrast to an explicit `Some(0)`. The restore fee is a
-    /// separate charge the operator pays on top of the resource fee, so it
-    /// is reported as its own component and deliberately never added into
-    /// `fee.total_stroops`, which stays the authoritative XDR-derived
-    /// total. `#[serde(default)]` keeps payloads serialized before this
-    /// field deserializable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub restore_fee_stroops: Option<i64>,
     /// The ledger sequence the simulation ran against.
     ///
     /// Serialized as `ledger_sequence` in JSON output (issue #329) while the
@@ -541,9 +670,13 @@ pub struct CostReport {
     pub ledger: u32,
     /// Network the simulation ran on.
     pub network: String,
-    /// RPC round-trip time of the `simulateTransaction` call, in
-    /// milliseconds. Helps identify slow or overloaded RPC endpoints.
-    pub rpc_latency_ms: u64,
+    /// Wall-clock duration of the `simulateTransaction` round-trip, in
+    /// milliseconds, measured around the RPC call itself. Serialized as
+    /// `simulation_duration_ms` so CI logs can separate time spent waiting on
+    /// the network from local computation and decoding, and rendered as
+    /// `Simulation latency: X ms` in the table footer. Also helps identify
+    /// slow or overloaded RPC endpoints.
+    pub simulation_duration_ms: u64,
     /// Fee rates used to compute the breakdown (carried so optimization
     /// suggestions can quantify per-resource savings). Excluded from
     /// serialized output; `None` when the rates were unavailable.
@@ -1374,7 +1507,10 @@ pub fn format_report_table(report: &CostReport) -> String {
         "Simulated at ledger sequence: {}\n",
         format_ledger_sequence(report.ledger)
     ));
-    output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
+    output.push_str(&format!(
+        "RPC round-trip: {} ms\n",
+        report.simulation_duration_ms
+    ));
     if report.wasm_size > 0 {
         output.push_str(&format!("WASM size: {} bytes\n", report.wasm_size));
     }
@@ -1463,14 +1599,6 @@ pub fn format_report_table(report: &CostReport) -> String {
             pct.get("rent").map(String::as_str).unwrap_or("")
         ),
     ]);
-    // Archival restore fee (#524) — only when the network reported one. It
-    // is a separate charge, listed before Total but never folded into it.
-    if let Some(restore_fee) = report.restore_fee_stroops {
-        fee_table.add_row(vec![
-            "Archival Restore",
-            &format!("{restore_fee} stroops (not included in Total)"),
-        ]);
-    }
     fee_table.add_row(vec![
         "Total",
         &format!(
@@ -2162,8 +2290,7 @@ mod tests {
             },
             ledger: 3_894_195,
             network: "testnet".to_string(),
-            rpc_latency_ms: 87,
-            restore_fee_stroops: None,
+            simulation_duration_ms: 87,
             rates: Some(rates),
             warnings: Vec::new(),
             history: None,
@@ -2180,68 +2307,6 @@ mod tests {
             fee_per_read_1kb: 447,
             fee_per_1kb: 406,
         }
-    }
-
-    // ── Archival restore fee (#524) ──────────────────────────────────
-
-    /// A network-reported restore fee is rendered as its own component,
-    /// next to the total but never folded into it: `fee.total_stroops`
-    /// stays the authoritative `SorobanTransactionData.resource_fee`.
-    #[test]
-    fn test_restore_fee_reported_as_distinct_component() {
-        let mut report = report_with_rates(sample_rates());
-        report.restore_fee_stroops = Some(230);
-
-        let table = format_report_table(&report);
-        assert!(table.contains("Archival Restore"), "{table}");
-        assert!(table.contains("230 stroops (not included in Total)"), "{table}");
-        // 15_527 + 230 = 15_757 must NOT appear: no double counting.
-        assert!(table.contains("15527 stroops (0.0015527)"), "{table}");
-        assert!(!table.contains("15757"), "{table}");
-
-        let json: serde_json::Value =
-            serde_json::from_str(&format_report_json(&report)).expect("report JSON parses");
-        assert_eq!(json["restore_fee_stroops"], 230);
-        assert_eq!(json["fee"]["total_stroops"], 15_527);
-    }
-
-    /// Absence means "unknown — the network did not report one", rendered
-    /// as the row/key simply not being there, never as a zero.
-    #[test]
-    fn test_restore_fee_absent_is_unknown_not_zero() {
-        let report = report_with_rates(sample_rates());
-        assert_eq!(report.restore_fee_stroops, None);
-
-        let table = format_report_table(&report);
-        assert!(!table.contains("Archival Restore"), "{table}");
-
-        let json = format_report_json(&report);
-        let parsed: serde_json::Value = serde_json::from_str(&json).expect("report JSON parses");
-        assert!(parsed.get("restore_fee_stroops").is_none());
-
-        // A payload serialized without the field still deserializes,
-        // with the restore fee staying unknown.
-        let back: CostReport = serde_json::from_str(&json).expect("report round-trips");
-        assert_eq!(back.restore_fee_stroops, None);
-    }
-
-    /// A reported zero is an explicit zero: distinct from absence in both
-    /// the table and the JSON.
-    #[test]
-    fn test_restore_fee_zero_is_explicit() {
-        let mut report = report_with_rates(sample_rates());
-        report.restore_fee_stroops = Some(0);
-
-        let table = format_report_table(&report);
-        assert!(table.contains("Archival Restore"), "{table}");
-        assert!(table.contains("0 stroops (not included in Total)"), "{table}");
-
-        let json = format_report_json(&report);
-        let parsed: serde_json::Value = serde_json::from_str(&json).expect("report JSON parses");
-        assert_eq!(parsed["restore_fee_stroops"], 0);
-
-        let back: CostReport = serde_json::from_str(&json).expect("report round-trips");
-        assert_eq!(back.restore_fee_stroops, Some(0));
     }
 
     #[test]
@@ -2346,8 +2411,7 @@ mod tests {
             },
             ledger: 0,
             network: "testnet".to_string(),
-            rpc_latency_ms: 0,
-            restore_fee_stroops: None,
+            simulation_duration_ms: 0,
             rates: None,
             warnings: Vec::new(),
             history: None,
@@ -2598,6 +2662,149 @@ mod tests {
 
         assert_eq!(format_thousands(-1_234_567), "-1,234,567");
         assert_eq!(format_thousands(500), "500");
+    }
+
+    // ── History footprint deltas (#530) ──────────────────────────────
+
+    fn footprint(
+        read_entries: u32,
+        write_entries: u32,
+        read_bytes: u32,
+        write_bytes: u32,
+    ) -> IoFootprint {
+        IoFootprint {
+            read_entries,
+            write_entries,
+            read_bytes,
+            write_bytes,
+        }
+    }
+
+    /// Deltas are `historical - current`, so a run that read less than the
+    /// current one yields a negative value rather than a wrapped `u32`.
+    #[test]
+    fn test_footprint_delta_is_signed_and_historical_minus_current() {
+        let previous = footprint(5, 1, 4_096, 136);
+        let current = footprint(2, 3, 0, 136);
+        let delta = FootprintDelta::between(Some(previous), Some(current))
+            .expect("both sides recorded a footprint");
+
+        assert_eq!(delta.read_entries, 3, "5 previous - 2 current");
+        assert_eq!(delta.write_entries, -2, "1 previous - 3 current");
+        assert_eq!(delta.read_bytes, 4_096);
+        assert_eq!(delta.write_bytes, 0);
+    }
+
+    /// An entry without a recorded footprint is unavailable on either side:
+    /// no delta is invented from absent data.
+    #[test]
+    fn test_footprint_delta_absent_when_either_side_is_unknown() {
+        let known = footprint(1, 1, 0, 136);
+        assert_eq!(FootprintDelta::between(None, Some(known)), None);
+        assert_eq!(FootprintDelta::between(Some(known), None), None);
+        assert_eq!(FootprintDelta::between(None, None), None);
+    }
+
+    /// `build_history_entries` attaches the footprint delta only when both
+    /// sides recorded one, and keeps the fee delta independent of it.
+    #[test]
+    fn test_build_history_entries_attaches_footprint_delta() {
+        let current_io = footprint(1, 2, 0, 136);
+        let entries = build_history_entries(
+            10_000,
+            crate::report::fee_calc::DEFAULT_PRECISION,
+            Some(current_io),
+            &[
+                HistoricalRun {
+                    timestamp: "2026-01-02T00:00:00Z".to_string(),
+                    ledger: 20,
+                    cpu_instructions: 200,
+                    total_stroops: 12_000,
+                    io: Some(footprint(3, 1, 512, 136)),
+                },
+                HistoricalRun {
+                    timestamp: "2026-01-01T00:00:00Z".to_string(),
+                    ledger: 10,
+                    cpu_instructions: 100,
+                    total_stroops: 9_000,
+                    io: None,
+                },
+            ],
+        );
+
+        assert_eq!(entries.len(), 2);
+        let recorded = entries[0]
+            .footprint_delta
+            .expect("both runs recorded a footprint");
+        assert_eq!(recorded.read_entries, 2);
+        assert_eq!(recorded.write_entries, -1);
+        assert_eq!(recorded.read_bytes, 512);
+        assert_eq!(recorded.write_bytes, 0);
+        // The fee delta is untouched by the I/O comparison.
+        assert_eq!(entries[0].delta_stroops, 2_000);
+        assert_eq!(entries[0].trend, CostTrend::Regression);
+
+        assert!(
+            entries[1].footprint_delta.is_none(),
+            "a legacy run must be unavailable, not zero"
+        );
+        assert_eq!(entries[1].delta_stroops, -1_000);
+        assert_eq!(entries[1].trend, CostTrend::Improvement);
+    }
+
+    /// The I/O table only renders when at least one entry has a delta, and
+    /// marks the rest as unavailable.
+    #[test]
+    fn test_format_cost_history_footprints_marks_legacy_entries() {
+        let entries = build_history_entries(
+            10_000,
+            crate::report::fee_calc::DEFAULT_PRECISION,
+            Some(footprint(1, 1, 0, 136)),
+            &[
+                HistoricalRun {
+                    timestamp: "2026-01-02T00:00:00Z".to_string(),
+                    ledger: 20,
+                    cpu_instructions: 200,
+                    total_stroops: 12_000,
+                    io: Some(footprint(4, 1, 0, 136)),
+                },
+                HistoricalRun {
+                    timestamp: "2026-01-01T00:00:00Z".to_string(),
+                    ledger: 10,
+                    cpu_instructions: 100,
+                    total_stroops: 9_000,
+                    io: None,
+                },
+            ],
+        );
+
+        let out = format_cost_history(&entries);
+        assert!(out.contains("Cost history"));
+        assert!(out.contains("I/O footprint change (historical - current):"));
+        assert!(out.contains(FOOTPRINT_UNAVAILABLE));
+        assert!(out.contains("+3"), "four previous reads minus one: {out}");
+    }
+
+    /// Without any recorded footprint the rendering is byte-identical to the
+    /// pre-#530 output: no extra section.
+    #[test]
+    fn test_format_cost_history_omits_footprints_when_unknown() {
+        let entries = build_history_entries(
+            10_000,
+            crate::report::fee_calc::DEFAULT_PRECISION,
+            None,
+            &[HistoricalRun {
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                ledger: 10,
+                cpu_instructions: 100,
+                total_stroops: 9_000,
+                io: None,
+            }],
+        );
+
+        let out = format_cost_history(&entries);
+        assert!(!out.contains("I/O footprint change"), "{out}");
+        assert!(!out.contains(FOOTPRINT_UNAVAILABLE), "{out}");
     }
 
     #[test]
