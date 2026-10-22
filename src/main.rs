@@ -516,6 +516,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
             cli::ConfigAction::Snapshot {
                 action,
                 network,
+                rpc_url,
                 out,
                 json,
                 retain,
@@ -565,6 +566,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
                     };
                     cmd_config_snapshot(
                         &env_string(network, &default_network, "SOROBAN_NETWORK"),
+                        rpc_url.as_deref(),
                         fallback,
                         out.as_deref(),
                         format,
@@ -583,6 +585,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
             cli::ConfigAction::List { network } => cmd_config_snapshot_list(&network, quiet),
             cli::ConfigAction::Diff {
                 network,
+                rpc_url,
                 against,
                 against_previous,
                 pricing_only,
@@ -614,6 +617,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
                 } else {
                     cmd_config_diff(
                         &env_string(network, &default_network, "SOROBAN_NETWORK"),
+                        rpc_url.as_deref(),
                         fallback,
                         against.as_deref(),
                         pricing_only,
@@ -3910,6 +3914,7 @@ fn prune_output<'a>(
 /// snapshots it would have pruned.
 async fn cmd_config_snapshot(
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     out_path: Option<&str>,
     format: cli::OutputFormat,
@@ -3930,7 +3935,7 @@ async fn cmd_config_snapshot(
         info!("taking config snapshot");
         let snapshot = fetch_config_snapshot(
             network,
-            None,
+            rpc_url,
             rpc_fallback_url,
             rps,
             timeout,
@@ -4284,6 +4289,7 @@ fn load_baseline_payload(
 #[allow(clippy::fn_params_excessive_bools)]
 async fn cmd_config_diff(
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     against_path: Option<&str>,
     pricing_only: bool,
@@ -4315,7 +4321,7 @@ async fn cmd_config_diff(
 
         let new_snapshot = fetch_config_snapshot(
             network,
-            None,
+            rpc_url,
             rpc_fallback_url,
             rps,
             timeout,
