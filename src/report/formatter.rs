@@ -187,7 +187,10 @@ impl TableFormatter {
             "Simulated at ledger sequence: {}\n",
             crate::report::cost_report::format_ledger_sequence(report.ledger)
         ));
-        output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
+        output.push_str(&format!(
+            "RPC round-trip: {} ms\n",
+            report.simulation_duration_ms
+        ));
         output.push_str(&format!("WASM hash: {}\n", report.wasm_hash));
         output.push_str(&format!("WASM size: {} bytes\n", report.wasm_size));
         output.push('\n');
@@ -968,7 +971,7 @@ mod tests {
         assert_eq!(parsed["wasm_hash"], "abc123def456");
         assert_eq!(parsed["ledger_sequence"], 3_894_195);
         assert_eq!(parsed["network"], "testnet");
-        assert_eq!(parsed["rpc_latency_ms"], 87);
+        assert_eq!(parsed["simulation_duration_ms"], 87);
         assert_eq!(parsed["fee"]["total_stroops"], 15_427);
         assert_eq!(parsed["fee"]["total_xlm"], "0.0015427");
     }

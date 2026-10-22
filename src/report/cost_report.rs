@@ -1507,7 +1507,10 @@ pub fn format_report_table(report: &CostReport) -> String {
         "Simulated at ledger sequence: {}\n",
         format_ledger_sequence(report.ledger)
     ));
-    output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
+    output.push_str(&format!(
+        "RPC round-trip: {} ms\n",
+        report.simulation_duration_ms
+    ));
     if report.wasm_size > 0 {
         output.push_str(&format!("WASM size: {} bytes\n", report.wasm_size));
     }
