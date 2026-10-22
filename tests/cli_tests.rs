@@ -2804,6 +2804,19 @@ fn start_mock_rpc_server(
     min_fee: &'static str,
     ledger: u64,
 ) -> (String, std::sync::mpsc::Sender<()>) {
+    start_mock_rpc_server_delayed(live_tx_data, min_fee, ledger, 0)
+}
+
+/// Same mock server, but every response is delayed by `delay_ms` so tests can
+/// assert on measured round-trip durations without depending on how fast
+/// loopback happens to be (`Instant::elapsed().as_millis()` truncates, so a
+/// sub-millisecond reply reports 0 ms).
+fn start_mock_rpc_server_delayed(
+    live_tx_data: &'static str,
+    min_fee: &'static str,
+    ledger: u64,
+    delay_ms: u64,
+) -> (String, std::sync::mpsc::Sender<()>) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
@@ -2884,6 +2897,10 @@ fn start_mock_rpc_server(
                     } else {
                         r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#.to_string()
                     };
+
+                    if delay_ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    }
 
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
