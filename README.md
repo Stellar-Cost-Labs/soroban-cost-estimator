@@ -393,6 +393,22 @@ Useful in CI or cron jobs to monitor for unexpected pricing changes.
 Press `Ctrl-C` (SIGINT) or send `SIGTERM` to stop **cleanly** (exit code 0):
 the in-flight poll is cancelled rather than writing a partial snapshot.
 
+### `config snapshot show`
+
+Print a previously captured snapshot without touching the network — as
+readable per-category tables, or as raw JSON with `--json`.
+
+```bash
+soroban-cost-estimator config snapshot show [--latest | --at <timestamp> | <path>] [--network testnet] [--json]
+```
+
+- No selector (or `--latest`): the most recent snapshot for `--network`
+- `--at <prefix>`: the most recent stored snapshot whose timestamp matches
+  the prefix, e.g. `--at 2026-08` for anything from August 2026
+- `<path>`: any snapshot JSON file by path
+- Sections or fields a pre-`0.1` snapshot never captured render as
+  `(not captured)` / `(unknown)`
+
 ### `cache verify`
 
 Check that every cached estimate in the SQLite cache database
@@ -401,7 +417,7 @@ carries a schema version this tool can read — i.e. nothing was corrupted by a
 crash or disk issue.
 
 ```bash
-soroban-cost-estimator cache verify
+soroban-cost-estimator cache verify [--repair]
 ```
 
 - Exits **0** if the cache is empty or every entry is valid
@@ -417,7 +433,6 @@ soroban-cost-estimator cache stats
 
 ```text
 Cache Statistics
-================
   Total entries:  128
   Disk usage:     96.0 KB
   Live size:      88.0 KB
@@ -737,6 +752,9 @@ Full reproduction steps (`stellar contract install` → `create` →
 | JSON output (`--json`) | ✅ |
 | Fee breakdown (non-refundable/refundable) | ✅ |
 | Estimate result caching | ✅ |
+| Cache key validation + `cache verify --repair` | ✅ |
+| `config snapshot show` | ✅ |
+| Protocol-upgrade auto-snapshot & announcement | ✅ |
 | Verified against live testnet (cross-checked) | ✅ |
 | Footprint read/write entries & bytes (real, not zeros) | ✅ |
 | Watch graceful shutdown (SIGINT/SIGTERM) | ✅ |

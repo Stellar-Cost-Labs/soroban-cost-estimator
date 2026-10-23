@@ -189,6 +189,7 @@ fn make_snapshot(compute_fee: i64, bandwidth_fee: i64) -> ConfigSnapshot {
             fee_tx_size1_kb: bandwidth_fee,
         }),
         state_archival: None,
+        tags: Vec::new(),
     }
 }
 

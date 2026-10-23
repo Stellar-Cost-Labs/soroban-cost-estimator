@@ -40,6 +40,15 @@ carries the hash
 why the tool's cached estimate for the deployed contract matches the fixture
 exactly.
 
+## Verifying and repairing the cache
+
+`cache verify` walks the cache directory and checks every file: valid JSON,
+the expected entry shape, and stored hashes matching the filename key. It
+prints one line per corrupted file and a summary, then exits `1` if anything
+is corrupt. With `--repair` (alias `--fix`) it also deletes the corrupted
+files and exits `0`, so a scheduled repair can be as simple as
+`soroban-cost-estimator cache verify --repair`.
+
 ## What a cache entry contains
 
 `cache export` serializes every row as the same JSON shape the old per-file

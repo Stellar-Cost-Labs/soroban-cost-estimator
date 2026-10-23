@@ -65,6 +65,7 @@ pub fn begin_snapshot(network: &str, ledger: u32) -> ConfigSnapshot {
         contract_events: None,
         contract_bandwidth: None,
         state_archival: None,
+        tags: Vec::new(),
     }
 }
 

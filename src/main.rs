@@ -276,6 +276,7 @@ async fn run_cli() -> i32 {
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level)),
         )
+        .with_writer(std::io::stderr)
         .init();
 
     if !args.quiet {
@@ -3986,6 +3987,11 @@ async fn cmd_config_snapshot(
 
         if format == cli::OutputFormat::Json {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            if let Some(upgrade) = &upgrade {
+                // JSON mode must stay machine-parseable: the notice and the
+                // automatic diff go to stderr.
+                announce_protocol_upgrade(upgrade, &snapshot, &path, false);
+            }
             return Ok(());
         }
         if !quiet {
@@ -4395,7 +4401,29 @@ async fn cmd_config_diff(
             );
         }
 
-        if upgrade_detected(&diff) {
+        // A protocol-version increase creates an annotated snapshot of its
+        // own, even when no pricing field moved. When the compared baseline
+        // was the latest stored snapshot (no explicit --against), its diff
+        // was already printed above, so the upgrade notice skips the repeat.
+        let protocol_upgrade = annotate_protocol_upgrade(network, &mut new_snapshot);
+
+        if let Some(upgrade) = &protocol_upgrade {
+            match config_snapshot::store::save_snapshot(&new_snapshot, None) {
+                Ok(path) => {
+                    info!(path = %path.display(), "auto-saved protocol-upgrade snapshot");
+                    announce_protocol_upgrade(
+                        upgrade,
+                        &new_snapshot,
+                        &path,
+                        against_path.is_some(),
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, "could not auto-save protocol-upgrade snapshot");
+                    eprintln!("  Warning: could not auto-save protocol-upgrade snapshot: {e}");
+                }
+            }
+        } else if upgrade_detected(&diff) {
             match config_snapshot::store::save_snapshot(&new_snapshot, None) {
                 Ok(path) => {
                     info!(path = %path.display(), "auto-saved post-upgrade snapshot");
@@ -4856,7 +4884,14 @@ async fn watch_poll_once(
                 }
             }
 
-            let _ = config_snapshot::store::save_snapshot(&snapshot, None);
+            // A protocol-version increase between polls captures an
+            // annotated snapshot; the diff against the previous protocol
+            // version was already printed above when changes were reported.
+            let upgrade = annotate_protocol_upgrade(network, &mut snapshot);
+            let saved = config_snapshot::store::save_snapshot(&snapshot, None).ok();
+            if let (Some(upgrade), Some(path)) = (&upgrade, saved.as_ref()) {
+                announce_protocol_upgrade(upgrade, &snapshot, path, false);
+            }
             *first = false;
         }
         Err(e) => {
@@ -5288,9 +5323,9 @@ fn format_bytes(bytes: u64) -> String {
 
 /// `cache verify` command: check every cache entry parses as valid JSON.
 ///
-/// Prints a summary line per corrupted entry and exits with code 1 when any
-/// entry fails verification, so scripts can treat a corrupt cache as an
-/// error. A healthy (or empty) cache exits 0.
+/// With `repair` (or `--fix`), corrupted entries are deleted instead of only
+/// reported; a repaired cache is healthy, so repair always exits 0 when the
+/// removal itself succeeds.
 ///
 /// # Network calls
 /// None â€” pure file I/O.
@@ -5309,6 +5344,11 @@ fn cmd_cache_verify(quiet: bool) -> error::AppResult<()> {
 
     let total = statuses.len();
     let corrupt: Vec<&cache::CacheEntryStatus> = statuses.iter().filter(|s| !s.valid).collect();
+    let valid = total - corrupt.len();
+
+    for status in &corrupt {
+        println!("Corrupted cache entry: {}", status.filename);
+    }
 
     if !quiet {
         println!("Checked {total} cache entries.");
@@ -6468,6 +6508,7 @@ mod tests {
             contract_events: None,
             contract_bandwidth: None,
             state_archival: None,
+            tags: Vec::new(),
         }
     }
 
