@@ -3649,6 +3649,7 @@ fn wasm_info_json(
                 }).collect::<Vec<_>>(),
             })
         }).collect::<Vec<_>>(),
+        "function_signatures": wasm::parser::function_signatures_json(wasm_info),
         "spec_entries": wasm_info.spec_entries.iter()
             .map(wasm::parser::spec_entry_json)
             .collect::<Vec<_>>(),
