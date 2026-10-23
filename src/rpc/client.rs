@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, Notify};
 use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
-use crate::rpc::retry::{DEFAULT_MAX_RETRIES, with_retry};
+use crate::rpc::retry::{DEFAULT_MAX_RETRIES, with_retry_deadline};
 
 /// Default per-request HTTP timeout applied to every RPC call. Matches the
 /// CLI's `--timeout` default (30 seconds).
@@ -48,20 +48,71 @@ fn endpoint_override(network: &str) -> AppResult<Option<String>> {
     Ok(guard.get(network).cloned())
 }
 
-/// Resolves a network name to its Soroban RPC endpoint.
+static DEFAULT_TOTAL_TIMEOUT_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Sets the process-wide default overall RPC operation deadline (`--total-timeout`).
 ///
+/// Newly created [`RpcClient`] instances inherit this deadline unless
+/// overridden via [`RpcClient::with_total_timeout`]. Passing `None` or a zero
+/// duration disables the overall deadline.
+pub fn set_default_total_timeout(total_timeout: Option<Duration>) {
+    let ms = total_timeout
+        .filter(|d| !d.is_zero())
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    DEFAULT_TOTAL_TIMEOUT_MS.store(ms, Ordering::Relaxed);
+}
+
+fn default_total_timeout() -> Option<Duration> {
+    let ms = DEFAULT_TOTAL_TIMEOUT_MS.load(Ordering::Relaxed);
+    if ms == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(ms))
+    }
+}
+
+/// Resolves a network name to its well-known Soroban RPC endpoint.
 /// Precedence: `custom_url` (`--rpc-url`), then the network's entry in the
-/// user config's `[rpc_urls]`, then the built-in well-known URL.
+/// user config's `[rpc_urls]`, then the built-in well-known URL. User-supplied
+/// URLs are validated by [`validate_rpc_url`] before they are returned, so a
+/// malformed endpoint fails before any network call is made.
+///
+/// # Errors
+///
+/// Returns [`AppError::InvalidRpcUrl`] when a custom or config-provided URL is
+/// malformed or uses an unsupported scheme, and [`AppError::UnknownNetwork`]
+/// when `network` has no configured or well-known endpoint.
 ///
 /// # Network calls
 /// None — returns configured or hardcoded well-known URLs.
+///
+/// # Examples
+///
+/// ```
+/// use soroban_cost_estimator::error::AppError;
+/// use soroban_cost_estimator::rpc::client::resolve_endpoint;
+///
+/// assert_eq!(
+///     resolve_endpoint("mainnet", None)?,
+///     "https://soroban.stellar.org"
+/// );
+/// assert!(matches!(
+///     resolve_endpoint("testnet", Some("ftp://example.com")),
+///     Err(AppError::InvalidRpcUrl(_))
+/// ));
+/// # Ok::<(), AppError>(())
+/// ```
 pub fn resolve_endpoint(network: &str, custom_url: Option<&str>) -> AppResult<String> {
     if let Some(url) = custom_url {
+        validate_rpc_url(url)?;
         debug!(url, "using custom RPC endpoint");
         return Ok(url.to_string());
     }
 
     if let Some(url) = endpoint_override(network)? {
+        validate_rpc_url(&url)?;
         debug!(network, url, "using RPC endpoint from config file");
         return Ok(url);
     }
@@ -82,29 +133,157 @@ pub fn resolve_endpoint(network: &str, custom_url: Option<&str>) -> AppResult<St
 /// Resolves a network name to its WebSocket RPC endpoint (`wss://…/ws`).
 ///
 /// Derives the WebSocket URL from the HTTP endpoint returned by
-/// [`resolve_endpoint`] by swapping the scheme (`https` → `wss`, `http` →
-/// `ws`) and appending the `/ws` path used by Stellar RPC for streaming
-/// subscriptions. Custom URLs override network resolution and must already
-/// be in WebSocket form.
+/// [`resolve_endpoint`]; custom URLs override network resolution and are
+/// normalized with [`to_websocket_url`], so `https://host` works as well as
+/// `wss://host`.
 ///
 /// # Network calls
 /// None — pure string transformation of the resolved endpoint.
 pub fn resolve_ws_endpoint(network: &str, custom_url: Option<&str>) -> AppResult<String> {
     if let Some(url) = custom_url {
         debug!(url, "using custom WebSocket RPC endpoint");
-        return Ok(url.to_string());
+        return to_websocket_url(url);
     }
 
     let http_endpoint = resolve_endpoint(network, None)?;
-    let ws_endpoint = match http_endpoint.strip_prefix("https://") {
-        Some(host) => format!("wss://{host}/ws"),
-        None => match http_endpoint.strip_prefix("http://") {
-            Some(host) => format!("ws://{host}/ws"),
-            None => return Err(AppError::UnknownNetwork(network.to_string())),
-        },
-    };
+    let ws_endpoint = to_websocket_url(&http_endpoint)?;
     debug!(network, ws_endpoint, "resolved WebSocket RPC endpoint");
     Ok(ws_endpoint)
+}
+
+/// Rewrites an RPC URL into its WebSocket form.
+///
+/// * `ws://` / `wss://` URLs are kept as-is.
+/// * `http://` / `https://` URLs have their scheme swapped (`http` → `ws`,
+///   `https` → `wss`).
+/// * A URL that carries no path (or only `/`) gets the `/ws` path Stellar RPC
+///   serves its streaming subscriptions on.
+///
+/// # Network calls
+/// None — pure string transformation.
+pub fn to_websocket_url(url: &str) -> AppResult<String> {
+    let (scheme, rest) = split_url_scheme(url)?;
+    let ws_scheme = match scheme.as_str() {
+        "ws" | "wss" => scheme.clone(),
+        "http" => "ws".to_string(),
+        "https" => "wss".to_string(),
+        _ => return Err(unsupported_scheme(url)),
+    };
+    Ok(format!("{ws_scheme}://{}", with_ws_path(rest)))
+}
+
+/// Rewrites an RPC URL into its HTTP form (the inverse of
+/// [`to_websocket_url`]).
+///
+/// `http://` / `https://` URLs are kept as-is; `ws://` / `wss://` URLs have
+/// their scheme swapped and any trailing `/ws` path stripped, so the same
+/// `--rpc-url` value can drive both the WebSocket subscription and the
+/// request/response JSON-RPC calls.
+///
+/// # Network calls
+/// None — pure string transformation.
+pub fn to_http_url(url: &str) -> AppResult<String> {
+    let (scheme, rest) = split_url_scheme(url)?;
+    let http_scheme = match scheme.as_str() {
+        "http" | "https" => scheme.clone(),
+        "ws" => "http".to_string(),
+        "wss" => "https".to_string(),
+        _ => return Err(unsupported_scheme(url)),
+    };
+    let rest = rest.strip_suffix("/ws").unwrap_or(rest);
+    Ok(format!("{http_scheme}://{rest}"))
+}
+
+/// Splits `scheme://rest` into its lowercased scheme and the remainder.
+fn split_url_scheme(url: &str) -> AppResult<(String, &str)> {
+    match url.split_once("://") {
+        Some((scheme, rest)) if !scheme.is_empty() && !rest.is_empty() => {
+            Ok((scheme.to_ascii_lowercase(), rest))
+        }
+        _ => Err(unsupported_scheme(url)),
+    }
+}
+
+/// Appends the `/ws` subscription path when the URL has no path of its own.
+///
+/// Only the authority (plus any path) is inspected; a trailing `/` counts as
+/// "no path" so `https://host/` becomes `wss://host/ws`.
+fn with_ws_path(rest: &str) -> String {
+    let path_part = rest.split(['?', '#']).next().unwrap_or(rest);
+    let has_path = path_part
+        .split_once('/')
+        .is_some_and(|(_, path)| !path.is_empty());
+    if has_path {
+        rest.to_string()
+    } else {
+        format!("{}/ws", path_part.trim_end_matches('/'))
+    }
+}
+
+/// Validates a user-supplied RPC endpoint before any network work begins.
+///
+/// Accepts only absolute URLs with an `http`, `https`, `ws`, or `wss` scheme
+/// and a non-empty host: the four schemes this tool can actually speak. A URL
+/// without a scheme, a host, or with a malformed/out-of-range port is rejected
+/// with [`AppError::InvalidRpcUrl`], as are unrelated schemes such as `ftp://`
+/// or `file://`.
+///
+/// Calling this up front means a typo in `--rpc-url` is reported immediately,
+/// instead of surfacing as a confusing JSON-deserialization or XDR-decoding
+/// failure halfway through a simulation.
+///
+/// # Errors
+///
+/// Returns [`AppError::InvalidRpcUrl`] when `url` is not a usable endpoint, with
+/// the offending value and the reason in the message.
+///
+/// # Examples
+///
+/// ```
+/// use soroban_cost_estimator::error::AppError;
+/// use soroban_cost_estimator::rpc::client::validate_rpc_url;
+///
+/// assert!(validate_rpc_url("https://soroban-testnet.stellar.org").is_ok());
+/// assert!(validate_rpc_url("http://localhost:8000").is_ok());
+/// assert!(matches!(
+///     validate_rpc_url("ftp://example.com"),
+///     Err(AppError::InvalidRpcUrl(_))
+/// ));
+/// # Ok::<(), AppError>(())
+/// ```
+pub fn validate_rpc_url(url: &str) -> AppResult<()> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| AppError::InvalidRpcUrl(format!("`{url}` is not a valid URL: {e}")))?;
+
+    match parsed.scheme() {
+        "http" | "https" | "ws" | "wss" => {}
+        scheme => {
+            return Err(AppError::InvalidRpcUrl(format!(
+                "`{url}` uses unsupported scheme `{scheme}`; expected http://, https://, ws://, or wss://"
+            )));
+        }
+    }
+
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return Err(AppError::InvalidRpcUrl(format!(
+            "`{url}` is missing a host"
+        )));
+    }
+
+    if parsed.port() == Some(0) {
+        return Err(AppError::InvalidRpcUrl(format!(
+            "`{url}` has an invalid port 0"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Error for a URL whose scheme this tool cannot speak.
+fn unsupported_scheme(url: &str) -> AppError {
+    AppError::General(format!(
+        "unsupported RPC URL `{url}`: expected a ws://, wss://, http://, or https:// URL"
+    ))
 }
 
 /// Key identifying a deduplicable JSON-RPC request: `(method, serialized params)`.
@@ -244,6 +423,9 @@ pub struct RpcClient {
     pub headers: HeaderMap,
     /// Whether to print verbose RPC request/response diagnostics to stderr.
     pub verbose: bool,
+    /// Optional overall deadline spanning retries, backoff, and failover for a
+    /// single RPC operation.
+    total_timeout: Option<Duration>,
 }
 
 impl RpcClient {
@@ -384,7 +566,7 @@ impl RpcClient {
     ///
     /// Behaves exactly like [`Self::with_fallback_headers_connect_timeout`] and
     /// additionally attaches the parsed `KEY=VALUE` / `KEY: VALUE` headers to
-    /// every outbound request. Uses the [`DEFAULT_CONNECT_TIMEOUT`] default.
+    /// every outbound request. Uses the default connect timeout.
     ///
     /// # Errors
     /// Returns [`AppError::InvalidHeader`] when any supplied header is
@@ -489,7 +671,17 @@ impl RpcClient {
             connect_timeout,
             headers,
             verbose,
+            total_timeout: default_total_timeout(),
         }
+    }
+
+    /// Sets an overall per-operation deadline spanning all retry attempts,
+    /// backoff delays, and fallback endpoint calls. A zero duration disables
+    /// the overall deadline.
+    #[must_use]
+    pub fn with_total_timeout(mut self, total_timeout: Option<Duration>) -> Self {
+        self.total_timeout = total_timeout.filter(|d| !d.is_zero());
+        self
     }
 
     /// Returns the custom HTTP headers configured for this client.
@@ -559,7 +751,7 @@ impl RpcClient {
     /// * a request identical to one that already **completed** returns the
     ///   cached result without sending anything;
     /// * a request identical to one currently **in flight** attaches to that
-    ///   request's [`SharedFuture`] and awaits it, so concurrent duplicates
+    ///   request's `SharedFuture` and awaits it, so concurrent duplicates
     ///   share a single underlying future and a single HTTP POST.
     ///
     /// A failed leader publishes no outcome, so its followers loop back and
@@ -675,17 +867,28 @@ impl RpcClient {
             "params": params,
         });
 
+        let deadline = self.total_timeout.map(|d| tokio::time::Instant::now() + d);
+
         trace!(
             method,
             header_count = self.headers.len(),
             "sending RPC request"
         );
         match self
-            .post_and_parse(method, &body, &self.url, self.connect_timeout)
+            .post_and_parse(method, &body, &self.url, self.connect_timeout, deadline)
             .await
         {
             Ok(result) => Ok(result),
             Err(e) if Self::is_failover_trigger(&e) => {
+                if let Some(d) = deadline
+                    && tokio::time::Instant::now() >= d
+                {
+                    let timeout_ms = self
+                        .total_timeout
+                        .map(|t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX))
+                        .unwrap_or(0);
+                    return Err(AppError::TotalTimeout { timeout_ms });
+                }
                 if let Some(ref fallback) = self.fallback_url {
                     // The operator-facing notice goes to stderr so it never
                     // contaminates machine-readable stdout (json/csv/markdown).
@@ -697,7 +900,7 @@ impl RpcClient {
                         error = %e,
                         "primary RPC endpoint failed — failing over to fallback"
                     );
-                    self.post_and_parse(method, &body, fallback, self.connect_timeout)
+                    self.post_and_parse(method, &body, fallback, self.connect_timeout, deadline)
                         .await
                 } else {
                     Err(e)
@@ -740,11 +943,15 @@ impl RpcClient {
         body: &Value,
         url: &str,
         connect_timeout: Duration,
+        deadline: Option<tokio::time::Instant>,
     ) -> AppResult<Value> {
         let client = self.client.clone();
         let url = url.to_string();
         let request_body = body.clone();
         let limiter = self.limiter.clone();
+        // Custom headers are attached per request (rather than as client
+        // defaults) so the stored configuration stays authoritative.
+        let headers = self.headers.clone();
 
         let start = std::time::Instant::now();
         let request_body_str = serde_json::to_string(&request_body).unwrap_or_default();
@@ -754,11 +961,12 @@ impl RpcClient {
             eprintln!("[RPC] -> {}", request_body_str);
         }
 
-        let response = with_retry(self.max_retries, || {
+        let response = with_retry_deadline(self.max_retries, deadline, self.total_timeout, || {
             let client = client.clone();
             let url = url.clone();
             let request_body = request_body.clone();
             let limiter = limiter.clone();
+            let headers = headers.clone();
 
             async move {
                 // Every outbound attempt (including retries) consumes a
@@ -769,6 +977,7 @@ impl RpcClient {
                 }
                 let response = client
                     .post(&url)
+                    .headers(headers)
                     .json(&request_body)
                     .send()
                     .await
@@ -807,7 +1016,18 @@ impl RpcClient {
             });
         }
 
-        let response_body: Value = response.json().await?;
+        let response_body: Value = if let Some(d) = deadline {
+            let timeout_ms = self
+                .total_timeout
+                .map(|t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            match tokio::time::timeout_at(d, response.json()).await {
+                Ok(res) => res?,
+                Err(_) => return Err(AppError::TotalTimeout { timeout_ms }),
+            }
+        } else {
+            response.json().await?
+        };
 
         if let Some(error) = response_body.get("error") {
             let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
@@ -1056,7 +1276,10 @@ mod tests {
     use crate::error::{AppError, AppResult};
     use crate::rpc::retry::DEFAULT_MAX_RETRIES;
 
-    use super::{RpcClient, resolve_endpoint, resolve_ws_endpoint, set_endpoint_overrides};
+    use super::{
+        RpcClient, resolve_endpoint, resolve_ws_endpoint, set_endpoint_overrides, to_http_url,
+        to_websocket_url, validate_rpc_url,
+    };
 
     /// Spawns a tiny HTTP server that answers JSON-RPC
     /// `simulateTransaction`-style calls with `{"result":{"pong":true}}`,
@@ -1993,6 +2216,127 @@ mod tests {
             resolve_ws_endpoint("testnet", Some("ws://localhost:8000/ws")).unwrap(),
             "ws://localhost:8000/ws"
         );
+    }
+
+    #[test]
+    fn test_resolve_ws_endpoint_accepts_https_custom_url() {
+        assert_eq!(
+            resolve_ws_endpoint("testnet", Some("https://soroban-testnet.stellar.org")).unwrap(),
+            "wss://soroban-testnet.stellar.org/ws"
+        );
+        assert_eq!(
+            resolve_ws_endpoint("testnet", Some("https://soroban-testnet.stellar.org/")).unwrap(),
+            "wss://soroban-testnet.stellar.org/ws"
+        );
+    }
+
+    #[test]
+    fn test_validate_rpc_url_accepts_supported_schemes() {
+        for url in [
+            "https://soroban-testnet.stellar.org",
+            "https://soroban-testnet.stellar.org/soroban/rpc",
+            "http://localhost:8000",
+            "ws://127.0.0.1:8000/ws",
+            "wss://example.org/ws",
+        ] {
+            assert!(validate_rpc_url(url).is_ok(), "{url} should be accepted");
+        }
+    }
+
+    #[test]
+    fn test_validate_rpc_url_rejects_other_schemes() {
+        for url in [
+            "ftp://example.org/rpc",
+            "file:///etc/passwd",
+            "soroban-testnet.stellar.org",
+        ] {
+            let err = validate_rpc_url(url).expect_err("{url} should be rejected");
+            assert!(matches!(err, AppError::InvalidRpcUrl(_)), "got: {err:?}");
+            assert!(
+                err.to_string().contains(url),
+                "message should name the URL: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_rpc_url_rejects_missing_host_and_bad_ports() {
+        for url in [
+            "https://",
+            "https://host:99999",
+            "https://host:not-a-port",
+            "http://host:0",
+        ] {
+            let err = validate_rpc_url(url).expect_err("{url} should be rejected");
+            assert!(matches!(err, AppError::InvalidRpcUrl(_)), "got: {err:?}");
+        }
+    }
+
+    #[test]
+    fn test_resolve_endpoint_validates_custom_url_before_use() {
+        let err = resolve_endpoint("testnet", Some("ftp://example.org/rpc"))
+            .expect_err("non-HTTP schemes must be rejected up front");
+        assert!(matches!(err, AppError::InvalidRpcUrl(_)), "got: {err:?}");
+        assert!(
+            err.to_string().contains("ftp"),
+            "message should name the offending scheme: {err}"
+        );
+    }
+
+    #[test]
+    fn test_to_websocket_url_converts_schemes_and_defaults_path() {
+        assert_eq!(
+            to_websocket_url("https://soroban.stellar.org").unwrap(),
+            "wss://soroban.stellar.org/ws"
+        );
+        assert_eq!(
+            to_websocket_url("http://127.0.0.1:8000").unwrap(),
+            "ws://127.0.0.1:8000/ws"
+        );
+        assert_eq!(
+            to_websocket_url("wss://example.org/ws").unwrap(),
+            "wss://example.org/ws"
+        );
+    }
+
+    #[test]
+    fn test_to_websocket_url_keeps_explicit_path() {
+        assert_eq!(
+            to_websocket_url("https://example.org/custom/stream").unwrap(),
+            "wss://example.org/custom/stream"
+        );
+    }
+
+    #[test]
+    fn test_to_websocket_url_rejects_unknown_scheme() {
+        assert!(to_websocket_url("ftp://example.org").is_err());
+        assert!(to_websocket_url("soroban-testnet.stellar.org").is_err());
+    }
+
+    #[test]
+    fn test_to_http_url_is_the_inverse_for_local_endpoints() {
+        // A single `--rpc-url` value drives both the WebSocket subscription and
+        // the request/response JSON-RPC calls.
+        assert_eq!(
+            to_http_url("ws://127.0.0.1:8000/ws").unwrap(),
+            "http://127.0.0.1:8000"
+        );
+        assert_eq!(
+            to_http_url("wss://soroban-testnet.stellar.org/ws").unwrap(),
+            "https://soroban-testnet.stellar.org"
+        );
+        assert_eq!(
+            to_http_url("https://soroban-testnet.stellar.org").unwrap(),
+            "https://soroban-testnet.stellar.org"
+        );
+        assert!(to_http_url("ftp://example.org").is_err());
+    }
+
+    #[test]
+    fn test_ws_and_http_round_trip() {
+        let http = "http://127.0.0.1:8000";
+        let ws = to_websocket_url(http).unwrap();
+        assert_eq!(to_http_url(&ws).unwrap(), http);
     }
 }
 

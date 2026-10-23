@@ -176,6 +176,49 @@ sequenceDiagram
     CLI->>Fee: formatter_by_name(format).format(report)
     Fee-->>User: cost report on stdout
 ```
+src/
+├── main.rs               # CLI entry point, command dispatch, top-level orchestration
+├── lib.rs                # Crate root — re-exports public modules
+├── cli.rs                # clap-based CLI definition (Command, ConfigAction, CacheAction)
+├── error.rs              # Unified error type (AppError) and AppResult alias
+├── cache.rs              # Estimate caching (~/.soroban-cost-estimator/cache/)
+├── xdr_helper.rs         # XDR encode/decode, tx-envelope construction, arg parsing
+├── bin/
+│   └── gen_test_wasm.rs  # Utility binary: generates minimal test WASM fixtures
+├── rpc/
+│   ├── mod.rs            # Module re-exports
+│   ├── client.rs         # JSON-RPC 2.0 client, network-to-URL (HTTP/WS) resolution
+│   ├── simulate.rs       # simulateTransaction call + response parsing
+│   ├── ws.rs             # WebSocket JSON-RPC client, events + ledger-close subscriptions
+│   └── config.rs         # getLedgerEntries for ConfigSetting* entries
+├── wasm/
+│   ├── mod.rs            # Module re-exports
+│   └── parser.rs         # WASM loading, validation, function enumeration, contract spec decoding
+├── report/
+│   ├── mod.rs            # Module re-exports
+│   ├── cost_report.rs    # CostReport struct and basic formatters
+│   ├── fee_calc.rs       # FeeBreakdown, FeeRates, integer stroops math
+│   └── formatter.rs      # ReportFormatter trait + Table/JSON/CSV/Markdown impls
+├── config_snapshot/
+│   ├── mod.rs            # Module re-exports
+│   ├── model.rs          # ConfigSnapshot and per-setting structs (6 settings)
+│   ├── diff.rs           # Field-by-field snapshot comparison, pricing-change detection
+│   ├── store.rs          # Snapshot persistence (~/.soroban-cost-estimator/snapshots/)
+│   └── history.rs        # Chronological change log, last-changed tracking
+tests/
+├── cli_tests.rs          # CLI integration tests
+├── parser_tests.rs       # WASM parser tests
+├── fee_calc_tests.rs     # Fee calculation unit tests
+├── cache_tests.rs        # Cache round-trip tests
+├── report_snapshots.rs   # insta snapshot tests for all formatters
+├── fixtures/             # Test WASM binaries and contract sources
+└── snapshots/            # insta snapshot files
+benches/
+└── wasm_parse.rs         # Criterion benchmarks for WASM parsing
+docs/                     # This documentation (mdBook-style)
+```
+
+## Module Details
 
 A few details worth knowing before you change this path:
 
@@ -202,40 +245,19 @@ The second pipeline answers "has the network's pricing changed since I last
 looked, and which of my cached estimates does that invalidate?" It is
 designed to run in CI, so its exit code is part of its contract.
 
-```mermaid
-flowchart TD
-    A(["config diff --network testnet"]) --> B{"--against-previous?"}
+Uses `clap` derive macros to define the CLI surface. The top-level `Cli`
+struct contains a `Command` enum with five subcommands:
 
-    B -->|yes| B1["Load the two newest snapshots on disk<br/>store::load_last_two_snapshot_payloads<br/>no network calls"]
-    B1 --> E
-
-    B -->|no| C["Load baseline payload<br/>--against path, or latest snapshot"]
-    C --> D1["getLedgerEntries — all 6 ConfigSetting keys<br/>one batched call"]
-    D1 --> D2{"every key returned?"}
-    D2 -->|no| D3["AppError::ConfigSettingNotFound"]
-    D2 -->|yes| D4["Decode each ConfigSettingEntry XDR<br/>apply_config_entry into ConfigSnapshot<br/>ledger = max lastModifiedLedgerSeq"]
-    D4 --> D5["getLatestLedger for protocol version<br/>best effort, never fatal"]
-    D5 --> E["diff_payloads<br/>field-by-field + unknown fields"]
-
-    E --> F{"--pricing-only?"}
-    F -->|yes| F1["Keep only is_pricing_change rows"] --> G
-    F -->|no| G["Render diff<br/>table, summary, json, csv, markdown"]
-
-    G --> H{"pricing changed and<br/>newer side came from network?"}
-    H -->|yes| H1["Auto-save post-upgrade snapshot<br/>store::save_snapshot"] --> I
-    H -->|no| I["List stale cached estimates<br/>cached ledger < new snapshot ledger"]
-
-    I --> J["resolve_exit_code"]
-    J --> J1{"--ignore-pricing-exit?"}
-    J1 -->|yes| X0(["exit 0"])
-    J1 -->|no| J2{"--fail-on-any-change?"}
-    J2 -->|yes| J3{"any change?"}
-    J3 -->|yes| X1(["exit 1"])
-    J3 -->|no| X0
-    J2 -->|no| J4{"pricing change<br/>at or above --threshold-percent?"}
-    J4 -->|yes| X1
-    J4 -->|no| X0
-```
+| Subcommand | Purpose |
+|---|---|
+| `estimate` | Simulate a single contract invocation and print the cost report |
+| `estimate-all` | Enumerate all exported functions and estimate each one |
+| `config snapshot` | Fetch and store a snapshot of network pricing configuration |
+| `config diff` | Compare current config against a stored snapshot |
+| `config history` | Show the full chronological change log |
+| `config last-changed` | Show when each setting last changed |
+| `watch` | Watch network config over WebSocket ledger-close notifications (HTTP polling fallback) and print diffs |
+| `cache verify` | Check every cache entry for corruption |
 
 How snapshots get onto disk in the first place:
 
@@ -278,9 +300,22 @@ section plus the fixed 8-byte module header, so
 `header_size + sum(row.total_size)` equals the file length exactly
 (pinned by `test_section_sizes_sum_to_total_wasm_byte_length`).
 
-The SHA-256 of the WASM bytes (`wasm_sha256_hex`) is the contract's identity
-everywhere else in the tool — most importantly as the first part of the cache
-key.
+### `rpc/ws.rs` — WebSocket Client
+
+`WsRpcClient` speaks JSON-RPC 2.0 over a WebSocket (`wss://…/ws`), where the
+server pushes notifications in addition to answering requests. It backs two
+subscriptions:
+
+- `subscribe_events` / `next_event` — contract and diagnostic events.
+- `subscribe_ledger_closes` / `next_ledger_close` — ledger-close
+  notifications, which `watch` uses to re-check the network config the moment a
+  new ledger lands.
+
+`resolve_ws_endpoint` derives the WebSocket URL from the HTTP one, and
+`to_websocket_url` / `to_http_url` convert between the two schemes so a single
+`--rpc-url` value works for both transports.
+
+### `rpc/simulate.rs` — Simulation
 
 ### 2. RPC client — `rpc/`
 
