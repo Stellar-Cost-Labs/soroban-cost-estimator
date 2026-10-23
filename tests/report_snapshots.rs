@@ -41,6 +41,7 @@ fn sample_report() -> CostReport {
         history: None,
         projections: None,
         contract_meta: ContractMeta::default(),
+        diagnostics: None,
     }
 }
 
@@ -78,6 +79,7 @@ fn empty_report() -> CostReport {
         history: None,
         projections: None,
         contract_meta: ContractMeta::default(),
+        diagnostics: None,
     }
 }
 
@@ -190,6 +192,7 @@ fn batch_report(function: &str, cpu: u64, fee_stroops: i64, writes: u32) -> Cost
         history: None,
         projections: None,
         contract_meta: ContractMeta::default(),
+        diagnostics: None,
     }
 }
 
