@@ -1,11 +1,18 @@
-//! Edge-case tests for `xlm_to_stroops` parsing.
+//! Edge-case tests for the fee calculator.
 //!
-//! Covers empty/whitespace input, malformed fractions, overflow, negative
-//! zero, and very large values at and beyond the `i64` stroops boundary.
+//! * `xlm_to_stroops` parsing: empty/whitespace input, malformed fractions,
+//!   overflow, negative zero, and very large values at and beyond the `i64`
+//!   stroops boundary.
+//! * `compute_fee_breakdown` refundable-fee regressions: the historical
+//!   input that once reported a negative refundable fee, and storage I/O
+//!   fees large enough to exceed the authoritative total.
+//!
 //! Happy-path conversions are covered by unit tests in
 //! `src/report/fee_calc.rs`.
 
-use soroban_cost_estimator::report::fee_calc::xlm_to_stroops;
+use soroban_cost_estimator::report::fee_calc::{
+    DEFAULT_PRECISION, FeeBreakdown, FeeRates, compute_fee_breakdown, xlm_to_stroops,
+};
 
 /// `i64::MAX` stroops expressed as an XLM string: 922337203685 XLM +
 /// 4775807 stroops of fraction, exactly representable with 7 digits.
@@ -102,4 +109,335 @@ fn test_extra_fraction_digits_are_truncated() {
     // anything beyond is silently truncated rather than rounded.
     assert_eq!(xlm_to_stroops("0.12345678").unwrap(), 1_234_567);
     assert_eq!(xlm_to_stroops("1.00000009").unwrap(), 10_000_000);
+}
+
+// ---------------------------------------------------------------------------
+// Refundable fee regressions (issue #367)
+// ---------------------------------------------------------------------------
+
+/// Testnet fee rates from the live increment-contract cross-check in
+/// `src/report/fee_calc.rs`.
+fn testnet_rates() -> FeeRates {
+    FeeRates {
+        fee_per_10k_insns: 7,
+        fee_per_read_entry: 1_563,
+        fee_per_write_entry: 2_500,
+        fee_per_read_1kb: 447,
+        fee_per_1kb: 406,
+    }
+}
+
+/// Invariants every breakdown must hold, whatever the inputs:
+///
+/// * the refundable fee is never negative;
+/// * the non-refundable fee is exactly CPU + storage I/O + bandwidth;
+/// * the refundable fee is the remainder of the total, floored at zero;
+/// * when the total covers the non-refundable fee, the two portions add
+///   back up to the total exactly;
+/// * the reported total is the resource fee plus the base inclusion fee.
+///
+/// The remainder is checked in `i128` so the expected value cannot itself
+/// overflow on extreme inputs.
+fn assert_refundable_invariants(total_resource_fee: i64, breakdown: &FeeBreakdown) {
+    assert!(
+        breakdown.refundable_stroops >= 0,
+        "refundable fee went negative: {}",
+        breakdown.refundable_stroops
+    );
+
+    assert_eq!(
+        breakdown.non_refundable_stroops,
+        breakdown
+            .cpu_fee_stroops
+            .saturating_add(breakdown.storage_fee_stroops)
+            .saturating_add(breakdown.bandwidth_fee_stroops),
+        "non-refundable must equal cpu + storage + bandwidth"
+    );
+
+    let remainder = i128::from(total_resource_fee) - i128::from(breakdown.non_refundable_stroops);
+    assert_eq!(i128::from(breakdown.refundable_stroops), remainder.max(0));
+
+    if remainder >= 0 {
+        assert_eq!(
+            i128::from(breakdown.non_refundable_stroops) + i128::from(breakdown.refundable_stroops),
+            i128::from(total_resource_fee),
+            "non-refundable + refundable must sum to the total resource fee"
+        );
+    }
+
+    assert_eq!(
+        breakdown.total_stroops,
+        total_resource_fee.saturating_add(breakdown.base_fee_stroops)
+    );
+
+    // The rent share is derived from the refundable fee, so a negative
+    // refundable would surface here as a negative percentage.
+    let rent_share = &breakdown.fee_percentages["rent"];
+    assert!(
+        !rent_share.starts_with('-'),
+        "rent share went negative: {rent_share}"
+    );
+}
+
+/// The exact input behind the original bug (CID-021 in the conversation log).
+///
+/// A 976-byte WASM upload simulation came back with no `minResourceFee`, so
+/// the caller passed a total of 0. The testnet bandwidth rate still priced
+/// the transaction at `976 * 406 / 1024 = 386` stroops non-refundable, and
+/// the old `total - non_refundable` produced `Refundable: -386 stroops`.
+#[test]
+fn test_historical_upload_input_does_not_report_negative_refundable() {
+    let breakdown = compute_fee_breakdown(
+        0,   // total_resource_fee (omitted by the upload simulation)
+        0,   // cpu_insns
+        0,   // read_entries
+        0,   // write_entries
+        0,   // read_bytes
+        976, // tx_size
+        testnet_rates(),
+        DEFAULT_PRECISION,
+    );
+
+    assert_eq!(breakdown.bandwidth_fee_stroops, 386);
+    assert_eq!(breakdown.non_refundable_stroops, 386);
+    assert_eq!(breakdown.refundable_stroops, 0);
+    assert_eq!(breakdown.total_stroops, 0);
+    assert_eq!(breakdown.total_xlm, "0.0000000");
+    assert_refundable_invariants(0, &breakdown);
+}
+
+/// The same zero-total upload path once the contract-code write is priced
+/// in: storage I/O pushes the non-refundable fee further above the total,
+/// which must still floor the refundable at zero rather than at `-2_886`.
+#[test]
+fn test_historical_upload_with_storage_write_floors_refundable() {
+    let breakdown = compute_fee_breakdown(
+        0,   // total_resource_fee
+        0,   // cpu_insns
+        0,   // read_entries
+        1,   // write_entries (the uploaded contract code)
+        0,   // read_bytes
+        976, // tx_size
+        testnet_rates(),
+        DEFAULT_PRECISION,
+    );
+
+    assert_eq!(breakdown.storage_fee_stroops, 2_500);
+    assert_eq!(breakdown.non_refundable_stroops, 2_886);
+    assert_eq!(breakdown.refundable_stroops, 0);
+    assert_refundable_invariants(0, &breakdown);
+}
+
+/// Storage fees alone exceed a real, non-zero total: 50 ledger writes at
+/// the testnet write rate cost 125_000 stroops against a 15_427-stroop
+/// simulated total. The non-refundable fee stays at its rate-derived value
+/// (it is deliberately not clamped) and the refundable floors at zero.
+#[test]
+fn test_storage_fee_exceeding_total_floors_refundable() {
+    let total_resource_fee = 15_427;
+    let breakdown = compute_fee_breakdown(
+        total_resource_fee,
+        532_502, // cpu_insns
+        1,       // read_entries
+        50,      // write_entries
+        0,       // read_bytes
+        156,     // tx_size
+        testnet_rates(),
+        DEFAULT_PRECISION,
+    );
+
+    // 1 * 1_563 + 50 * 2_500
+    assert_eq!(breakdown.storage_fee_stroops, 126_563);
+    assert!(breakdown.storage_fee_stroops > total_resource_fee);
+    // 372 cpu + 126_563 storage + 61 bandwidth
+    assert_eq!(breakdown.non_refundable_stroops, 126_996);
+    assert_eq!(breakdown.refundable_stroops, 0);
+    assert_eq!(breakdown.total_stroops, 15_527);
+    assert_refundable_invariants(total_resource_fee, &breakdown);
+}
+
+/// Off-by-one boundary around the point where the non-refundable fee
+/// (4_496 stroops for the live increment cross-check) uses up the whole
+/// total.
+#[test]
+fn test_refundable_boundary_around_non_refundable_total() {
+    let cases = [
+        (4_495, 0), // one stroop short: floored, not -1
+        (4_496, 0), // exactly consumed
+        (4_497, 1), // one stroop left over
+    ];
+
+    for (total_resource_fee, expected_refundable) in cases {
+        let breakdown = compute_fee_breakdown(
+            total_resource_fee,
+            532_502, // cpu_insns
+            1,       // read_entries
+            1,       // write_entries
+            0,       // read_bytes
+            156,     // tx_size
+            testnet_rates(),
+            DEFAULT_PRECISION,
+        );
+
+        assert_eq!(breakdown.non_refundable_stroops, 4_496);
+        assert_eq!(
+            breakdown.refundable_stroops, expected_refundable,
+            "total_resource_fee = {total_resource_fee}"
+        );
+        assert_refundable_invariants(total_resource_fee, &breakdown);
+    }
+}
+
+/// The maximum ledger write count at the maximum write rate produces a fee
+/// far beyond the `i64` range. The write fee saturates at `i64::MAX`
+/// instead of wrapping negative, and the refundable floors at zero.
+#[test]
+fn test_max_write_entries_at_max_write_rate_saturates() {
+    let total_resource_fee = 15_427;
+    let rates = FeeRates {
+        fee_per_write_entry: i64::MAX,
+        ..testnet_rates()
+    };
+    let breakdown = compute_fee_breakdown(
+        total_resource_fee,
+        532_502,  // cpu_insns
+        1,        // read_entries
+        u32::MAX, // write_entries
+        0,        // read_bytes
+        156,      // tx_size
+        rates,
+        DEFAULT_PRECISION,
+    );
+
+    assert_eq!(breakdown.storage_fee_stroops, i64::MAX);
+    assert_eq!(breakdown.non_refundable_stroops, i64::MAX);
+    assert_eq!(breakdown.refundable_stroops, 0);
+    assert_eq!(breakdown.total_stroops, 15_527);
+    assert_refundable_invariants(total_resource_fee, &breakdown);
+}
+
+/// Large storage I/O that stays inside the `i64` range, so the components
+/// are summed exactly rather than saturated: every possible disk read byte
+/// at 10^9 stroops/KB plus every possible ledger write at 10_000 stroops
+/// each, against a 100 XLM total.
+#[test]
+fn test_large_storage_io_without_saturation() {
+    let total_resource_fee = 1_000_000_000;
+    let rates = FeeRates {
+        fee_per_write_entry: 10_000,
+        fee_per_read_1kb: 1_000_000_000,
+        ..testnet_rates()
+    };
+    let breakdown = compute_fee_breakdown(
+        total_resource_fee,
+        0,        // cpu_insns
+        0,        // read_entries
+        u32::MAX, // write_entries
+        u32::MAX, // read_bytes
+        0,        // tx_size
+        rates,
+        DEFAULT_PRECISION,
+    );
+
+    // u32::MAX * 10_000 = 42_949_672_950_000
+    // u32::MAX * 1_000_000_000 / 1024 = 4_194_303_999_023_437
+    assert_eq!(breakdown.storage_fee_stroops, 4_237_253_671_973_437);
+    assert_eq!(breakdown.non_refundable_stroops, 4_237_253_671_973_437);
+    assert_eq!(breakdown.refundable_stroops, 0);
+    assert_refundable_invariants(total_resource_fee, &breakdown);
+}
+
+/// With the total itself at `i64::MAX`, a saturated storage fee consumes it
+/// exactly (refundable 0), while an unsaturated one leaves a positive
+/// remainder that still adds back up to the total.
+#[test]
+fn test_max_total_with_extreme_storage_io() {
+    let saturated = compute_fee_breakdown(
+        i64::MAX,
+        0,        // cpu_insns
+        0,        // read_entries
+        u32::MAX, // write_entries
+        0,        // read_bytes
+        0,        // tx_size
+        FeeRates {
+            fee_per_write_entry: i64::MAX,
+            ..testnet_rates()
+        },
+        DEFAULT_PRECISION,
+    );
+    assert_eq!(saturated.non_refundable_stroops, i64::MAX);
+    assert_eq!(saturated.refundable_stroops, 0);
+    assert_eq!(saturated.total_stroops, i64::MAX);
+    assert_refundable_invariants(i64::MAX, &saturated);
+
+    let unsaturated = compute_fee_breakdown(
+        i64::MAX,
+        0,        // cpu_insns
+        0,        // read_entries
+        u32::MAX, // write_entries
+        0,        // read_bytes
+        0,        // tx_size
+        FeeRates {
+            fee_per_write_entry: 10_000,
+            ..testnet_rates()
+        },
+        DEFAULT_PRECISION,
+    );
+    assert_eq!(unsaturated.storage_fee_stroops, 42_949_672_950_000);
+    assert_eq!(
+        unsaturated.refundable_stroops,
+        i64::MAX - 42_949_672_950_000
+    );
+    assert_refundable_invariants(i64::MAX, &unsaturated);
+}
+
+/// A negative total (never returned by a well-behaved RPC, but reachable
+/// through a malformed response) must not leak through as a negative
+/// refundable, including at `i64::MIN` where `saturating_sub` alone would
+/// stick at `i64::MIN`.
+#[test]
+fn test_negative_total_with_storage_io_floors_refundable() {
+    for total_resource_fee in [-1, -15_427, i64::MIN] {
+        let breakdown = compute_fee_breakdown(
+            total_resource_fee,
+            532_502, // cpu_insns
+            1,       // read_entries
+            1,       // write_entries
+            1_024,   // read_bytes
+            156,     // tx_size
+            testnet_rates(),
+            DEFAULT_PRECISION,
+        );
+
+        assert_eq!(
+            breakdown.refundable_stroops, 0,
+            "total_resource_fee = {total_resource_fee}"
+        );
+        assert_eq!(breakdown.base_fee_stroops, 0);
+        assert_refundable_invariants(total_resource_fee, &breakdown);
+    }
+}
+
+/// Control case: the live testnet cross-check, where the total comfortably
+/// covers storage I/O, splits into parts that sum back to the total.
+#[test]
+fn test_live_testnet_breakdown_sums_to_total() {
+    let total_resource_fee = 15_427;
+    let breakdown = compute_fee_breakdown(
+        total_resource_fee,
+        532_502, // cpu_insns
+        1,       // read_entries
+        1,       // write_entries
+        0,       // read_bytes
+        156,     // tx_size
+        testnet_rates(),
+        DEFAULT_PRECISION,
+    );
+
+    assert_eq!(breakdown.cpu_fee_stroops, 372);
+    assert_eq!(breakdown.storage_fee_stroops, 4_063);
+    assert_eq!(breakdown.bandwidth_fee_stroops, 61);
+    assert_eq!(breakdown.refundable_stroops, 10_931);
+    assert_eq!(breakdown.total_stroops, 15_527);
+    assert_refundable_invariants(total_resource_fee, &breakdown);
 }
