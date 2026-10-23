@@ -23,7 +23,7 @@ expression: JsonFormatter.format(&report)
   "optimization_suggestions": [],
   "read_bytes": 0,
   "read_entries": 1,
-  "rpc_latency_ms": 87,
+  "simulation_duration_ms": 87,
   "suggestions": [
     "Tip: 70% of the total fee is refundable, which comes from ledger rent bumps and contract events. Consider reducing state growth and the number or size of emitted events."
   ],

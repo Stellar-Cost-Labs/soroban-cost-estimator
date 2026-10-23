@@ -460,9 +460,13 @@ pub fn load_snapshot_by_timestamp(network: &str, timestamp: &str) -> AppResult<C
 /// Result of validating a single snapshot file.
 #[derive(Debug, Clone)]
 pub struct SnapshotValidation {
+    /// Full path of the validated file.
     pub path: PathBuf,
+    /// File name shown in validation reports.
     pub filename: String,
+    /// Whether the file passed every structural check.
     pub valid: bool,
+    /// Why validation failed, when it did.
     pub error: Option<String>,
 }
 
@@ -799,6 +803,7 @@ mod tests {
 /// A bundle of config snapshots for export/import.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotBundle {
+    /// Snapshots included in the bundle, in file order.
     pub snapshots: Vec<ConfigSnapshot>,
 }
 
@@ -856,9 +861,13 @@ pub fn import_snapshots(bundle_path: &str) -> AppResult<usize> {
 /// Summary of one saved snapshot, read from the snapshot file itself.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SnapshotMetadata {
+    /// File name of the snapshot on disk.
     pub filename: String,
+    /// Network the snapshot was captured from.
     pub network: String,
+    /// RFC 3339 timestamp of when the snapshot was taken.
     pub timestamp: String,
+    /// Ledger sequence at capture time.
     pub ledger_sequence: u32,
     /// `None` for snapshots saved before the protocol version was recorded.
     pub protocol_version: Option<u32>,
