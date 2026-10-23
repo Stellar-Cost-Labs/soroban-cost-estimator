@@ -1,0 +1,8 @@
+---
+source: tests/report_snapshots.rs
+expression: format_diff_csv(&diff)
+---
+field,old_value,new_value,is_pricing_change
+contract_compute.tx_max_instructions,1000000,2750000,true
+contract_ledger_cost.fee_write_ledger_entry,1000,1040,true
+state_archival.max_entry_ttl,3110400,5184000,false

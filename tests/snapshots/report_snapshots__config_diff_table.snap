@@ -1,0 +1,20 @@
+---
+source: tests/report_snapshots.rs
+expression: "format_diff(&diff, false, false, None)"
+---
+Config diff: 2026-09-01T00:00:00+00:00 (ledger 3800000) → 2026-09-15T00:00:00+00:00 (ledger 3894195)
+Network: testnet
+
+Found 3 field change(s):
+
+  📈 Contract Compute V0 > Tx Max Instructions
+      Old: 1000000
+      New: 2750000
+  📈 Contract Ledger Cost V0 > Fee Write Ledger Entry
+      Old: 1000
+      New: 1040
+  🔄 State Archival > Max Entry Ttl
+      Old: 3110400
+      New: 5184000
+
+⚠️  Pricing changes detected! Your cached estimates may be stale.
