@@ -939,6 +939,7 @@ impl RpcClient {
 
     /// POST `body` to `url` (with retries), parse the JSON-RPC response, and
     /// extract the raw `result` value.
+    #[allow(clippy::too_many_lines)]
     async fn post_and_parse(
         &self,
         method: &str,

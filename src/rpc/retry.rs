@@ -345,7 +345,7 @@ mod tests {
             async move {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 Err(AppError::Rpc {
-                    status: -32000,
+                    status: -32602,
                     message: "permanent".to_string(),
                     data: None,
                 })
