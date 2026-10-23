@@ -177,6 +177,13 @@ async fn rpc_handler(Json(body): Json<Value>) -> Json<Value> {
     let params = body.get("params");
 
     match method {
+        // The CLI probes endpoint health (`Server::health_check`) before any
+        // simulation; answer `healthy` so the estimate flow gets past it.
+        "getHealth" => Json(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "status": "healthy" }
+        })),
         "simulateTransaction" => Json(simulate_response()),
         "getLedgerEntries" => {
             let keys: Vec<String> = params
@@ -322,7 +329,7 @@ async fn test_config_snapshot_offline() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "unknown network should fail");
     assert!(
-        stderr.contains("RPC endpoint not configured"),
+        stderr.contains("not configured for network not-a-network"),
         "should name the unknown network; stderr: {stderr}"
     );
 }
@@ -350,7 +357,7 @@ async fn test_estimate_all_json_output_offline() {
     // Should fail because the network is unknown
     assert!(!output.status.success(), "unknown network should fail");
     assert!(
-        stderr.contains("RPC endpoint not configured"),
+        stderr.contains("not configured for network not-a-network"),
         "should name the unknown network; stderr: {stderr}"
     );
 }

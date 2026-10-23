@@ -108,7 +108,6 @@ governor = "0.10.4"
 [dev-dependencies]
 insta = "1.40.0"
 proptest = "1.11.0"
-criterion = "0.5"
 axum = "0.8"
 # `html_reports` is listed explicitly for the bench targets. It pulls in no
 # extra dependencies itself (it is a bare cfg flag); the plotting backend comes

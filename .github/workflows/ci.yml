@@ -40,8 +40,6 @@ jobs:
       - name: Run integration tests (mock RPC)
         run: cargo test --test mock_rpc
 
-  audit:
-    name: Audit dependencies
   security-audit:
     name: Security Audit
     runs-on: ubuntu-latest
