@@ -45,6 +45,8 @@ pub enum AppError {
         status: i64,
         /// Human-readable error message returned by the RPC server.
         message: String,
+        /// Optional structured data returned by the RPC server.
+        data: Option<serde_json::Value>,
     },
 
     /// The endpoint answered with a transient gateway status (502/503/504),
