@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, Notify};
 use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
-use crate::rpc::retry::{DEFAULT_MAX_RETRIES, with_retry};
+use crate::rpc::retry::{DEFAULT_MAX_RETRIES, with_retry_deadline};
 
 /// Default per-request HTTP timeout applied to every RPC call. Matches the
 /// CLI's `--timeout` default (30 seconds).
@@ -48,8 +48,32 @@ fn endpoint_override(network: &str) -> AppResult<Option<String>> {
     Ok(guard.get(network).cloned())
 }
 
-/// Resolves a network name to its Soroban RPC endpoint.
+static DEFAULT_TOTAL_TIMEOUT_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Sets the process-wide default overall RPC operation deadline (`--total-timeout`).
 ///
+/// Newly created [`RpcClient`] instances inherit this deadline unless
+/// overridden via [`RpcClient::with_total_timeout`]. Passing `None` or a zero
+/// duration disables the overall deadline.
+pub fn set_default_total_timeout(total_timeout: Option<Duration>) {
+    let ms = total_timeout
+        .filter(|d| !d.is_zero())
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    DEFAULT_TOTAL_TIMEOUT_MS.store(ms, Ordering::Relaxed);
+}
+
+fn default_total_timeout() -> Option<Duration> {
+    let ms = DEFAULT_TOTAL_TIMEOUT_MS.load(Ordering::Relaxed);
+    if ms == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(ms))
+    }
+}
+
+/// Resolves a network name to its well-known Soroban RPC endpoint.
 /// Precedence: `custom_url` (`--rpc-url`), then the network's entry in the
 /// user config's `[rpc_urls]`, then the built-in well-known URL. User-supplied
 /// URLs are validated by [`validate_rpc_url`] before they are returned, so a
@@ -399,6 +423,9 @@ pub struct RpcClient {
     pub headers: HeaderMap,
     /// Whether to print verbose RPC request/response diagnostics to stderr.
     pub verbose: bool,
+    /// Optional overall deadline spanning retries, backoff, and failover for a
+    /// single RPC operation.
+    total_timeout: Option<Duration>,
 }
 
 impl RpcClient {
@@ -644,7 +671,17 @@ impl RpcClient {
             connect_timeout,
             headers,
             verbose,
+            total_timeout: default_total_timeout(),
         }
+    }
+
+    /// Sets an overall per-operation deadline spanning all retry attempts,
+    /// backoff delays, and fallback endpoint calls. A zero duration disables
+    /// the overall deadline.
+    #[must_use]
+    pub fn with_total_timeout(mut self, total_timeout: Option<Duration>) -> Self {
+        self.total_timeout = total_timeout.filter(|d| !d.is_zero());
+        self
     }
 
     /// Returns the custom HTTP headers configured for this client.
@@ -830,17 +867,28 @@ impl RpcClient {
             "params": params,
         });
 
+        let deadline = self.total_timeout.map(|d| tokio::time::Instant::now() + d);
+
         trace!(
             method,
             header_count = self.headers.len(),
             "sending RPC request"
         );
         match self
-            .post_and_parse(method, &body, &self.url, self.connect_timeout)
+            .post_and_parse(method, &body, &self.url, self.connect_timeout, deadline)
             .await
         {
             Ok(result) => Ok(result),
             Err(e) if Self::is_failover_trigger(&e) => {
+                if let Some(d) = deadline
+                    && tokio::time::Instant::now() >= d
+                {
+                    let timeout_ms = self
+                        .total_timeout
+                        .map(|t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX))
+                        .unwrap_or(0);
+                    return Err(AppError::TotalTimeout { timeout_ms });
+                }
                 if let Some(ref fallback) = self.fallback_url {
                     // The operator-facing notice goes to stderr so it never
                     // contaminates machine-readable stdout (json/csv/markdown).
@@ -852,7 +900,7 @@ impl RpcClient {
                         error = %e,
                         "primary RPC endpoint failed — failing over to fallback"
                     );
-                    self.post_and_parse(method, &body, fallback, self.connect_timeout)
+                    self.post_and_parse(method, &body, fallback, self.connect_timeout, deadline)
                         .await
                 } else {
                     Err(e)
@@ -895,6 +943,7 @@ impl RpcClient {
         body: &Value,
         url: &str,
         connect_timeout: Duration,
+        deadline: Option<tokio::time::Instant>,
     ) -> AppResult<Value> {
         let client = self.client.clone();
         let url = url.to_string();
@@ -912,7 +961,7 @@ impl RpcClient {
             eprintln!("[RPC] -> {}", request_body_str);
         }
 
-        let response = with_retry(self.max_retries, || {
+        let response = with_retry_deadline(self.max_retries, deadline, self.total_timeout, || {
             let client = client.clone();
             let url = url.clone();
             let request_body = request_body.clone();
@@ -967,7 +1016,18 @@ impl RpcClient {
             });
         }
 
-        let response_body: Value = response.json().await?;
+        let response_body: Value = if let Some(d) = deadline {
+            let timeout_ms = self
+                .total_timeout
+                .map(|t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            match tokio::time::timeout_at(d, response.json()).await {
+                Ok(res) => res?,
+                Err(_) => return Err(AppError::TotalTimeout { timeout_ms }),
+            }
+        } else {
+            response.json().await?
+        };
 
         if let Some(error) = response_body.get("error") {
             let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
