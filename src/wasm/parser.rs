@@ -533,8 +533,8 @@ pub fn type_ref_kind_name(ty: &wasmparser::TypeRef) -> &'static str {
     }
 }
 
-/// Decoded spec function entries: (function name, typed parameter list).
-pub type SpecFunctions = Vec<(String, Vec<ParamInfo>)>;
+/// Decoded spec function entries: (function name, typed parameter list, docstring).
+pub type SpecFunctions = Vec<(String, Vec<ParamInfo>, Option<String>)>;
 
 /// A typed value (function return, or any other spec type) with both its
 /// human-readable name and the raw spec type definition.

@@ -6608,6 +6608,7 @@ mod tests {
         );
         assert_eq!(value["contract_meta"]["entries"], serde_json::json!([]));
         assert_eq!(value["functions"][0]["name"], "increment");
+        assert_eq!(value["functions"][0]["doc"], "Increment the counter");
         assert_eq!(value["functions"][0]["params"][0]["name"], "step");
         assert_eq!(value["functions"][0]["params"][0]["type"], "I64");
         assert_eq!(value["functions"][0]["returns"][0]["type"], "i64");
