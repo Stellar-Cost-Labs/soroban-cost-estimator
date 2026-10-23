@@ -558,6 +558,7 @@ mod tests {
             history: None,
             projections: None,
             contract_meta: crate::wasm::parser::ContractMeta::default(),
+            diagnostics: None,
         }
     }
 
