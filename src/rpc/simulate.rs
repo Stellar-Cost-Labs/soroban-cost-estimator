@@ -47,16 +47,25 @@ pub struct SimulateTransactionResponse {
     /// depending on the RPC version, so both are accepted.
     #[serde(default, deserialize_with = "deserialize_u64_flexible_opt")]
     pub latest_ledger: Option<u64>,
-    /// Events emitted during simulation (base64-encoded XDR).
+    /// Events emitted during simulation (issue #525). Each item is the
+    /// RPC's raw JSON event object (`{ type, topic: [b64 ScVal XDR], data:
+    /// b64 ScVal XDR, … }`); older RPC versions returned plain base64 XDR
+    /// strings. Items are kept as raw `Value` so a version-drifted or
+    /// malformed payload can never fail the whole response —
+    /// [`crate::report::cost_report::build_simulation_diagnostics`]
+    /// summarizes them leniently.
     #[serde(default)]
-    pub events: Option<Vec<String>>,
+    pub events: Option<Vec<Value>>,
     /// Minimum resource fee (base64-encoded int64 XDR).
     #[serde(default)]
     pub min_resource_fee: Option<String>,
     /// Restore fee if state archival entry needs to be restored.
     #[serde(default)]
     pub restore_fee: Option<String>,
-    /// State changes produced by the simulation.
+    /// State changes produced by the simulation (issue #525): raw
+    /// `LedgerEntryChange` objects (`{ key, created?, updated?, deleted? }`,
+    /// payloads base64 XDR). Kept as raw `Value` for the same leniency
+    /// reason as `events`.
     #[serde(default)]
     pub state_changes: Option<Vec<Value>>,
 }
