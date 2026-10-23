@@ -298,6 +298,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
     let rps = args.rps;
     let timeout = args.timeout;
     let connect_timeout = args.connect_timeout;
+    rpc::client::set_default_total_timeout(args.total_timeout.map(std::time::Duration::from_secs));
     let max_retries = args.max_retries;
     let verbose = args.verbose;
     // `--precision` is a single global flag; read it once so every command
@@ -325,6 +326,11 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
         .default_network
         .unwrap_or_else(|| "testnet".to_string());
     let default_rpc_url = file.rpc_url;
+    // Validate an explicit `--rpc-url` before any command parses WASM or
+    // opens the cache, so a typo fails immediately with a clear message.
+    if let Some(url) = args.command.rpc_url() {
+        rpc::client::validate_rpc_url(url)?;
+    }
     match args.command {
         cli::Command::Estimate {
             wasm,
@@ -349,6 +355,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
             dry_run,
             project,
             repeat,
+            show_events,
         } => {
             if recover_cache {
                 if let Ok(false) = cache::check_cache_health() {
@@ -426,6 +433,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
                     wasm_new.as_deref(),
                     dry_run,
                     project.as_deref(),
+                    show_events,
                 )
                 .await
             }
@@ -978,6 +986,7 @@ struct SimulationRequest<'a> {
     extra_headers: &'a [String],
     quiet: bool,
     verbose: bool,
+    show_events: bool,
 }
 
 /// A `simulateTransaction` failure with no RPC-provided error code or details.
@@ -1004,6 +1013,7 @@ fn simulation_failed(message: impl Into<String>) -> error::AppError {
 /// All RPC traffic (simulation and fee-rate fetches) goes through one
 /// `RpcClient`, which deduplicates identical requests â€” the same method with
 /// the same params â€” so identical fee-rate fetches transmit at most once.
+#[allow(clippy::too_many_lines)]
 async fn simulate_report(
     req: &SimulationRequest<'_>,
 ) -> error::AppResult<report::cost_report::CostReport> {
@@ -1103,6 +1113,16 @@ async fn simulate_report(
         &network_config,
     );
 
+    // Simulation diagnostics (#525): counts of the response's events and
+    // state changes, with bounded per-entry summaries only under the
+    // `--show-events` opt-in. `None` when the response carried neither,
+    // keeping the default report shape unchanged.
+    let diagnostics = report::cost_report::build_simulation_diagnostics(
+        &response.events,
+        &response.state_changes,
+        req.show_events,
+    );
+
     Ok(report::cost_report::CostReport {
         function: req.fn_name.unwrap_or("(wasm upload)").to_string(),
         wasm_hash: req.wasm_hash.to_string(),
@@ -1124,6 +1144,7 @@ async fn simulate_report(
         history: None,
         projections: None,
         contract_meta: req.contract_meta.clone(),
+        diagnostics,
     })
 }
 
@@ -1167,6 +1188,7 @@ async fn cmd_estimate(
     wasm_new: Option<&str>,
     dry_run: bool,
     project: Option<&str>,
+    show_events: bool,
 ) -> error::AppResult<()> {
     // Parse the requested projection counts up front so an invalid list is
     // rejected before any RPC traffic, regardless of the output format.
@@ -1202,6 +1224,7 @@ async fn cmd_estimate(
             extra_headers,
             quiet,
             verbose,
+            show_events,
         )
         .await;
     }
@@ -1224,6 +1247,7 @@ async fn cmd_estimate(
             extra_headers,
             quiet,
             verbose,
+            show_events,
         )
         .await;
     }
@@ -1287,6 +1311,7 @@ async fn cmd_estimate(
         quiet,
         verbose,
         dry_run,
+        show_events,
     )
     .await?;
 
@@ -1701,6 +1726,7 @@ async fn cmd_estimate_repeat(
                     history: None,
                     projections: None,
                     contract_meta: wasm_info.contract_meta.clone(),
+                    diagnostics: None,
                 });
             }
         }
@@ -1794,6 +1820,7 @@ async fn estimate_once(
     quiet: bool,
     verbose: bool,
     dry_run: bool,
+    show_events: bool,
 ) -> error::AppResult<EstimateRun> {
     let json_flag = format == "json";
     // Formats whose stdout is consumed by a script (`json`, `summary`) keep
@@ -1985,6 +2012,7 @@ async fn estimate_once(
             extra_headers,
             quiet,
             verbose,
+            show_events,
         })
         .await?;
 
@@ -2265,6 +2293,7 @@ fn watch_build_header(
 /// # Network calls
 /// One full estimation (see [`estimate_once`]).
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::fn_params_excessive_bools)]
 async fn emit_watch_estimate(
     state: &mut EstimateWatchState,
     wasm_path: &str,
@@ -2284,6 +2313,7 @@ async fn emit_watch_estimate(
     human: bool,
     quiet: bool,
     verbose: bool,
+    show_events: bool,
 ) {
     match estimate_once(
         wasm_path,
@@ -2321,6 +2351,7 @@ async fn emit_watch_estimate(
         verbose,
         // `--watch` wins over `--dry-run`: watching exists to re-simulate.
         false,
+        show_events,
     )
     .await
     {
@@ -2364,6 +2395,7 @@ async fn emit_watch_estimate(
 /// None when nothing changed; otherwise one full estimation (see
 /// [`emit_watch_estimate`]).
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::fn_params_excessive_bools)]
 async fn estimate_watch_poll_once(
     state: &mut EstimateWatchState,
     wasm_path: &str,
@@ -2383,6 +2415,7 @@ async fn estimate_watch_poll_once(
     human: bool,
     quiet: bool,
     verbose: bool,
+    show_events: bool,
 ) -> error::AppResult<()> {
     let path = std::path::Path::new(wasm_path);
     let hash = match wasm_content_hash(path) {
@@ -2427,6 +2460,7 @@ async fn estimate_watch_poll_once(
         human,
         quiet,
         verbose,
+        show_events,
     )
     .await;
     Ok(())
@@ -2464,6 +2498,7 @@ async fn cmd_estimate_watch(
     extra_headers: &[String],
     quiet: bool,
     verbose: bool,
+    show_events: bool,
 ) -> error::AppResult<()> {
     use tracing::info;
 
@@ -2508,6 +2543,7 @@ async fn cmd_estimate_watch(
                 human,
                 quiet,
                 verbose,
+                show_events,
             )
             .await;
         }
@@ -2552,6 +2588,7 @@ async fn cmd_estimate_watch(
                     human,
                     quiet,
                     verbose,
+                    show_events,
                 ).await;
                 tokio::time::sleep(WATCH_POLL_DURATION).await;
             } => {}
@@ -2761,6 +2798,7 @@ pub fn format_estimate_all_markdown(results: &[EstimateAllResult]) -> String {
 /// ("new") build; everything else (`--fn`, `--arg`, `--id`, `--network`) is
 /// applied identically to both simulations so the numbers are comparable.
 /// The cache is neither read nor written in diff mode.
+#[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 async fn cmd_estimate_diff(
     old_path: &str,
@@ -2780,6 +2818,7 @@ async fn cmd_estimate_diff(
     extra_headers: &[String],
     quiet: bool,
     verbose: bool,
+    show_events: bool,
 ) -> error::AppResult<()> {
     use sha2::Digest;
 
@@ -2835,6 +2874,7 @@ async fn cmd_estimate_diff(
         extra_headers,
         quiet,
         verbose,
+        show_events,
     })
     .await?;
 
@@ -2859,6 +2899,7 @@ async fn cmd_estimate_diff(
         extra_headers,
         quiet,
         verbose,
+        show_events,
     })
     .await?;
 
@@ -6890,6 +6931,7 @@ mod tests {
             history: None,
             projections: None,
             contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
+            diagnostics: None,
         }
     }
 
