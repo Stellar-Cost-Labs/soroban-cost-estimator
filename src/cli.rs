@@ -98,6 +98,19 @@ impl ConfigAction {
     }
 }
 
+fn parse_threshold_percent(value: &str) -> Result<f64, String> {
+    let threshold = value
+        .parse::<f64>()
+        .map_err(|_| format!("invalid threshold percentage: {value}"))?;
+    if threshold.is_finite() && threshold >= 0.0 {
+        Ok(threshold)
+    } else {
+        Err(format!(
+            "threshold percentage must be a finite, non-negative number: {value}"
+        ))
+    }
+}
+
 /// Build version string with metadata from build.rs
 fn build_version() -> &'static str {
     concat!(
