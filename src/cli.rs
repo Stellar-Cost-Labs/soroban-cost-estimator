@@ -303,6 +303,11 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
+        /// Exit with failure after printing the report if resource-limit
+        /// (80%+) or Soroban WASM memory-limit warnings are present.
+        #[arg(long)]
+        fail_on_warning: bool,
+
         /// Automatically save a new config snapshot if network pricing
         /// configuration has changed since the last snapshot.
         #[arg(long)]
@@ -385,6 +390,11 @@ pub enum Command {
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
         json: bool,
+
+        /// Exit with failure after printing the report if resource-limit
+        /// (80%+) or Soroban WASM memory-limit warnings are present.
+        #[arg(long)]
+        fail_on_warning: bool,
 
         /// Automatically save a new config snapshot if network pricing
         /// configuration has changed since the last snapshot.
@@ -997,6 +1007,30 @@ mod tests {
         assert_eq!(
             chart_width_for(false, true, None),
             Some(DEFAULT_CHART_WIDTH)
+        );
+    }
+
+    #[test]
+    fn test_estimate_workflows_accept_fail_on_warning() {
+        assert!(
+            Cli::try_parse_from([
+                "soroban-cost-estimator",
+                "estimate",
+                "--wasm",
+                "contract.wasm",
+                "--fail-on-warning",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "soroban-cost-estimator",
+                "estimate-all",
+                "--wasm",
+                "contract.wasm",
+                "--fail-on-warning",
+            ])
+            .is_ok()
         );
     }
 
