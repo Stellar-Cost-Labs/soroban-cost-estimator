@@ -13,6 +13,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cached runs of the same contract function, rendered as a trend table
   (regressions in red, improvements in green) with a `history` array in
   `--json` output (#321).
+- `estimate --history` also reports per-resource ledger I/O deltas — read and
+  write entries and bytes — whenever both the historical and the current run
+  recorded a footprint, in a second table and as a `footprint_delta` object in
+  `--json` output. Runs without a recorded footprint are reported as
+  `unavailable`, never as zero usage (#530).
+- `--format summary` — exactly one tab-delimited result line per successful
+  `estimate` (`function`, `network`, `ledger`, `total_stroops`, `total_xlm`,
+  `cpu_instructions`, `read_entries`, `write_entries`, `read_bytes`,
+  `write_bytes`, `tx_size`), with documented escaping and no ANSI codes, for
+  shell pipelines and batch logs (#533).
+- Simulation failures now retain the RPC's machine-readable error code and a
+  bounded copy of its structured details: `AppError::SimulationFailed` wraps
+  `rpc::simulate::SimulationError`, whose `Display` stays a concise human
+  message and whose serialized form is a stable, size-limited JSON document
+  (#532).
+- `docs/concepts/fee-calculation.md` — the complete fee methodology: every
+  formula and unit scale, the `ConfigSetting*` XDR fields behind each rate,
+  the refundable rent deposit, and the integer-arithmetic rules that keep the
+  estimate in step with Stellar Core (#375).
 - Resource-limit warnings — `estimate` and `estimate-all` now warn when CPU
   instructions, ledger read/write entries or bytes, or transaction size reach
   80% of the network's protocol limits, with a `warnings` array in JSON output
@@ -30,12 +49,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   network, pruning older ones after the new snapshot is safely on disk.
 - `config snapshot prune --older-than <DAYS>` — delete snapshots recorded more
   than D days ago. Pure file I/O, so it is safe offline and in a cron job.
+- `cache list` — the read-only cache listing now accepts the same filters as
+  `cache query` (`--network`, `--fn`, `--wasm-hash`, `--since`, `--to`, plus a
+  new `--older-than` age filter) and is paginated with `--limit` (default 50,
+  capped at 1000) and `--offset`. Without `--network` it lists entries from
+  every network.
+- `cache delete` — remove cached estimates by network, function, WASM hash,
+  time range or age instead of clearing a whole network. Supports `--dry-run`
+  (report the count, change nothing), an interactive confirmation prompt
+  (skippable with `--yes`) and `--all` for an explicit whole-cache removal. A
+  filter is required otherwise. Selection and deletion run in one transaction.
+- Config diffs now model setting **presence** explicitly: added, removed and
+  unrecognized settings are reported distinctly from numeric value changes,
+  and a missing setting is never treated as a zero value.
+- Unrecognized top-level fields in a stored snapshot are captured and
+  surfaced in `config diff` instead of being ignored silently.
+- Snapshot listings and "latest snapshot" selection are ordered by the
+  timestamp embedded in the file name, so snapshots taken with different UTC
+  offsets are ordered chronologically.
 
 ### Fixed
 
+- The CLI no longer overflows the stack on Windows. `clap`'s derive macros
+  build the whole command tree on the stack, which needs close to a megabyte
+  in an unoptimized build, while the main thread of a Windows process is
+  capped at 1 MiB by the linker. Every invocation — even `--help` — aborted
+  with a stack overflow. The CLI now runs on a dedicated thread with an 8 MiB
+  stack; output and exit codes are unchanged.
+- `cache delete --all` can no longer be combined with a filter. `--all` means
+  "every cached estimate on every network", and a stray `--network` used to
+  silently narrow it; the combination is now rejected and nothing is deleted.
 - Snapshot retention never deletes the newest snapshot for a network, however
   old it is or however small `--retain` is, so a `config diff` always has a
   pair left to compare.
+- `webpki-roots`, `webpki-root-certs` and `rustls-webpki` bumped to their
+  patched releases, which drop the distrusted `emSign ECC Root CA - G3`
+  certificate (RUSTSEC-2026-0381/0382/0383) and clear the `cargo deny`
+  advisory check.
 
 ### Added
 
@@ -62,9 +112,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `cache list` now lists entries from **every** network unless `--network` is
+  given (it used to default to `testnet` only), matching `cache query`. The
+  `--json` output is unchanged: a JSON array of cached-estimate records.
 - `estimate-all --json` now emits an object (`{ "functions": [...],
   "fee_distribution": { ... } }`) instead of a bare array; the per-function
   records moved under the `functions` key.
+
+### Changed
+
+- Renamed the report field `rpc_latency_ms` to `simulation_duration_ms`
+  (JSON key, CSV column, and Markdown/table labels) to match the simulation
+  round-trip semantics it measures.
 
 ### Fixed
 
