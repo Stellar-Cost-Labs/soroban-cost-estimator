@@ -153,3 +153,83 @@ async fn mock_rpc_fixture_surfaces_rpc_errors_from_the_server() {
 
     assert!(matches!(err, AppError::Rpc { status: -32602, .. }));
 }
+
+#[tokio::test]
+async fn rpc_rejects_oversized_response_with_content_length() {
+    let server = common::start_mock_rpc_server().await;
+
+    // Response exceeds the 10 MB limit
+    common::stub_oversized_response_with_content_length(&server, "simulateTransaction").await;
+
+    let client = RpcClient::new(server.uri().as_str());
+    let err = client
+        .call::<serde_json::Value>("simulateTransaction", json!({ "transaction": "abc" }))
+        .await
+        .expect_err("oversized response should be rejected");
+
+    match err {
+        AppError::ResponseTooLarge {
+            endpoint,
+            observed_size,
+            max_size,
+        } => {
+            assert_eq!(endpoint, server.uri().as_str());
+            assert!(observed_size > 10 * 1024 * 1024);
+            assert_eq!(max_size, 10 * 1024 * 1024);
+        }
+        _ => panic!("expected ResponseTooLarge error, got: {:?}", err),
+    }
+}
+
+#[tokio::test]
+async fn rpc_rejects_oversized_response_without_content_length() {
+    let server = common::start_mock_rpc_server().await;
+
+    // Response exceeds the 10 MB limit, without Content-Length header
+    common::stub_oversized_response_without_content_length(&server, "getLedgerEntries").await;
+
+    let client = RpcClient::new(server.uri().as_str());
+    let err = client
+        .call::<serde_json::Value>("getLedgerEntries", json!({ "keys": ["abc"] }))
+        .await
+        .expect_err("oversized response without Content-Length should be rejected");
+
+    match err {
+        AppError::ResponseTooLarge {
+            endpoint,
+            observed_size,
+            max_size,
+        } => {
+            assert_eq!(endpoint, server.uri().as_str());
+            assert!(observed_size > 10 * 1024 * 1024);
+            assert_eq!(max_size, 10 * 1024 * 1024);
+        }
+        _ => panic!("expected ResponseTooLarge error, got: {:?}", err),
+    }
+}
+
+#[tokio::test]
+async fn rpc_accepts_response_within_size_limit() {
+    let server = common::start_mock_rpc_server().await;
+
+    // 5 MB is within the 10 MB limit
+    let large_but_valid_response = vec![b'x'; 5 * 1024 * 1024];
+    common::stub_jsonrpc_success(
+        &server,
+        "simulateTransaction",
+        json!({
+            "latestLedger": 42,
+            "minResourceFee": "100",
+            "transactionData": "abc123"
+        }),
+    )
+    .await;
+
+    let client = RpcClient::new(server.uri().as_str());
+    let result: serde_json::Value = client
+        .call("simulateTransaction", json!({ "transaction": "abc" }))
+        .await
+        .expect("normal-sized response should succeed");
+
+    assert_eq!(result["latestLedger"], 42);
+}
