@@ -22,6 +22,18 @@ pub async fn stub_jsonrpc_success(server: &MockServer, method_name: &str, result
         .await;
 }
 
+/// Stubs a JSON-RPC method with a non-success HTTP status, so error paths
+/// (retry exhaustion, gateway failover) can be exercised offline.
+pub async fn stub_jsonrpc_http_error(server: &MockServer, method_name: &str, status: u16) {
+    Mock::given(method("POST"))
+        .and(body_string_contains(format!(
+            "\"method\":\"{method_name}\""
+        )))
+        .respond_with(ResponseTemplate::new(status))
+        .mount(server)
+        .await;
+}
+
 pub async fn stub_jsonrpc_error(server: &MockServer, method_name: &str, code: i64, message: &str) {
     Mock::given(method("POST"))
         .and(body_string_contains(format!(

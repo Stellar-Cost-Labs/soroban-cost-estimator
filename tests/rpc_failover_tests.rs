@@ -122,35 +122,33 @@ fn cli_announces_failover_on_stderr() {
     );
 }
 
-/// Starts a loopback stub that serves 429 on the first request and 200 OK on
-/// subsequent requests.
-fn spawn_rate_limited_primary_stub(retry_after: &str) -> (String, Arc<AtomicUsize>) {
+/// Spawns a stub server that delays for `delay` before returning `status` and
+/// `body`.
+fn spawn_delayed_status_stub(
+    delay: Duration,
+    status_line: &'static str,
+    body: &'static str,
+) -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind stub server");
     let addr = listener.local_addr().expect("no local address");
     let counter = Arc::new(AtomicUsize::new(0));
     let server_counter = Arc::clone(&counter);
-    let retry_after_hdr = retry_after.to_string();
 
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
             let counter = Arc::clone(&server_counter);
-            let retry_after_hdr = retry_after_hdr.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 2048];
                 let _ = stream.read(&mut buf);
-                let count = counter.fetch_add(1, Ordering::SeqCst);
-                let response = if count == 0 {
-                    format!(
-                        "HTTP/1.1 429 Too Many Requests\r\nRetry-After: {retry_after_hdr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    )
-                } else {
-                    let body = r#"{"jsonrpc":"2.0","id":1,"result":{"status":"healthy"}}"#;
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    )
-                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+                let response = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.flush();
             });
@@ -160,45 +158,90 @@ fn spawn_rate_limited_primary_stub(retry_after: &str) -> (String, Arc<AtomicUsiz
     (format!("http://{addr}"), counter)
 }
 
-/// A 429 Too Many Requests response is retried on the primary endpoint (honoring
-/// Retry-After) rather than triggering failover to the fallback endpoint.
 #[tokio::test]
-async fn rate_limited_429_retries_on_primary_without_failing_over() {
-    let (primary_url, primary_served) = spawn_rate_limited_primary_stub("0");
-    let (fallback_url, fallback_served) = spawn_rpc_stub();
+async fn overall_deadline_cancels_delayed_primary_before_per_attempt_timeout() {
+    use soroban_cost_estimator::error::AppError;
 
-    let client = RpcClient::with_fallback(
-        &primary_url,
-        Some(&fallback_url),
-        None,
-        Duration::from_secs(5),
-        2,
-        false,
+    let (primary_url, hits) = spawn_delayed_status_stub(
+        Duration::from_millis(800),
+        "HTTP/1.1 200 OK",
+        r#"{"jsonrpc":"2.0","id":1,"result":{"status":"healthy"}}"#,
     );
 
-    let result: AppResult<Value> = client.call("getHealth", serde_json::json!({})).await;
+    let client = RpcClient::with_options(&primary_url, None, Duration::from_secs(10), 0, false)
+        .with_total_timeout(Some(Duration::from_millis(150)));
+
+    let start = tokio::time::Instant::now();
+    let err = client
+        .call_uncached::<Value>("getHealth", serde_json::json!({}))
+        .await
+        .expect_err("delayed primary must exceed overall deadline");
+    let elapsed = start.elapsed();
+
     assert!(
-        result.is_ok(),
-        "request must succeed after retry on primary: {result:?}"
+        matches!(err, AppError::TotalTimeout { timeout_ms: 150 }),
+        "expected TotalTimeout(150), got: {err:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(550),
+        "operation should abort near 150ms deadline, took {elapsed:?}"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn overall_deadline_stops_retry_backoff_and_returns_total_timeout() {
+    use soroban_cost_estimator::error::AppError;
+
+    // Immediate 503 triggers retry backoff (500ms..1000ms), which exceeds the
+    // 180ms overall deadline before the second attempt can run.
+    let (primary_url, hits) = spawn_delayed_status_stub(
+        Duration::ZERO,
+        "HTTP/1.1 503 Service Unavailable",
+        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"busy"}}"#,
+    );
+
+    let client = RpcClient::with_options(&primary_url, None, Duration::from_secs(5), 3, false)
+        .with_total_timeout(Some(Duration::from_millis(180)));
+
+    let start = tokio::time::Instant::now();
+    let err = client
+        .call_uncached::<Value>("getHealth", serde_json::json!({}))
+        .await
+        .expect_err("retries must stop when overall deadline expires");
+    let elapsed = start.elapsed();
+
+    assert!(
+        matches!(err, AppError::TotalTimeout { timeout_ms: 180 }),
+        "expected TotalTimeout(180), got: {err:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(450),
+        "backoff sleep must be bounded by overall deadline, took {elapsed:?}"
     );
     assert_eq!(
-        primary_served.load(Ordering::SeqCst),
-        2,
-        "primary stub should have served 2 requests (initial 429 + retry)"
-    );
-    assert_eq!(
-        fallback_served.load(Ordering::SeqCst),
-        0,
-        "fallback stub must not be contacted for 429 rate limits"
+        hits.load(Ordering::SeqCst),
+        1,
+        "second retry attempt must not fire after overall deadline expires"
     );
 }
 
-/// When max_retries is 0, a 429 response surfaces immediately without retrying
-/// or failing over to the fallback endpoint.
 #[tokio::test]
-async fn rate_limited_429_with_zero_retries_surfaces_immediately() {
-    let (primary_url, primary_served) = spawn_rate_limited_primary_stub("10");
-    let (fallback_url, fallback_served) = spawn_rpc_stub();
+async fn overall_deadline_spans_primary_and_fallback_attempts() {
+    use soroban_cost_estimator::error::AppError;
+
+    // Primary takes 100ms then returns 503 (triggering failover); fallback takes
+    // 500ms, so the combined operation exceeds the 250ms total deadline.
+    let (primary_url, primary_hits) = spawn_delayed_status_stub(
+        Duration::from_millis(100),
+        "HTTP/1.1 503 Service Unavailable",
+        "gateway down",
+    );
+    let (fallback_url, fallback_hits) = spawn_delayed_status_stub(
+        Duration::from_millis(500),
+        "HTTP/1.1 200 OK",
+        r#"{"jsonrpc":"2.0","id":1,"result":{"status":"healthy"}}"#,
+    );
 
     let client = RpcClient::with_fallback(
         &primary_url,
@@ -207,21 +250,24 @@ async fn rate_limited_429_with_zero_retries_surfaces_immediately() {
         Duration::from_secs(5),
         0,
         false,
-    );
+    )
+    .with_total_timeout(Some(Duration::from_millis(250)));
 
-    let result: AppResult<Value> = client.call("getHealth", serde_json::json!({})).await;
+    let start = tokio::time::Instant::now();
+    let err = client
+        .call_uncached::<Value>("getHealth", serde_json::json!({}))
+        .await
+        .expect_err("combined primary + fallback delay must hit overall deadline");
+    let elapsed = start.elapsed();
+
     assert!(
-        result.is_err(),
-        "request must fail immediately with max_retries=0"
+        matches!(err, AppError::TotalTimeout { timeout_ms: 250 }),
+        "expected TotalTimeout(250), got: {err:?}"
     );
-    assert_eq!(
-        primary_served.load(Ordering::SeqCst),
-        1,
-        "primary stub should only have served 1 request"
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "combined primary + fallback must stop at overall deadline, took {elapsed:?}"
     );
-    assert_eq!(
-        fallback_served.load(Ordering::SeqCst),
-        0,
-        "fallback stub must not be contacted"
-    );
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
 }

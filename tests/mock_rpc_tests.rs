@@ -92,6 +92,54 @@ async fn mock_rpc_fixture_handles_ledger_entries_and_network_payloads() {
 }
 
 #[tokio::test]
+async fn mock_rpc_fixture_serves_get_latest_ledger() {
+    let server = common::start_mock_rpc_server().await;
+    common::stub_jsonrpc_success(
+        &server,
+        "getLatestLedger",
+        json!({
+            "id": "3a1c",
+            "protocolVersion": 23,
+            "sequence": 1234
+        }),
+    )
+    .await;
+
+    let client = RpcClient::new(server.uri().as_str());
+    let ledger: serde_json::Value = client
+        .call("getLatestLedger", json!({}))
+        .await
+        .expect("latest ledger should succeed against the mock server");
+
+    assert_eq!(ledger["sequence"], 1234);
+    assert_eq!(ledger["protocolVersion"], 23);
+}
+
+#[tokio::test]
+async fn mock_rpc_fixture_surfaces_transient_http_errors() {
+    let server = common::start_mock_rpc_server().await;
+    common::stub_jsonrpc_http_error(&server, "simulateTransaction", 503).await;
+
+    // Retries are disabled so the assertion does not wait out the backoff.
+    let client = RpcClient::with_options(
+        server.uri().as_str(),
+        None,
+        std::time::Duration::from_secs(5),
+        0,
+        false,
+    );
+    let err = client
+        .call::<serde_json::Value>("simulateTransaction", json!({ "transaction": "bad" }))
+        .await
+        .expect_err("a transient gateway status must surface as an error");
+
+    assert!(
+        matches!(err, AppError::HttpStatus { status: 503, .. }),
+        "expected HttpStatus(503), got: {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn mock_rpc_fixture_surfaces_rpc_errors_from_the_server() {
     let server = common::start_mock_rpc_server().await;
 
