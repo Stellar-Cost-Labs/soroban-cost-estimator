@@ -126,6 +126,12 @@ soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
   the cache. Unlike `--clear-cache`, it deletes nothing — use it to benchmark
   network changes or debug transient state differences without disturbing the
   entries you already have.
+- **Benchmarking with `--repeat N`** runs `simulateTransaction` N times
+  (1–100), bypassing and never writing the estimate cache. It prints a
+  `Benchmark Summary` with min/max/mean/stddev latency plus fee/CPU
+  consistency; `--repeat 1` keeps the existing single-run output. With
+  `--json`, the report gains a `benchmark` object. `--compare` and `--project`
+  are ignored in repeat mode.
 - **Exit codes**: 0 on success, 1 on any error (simulation failure, missing
   WASM file, network error, etc.).
 
