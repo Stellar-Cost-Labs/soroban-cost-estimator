@@ -6538,6 +6538,7 @@ mod tests {
             has_spec: true,
             spec_entries: Vec::new(),
             contract_meta: ContractMeta::default(),
+            spec_diagnostics: Vec::new(),
             functions: vec![FunctionInfo {
                 name: "increment".to_string(),
                 param_count: 1,
