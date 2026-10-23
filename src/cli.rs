@@ -141,10 +141,15 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "N")]
     pub rps: Option<u64>,
 
-    /// HTTP request timeout for RPC calls, in seconds (applies to every
-    /// network call).
+    /// Per-attempt HTTP request timeout for RPC calls, in seconds (applies to
+    /// each individual network attempt).
     #[arg(long, global = true, value_name = "SECS", default_value_t = 30)]
     pub timeout: u64,
+
+    /// Optional overall RPC operation deadline, in seconds, spanning all retry
+    /// attempts, backoff delays, and fallback endpoint calls. 0 disables it.
+    #[arg(long, global = true, value_name = "SECS")]
+    pub total_timeout: Option<u64>,
 
     /// TCP connection establishment timeout for RPC calls, in seconds. Bounds
     /// only the initial connect — a dead or unreachable host fails within
@@ -344,6 +349,15 @@ pub enum Command {
         /// fee/CPU consistency across runs.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=100))]
         repeat: u32,
+
+        /// Include per-entry summaries of the simulation's events and state
+        /// changes (issue #525). Without this flag the report still shows
+        /// their counts when present, but never any payload bytes; with it,
+        /// bounded hex previews (32 bytes, 4 topics, 10 entries) are added.
+        /// Raw XDR/JSON payloads are never printed in full and are not
+        /// cached.
+        #[arg(long)]
+        show_events: bool,
     },
 
     /// Enumerate all public contract functions and estimate each one.
