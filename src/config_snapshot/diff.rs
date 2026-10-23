@@ -930,18 +930,35 @@ pub fn format_diff_summary(diff: &ConfigDiff) -> String {
     }
 }
 
-/// ANSI escape sequences used to color pricing-change indicators by severity.
+/// ANSI escape sequences used to color pricing-change indicators by direction.
 const ANSI_RED: &str = "\u{1b}[31m";
-const ANSI_YELLOW: &str = "\u{1b}[33m";
 const ANSI_GREEN: &str = "\u{1b}[32m";
+const ANSI_CYAN: &str = "\u{1b}[36m";
 const ANSI_RESET: &str = "\u{1b}[0m";
 
-/// Picks an ANSI color for a pricing change based on the relative magnitude
-/// of the value change:
+/// Returns whether color output should be enabled based on the `--color` flag
+/// and the `NO_COLOR` environment variable.
 ///
-/// - `< 10%` — green (minor adjustment)
-/// - `10% – 50%` — yellow (moderate adjustment)
-/// - `> 50%` — red (major repricing)
+/// - `"always"` → always true
+/// - `"never"` → always false
+/// - `"auto"` → false when `NO_COLOR` is set or stdout is not a TTY
+pub fn should_use_color(color_flag: &str) -> bool {
+    match color_flag {
+        "always" => true,
+        "never" => false,
+        _ => {
+            // "auto" or any unrecognized value: respect NO_COLOR and TTY
+            if std::env::var("NO_COLOR").is_ok() {
+                return false;
+            }
+            // Check if stdout is a TTY (simple heuristic for non-piped output)
+            std::io::IsTerminal::is_terminal(&std::io::stdout())
+        }
+    }
+}
+
+/// Picks an ANSI color for a pricing change based on the direction of the
+/// value change:
 ///
 /// Non-numeric transitions (e.g. a setting appearing or disappearing) cannot
 /// be quantified and are treated as major changes, colored red.
@@ -952,17 +969,15 @@ pub fn pricing_change_color(old_value: &str, new_value: &str, colorize: bool) ->
     let (Ok(old), Ok(new)) = (old_value.parse::<f64>(), new_value.parse::<f64>()) else {
         return ANSI_RED;
     };
-    // Avoid division by zero: a change from 0 to any nonzero value is a
-    // major repricing.
-    let denominator = old.abs().max(f64::EPSILON);
-    let ratio = (new - old).abs() / denominator;
-    if ratio < 0.10 {
-        ANSI_GREEN
-    } else if ratio < 0.50 {
-        ANSI_YELLOW
-    } else {
-        ANSI_RED
-    }
+    if new > old { ANSI_RED } else { ANSI_GREEN }
+}
+
+/// Returns the ANSI color for a non-pricing configuration change.
+///
+/// Non-pricing changes are dimmed/cyan to visually distinguish them from
+/// pricing changes while still making them identifiable.
+pub fn non_pricing_change_color() -> &'static str {
+    ANSI_CYAN
 }
 
 /// Whether a change exceeds the given percentage threshold.
@@ -1448,14 +1463,14 @@ mod tests {
     }
 
     #[test]
-    fn test_format_diff_colors_pricing_changes() {
+    fn test_format_diff_colors_pricing_increases_red() {
         let old = make_snapshot(100, 5);
         let new = make_snapshot(160, 5); // +60% compute fee → red
         let diff = diff_snapshots(&old, &new);
         let output = format_diff(&diff, true, false, None);
         assert!(
             output.contains(ANSI_RED),
-            "large pricing change should be red: {output}"
+            "pricing increase should be red: {output}"
         );
         assert!(
             output.contains(ANSI_RESET),
@@ -1464,19 +1479,19 @@ mod tests {
     }
 
     #[test]
-    fn test_format_diff_colors_small_pricing_change_green() {
-        let old = make_snapshot(100, 5);
-        let new = make_snapshot(105, 5); // +5% compute fee → green
+    fn test_format_diff_colors_pricing_decreases_green() {
+        let old = make_snapshot(200, 5);
+        let new = make_snapshot(100, 5); // -50% compute fee → green
         let diff = diff_snapshots(&old, &new);
         let output = format_diff(&diff, true, false, None);
         assert!(
             output.contains(ANSI_GREEN),
-            "small pricing change should be green: {output}"
+            "pricing decrease should be green: {output}"
         );
     }
 
     #[test]
-    fn test_format_diff_no_color_for_non_pricing_changes() {
+    fn test_format_diff_cyan_for_non_pricing_changes() {
         let old = make_snapshot(100, 5);
         let mut new = make_snapshot(100, 5);
         // Only touch a non-pricing field (ledger_max_instructions).
@@ -1486,10 +1501,24 @@ mod tests {
         let diff = diff_snapshots(&old, &new);
         let output = format_diff(&diff, false, false, None);
         assert!(
-            !output.contains(ANSI_RED)
-                && !output.contains(ANSI_GREEN)
-                && !output.contains(ANSI_YELLOW),
-            "non-pricing changes should not be colored: {output}"
+            output.contains(ANSI_CYAN),
+            "non-pricing changes should be cyan: {output}"
+        );
+        assert!(
+            !output.contains(ANSI_RED) && !output.contains(ANSI_GREEN),
+            "non-pricing changes should not be red/green: {output}"
+        );
+    }
+
+    #[test]
+    fn test_format_diff_no_color_when_disabled() {
+        let old = make_snapshot(100, 5);
+        let new = make_snapshot(160, 5);
+        let diff = diff_snapshots(&old, &new);
+        let output = format_diff(&diff, false);
+        assert!(
+            !output.contains("\u{1b}["),
+            "no-color output should have no ANSI codes: {output}"
         );
     }
 
