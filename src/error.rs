@@ -106,7 +106,10 @@ pub enum AppError {
     /// An RPC operation exceeded its overall deadline across retries, backoff,
     /// and fallback endpoints.
     #[error("RPC operation timed out: exceeded overall deadline of {timeout_ms} ms")]
-    TotalTimeout { timeout_ms: u64 },
+    TotalTimeout {
+        /// The overall deadline, in milliseconds, that was exceeded.
+        timeout_ms: u64,
+    },
 
     // ── WebSocket ────────────────────────────────────────────────
     /// The WebSocket handshake or connection attempt failed.
