@@ -5,11 +5,11 @@
 //!
 //! # Implementations
 //!
-//! - [`TableFormatter`] — human-readable table with fee breakdown
-//! - [`JsonFormatter`] — pretty-printed JSON
-//! - [`CsvFormatter`] — comma-separated values
-//! - [`MarkdownFormatter`] — GitHub-flavored Markdown table
-//! - [`SummaryFormatter`] — one pipe-delimited line per report (#533)
+//! - [`crate::report::formatter::TableFormatter`] — human-readable table with fee breakdown
+//! - [`crate::report::formatter::JsonFormatter`] — pretty-printed JSON
+//! - [`crate::report::formatter::CsvFormatter`] — comma-separated values
+//! - [`crate::report::formatter::MarkdownFormatter`] — GitHub-flavored Markdown table
+//! - [`crate::report::formatter::SummaryFormatter`] — one pipe-delimited line per report (#533)
 
 use std::fmt;
 
@@ -21,7 +21,7 @@ use crate::report::cost_report::CostReport;
 /// `--quiet` flag, which drops every *advisory* section (optimization tips and
 /// the quantified savings breakdown) while leaving the measured cost data
 /// untouched. Machine consumers that already read the JSON keys are
-/// unaffected — see [`JsonFormatter`] — so a caller can always ask for the
+/// unaffected — see [`crate::report::formatter::JsonFormatter`] — so a caller can always ask for the
 /// structured data explicitly.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReportOptions {
@@ -187,7 +187,10 @@ impl TableFormatter {
             "Simulated at ledger sequence: {}\n",
             crate::report::cost_report::format_ledger_sequence(report.ledger)
         ));
-        output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
+        output.push_str(&format!(
+            "RPC round-trip: {} ms\n",
+            report.simulation_duration_ms
+        ));
         output.push_str(&format!("WASM hash: {}\n", report.wasm_hash));
         output.push_str(&format!("WASM size: {} bytes\n", report.wasm_size));
         output.push('\n');
@@ -230,6 +233,13 @@ impl TableFormatter {
             &report.warnings,
         ));
 
+        // Simulation diagnostics (#525) — counts always when the response
+        // carried events/state changes; per-entry summaries only under the
+        // `--show-events` opt-in. Empty string when absent.
+        output.push_str(&crate::report::cost_report::format_simulation_diagnostics(
+            report.diagnostics.as_ref(),
+        ));
+
         // Historical trend table (#321) — only populated with `--history`.
         if let Some(history) = &report.history {
             output.push_str(&crate::report::cost_report::format_cost_history(history));
@@ -254,6 +264,13 @@ impl TableFormatter {
                 &report.suggest_optimizations(),
             ));
         }
+
+        // Footer: how long the simulated RPC round-trip actually took, so the
+        // network wait is separable from local computation in CI logs (#304).
+        output.push_str(&format!(
+            "\nSimulation latency: {} ms\n",
+            report.simulation_duration_ms
+        ));
 
         output
     }
@@ -365,7 +382,7 @@ impl ReportFormatter for CsvFormatter {
             "function,network,ledger,wasm_hash,wasm_size,cpu_instructions,memory_bytes,\
              read_entries,write_entries,read_bytes,write_bytes,tx_size,\
              non_refundable_stroops,refundable_stroops,total_stroops,total_xlm,\
-             rpc_latency_ms\n",
+             simulation_duration_ms\n",
         );
 
         let row = csv_row(&[
@@ -385,7 +402,7 @@ impl ReportFormatter for CsvFormatter {
             &report.fee.refundable_stroops.to_string(),
             &report.fee.total_stroops.to_string(),
             &report.fee.total_xlm,
-            &report.rpc_latency_ms.to_string(),
+            &report.simulation_duration_ms.to_string(),
         ]);
         output.push_str(&row);
         output.push('\n');
@@ -427,8 +444,8 @@ impl ReportFormatter for MarkdownFormatter {
         output.push_str(&format!("- **WASM hash:** `{}`\n", report.wasm_hash));
         output.push_str(&format!("- **WASM size:** {} bytes\n", report.wasm_size));
         output.push_str(&format!(
-            "- **RPC round-trip:** {} ms\n\n",
-            report.rpc_latency_ms
+            "- **Simulation latency:** {} ms\n\n",
+            report.simulation_duration_ms
         ));
 
         // Resource table
@@ -453,6 +470,14 @@ impl ReportFormatter for MarkdownFormatter {
                 output.push_str(&format!("> **Warning:** {}\n\n", warning.message));
             }
         }
+
+        // Simulation diagnostics (#525) — counts always when present,
+        // per-entry summaries only under the `--show-events` opt-in.
+        output.push_str(
+            &crate::report::cost_report::format_simulation_diagnostics_markdown(
+                report.diagnostics.as_ref(),
+            ),
+        );
 
         // Fee breakdown, nested in a collapsible section so long reports stay
         // compact when posted as a GitHub PR comment (#325).
@@ -742,12 +767,13 @@ mod tests {
             },
             ledger: 3_894_195,
             network: "testnet".to_string(),
-            rpc_latency_ms: 87,
+            simulation_duration_ms: 87,
             rates: None,
             warnings: Vec::new(),
             history: None,
             projections: None,
             contract_meta: crate::wasm::parser::ContractMeta::default(),
+            diagnostics: None,
         }
     }
 
@@ -777,12 +803,13 @@ mod tests {
             },
             ledger: 0,
             network: "mainnet".to_string(),
-            rpc_latency_ms: 0,
+            simulation_duration_ms: 0,
             rates: None,
             warnings: Vec::new(),
             history: None,
             projections: None,
             contract_meta: crate::wasm::parser::ContractMeta::default(),
+            diagnostics: None,
         }
     }
 
@@ -817,7 +844,12 @@ mod tests {
     fn test_table_formatter_contains_rpc_latency() {
         let formatter = TableFormatter;
         let output = formatter.format(&sample_report());
-        assert!(output.contains("RPC round-trip: 87 ms"));
+        assert!(output.contains("Simulation latency: 87 ms"));
+        // The latency line is a footer summary: it closes out the report.
+        assert!(
+            output.trim_end().ends_with("Simulation latency: 87 ms"),
+            "latency should be the last line; got: {output}"
+        );
     }
 
     #[test]
@@ -956,7 +988,7 @@ mod tests {
         assert_eq!(parsed["wasm_hash"], "abc123def456");
         assert_eq!(parsed["ledger_sequence"], 3_894_195);
         assert_eq!(parsed["network"], "testnet");
-        assert_eq!(parsed["rpc_latency_ms"], 87);
+        assert_eq!(parsed["simulation_duration_ms"], 87);
         assert_eq!(parsed["fee"]["total_stroops"], 15_427);
         assert_eq!(parsed["fee"]["total_xlm"], "0.0015427");
     }
@@ -1090,7 +1122,7 @@ mod tests {
         assert!(output.contains("**Network:** testnet (ledger 3894195)"));
         assert!(output.contains("- **Simulated at ledger sequence:** `3,894,195`"));
         assert!(output.contains("**WASM hash:** `abc123def456`"));
-        assert!(output.contains("**RPC round-trip:** 87 ms"));
+        assert!(output.contains("**Simulation latency:** 87 ms"));
     }
 
     #[test]
@@ -1670,5 +1702,75 @@ mod tests {
         let md_out = MarkdownFormatter.format(&report);
         assert!(md_out.contains("### Cost Projections"));
         assert!(md_out.contains("| 100 | 1,552,700 | 0.1552700 | $0.18 |"));
+    }
+
+    // ── Simulation diagnostics (#525) ───────────────────────────────
+
+    /// A report carrying diagnostics with counts only (no `--show-events`).
+    fn counted_diagnostics_report() -> CostReport {
+        use crate::report::cost_report::{EventSummary, SimulationDiagnostics};
+        let mut report = sample_report();
+        report.diagnostics = Some(SimulationDiagnostics {
+            event_count: 3,
+            state_change_count: 1,
+            events: Vec::<EventSummary>::new(),
+            state_changes: Vec::new(),
+        });
+        report
+    }
+
+    /// Counts render in table mode and name the opt-in; JSON keeps summaries
+    /// absent until `--show-events` attached them.
+    #[test]
+    fn test_formatters_render_diagnostics_counts_by_default() {
+        let report = counted_diagnostics_report();
+
+        let table_out = TableFormatter.format(&report);
+        assert!(
+            table_out.contains("Simulation diagnostics: 3 events, 1 state change"),
+            "{table_out}"
+        );
+        assert!(
+            table_out.contains("re-run with --show-events"),
+            "{table_out}"
+        );
+
+        let json_out = JsonFormatter.format(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json_out).expect("valid json");
+        assert_eq!(parsed["diagnostics"]["event_count"], 3);
+        assert_eq!(parsed["diagnostics"]["state_change_count"], 1);
+        assert!(parsed["diagnostics"].get("events").is_none());
+
+        // A report without diagnostics keeps its exact previous output.
+        let clean = TableFormatter.format(&sample_report());
+        assert!(!clean.contains("Simulation diagnostics"), "{clean}");
+    }
+
+    /// `--show-events` details render as entries in both text formats.
+    #[test]
+    fn test_formatters_render_diagnostics_details_when_requested() {
+        use crate::report::cost_report::{EventSummary, SimulationDiagnostics};
+        let mut report = sample_report();
+        report.diagnostics = Some(SimulationDiagnostics {
+            event_count: 1,
+            state_change_count: 0,
+            events: vec![EventSummary {
+                kind: "contract".to_string(),
+                topic_count: 1,
+                data_bytes: Some(5),
+                topic_previews: vec!["00000000".to_string()],
+                data_preview: Some("68656c6c6f".to_string()),
+            }],
+            state_changes: Vec::new(),
+        });
+
+        let table_out = TableFormatter.format(&report);
+        assert!(table_out.contains("Events:"), "{table_out}");
+        assert!(table_out.contains("event[0]: contract"), "{table_out}");
+        assert!(table_out.contains("data: 68656c6c6f"), "{table_out}");
+
+        let md_out = MarkdownFormatter.format(&report);
+        assert!(md_out.contains("### Simulation Diagnostics"), "{md_out}");
+        assert!(md_out.contains("`event[0]`: contract"), "{md_out}");
     }
 }

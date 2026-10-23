@@ -33,12 +33,13 @@ fn sample_report() -> CostReport {
         },
         ledger: 3_894_195,
         network: "testnet".to_string(),
-        rpc_latency_ms: 87,
+        simulation_duration_ms: 87,
         rates: None,
         warnings: Vec::new(),
         history: None,
         projections: None,
         contract_meta: ContractMeta::default(),
+        diagnostics: None,
     }
 }
 
@@ -68,12 +69,13 @@ fn empty_report() -> CostReport {
         },
         ledger: 0,
         network: "mainnet".to_string(),
-        rpc_latency_ms: 0,
+        simulation_duration_ms: 0,
         rates: None,
         warnings: Vec::new(),
         history: None,
         projections: None,
         contract_meta: ContractMeta::default(),
+        diagnostics: None,
     }
 }
 
@@ -178,12 +180,13 @@ fn batch_report(function: &str, cpu: u64, fee_stroops: i64, writes: u32) -> Cost
         },
         ledger: 3_894_195,
         network: "testnet".to_string(),
-        rpc_latency_ms: 87,
+        simulation_duration_ms: 87,
         rates: None,
         warnings: Vec::new(),
         history: None,
         projections: None,
         contract_meta: ContractMeta::default(),
+        diagnostics: None,
     }
 }
 

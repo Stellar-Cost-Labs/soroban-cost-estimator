@@ -17,14 +17,14 @@
 //!
 //! Every row records a `version` (serialized as `schema_version`). Rows
 //! written by older releases are migrated forward by
-//! [`migrate_to_latest`]; rows from a newer release are rejected with an
+//! [`crate::cache::migrate_to_latest`]; rows from a newer release are rejected with an
 //! upgrade hint rather than silently misread.
 //!
 //! # LRU eviction
 //!
-//! [`save_estimate`] keeps the cache bounded: once the configured byte or
+//! [`crate::cache::save_estimate`] keeps the cache bounded: once the configured byte or
 //! entry quota is exceeded, the least-recently-accessed rows are deleted
-//! until usage drops below 90% of the quota. See [`CacheLimits`].
+//! until usage drops below 90% of the quota. See [`crate::cache::CacheLimits`].
 //!
 //! # Permissions and security
 //!
@@ -38,7 +38,7 @@
 //! # Corruption recovery
 //!
 //! If the SQLite database becomes corrupt (e.g. due to sudden power loss or filesystem
-//! damage), operations fail fast with [`AppError::CacheCorrupt`]. The operator can
+//! damage), operations fail fast with [`crate::error::AppError::CacheCorrupt`]. The operator can
 //! run `cache recover` to atomically quarantine the damaged database to a timestamped
 //! backup (`cache.db.corrupt-<timestamp>.bak`) and initialize a fresh, empty cache.
 
@@ -115,7 +115,7 @@ pub fn is_database_corrupt_error(err: &rusqlite::Error) -> bool {
 ///
 /// Bump this whenever the on-disk `CachedEstimate` shape changes.
 /// Entries written by a version of the tool with an older schema are
-/// migrated forward through [`migrate_to_latest`]; entries written by a
+/// migrated forward through [`crate::cache::migrate_to_latest`]; entries written by a
 /// *newer* tool (version greater than this) are rejected rather than
 /// silently misread.
 ///
@@ -130,7 +130,7 @@ pub const CACHE_SCHEMA_VERSION: u32 = 3;
 /// field existed.
 ///
 /// Those legacy entries have no `version` key in their JSON, so serde's
-/// `default` fills in this value via [`default_schema_version`]. They are
+/// `default` fills in this value via `default_schema_version`. They are
 /// the first schema version and require no transformation to reach the
 /// current schema.
 pub const INITIAL_SCHEMA_VERSION: u32 = 1;
@@ -1587,7 +1587,7 @@ fn estimate_from_row(row: &rusqlite::Row<'_>) -> Result<CachedEstimate, rusqlite
 /// Carry a cached estimate forward to the current schema version.
 ///
 /// * `version < CACHE_SCHEMA_VERSION`: entries from older schemas are
-///   migrated forward one step at a time (see [`migrate_one_step`]) until
+///   migrated forward one step at a time (see `migrate_one_step`) until
 ///   they match the current schema.
 /// * `version == CACHE_SCHEMA_VERSION`: returned unchanged.
 /// * `version > CACHE_SCHEMA_VERSION`: an entry written by a *newer* tool.
