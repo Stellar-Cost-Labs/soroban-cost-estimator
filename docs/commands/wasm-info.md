@@ -176,3 +176,10 @@ WASM sections (4734 bytes of section data, largest first):
 
 `estimate --format json` carries the same data as `wasm_size`, `wasm_sections`
 (an array with `percent` per row), and a `section_sizes` map.
+
+## JSON output compatibility
+
+The inspection document always carries every top-level key listed above,
+with unset metadata rendered as explicit `null`. See [`estimate` — JSON
+output compatibility](estimate.md#json-output-compatibility) for the full
+policy.
