@@ -6,6 +6,7 @@
 # Concepts
 
 - [Resource Fees](concepts/resource-fees.md)
+- [Fee Calculation Methodology](concepts/fee-calculation.md)
 - [Config Drift](concepts/config-drift.md)
 - [Caching](concepts/caching.md)
 
@@ -28,8 +29,10 @@
 
 # Reference
 
+- [Networks & RPC Providers](networks.md)
 - [Architecture](architecture.md)
 - [Migrating from the Stellar CLI](migration.md)
 - [Verification](verification.md)
+- [Troubleshooting](troubleshooting.md)
 - [Contributing](contributing.md)
 - [FAQ](faq.md)
