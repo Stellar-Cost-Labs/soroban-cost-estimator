@@ -141,10 +141,15 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "N")]
     pub rps: Option<u64>,
 
-    /// HTTP request timeout for RPC calls, in seconds (applies to every
-    /// network call).
+    /// Per-attempt HTTP request timeout for RPC calls, in seconds (applies to
+    /// each individual network attempt).
     #[arg(long, global = true, value_name = "SECS", default_value_t = 30)]
     pub timeout: u64,
+
+    /// Optional overall RPC operation deadline, in seconds, spanning all retry
+    /// attempts, backoff delays, and fallback endpoint calls. 0 disables it.
+    #[arg(long, global = true, value_name = "SECS")]
+    pub total_timeout: Option<u64>,
 
     /// TCP connection establishment timeout for RPC calls, in seconds. Bounds
     /// only the initial connect — a dead or unreachable host fails within
