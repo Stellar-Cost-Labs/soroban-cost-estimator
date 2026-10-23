@@ -348,6 +348,44 @@ pub fn format_resource_warnings(warnings: &[ResourceWarning]) -> String {
     out
 }
 
+/// Render an opt-in summary of simulation events and state changes (#525).
+#[must_use]
+pub fn format_simulation_diagnostics(
+    summary: &crate::rpc::simulate::SimulationDiagnosticsSummary,
+) -> String {
+    let mut out = String::from("\nSimulation Events & State Changes:\n");
+    out.push_str(&format!(
+        "  Events: {} (malformed: {})\n",
+        summary.event_count, summary.malformed_event_count
+    ));
+    for ev in &summary.events {
+        out.push_str(&format!("    - {}\n", ev.summary));
+    }
+    if summary.truncated_events > 0 {
+        out.push_str(&format!(
+            "    ... ({} additional event(s) omitted)\n",
+            summary.truncated_events
+        ));
+    }
+    out.push_str(&format!(
+        "  State changes: {} (malformed: {})\n",
+        summary.state_change_count, summary.malformed_state_change_count
+    ));
+    for sc in &summary.state_changes {
+        out.push_str(&format!(
+            "    - change #{}: type={}, key={}, before={}, after={}\n",
+            sc.index, sc.change_type, sc.key_preview, sc.has_before, sc.has_after
+        ));
+    }
+    if summary.truncated_state_changes > 0 {
+        out.push_str(&format!(
+            "    ... ({} additional state change(s) omitted)\n",
+            summary.truncated_state_changes
+        ));
+    }
+    out
+}
+
 /// Direction of a historical fee change relative to the current run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]

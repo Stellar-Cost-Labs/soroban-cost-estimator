@@ -195,6 +195,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub wasm_info: bool,
 
+    /// Include bounded summaries of simulation events and state changes in
+    /// cost reports (#525).
+    #[arg(long, global = true)]
+    pub show_events: bool,
+
     /// Maximum on-disk estimate cache size, in megabytes. When exceeded,
     /// the least-recently-accessed estimates are evicted down to 90% of the
     /// limit. 0 disables the byte quota.
