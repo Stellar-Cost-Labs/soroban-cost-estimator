@@ -1,8 +1,6 @@
-use std::path::PathBuf;
-use std::str::FromStr;
-
 use clap::builder::{PossibleValue, TypedValueParser};
 use clap::{Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
 
 /// Value parser for `--network` that advertises the supported network names to
 /// shell completion generators and `--help` output while still accepting any
