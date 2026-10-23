@@ -27,7 +27,7 @@ const TRANSIENT_STATUSES: [u16; 5] = [429, 500, 502, 503, 504];
 /// transient failures back off progressively without synchronizing retries
 /// across concurrent callers.
 ///
-/// Only retryable errors (see [`is_retryable`]) trigger a retry; permanent
+/// Only retryable errors (see `is_retryable`) trigger a retry; permanent
 /// errors, including deterministic client errors and invalid XDR, are
 /// returned immediately. When the failing error carries a `Retry-After`
 /// hint (HTTP 429), that value is honored in place of the computed backoff.
