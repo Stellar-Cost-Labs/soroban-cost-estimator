@@ -22,6 +22,14 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Matches the CLI's `--connect-timeout` default (5 seconds).
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Maximum allowed RPC response body size in bytes.
+///
+/// This bounds memory usage before JSON deserialization, preventing an
+/// unexpectedly large response from consuming excessive memory. The value
+/// (10 MB) is chosen to accommodate legitimate XDR payloads while providing
+/// a defensible upper bound against malformed or malicious responses.
+const MAX_RESPONSE_BODY_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
+
 /// Per-network endpoints from the user's `config.toml` (`[rpc_urls]`),
 /// consulted by [`resolve_endpoint`] before the built-in well-known URLs.
 static ENDPOINT_OVERRIDES: std::sync::Mutex<std::collections::BTreeMap<String, String>> =
@@ -1050,7 +1058,7 @@ impl RpcClient {
 
         let elapsed = start.elapsed();
         if self.verbose {
-            let response_str = serde_json::to_string(&result).unwrap_or_default();
+            let response_str = serde_json::to_string(&response_body).unwrap_or_default();
             eprintln!("[RPC] <- HTTP {} ({} ms)", status, elapsed.as_millis());
             eprintln!("[RPC] <- {}", response_str);
         }

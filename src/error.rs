@@ -307,6 +307,11 @@ mod tests {
                 size: 20_000_000,
                 max_size: 16_777_216,
             },
+            AppError::ResponseTooLarge {
+                endpoint: "https://soroban-testnet.stellar.org".to_string(),
+                observed_size: 100_000_000,
+                max_size: 10_000_000,
+            },
             AppError::TypeValidation("arg 'abc' cannot be used as 'i64'".to_string()),
             AppError::SnapshotNotFound("/tmp/s.json".to_string()),
             AppError::SnapshotParse("invalid bundle".to_string()),
