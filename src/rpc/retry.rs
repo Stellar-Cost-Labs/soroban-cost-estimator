@@ -27,32 +27,82 @@ const TRANSIENT_STATUSES: [u16; 5] = [429, 500, 502, 503, 504];
 /// transient failures back off progressively without synchronizing retries
 /// across concurrent callers.
 ///
-/// Only retryable errors (see [`is_retryable`]) trigger a retry; permanent
+/// Only retryable errors (see `is_retryable`) trigger a retry; permanent
 /// errors, including deterministic client errors and invalid XDR, are
 /// returned immediately. When the failing error carries a `Retry-After`
 /// hint (HTTP 429), that value is honored in place of the computed backoff.
 ///
 /// Retry attempts are logged to stderr when debug logging is enabled (i.e.
 /// when the CLI is run with `--verbose`).
-pub async fn with_retry<F, Fut, T>(max_retries: usize, mut operation: F) -> AppResult<T>
+pub async fn with_retry<F, Fut, T>(max_retries: usize, operation: F) -> AppResult<T>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = AppResult<T>>,
 {
-    // `attempts` counts retries already performed. The initial attempt runs
-    // before any check, so the operation executes once plus up to
-    // `max_retries` extra times.
+    with_retry_deadline(max_retries, None, None, operation).await
+}
+
+/// Executes an async operation with retries, bounded by an optional overall
+/// monotonic `deadline` (`tokio::time::Instant`).
+///
+/// When `deadline` is `Some(d)`, every attempt is wrapped in
+/// [`tokio::time::timeout_at`] and any backoff sleep is capped at `d`. Once
+/// `d` expires, in-flight and subsequent retry work stops immediately and
+/// [`AppError::TotalTimeout`] is returned.
+pub async fn with_retry_deadline<F, Fut, T>(
+    max_retries: usize,
+    deadline: Option<tokio::time::Instant>,
+    total_timeout: Option<Duration>,
+    mut operation: F,
+) -> AppResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = AppResult<T>>,
+{
+    let timeout_ms = total_timeout
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
     let mut attempts = 0;
 
     loop {
-        match operation().await {
+        if let Some(d) = deadline
+            && tokio::time::Instant::now() >= d
+        {
+            return Err(AppError::TotalTimeout { timeout_ms });
+        }
+
+        let attempt_result = if let Some(d) = deadline {
+            match tokio::time::timeout_at(d, operation()).await {
+                Ok(res) => res,
+                Err(_) => return Err(AppError::TotalTimeout { timeout_ms }),
+            }
+        } else {
+            operation().await
+        };
+
+        match attempt_result {
             Ok(value) => return Ok(value),
             Err(error) => {
-                if attempts >= max_retries || !is_retryable(&error) {
+                if matches!(error, AppError::TotalTimeout { .. })
+                    || attempts >= max_retries
+                    || !is_retryable(&error)
+                {
                     return Err(error);
                 }
 
                 let delay = retry_delay(&error, attempts);
+                if let Some(d) = deadline {
+                    let now = tokio::time::Instant::now();
+                    let Some(remaining) = d.checked_duration_since(now) else {
+                        return Err(AppError::TotalTimeout { timeout_ms });
+                    };
+                    if delay >= remaining {
+                        log_retry(&error, attempts + 1, max_retries, remaining);
+                        tokio::time::sleep_until(d).await;
+                        return Err(AppError::TotalTimeout { timeout_ms });
+                    }
+                }
+
                 log_retry(&error, attempts + 1, max_retries, delay);
                 tokio::time::sleep(delay).await;
                 attempts += 1;
