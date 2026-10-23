@@ -1215,13 +1215,20 @@ pub fn format_function(fn_info: &FunctionInfo) -> String {
     signature
 }
 
+/// A compact summary of a WASM module's memory and section structure.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WasmStructureSummary {
+    /// Initial linear-memory size, in 64 KiB pages.
     pub initial_pages: u64,
+    /// Maximum linear-memory size, in pages, when the module declares one.
     pub max_pages: Option<u64>,
+    /// Number of imported functions.
     pub imports_count: usize,
+    /// Number of exported functions.
     pub exports_count: usize,
+    /// Whether the module declares a start function.
     pub has_start_function: bool,
+    /// Number of tables declared by the module.
     pub tables_count: usize,
 }
 

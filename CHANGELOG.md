@@ -13,6 +13,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cached runs of the same contract function, rendered as a trend table
   (regressions in red, improvements in green) with a `history` array in
   `--json` output (#321).
+- `estimate --history` also reports per-resource ledger I/O deltas — read and
+  write entries and bytes — whenever both the historical and the current run
+  recorded a footprint, in a second table and as a `footprint_delta` object in
+  `--json` output. Runs without a recorded footprint are reported as
+  `unavailable`, never as zero usage (#530).
+- `--format summary` — exactly one tab-delimited result line per successful
+  `estimate` (`function`, `network`, `ledger`, `total_stroops`, `total_xlm`,
+  `cpu_instructions`, `read_entries`, `write_entries`, `read_bytes`,
+  `write_bytes`, `tx_size`), with documented escaping and no ANSI codes, for
+  shell pipelines and batch logs (#533).
+- Simulation failures now retain the RPC's machine-readable error code and a
+  bounded copy of its structured details: `AppError::SimulationFailed` wraps
+  `rpc::simulate::SimulationError`, whose `Display` stays a concise human
+  message and whose serialized form is a stable, size-limited JSON document
+  (#532).
+- `docs/concepts/fee-calculation.md` — the complete fee methodology: every
+  formula and unit scale, the `ConfigSetting*` XDR fields behind each rate,
+  the refundable rent deposit, and the integer-arithmetic rules that keep the
+  estimate in step with Stellar Core (#375).
 - Resource-limit warnings — `estimate` and `estimate-all` now warn when CPU
   instructions, ledger read/write entries or bytes, or transaction size reach
   80% of the network's protocol limits, with a `warnings` array in JSON output
@@ -99,6 +118,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `estimate-all --json` now emits an object (`{ "functions": [...],
   "fee_distribution": { ... } }`) instead of a bare array; the per-function
   records moved under the `functions` key.
+
+### Changed
+
+- Renamed the report field `rpc_latency_ms` to `simulation_duration_ms`
+  (JSON key, CSV column, and Markdown/table labels) to match the simulation
+  round-trip semantics it measures.
 
 ### Fixed
 

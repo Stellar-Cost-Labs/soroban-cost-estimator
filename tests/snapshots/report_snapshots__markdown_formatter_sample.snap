@@ -8,7 +8,7 @@ expression: MarkdownFormatter.format(&report)
 - **Simulated at ledger sequence:** `3,894,195`
 - **WASM hash:** `abc123def456`
 - **WASM size:** 14432 bytes
-- **RPC round-trip:** 87 ms
+- **Simulation latency:** 87 ms
 
 ### Resources
 
