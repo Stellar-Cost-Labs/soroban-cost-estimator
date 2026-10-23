@@ -1,6 +1,6 @@
 //! Side-by-side cost report diff formatting.
 //!
-//! Renders two [`CostReport`]s (e.g. the same function simulated from two
+//! Renders two [`crate::report::cost_report::CostReport`]s (e.g. the same function simulated from two
 //! WASM builds) as a single comparative table:
 //!
 //! ```text
@@ -16,7 +16,7 @@
 //! bad, a decrease is good), using comfy-table's native cell styling so
 //! column widths stay correct even with ANSI escape sequences present.
 //!
-//! Machine-readable output is available through [`CostReportDiff`], which
+//! Machine-readable output is available through [`crate::report::diff::CostReportDiff`], which
 //! serializes to a stable JSON structure (`old`, `new`, and a `rows` array
 //! with per-resource `delta` / `change_percent` values).
 
@@ -552,12 +552,13 @@ mod tests {
             },
             ledger: 100,
             network: "testnet".to_string(),
-            rpc_latency_ms: 42,
+            simulation_duration_ms: 42,
             rates: None,
             warnings: Vec::new(),
             history: None,
             projections: None,
             contract_meta: crate::wasm::parser::ContractMeta::default(),
+            diagnostics: None,
         }
     }
 
