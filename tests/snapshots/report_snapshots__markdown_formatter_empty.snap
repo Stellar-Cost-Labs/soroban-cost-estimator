@@ -5,8 +5,10 @@ expression: MarkdownFormatter.format(&empty)
 ## Cost Report: `(wasm upload)`
 
 - **Network:** mainnet (ledger 0)
+- **Simulated at ledger sequence:** `0`
 - **WASM hash:** `0000000000000000`
-- **RPC round-trip:** 0 ms
+- **WASM size:** 0 bytes
+- **Simulation latency:** 0 ms
 
 ### Resources
 
@@ -19,6 +21,9 @@ expression: MarkdownFormatter.format(&empty)
 | Read Bytes | 0 |
 | Write Bytes | 0 |
 | Transaction Size | 0 |
+
+<details>
+<summary>Fee breakdown</summary>
 
 ### Fee Breakdown
 
@@ -34,3 +39,5 @@ expression: MarkdownFormatter.format(&empty)
 ### Optimization Suggestions
 
 No cost optimizations identified (fee rates unavailable or no reducible resources).
+
+</details>

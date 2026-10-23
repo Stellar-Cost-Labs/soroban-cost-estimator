@@ -1,6 +1,7 @@
 use crate::config_snapshot::model::{
     ConfigSnapshot, ContractBandwidthV0, ContractComputeV0, ContractEventsV0,
-    ContractHistoricalDataV0, ContractLedgerCostV0, StateArchivalV0,
+    ContractHistoricalDataV0, ContractLedgerCostV0, SnapshotPayload, StateArchivalV0,
+    config_setting_human_name, config_setting_id_for_prefix,
 };
 
 /// Returns a human-readable explanation for a given config setting field path.
@@ -106,16 +107,15 @@ pub fn setting_explanation(field_path: &str) -> Option<&'static str> {
 
 /// Maps a config setting prefix to its human-readable name.
 ///
-/// Matches the XDR enum variant names from `ConfigSettingId`.
+/// Names come from [`config_setting_human_name`] (resolved through
+/// [`config_setting_id_for_prefix`]) so diff tables, diff headers, and
+/// `--json` payloads always agree. Unknown prefixes fall back to the raw
+/// field path.
 pub fn setting_display_name(field_path: &str) -> &str {
-    match field_path.split('.').next() {
-        Some("contract_compute") => "Contract Compute V0",
-        Some("contract_ledger_cost") => "Contract Ledger Cost V0",
-        Some("contract_historical_data") => "Contract Historical Data V0",
-        Some("contract_events") => "Contract Events V0",
-        Some("contract_bandwidth") => "Contract Bandwidth V0",
-        Some("state_archival") => "State Archival",
-        _ => field_path,
+    let prefix = field_path.split('.').next().unwrap_or(field_path);
+    match config_setting_id_for_prefix(prefix) {
+        Some(id) => config_setting_human_name(&id),
+        None => field_path,
     }
 }
 
@@ -167,26 +167,176 @@ pub fn field_display_name(field_path: &str) -> String {
     }
 }
 
+/// The state of a config setting on one side of a diff.
+///
+/// A missing setting is **not** the same as a setting whose value is zero:
+/// absence usually means "this snapshot was taken against an older protocol
+/// version" or "the fetch was incomplete", so the two cases are modelled
+/// separately instead of being collapsed into a numeric default.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingState {
+    /// The setting is present with a known value.
+    Present(String),
+    /// The setting is absent from the snapshot.
+    Missing,
+    /// The setting is stored but not recognized by this build.
+    Unknown(String),
+}
+
+impl SettingState {
+    /// A short, human-readable label for the state.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Present(_) => "present",
+            Self::Missing => "missing",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+
+    /// The value carried by the state, or `None` when the setting is absent.
+    pub fn as_value_string(&self) -> Option<String> {
+        match self {
+            Self::Present(value) | Self::Unknown(value) => Some(value.clone()),
+            Self::Missing => None,
+        }
+    }
+}
+
+/// How a setting changed between two snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingChangeKind {
+    /// A known value changed.
+    Value,
+    /// The setting is present in the new snapshot only.
+    Added,
+    /// The setting is present in the old snapshot only.
+    Removed,
+    /// The setting is stored in the snapshot but not recognized by this build.
+    Unknown,
+}
+
 /// A single changed field between two snapshots.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct FieldDiff {
+    /// Dotted path of the changed field (e.g. `contract_compute.tx_max_instructions`).
     pub field_path: String,
+    /// Raw `ConfigSettingId` number (e.g. `0` for contract compute), or
+    /// `None` when the path's setting prefix is unknown.
+    pub setting_id: Option<u32>,
+    /// Friendly setting name (e.g. `Contract Compute V0`) for `field_path`.
+    pub setting_name: String,
+    /// Value in the older snapshot, rendered for display.
     pub old_value: String,
+    /// Value in the newer snapshot, rendered for display.
     pub new_value: String,
+    /// Whether the field affects what a contract invocation costs.
     pub is_pricing_change: bool,
+    /// Optional short explanation of what the setting controls.
     pub explanation: Option<&'static str>,
+    /// How the setting changed: a numeric value change, an added/removed
+    /// section, or a field this build does not recognize.
+    pub change_kind: SettingChangeKind,
+    /// The state of the setting in the old snapshot.
+    pub old_state: SettingState,
+    /// The state of the setting in the new snapshot.
+    pub new_state: SettingState,
+}
+
+impl FieldDiff {
+    /// Builds one change entry, deriving the raw setting id and the
+    /// friendly setting name from `field_path` so `--json` output carries
+    /// both alongside the machine path and always matches the table text.
+    fn new(
+        field_path: &str,
+        old_value: String,
+        new_value: String,
+        is_pricing_change: bool,
+        explanation: Option<&'static str>,
+    ) -> Self {
+        Self::new_with_state(
+            field_path,
+            old_value.clone(),
+            new_value.clone(),
+            is_pricing_change,
+            explanation,
+            SettingChangeKind::Value,
+            SettingState::Present(old_value),
+            SettingState::Present(new_value),
+        )
+    }
+
+    /// Builds one change entry with an explicit change kind and the state
+    /// of the setting on each side of the diff.
+    ///
+    /// Presence changes (a setting that appeared or disappeared) and
+    /// unrecognized fields carry their own kind so a consumer can tell them
+    /// apart from a plain numeric change without parsing the placeholder
+    /// values.
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_state(
+        field_path: &str,
+        old_value: String,
+        new_value: String,
+        is_pricing_change: bool,
+        explanation: Option<&'static str>,
+        change_kind: SettingChangeKind,
+        old_state: SettingState,
+        new_state: SettingState,
+    ) -> Self {
+        let prefix = field_path.split('.').next().unwrap_or(field_path);
+        let id = config_setting_id_for_prefix(prefix);
+        let setting_id = id.map(|id| id as u32);
+        let setting_name = match id {
+            Some(id) => config_setting_human_name(&id).to_string(),
+            None => field_path.to_string(),
+        };
+        Self {
+            field_path: field_path.to_string(),
+            setting_id,
+            setting_name,
+            old_value,
+            new_value,
+            is_pricing_change,
+            explanation,
+            change_kind,
+            old_state,
+            new_state,
+        }
+    }
 }
 
 /// The result of comparing two config snapshots.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConfigDiff {
+    /// Identity of the older snapshot in the comparison.
     pub old_snapshot: SnapshotInfo,
+    /// Identity of the newer snapshot in the comparison.
     pub new_snapshot: SnapshotInfo,
+    /// Every field-level change, in discovery order.
     pub changes: Vec<FieldDiff>,
+    /// Whether at least one change affects pricing.
     pub has_pricing_changes: bool,
+    /// Whether any change involves a setting this build does not recognize.
+    pub has_unknown_changes: bool,
 }
 
 impl ConfigDiff {
+    /// True when any config setting changed, pricing or not.
+    pub fn has_any_changes(&self) -> bool {
+        !self.changes.is_empty()
+    }
+
+    /// True when at least one pricing change was detected.
+    ///
+    /// Provided as a method so callers (e.g. `cmd_config_diff` exit-code
+    /// evaluation) can use `ConfigDiff::has_pricing_changes()` without
+    /// touching the serialized `has_pricing_changes` field directly.
+    pub fn has_pricing_changes(&self) -> bool {
+        self.has_pricing_changes
+    }
+
     /// Returns true if any pricing change exceeds the given percentage threshold.
     /// Non-numeric changes are considered significant.
     pub fn has_significant_pricing_changes(&self, threshold_percent: f64) -> bool {
@@ -207,10 +357,70 @@ impl ConfigDiff {
     }
 }
 
+/// Returns a new `ConfigDiff` containing only the changes where `is_pricing_change` is true.
+pub fn pricing_only(diff: &ConfigDiff) -> ConfigDiff {
+    let changes: Vec<FieldDiff> = diff
+        .changes
+        .iter()
+        .filter(|c| c.is_pricing_change)
+        .cloned()
+        .collect();
+
+    let has_pricing_changes = changes.iter().any(|c| c.is_pricing_change);
+    let has_unknown_changes = changes
+        .iter()
+        .any(|c| c.change_kind == SettingChangeKind::Unknown);
+
+    ConfigDiff {
+        old_snapshot: diff.old_snapshot.clone(),
+        new_snapshot: diff.new_snapshot.clone(),
+        changes,
+        has_pricing_changes,
+        has_unknown_changes,
+    }
+}
+
+/// Resolve the process exit code for `config diff` from the diff and the
+/// CI-oriented flags.
+///
+/// Semantics (for CI drift detection):
+/// - default: `0` when no pricing changes, `1` when pricing changes detected.
+///   When `threshold_percent` is `Some(t)`, only pricing changes of at least
+///   `t` percent count.
+/// - `ignore_pricing_exit`: always `0`, even when pricing changed. Takes
+///   precedence over `fail_on_any_change` for informative reports that must
+///   not fail the build.
+/// - `fail_on_any_change`: `1` when any setting changed (pricing or not),
+///   `0` otherwise.
+///
+/// Returns `0` or `1`.
+pub fn resolve_exit_code(
+    diff: &ConfigDiff,
+    ignore_pricing_exit: bool,
+    fail_on_any_change: bool,
+    threshold_percent: Option<f64>,
+) -> i32 {
+    if ignore_pricing_exit {
+        return 0;
+    }
+    if fail_on_any_change {
+        return i32::from(diff.has_any_changes());
+    }
+    let pricing_changed = match threshold_percent {
+        Some(t) => diff.has_significant_pricing_changes(t),
+        None => diff.has_pricing_changes(),
+    };
+    i32::from(pricing_changed)
+}
+
+/// Identity of one snapshot inside a [`ConfigDiff`].
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SnapshotInfo {
+    /// Network the snapshot was captured from.
     pub network: String,
+    /// RFC 3339 timestamp of when the snapshot was taken.
     pub timestamp: String,
+    /// Ledger sequence at capture time.
     pub ledger: u32,
 }
 
@@ -238,6 +448,9 @@ pub fn diff_snapshots(old: &ConfigSnapshot, new: &ConfigSnapshot) -> ConfigDiff 
     compare_state_archival(&mut changes, &old.state_archival, &new.state_archival);
 
     let has_pricing_changes = changes.iter().any(|c| c.is_pricing_change);
+    let has_unknown_changes = changes
+        .iter()
+        .any(|c| c.change_kind == SettingChangeKind::Unknown);
 
     ConfigDiff {
         old_snapshot: SnapshotInfo {
@@ -252,7 +465,119 @@ pub fn diff_snapshots(old: &ConfigSnapshot, new: &ConfigSnapshot) -> ConfigDiff 
         },
         changes,
         has_pricing_changes,
+        has_unknown_changes,
     }
+}
+
+/// Compares two snapshot payloads and returns a detailed diff.
+///
+/// In addition to the setting-level comparison performed by
+/// [`diff_snapshots`], this reports fields that are present in the stored
+/// JSON but not modeled by this build. Those fields are surfaced as
+/// [`SettingChangeKind::Unknown`] changes instead of being ignored, so a
+/// snapshot written by a newer tool never silently looks "unchanged".
+pub fn diff_payloads(old: &SnapshotPayload, new: &SnapshotPayload) -> ConfigDiff {
+    let mut diff = diff_snapshots(&old.snapshot, &new.snapshot);
+
+    let mut names: Vec<&String> = old
+        .unknown_fields
+        .keys()
+        .chain(new.unknown_fields.keys())
+        .collect();
+    names.sort();
+    names.dedup();
+
+    for name in names {
+        let old_value = old.unknown_fields.get(name);
+        let new_value = new.unknown_fields.get(name);
+        if old_value == new_value {
+            continue;
+        }
+
+        let old_state = match old_value {
+            Some(value) => SettingState::Unknown(render_unknown_value(value)),
+            None => SettingState::Missing,
+        };
+        let new_state = match new_value {
+            Some(value) => SettingState::Unknown(render_unknown_value(value)),
+            None => SettingState::Missing,
+        };
+
+        diff.changes.push(FieldDiff::new_with_state(
+            name,
+            old_state
+                .as_value_string()
+                .unwrap_or_else(|| "(missing)".to_string()),
+            new_state
+                .as_value_string()
+                .unwrap_or_else(|| "(missing)".to_string()),
+            // Conservative: an unrecognized field may well carry pricing
+            // information this build cannot reason about, so it is treated
+            // as pricing-relevant rather than ignored.
+            true,
+            None,
+            SettingChangeKind::Unknown,
+            old_state,
+            new_state,
+        ));
+    }
+
+    diff.has_pricing_changes = diff.changes.iter().any(|c| c.is_pricing_change);
+    diff.has_unknown_changes = diff
+        .changes
+        .iter()
+        .any(|c| c.change_kind == SettingChangeKind::Unknown);
+    diff
+}
+
+/// Renders an unrecognized JSON value as a compact, single-line string.
+fn render_unknown_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Records a change in which a whole setting section is present on only one
+/// side of the diff.
+///
+/// A missing section is *not* treated as a section whose values are zero:
+/// the transition is reported with its own [`SettingChangeKind`] so the
+/// output never claims "the fee went from 0 to 10".
+fn push_presence_change(diffs: &mut Vec<FieldDiff>, path: &str, added: bool) {
+    let (old_state, new_state) = if added {
+        (
+            SettingState::Missing,
+            SettingState::Present("(present)".to_string()),
+        )
+    } else {
+        (
+            SettingState::Present("(present)".to_string()),
+            SettingState::Missing,
+        )
+    };
+
+    diffs.push(FieldDiff::new_with_state(
+        path,
+        old_state
+            .as_value_string()
+            .unwrap_or_else(|| "(missing)".to_string()),
+        new_state
+            .as_value_string()
+            .unwrap_or_else(|| "(missing)".to_string()),
+        // Conservative: a missing setting is not a zero value, so the
+        // transition stays flagged as pricing-relevant until both sides
+        // carry an actual value.
+        true,
+        None,
+        if added {
+            SettingChangeKind::Added
+        } else {
+            SettingChangeKind::Removed
+        },
+        old_state,
+        new_state,
+    ));
 }
 
 fn compare_contract_compute(
@@ -291,20 +616,8 @@ fn compare_contract_compute(
                 false,
             );
         }
-        (None, Some(_)) => diffs.push(FieldDiff {
-            field_path: "contract_compute".to_string(),
-            old_value: "(missing)".to_string(),
-            new_value: "(present)".to_string(),
-            is_pricing_change: true,
-            explanation: None,
-        }),
-        (Some(_), None) => diffs.push(FieldDiff {
-            field_path: "contract_compute".to_string(),
-            old_value: "(present)".to_string(),
-            new_value: "(missing)".to_string(),
-            is_pricing_change: true,
-            explanation: None,
-        }),
+        (None, Some(_)) => push_presence_change(diffs, "contract_compute", true),
+        (Some(_), None) => push_presence_change(diffs, "contract_compute", false),
         _ => {}
     }
 }
@@ -394,20 +707,8 @@ fn compare_ledger_cost(
                 false,
             );
         }
-        (None, Some(_)) => diffs.push(FieldDiff {
-            field_path: "contract_ledger_cost".to_string(),
-            old_value: "(missing)".to_string(),
-            new_value: "(present)".to_string(),
-            is_pricing_change: true,
-            explanation: None,
-        }),
-        (Some(_), None) => diffs.push(FieldDiff {
-            field_path: "contract_ledger_cost".to_string(),
-            old_value: "(present)".to_string(),
-            new_value: "(missing)".to_string(),
-            is_pricing_change: true,
-            explanation: None,
-        }),
+        (None, Some(_)) => push_presence_change(diffs, "contract_ledger_cost", true),
+        (Some(_), None) => push_presence_change(diffs, "contract_ledger_cost", false),
         _ => {}
     }
 }
@@ -427,20 +728,8 @@ fn compare_historical_data(
                 true,
             );
         }
-        (None, Some(_)) => diffs.push(FieldDiff {
-            field_path: "contract_historical_data".to_string(),
-            old_value: "(missing)".to_string(),
-            new_value: "(present)".to_string(),
-            is_pricing_change: true,
-            explanation: None,
-        }),
-        (Some(_), None) => diffs.push(FieldDiff {
-            field_path: "contract_historical_data".to_string(),
-            old_value: "(present)".to_string(),
-            new_value: "(missing)".to_string(),
-            is_pricing_change: true,
-            explanation: None,
-        }),
+        (None, Some(_)) => push_presence_change(diffs, "contract_historical_data", true),
+        (Some(_), None) => push_presence_change(diffs, "contract_historical_data", false),
         _ => {}
     }
 }
@@ -467,20 +756,8 @@ fn compare_events(
                 true,
             );
         }
-        (None, Some(_)) => diffs.push(FieldDiff {
-            field_path: "contract_events".to_string(),
-            old_value: "(missing)".to_string(),
-            new_value: "(present)".to_string(),
-            is_pricing_change: true,
-            explanation: None,
-        }),
-        (Some(_), None) => diffs.push(FieldDiff {
-            field_path: "contract_events".to_string(),
-            old_value: "(present)".to_string(),
-            new_value: "(missing)".to_string(),
-            is_pricing_change: true,
-            explanation: None,
-        }),
+        (None, Some(_)) => push_presence_change(diffs, "contract_events", true),
+        (Some(_), None) => push_presence_change(diffs, "contract_events", false),
         _ => {}
     }
 }
@@ -514,20 +791,8 @@ fn compare_bandwidth(
                 true,
             );
         }
-        (None, Some(_)) => diffs.push(FieldDiff {
-            field_path: "contract_bandwidth".to_string(),
-            old_value: "(missing)".to_string(),
-            new_value: "(present)".to_string(),
-            is_pricing_change: true,
-            explanation: None,
-        }),
-        (Some(_), None) => diffs.push(FieldDiff {
-            field_path: "contract_bandwidth".to_string(),
-            old_value: "(present)".to_string(),
-            new_value: "(missing)".to_string(),
-            is_pricing_change: true,
-            explanation: None,
-        }),
+        (None, Some(_)) => push_presence_change(diffs, "contract_bandwidth", true),
+        (Some(_), None) => push_presence_change(diffs, "contract_bandwidth", false),
         _ => {}
     }
 }
@@ -610,20 +875,8 @@ fn compare_state_archival(
                 false,
             );
         }
-        (None, Some(_)) => diffs.push(FieldDiff {
-            field_path: "state_archival".to_string(),
-            old_value: "(missing)".to_string(),
-            new_value: "(present)".to_string(),
-            is_pricing_change: true,
-            explanation: None,
-        }),
-        (Some(_), None) => diffs.push(FieldDiff {
-            field_path: "state_archival".to_string(),
-            old_value: "(present)".to_string(),
-            new_value: "(missing)".to_string(),
-            is_pricing_change: true,
-            explanation: None,
-        }),
+        (None, Some(_)) => push_presence_change(diffs, "state_archival", true),
+        (Some(_), None) => push_presence_change(diffs, "state_archival", false),
         _ => {}
     }
 }
@@ -636,24 +889,45 @@ fn check<T: PartialEq + std::fmt::Display>(
     is_pricing: bool,
 ) {
     if old != new {
-        diffs.push(FieldDiff {
-            field_path: path.to_string(),
-            old_value: old.to_string(),
-            new_value: new.to_string(),
-            is_pricing_change: is_pricing,
-            explanation: setting_explanation(path),
-        });
+        diffs.push(FieldDiff::new(
+            path,
+            old.to_string(),
+            new.to_string(),
+            is_pricing,
+            setting_explanation(path),
+        ));
     }
 }
 
 /// Formats a `ConfigDiff` as a single-line summary for CI status lines.
 ///
-/// Example: `2 pricing changes, 1 non-pricing changes` or
-/// `0 pricing changes, 0 non-pricing changes`.
+/// When nothing changed the line simply confirms the network config matches
+/// the stored snapshot: `Network config up to date (ledger 1234)`. When any
+/// field drifted it reports how many of the changes were pricing vs.
+/// non-pricing: `Config drift detected: 2 pricing changes, 1 non-pricing changes`.
 pub fn format_diff_summary(diff: &ConfigDiff) -> String {
+    if diff.changes.is_empty() {
+        return format!(
+            "Network config up to date (ledger {})",
+            diff.new_snapshot.ledger
+        );
+    }
     let pricing = diff.changes.iter().filter(|c| c.is_pricing_change).count();
     let non_pricing = diff.changes.len() - pricing;
-    format!("{pricing} pricing changes, {non_pricing} non-pricing changes")
+    let unknown = diff
+        .changes
+        .iter()
+        .filter(|c| c.change_kind == SettingChangeKind::Unknown)
+        .count();
+    if unknown > 0 {
+        format!(
+            "Config drift detected: {pricing} pricing changes, {non_pricing} non-pricing changes, {unknown} unknown"
+        )
+    } else {
+        format!(
+            "Config drift detected: {pricing} pricing changes, {non_pricing} non-pricing changes"
+        )
+    }
 }
 
 /// ANSI escape sequences used to color pricing-change indicators by severity.
@@ -689,6 +963,92 @@ pub fn pricing_change_color(old_value: &str, new_value: &str, colorize: bool) ->
     } else {
         ANSI_RED
     }
+}
+
+/// Whether a change exceeds the given percentage threshold.
+///
+/// Non-numeric changes (a setting appearing or disappearing) cannot be
+/// quantified, so they count as exceeding every threshold.
+fn exceeds_threshold(change: &FieldDiff, threshold_percent: Option<f64>) -> bool {
+    let Some(threshold) = threshold_percent else {
+        return false;
+    };
+    if !change.is_pricing_change {
+        return false;
+    }
+    let (Ok(old), Ok(new)) = (
+        change.old_value.parse::<f64>(),
+        change.new_value.parse::<f64>(),
+    ) else {
+        return true;
+    };
+    let denominator = old.abs().max(f64::EPSILON);
+    let ratio = (new - old).abs() / denominator;
+    ratio * 100.0 >= threshold
+}
+
+/// Renders one change entry of a diff.
+///
+/// Numeric value changes are color-coded by magnitude; presence changes
+/// (added / removed) and unrecognized settings are rendered with their own
+/// icon and an explicit state line, so a missing setting is never read as a
+/// value of zero.
+fn render_change(
+    change: &FieldDiff,
+    colorize: bool,
+    is_exceeding: bool,
+    reset_code: &str,
+) -> String {
+    let icon = match change.change_kind {
+        SettingChangeKind::Value => {
+            if change.is_pricing_change {
+                "\u{1f4c8}"
+            } else {
+                "\u{1f504}"
+            }
+        }
+        SettingChangeKind::Added => "\u{1f195}",
+        SettingChangeKind::Removed => "\u{1f5d1}\u{fe0f}",
+        SettingChangeKind::Unknown => "\u{2753}",
+    };
+    let display = field_display_name(&change.field_path);
+    let mut output = String::new();
+
+    if change.is_pricing_change && change.change_kind == SettingChangeKind::Value {
+        let color = if is_exceeding {
+            if colorize { ANSI_RED } else { "" }
+        } else {
+            pricing_change_color(&change.old_value, &change.new_value, colorize)
+        };
+        output.push_str(&format!("  {color}{icon} {display}{reset_code}\n"));
+        if let Some(explanation) = change.explanation {
+            output.push_str(&format!("      \u{2139}\u{fe0f}  {explanation}\n"));
+        }
+        output.push_str(&format!("      Old: {}\n", change.old_value));
+        output.push_str(&format!(
+            "      New: {color}{}{reset_code}\n",
+            change.new_value
+        ));
+        return output;
+    }
+
+    output.push_str(&format!("  {icon} {display}\n"));
+    if let Some(explanation) = change.explanation {
+        output.push_str(&format!("      \u{2139}\u{fe0f}  {explanation}\n"));
+    }
+    if change.change_kind == SettingChangeKind::Unknown {
+        output.push_str("      \u{2139}\u{fe0f}  Setting is not recognized by this build.\n");
+    }
+    output.push_str(&format!("      Old: {}\n", change.old_value));
+    output.push_str(&format!("      New: {}\n", change.new_value));
+    if change.change_kind != SettingChangeKind::Value {
+        output.push_str(&format!(
+            "      State: {} \u{2192} {}\n",
+            change.old_state.label(),
+            change.new_state.label()
+        ));
+    }
+    output
 }
 
 /// Formats a `ConfigDiff` as a human-readable string for display.
@@ -743,55 +1103,96 @@ pub fn format_diff(
     ));
 
     for change in visible_changes {
-        let is_exceeding = match threshold_percent {
-            Some(t) if change.is_pricing_change => {
-                if let (Ok(old), Ok(new)) = (
-                    change.old_value.parse::<f64>(),
-                    change.new_value.parse::<f64>(),
-                ) {
-                    let denominator = old.abs().max(f64::EPSILON);
-                    let ratio = (new - old).abs() / denominator;
-                    ratio * 100.0 >= t
-                } else {
-                    true
-                }
-            }
-            _ => false,
-        };
-
-        let icon = if change.is_pricing_change {
-            "📈"
-        } else {
-            "🔄"
-        };
-        let display = field_display_name(&change.field_path);
-        if change.is_pricing_change {
-            let color = if is_exceeding {
-                if colorize { ANSI_RED } else { "" }
-            } else {
-                pricing_change_color(&change.old_value, &change.new_value, colorize)
-            };
-            output.push_str(&format!("  {color}{icon} {display}{reset_code}\n"));
-            if let Some(explanation) = change.explanation {
-                output.push_str(&format!("      ℹ️  {explanation}\n"));
-            }
-            output.push_str(&format!("      Old: {}\n", change.old_value));
-            output.push_str(&format!(
-                "      New: {color}{}{reset_code}\n",
-                change.new_value
-            ));
-        } else {
-            output.push_str(&format!("  {icon} {display}\n"));
-            if let Some(explanation) = change.explanation {
-                output.push_str(&format!("      ℹ️  {explanation}\n"));
-            }
-            output.push_str(&format!("      Old: {}\n", change.old_value));
-            output.push_str(&format!("      New: {}\n", change.new_value));
-        }
+        let is_exceeding = exceeds_threshold(change, threshold_percent);
+        output.push_str(&render_change(change, colorize, is_exceeding, reset_code));
     }
 
     if diff.has_pricing_changes {
         output.push_str("\n⚠️  Pricing changes detected! Your cached estimates may be stale.\n");
+    }
+
+    if diff.has_unknown_changes {
+        output.push_str(
+            "\n⚠️  Unrecognized settings detected — their effect on pricing is unknown.\n",
+        );
+    }
+
+    output
+}
+
+/// Escapes a value for CSV output per RFC 4180.
+///
+/// Values containing a comma, double-quote, or newline are wrapped in
+/// double-quotes with internal quotes doubled.
+fn csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+/// Formats a `ConfigDiff` as RFC 4180 CSV records.
+///
+/// Emits a header row followed by one row per changed field, so the diff can
+/// be piped into a spreadsheet or `mlr`. The trade-off is deliberately
+/// machine-first: ANSI colors, icons, and explanations are omitted.
+pub fn format_diff_csv(diff: &ConfigDiff) -> String {
+    let mut output = String::from("field,old_value,new_value,is_pricing_change\n");
+    for change in &diff.changes {
+        output.push_str(&format!(
+            "{},{},{},{}\n",
+            csv_escape(&change.field_path),
+            csv_escape(&change.old_value),
+            csv_escape(&change.new_value),
+            change.is_pricing_change,
+        ));
+    }
+    output
+}
+
+/// Formats a `ConfigDiff` as a GitHub-flavored Markdown table.
+///
+/// Suitable for pasting straight into a pull request or issue comment.
+pub fn format_diff_markdown(diff: &ConfigDiff) -> String {
+    let mut output = String::new();
+
+    output.push_str(&format!(
+        "## Config diff: {} (ledger {}) → {} (ledger {})\n\n",
+        diff.old_snapshot.timestamp,
+        diff.old_snapshot.ledger,
+        diff.new_snapshot.timestamp,
+        diff.new_snapshot.ledger,
+    ));
+    output.push_str(&format!("- **Network:** {}\n", diff.new_snapshot.network));
+    output.push_str(&format!(
+        "- **Pricing changes:** {}\n\n",
+        if diff.has_pricing_changes {
+            "yes"
+        } else {
+            "no"
+        }
+    ));
+
+    if diff.changes.is_empty() {
+        output.push_str("✅ No changes detected.\n");
+        return output;
+    }
+
+    output.push_str("| Setting | Old | New | Pricing |\n");
+    output.push_str("| --- | --- | --- | --- |\n");
+    for change in &diff.changes {
+        output.push_str(&format!(
+            "| {} | `{}` | `{}` | {} |\n",
+            field_display_name(&change.field_path),
+            change.old_value,
+            change.new_value,
+            if change.is_pricing_change {
+                "💰 yes"
+            } else {
+                "no"
+            },
+        ));
     }
 
     output
@@ -807,6 +1208,8 @@ mod tests {
             network: "testnet".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             ledger: 100,
+            settings_last_modified: std::collections::BTreeMap::new(),
+            protocol_version: None,
             contract_compute: Some(ContractComputeV0 {
                 ledger_max_instructions: 1_000_000,
                 tx_max_instructions: 100_000,
@@ -909,7 +1312,7 @@ mod tests {
         let diff = diff_snapshots(&old, &new);
         assert_eq!(
             format_diff_summary(&diff),
-            "2 pricing changes, 1 non-pricing changes"
+            "Config drift detected: 2 pricing changes, 1 non-pricing changes"
         );
     }
 
@@ -919,7 +1322,7 @@ mod tests {
         let diff = diff_snapshots(&snap, &snap);
         assert_eq!(
             format_diff_summary(&diff),
-            "0 pricing changes, 0 non-pricing changes"
+            "Network config up to date (ledger 100)"
         );
     }
 
@@ -931,6 +1334,68 @@ mod tests {
         let output = format_diff(&diff, false, false, None);
         assert!(output.contains("Contract Compute V0"));
         assert!(output.contains("Contract Bandwidth V0"));
+    }
+
+    /// AC: `--json` carries the friendly setting name alongside the raw
+    /// `ConfigSettingId` number, not just the machine field path.
+    #[test]
+    fn test_json_has_friendly_name_alongside_raw_id() {
+        use crate::rpc::config::ConfigSettingId;
+
+        let old = make_snapshot(100, 5);
+        let new = make_snapshot(200, 5);
+        let diff = diff_snapshots(&old, &new);
+        let json = serde_json::to_value(&diff).expect("diff should serialize to JSON");
+        let change = &json["changes"][0];
+
+        assert_eq!(
+            change["field_path"],
+            "contract_compute.fee_rate_per_instructions_increment"
+        );
+        assert_eq!(change["setting_name"], "Contract Compute V0");
+        assert_eq!(
+            change["setting_name"],
+            config_setting_human_name(&ConfigSettingId::ContractComputeV0)
+        );
+        assert_eq!(change["setting_id"], 0);
+
+        // The in-memory struct exposes the same pair the JSON does.
+        assert_eq!(diff.changes[0].setting_name, "Contract Compute V0");
+        assert_eq!(diff.changes[0].setting_id, Some(0));
+    }
+
+    /// Missing-section entries (bare prefix paths) also carry name + id.
+    #[test]
+    fn test_missing_section_entry_carries_setting_name_and_id() {
+        let mut old = make_snapshot(100, 5);
+        old.contract_bandwidth = None;
+        let new = make_snapshot(100, 5);
+        let diff = diff_snapshots(&old, &new);
+        assert_eq!(diff.changes.len(), 1);
+        assert_eq!(diff.changes[0].field_path, "contract_bandwidth");
+        assert_eq!(diff.changes[0].setting_name, "Contract Bandwidth V0");
+        assert_eq!(diff.changes[0].setting_id, Some(4));
+    }
+
+    /// AC: diff tables render names from the shared helper, so table text,
+    /// header text, and JSON can never drift apart.
+    #[test]
+    fn test_format_diff_uses_config_setting_human_name() {
+        use crate::rpc::config::ConfigSettingId;
+
+        let old = make_snapshot(100, 5);
+        let new = make_snapshot(200, 5);
+        let diff = diff_snapshots(&old, &new);
+        let output = format_diff(&diff, false, false, None);
+        let expected = config_setting_human_name(&ConfigSettingId::ContractComputeV0);
+        assert!(
+            output.contains(expected),
+            "diff table should show `{expected}`: {output}"
+        );
+        assert_eq!(
+            field_display_name("contract_compute.fee_rate_per_instructions_increment"),
+            format!("{expected} > Fee Rate Per Instructions Increment")
+        );
     }
 
     // ── ANSI pricing-change colors (#81) ──────────────────────────────
@@ -1037,5 +1502,97 @@ mod tests {
             !output.contains("\u{1b}["),
             "no-change output should have no ANSI codes: {output}"
         );
+    }
+
+    // ── CI exit-code semantics (#112) ────────────────────────────────
+
+    fn non_pricing_only_diff() -> ConfigDiff {
+        let old = make_snapshot(100, 5);
+        let mut new = make_snapshot(100, 5);
+        if let Some(compute) = &mut new.contract_compute {
+            compute.ledger_max_instructions = 2_000_000;
+        }
+        diff_snapshots(&old, &new)
+    }
+
+    #[test]
+    fn test_resolve_exit_code_default_no_changes_is_zero() {
+        let snap = make_snapshot(100, 5);
+        let diff = diff_snapshots(&snap, &snap);
+        assert!(!diff.has_any_changes());
+        assert!(!diff.has_pricing_changes());
+        assert_eq!(resolve_exit_code(&diff, false, false, None), 0);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_default_pricing_change_is_one() {
+        let old = make_snapshot(100, 5);
+        let new = make_snapshot(200, 5);
+        let diff = diff_snapshots(&old, &new);
+        assert!(diff.has_pricing_changes());
+        assert_eq!(resolve_exit_code(&diff, false, false, None), 1);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_default_non_pricing_only_is_zero() {
+        let diff = non_pricing_only_diff();
+        assert!(diff.has_any_changes());
+        assert!(!diff.has_pricing_changes());
+        assert_eq!(resolve_exit_code(&diff, false, false, None), 0);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_ignore_pricing_exit_forces_zero() {
+        let old = make_snapshot(100, 5);
+        let new = make_snapshot(200, 5);
+        let diff = diff_snapshots(&old, &new);
+        assert_eq!(resolve_exit_code(&diff, true, false, None), 0);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_fail_on_any_change_catches_non_pricing() {
+        let diff = non_pricing_only_diff();
+        assert_eq!(resolve_exit_code(&diff, false, true, None), 1);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_fail_on_any_change_no_changes_is_zero() {
+        let snap = make_snapshot(100, 5);
+        let diff = diff_snapshots(&snap, &snap);
+        assert_eq!(resolve_exit_code(&diff, false, true, None), 0);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_ignore_takes_precedence_over_fail_on_any() {
+        let old = make_snapshot(100, 5);
+        let new = make_snapshot(200, 5);
+        let diff = diff_snapshots(&old, &new);
+        assert_eq!(resolve_exit_code(&diff, true, true, None), 0);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_threshold_below_significance_is_zero() {
+        // 100 → 200 is a 100% jump; a 500% threshold must not trigger exit 1.
+        let old = make_snapshot(100, 5);
+        let new = make_snapshot(200, 5);
+        let diff = diff_snapshots(&old, &new);
+        assert!(diff.has_pricing_changes());
+        assert_eq!(resolve_exit_code(&diff, false, false, Some(500.0)), 0);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_threshold_above_significance_is_one() {
+        let old = make_snapshot(100, 5);
+        let new = make_snapshot(200, 5);
+        let diff = diff_snapshots(&old, &new);
+        assert_eq!(resolve_exit_code(&diff, false, false, Some(10.0)), 1);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_ignore_wins_over_threshold() {
+        let old = make_snapshot(100, 5);
+        let new = make_snapshot(200, 5);
+        let diff = diff_snapshots(&old, &new);
+        assert_eq!(resolve_exit_code(&diff, true, false, Some(10.0)), 0);
     }
 }

@@ -12,20 +12,109 @@ use tokio::sync::{Mutex, Notify};
 use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
-use crate::rpc::retry::{DEFAULT_MAX_RETRIES, with_retry};
+use crate::rpc::retry::{DEFAULT_MAX_RETRIES, with_retry_deadline};
 
 /// Default per-request HTTP timeout applied to every RPC call. Matches the
 /// CLI's `--timeout` default (30 seconds).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default TCP connection establishment timeout applied to every RPC call.
+/// Matches the CLI's `--connect-timeout` default (5 seconds).
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Per-network endpoints from the user's `config.toml` (`[rpc_urls]`),
+/// consulted by [`resolve_endpoint`] before the built-in well-known URLs.
+static ENDPOINT_OVERRIDES: std::sync::Mutex<std::collections::BTreeMap<String, String>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Replaces the process-wide per-network endpoint overrides.
+///
+/// An explicit custom URL passed to [`resolve_endpoint`] (i.e. `--rpc-url`)
+/// still wins over these.
+pub fn set_endpoint_overrides(
+    overrides: std::collections::BTreeMap<String, String>,
+) -> AppResult<()> {
+    let mut guard = ENDPOINT_OVERRIDES
+        .lock()
+        .map_err(|e| AppError::General(format!("endpoint overrides lock poisoned: {e}")))?;
+    *guard = overrides;
+    Ok(())
+}
+
+fn endpoint_override(network: &str) -> AppResult<Option<String>> {
+    let guard = ENDPOINT_OVERRIDES
+        .lock()
+        .map_err(|e| AppError::General(format!("endpoint overrides lock poisoned: {e}")))?;
+    Ok(guard.get(network).cloned())
+}
+
+static DEFAULT_TOTAL_TIMEOUT_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Sets the process-wide default overall RPC operation deadline (`--total-timeout`).
+///
+/// Newly created [`RpcClient`] instances inherit this deadline unless
+/// overridden via [`RpcClient::with_total_timeout`]. Passing `None` or a zero
+/// duration disables the overall deadline.
+pub fn set_default_total_timeout(total_timeout: Option<Duration>) {
+    let ms = total_timeout
+        .filter(|d| !d.is_zero())
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    DEFAULT_TOTAL_TIMEOUT_MS.store(ms, Ordering::Relaxed);
+}
+
+fn default_total_timeout() -> Option<Duration> {
+    let ms = DEFAULT_TOTAL_TIMEOUT_MS.load(Ordering::Relaxed);
+    if ms == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(ms))
+    }
+}
+
 /// Resolves a network name to its well-known Soroban RPC endpoint.
+/// Precedence: `custom_url` (`--rpc-url`), then the network's entry in the
+/// user config's `[rpc_urls]`, then the built-in well-known URL. User-supplied
+/// URLs are validated by [`validate_rpc_url`] before they are returned, so a
+/// malformed endpoint fails before any network call is made.
+///
+/// # Errors
+///
+/// Returns [`AppError::InvalidRpcUrl`] when a custom or config-provided URL is
+/// malformed or uses an unsupported scheme, and [`AppError::UnknownNetwork`]
+/// when `network` has no configured or well-known endpoint.
 ///
 /// # Network calls
-/// None — returns hardcoded well-known URLs. Custom URLs override network resolution.
+/// None — returns configured or hardcoded well-known URLs.
+///
+/// # Examples
+///
+/// ```
+/// use soroban_cost_estimator::error::AppError;
+/// use soroban_cost_estimator::rpc::client::resolve_endpoint;
+///
+/// assert_eq!(
+///     resolve_endpoint("mainnet", None)?,
+///     "https://soroban.stellar.org"
+/// );
+/// assert!(matches!(
+///     resolve_endpoint("testnet", Some("ftp://example.com")),
+///     Err(AppError::InvalidRpcUrl(_))
+/// ));
+/// # Ok::<(), AppError>(())
+/// ```
 pub fn resolve_endpoint(network: &str, custom_url: Option<&str>) -> AppResult<String> {
     if let Some(url) = custom_url {
+        validate_rpc_url(url)?;
         debug!(url, "using custom RPC endpoint");
         return Ok(url.to_string());
+    }
+
+    if let Some(url) = endpoint_override(network)? {
+        validate_rpc_url(&url)?;
+        debug!(network, url, "using RPC endpoint from config file");
+        return Ok(url);
     }
 
     let endpoint = match network {
@@ -44,29 +133,157 @@ pub fn resolve_endpoint(network: &str, custom_url: Option<&str>) -> AppResult<St
 /// Resolves a network name to its WebSocket RPC endpoint (`wss://…/ws`).
 ///
 /// Derives the WebSocket URL from the HTTP endpoint returned by
-/// [`resolve_endpoint`] by swapping the scheme (`https` → `wss`, `http` →
-/// `ws`) and appending the `/ws` path used by Stellar RPC for streaming
-/// subscriptions. Custom URLs override network resolution and must already
-/// be in WebSocket form.
+/// [`resolve_endpoint`]; custom URLs override network resolution and are
+/// normalized with [`to_websocket_url`], so `https://host` works as well as
+/// `wss://host`.
 ///
 /// # Network calls
 /// None — pure string transformation of the resolved endpoint.
 pub fn resolve_ws_endpoint(network: &str, custom_url: Option<&str>) -> AppResult<String> {
     if let Some(url) = custom_url {
         debug!(url, "using custom WebSocket RPC endpoint");
-        return Ok(url.to_string());
+        return to_websocket_url(url);
     }
 
     let http_endpoint = resolve_endpoint(network, None)?;
-    let ws_endpoint = match http_endpoint.strip_prefix("https://") {
-        Some(host) => format!("wss://{host}/ws"),
-        None => match http_endpoint.strip_prefix("http://") {
-            Some(host) => format!("ws://{host}/ws"),
-            None => return Err(AppError::UnknownNetwork(network.to_string())),
-        },
-    };
+    let ws_endpoint = to_websocket_url(&http_endpoint)?;
     debug!(network, ws_endpoint, "resolved WebSocket RPC endpoint");
     Ok(ws_endpoint)
+}
+
+/// Rewrites an RPC URL into its WebSocket form.
+///
+/// * `ws://` / `wss://` URLs are kept as-is.
+/// * `http://` / `https://` URLs have their scheme swapped (`http` → `ws`,
+///   `https` → `wss`).
+/// * A URL that carries no path (or only `/`) gets the `/ws` path Stellar RPC
+///   serves its streaming subscriptions on.
+///
+/// # Network calls
+/// None — pure string transformation.
+pub fn to_websocket_url(url: &str) -> AppResult<String> {
+    let (scheme, rest) = split_url_scheme(url)?;
+    let ws_scheme = match scheme.as_str() {
+        "ws" | "wss" => scheme.clone(),
+        "http" => "ws".to_string(),
+        "https" => "wss".to_string(),
+        _ => return Err(unsupported_scheme(url)),
+    };
+    Ok(format!("{ws_scheme}://{}", with_ws_path(rest)))
+}
+
+/// Rewrites an RPC URL into its HTTP form (the inverse of
+/// [`to_websocket_url`]).
+///
+/// `http://` / `https://` URLs are kept as-is; `ws://` / `wss://` URLs have
+/// their scheme swapped and any trailing `/ws` path stripped, so the same
+/// `--rpc-url` value can drive both the WebSocket subscription and the
+/// request/response JSON-RPC calls.
+///
+/// # Network calls
+/// None — pure string transformation.
+pub fn to_http_url(url: &str) -> AppResult<String> {
+    let (scheme, rest) = split_url_scheme(url)?;
+    let http_scheme = match scheme.as_str() {
+        "http" | "https" => scheme.clone(),
+        "ws" => "http".to_string(),
+        "wss" => "https".to_string(),
+        _ => return Err(unsupported_scheme(url)),
+    };
+    let rest = rest.strip_suffix("/ws").unwrap_or(rest);
+    Ok(format!("{http_scheme}://{rest}"))
+}
+
+/// Splits `scheme://rest` into its lowercased scheme and the remainder.
+fn split_url_scheme(url: &str) -> AppResult<(String, &str)> {
+    match url.split_once("://") {
+        Some((scheme, rest)) if !scheme.is_empty() && !rest.is_empty() => {
+            Ok((scheme.to_ascii_lowercase(), rest))
+        }
+        _ => Err(unsupported_scheme(url)),
+    }
+}
+
+/// Appends the `/ws` subscription path when the URL has no path of its own.
+///
+/// Only the authority (plus any path) is inspected; a trailing `/` counts as
+/// "no path" so `https://host/` becomes `wss://host/ws`.
+fn with_ws_path(rest: &str) -> String {
+    let path_part = rest.split(['?', '#']).next().unwrap_or(rest);
+    let has_path = path_part
+        .split_once('/')
+        .is_some_and(|(_, path)| !path.is_empty());
+    if has_path {
+        rest.to_string()
+    } else {
+        format!("{}/ws", path_part.trim_end_matches('/'))
+    }
+}
+
+/// Validates a user-supplied RPC endpoint before any network work begins.
+///
+/// Accepts only absolute URLs with an `http`, `https`, `ws`, or `wss` scheme
+/// and a non-empty host: the four schemes this tool can actually speak. A URL
+/// without a scheme, a host, or with a malformed/out-of-range port is rejected
+/// with [`AppError::InvalidRpcUrl`], as are unrelated schemes such as `ftp://`
+/// or `file://`.
+///
+/// Calling this up front means a typo in `--rpc-url` is reported immediately,
+/// instead of surfacing as a confusing JSON-deserialization or XDR-decoding
+/// failure halfway through a simulation.
+///
+/// # Errors
+///
+/// Returns [`AppError::InvalidRpcUrl`] when `url` is not a usable endpoint, with
+/// the offending value and the reason in the message.
+///
+/// # Examples
+///
+/// ```
+/// use soroban_cost_estimator::error::AppError;
+/// use soroban_cost_estimator::rpc::client::validate_rpc_url;
+///
+/// assert!(validate_rpc_url("https://soroban-testnet.stellar.org").is_ok());
+/// assert!(validate_rpc_url("http://localhost:8000").is_ok());
+/// assert!(matches!(
+///     validate_rpc_url("ftp://example.com"),
+///     Err(AppError::InvalidRpcUrl(_))
+/// ));
+/// # Ok::<(), AppError>(())
+/// ```
+pub fn validate_rpc_url(url: &str) -> AppResult<()> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| AppError::InvalidRpcUrl(format!("`{url}` is not a valid URL: {e}")))?;
+
+    match parsed.scheme() {
+        "http" | "https" | "ws" | "wss" => {}
+        scheme => {
+            return Err(AppError::InvalidRpcUrl(format!(
+                "`{url}` uses unsupported scheme `{scheme}`; expected http://, https://, ws://, or wss://"
+            )));
+        }
+    }
+
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return Err(AppError::InvalidRpcUrl(format!(
+            "`{url}` is missing a host"
+        )));
+    }
+
+    if parsed.port() == Some(0) {
+        return Err(AppError::InvalidRpcUrl(format!(
+            "`{url}` has an invalid port 0"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Error for a URL whose scheme this tool cannot speak.
+fn unsupported_scheme(url: &str) -> AppError {
+    AppError::General(format!(
+        "unsupported RPC URL `{url}`: expected a ws://, wss://, http://, or https:// URL"
+    ))
 }
 
 /// Key identifying a deduplicable JSON-RPC request: `(method, serialized params)`.
@@ -153,13 +370,27 @@ struct DedupState {
 
 /// Response envelope for the `getHealth` JSON-RPC method.
 ///
-/// Stellar RPC returns a `status` of `healthy`, `degraded`, or `unhealthy`
-/// plus ledger-window information; the health check only needs `status`.
-/// Extra fields in the response are ignored by serde.
+/// Stellar RPC returns node status and optional node identity metadata.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct HealthResponse {
     /// Node health status: `healthy`, `degraded`, or `unhealthy`.
     status: String,
+    /// Stellar network passphrase served by the node.
+    #[serde(default)]
+    network_passphrase: Option<String>,
+    /// Stellar Core version served by the node.
+    #[serde(default)]
+    core_version: Option<String>,
+}
+
+/// Node identity metadata returned by `getHealth`.
+#[derive(Debug, Clone, Default)]
+pub struct HealthMetadata {
+    /// Stellar network passphrase, when the endpoint reports it.
+    pub network_passphrase: Option<String>,
+    /// Stellar Core version, when the endpoint reports it.
+    pub core_version: Option<String>,
 }
 
 /// A minimal JSON-RPC 2.0 client for Soroban RPC endpoints.
@@ -182,10 +413,19 @@ pub struct RpcClient {
     /// Maximum number of retries on transient (HTTP) failures, with
     /// exponential backoff.
     max_retries: usize,
+    /// TCP connection establishment timeout. Distinct from the total request
+    /// timeout: it bounds only the initial connect (TCP/TLS handshake), so a
+    /// dead or unreachable host fails fast instead of hanging for the full
+    /// request timeout.
+    #[cfg_attr(not(test), allow(dead_code))]
+    connect_timeout: Duration,
     /// Custom HTTP headers attached to every outbound request.
     pub headers: HeaderMap,
     /// Whether to print verbose RPC request/response diagnostics to stderr.
     pub verbose: bool,
+    /// Optional overall deadline spanning retries, backoff, and failover for a
+    /// single RPC operation.
+    total_timeout: Option<Duration>,
 }
 
 impl RpcClient {
@@ -232,6 +472,35 @@ impl RpcClient {
         Self::with_fallback(url, None, rps, timeout, max_retries, verbose)
     }
 
+    /// Create a new RPC client pointing at the given URL, optionally capping
+    /// outbound requests to `rps` requests per second, bounding each HTTP
+    /// request with `timeout`, bounding the TCP connection establishment with
+    /// `connect_timeout`, and retrying transient failures up to `max_retries`
+    /// times with exponential backoff.
+    ///
+    /// Rate limiting, retry behavior, and `timeout` behave exactly as in
+    /// [`Self::with_options`]. `connect_timeout` bounds only the initial
+    /// connect — a zero duration disables it (the total request timeout then
+    /// applies to the connect phase too).
+    pub fn with_connect_timeout(
+        url: &str,
+        rps: Option<u64>,
+        timeout: Duration,
+        connect_timeout: Duration,
+        max_retries: usize,
+    ) -> Self {
+        Self::from_parts(
+            url,
+            None,
+            rps,
+            timeout,
+            connect_timeout,
+            max_retries,
+            HeaderMap::new(),
+            false,
+        )
+    }
+
     /// Create a new RPC client pointing at the given URL, with an optional
     /// secondary URL used for failover, optionally capping outbound requests
     /// to `rps` requests per second, bounding each HTTP request with
@@ -256,19 +525,35 @@ impl RpcClient {
         max_retries: usize,
         verbose: bool,
     ) -> Self {
-        Self::with_fallback_headers(url, fallback_url, rps, timeout, max_retries, &[], verbose)
+        Self::from_parts(
+            url,
+            fallback_url,
+            rps,
+            timeout,
+            DEFAULT_CONNECT_TIMEOUT,
+            max_retries,
+            HeaderMap::new(),
+            verbose,
+        )
     }
 
     /// Create a new RPC client that attaches custom HTTP headers (each a
-    /// `"Key: Value"` string) to every request, without rate limiting, with
-    /// the default request timeout and the default retry policy. Entries
-    /// that cannot be parsed (or that carry an empty value) are skipped.
-    pub fn with_headers(url: &str, headers: &[String], verbose: bool) -> Self {
-        Self::with_fallback_headers(
+    /// `KEY=VALUE` or `KEY: VALUE` string) to every request, without rate
+    /// limiting, with the default request timeout, the default connect
+    /// timeout, and the default retry policy.
+    ///
+    /// # Errors
+    /// Returns [`AppError::InvalidHeader`] when any entry is malformed
+    /// (missing `=`/`:`, empty name, or a name/value `reqwest` rejects).
+    /// Headers are validated up front rather than silently dropped, so a
+    /// typo can never quietly leave a request unauthenticated.
+    pub fn with_headers(url: &str, headers: &[String], verbose: bool) -> AppResult<Self> {
+        Self::with_fallback_headers_connect_timeout(
             url,
             None,
             None,
             DEFAULT_TIMEOUT,
+            DEFAULT_CONNECT_TIMEOUT,
             DEFAULT_MAX_RETRIES,
             headers,
             verbose,
@@ -279,9 +564,14 @@ impl RpcClient {
     /// limit, request timeout, retry policy, and custom HTTP headers attached
     /// to every request.
     ///
-    /// Behaves exactly like [`Self::with_fallback`] and additionally attaches
-    /// the parsed `"Key: Value"` headers (skipping any entry that cannot be
-    /// parsed or that has an empty value) to every outbound request.
+    /// Behaves exactly like [`Self::with_fallback_headers_connect_timeout`] and
+    /// additionally attaches the parsed `KEY=VALUE` / `KEY: VALUE` headers to
+    /// every outbound request. Uses the default connect timeout.
+    ///
+    /// # Errors
+    /// Returns [`AppError::InvalidHeader`] when any supplied header is
+    /// malformed. Validation happens before any network traffic so a bad
+    /// `--header` argument fails immediately.
     pub fn with_fallback_headers(
         url: &str,
         fallback_url: Option<&str>,
@@ -290,16 +580,77 @@ impl RpcClient {
         max_retries: usize,
         headers: &[String],
         verbose: bool,
-    ) -> Self {
+    ) -> AppResult<Self> {
+        Self::with_fallback_headers_connect_timeout(
+            url,
+            fallback_url,
+            rps,
+            timeout,
+            DEFAULT_CONNECT_TIMEOUT,
+            max_retries,
+            headers,
+            verbose,
+        )
+    }
+
+    /// Create a new RPC client with an optional fallback URL, optional rate
+    /// limit, request timeout, TCP connect timeout, retry policy, and custom
+    /// HTTP headers attached to every request.
+    ///
+    /// Behaves exactly like [`Self::with_fallback_headers`], additionally
+    /// bounding the TCP connection establishment with `connect_timeout`.
+    /// A zero `connect_timeout` disables the connect timeout (the total
+    /// request timeout then applies to the connect phase too).
+    /// # Errors
+    /// Returns [`AppError::InvalidHeader`] when any supplied header is
+    /// malformed.
+    pub fn with_fallback_headers_connect_timeout(
+        url: &str,
+        fallback_url: Option<&str>,
+        rps: Option<u64>,
+        timeout: Duration,
+        connect_timeout: Duration,
+        max_retries: usize,
+        headers: &[String],
+        verbose: bool,
+    ) -> AppResult<Self> {
         debug!(
             url,
             ?fallback_url,
             rps,
             ?timeout,
+            ?connect_timeout,
             max_retries,
+            headers = %redacted_headers(headers),
             "creating RPC client"
         );
-        let headers = parseheaders(headers);
+        let headers = parse_headers(headers)?;
+        Ok(Self::from_parts(
+            url,
+            fallback_url,
+            rps,
+            timeout,
+            connect_timeout,
+            max_retries,
+            headers,
+            verbose,
+        ))
+    }
+
+    /// Shared, infallible construction path for every public constructor.
+    ///
+    /// `headers` has already been parsed and validated by the caller, so this
+    /// only wires the client together.
+    fn from_parts(
+        url: &str,
+        fallback_url: Option<&str>,
+        rps: Option<u64>,
+        timeout: Duration,
+        connect_timeout: Duration,
+        max_retries: usize,
+        headers: HeaderMap,
+        verbose: bool,
+    ) -> Self {
         Self {
             url: url.to_string(),
             fallback_url: fallback_url.map(String::from),
@@ -308,6 +659,7 @@ impl RpcClient {
             // construction infallible.
             client: reqwest::Client::builder()
                 .timeout(timeout)
+                .connect_timeout(connect_timeout)
                 .tcp_keepalive(Duration::from_secs(30))
                 .pool_idle_timeout(Duration::from_secs(90))
                 .default_headers(headers.clone())
@@ -316,9 +668,20 @@ impl RpcClient {
             dedup: Arc::new(Mutex::new(DedupState::default())),
             limiter: rps.and_then(build_rate_limiter),
             max_retries,
+            connect_timeout,
             headers,
             verbose,
+            total_timeout: default_total_timeout(),
         }
+    }
+
+    /// Sets an overall per-operation deadline spanning all retry attempts,
+    /// backoff delays, and fallback endpoint calls. A zero duration disables
+    /// the overall deadline.
+    #[must_use]
+    pub fn with_total_timeout(mut self, total_timeout: Option<Duration>) -> Self {
+        self.total_timeout = total_timeout.filter(|d| !d.is_zero());
+        self
     }
 
     /// Returns the custom HTTP headers configured for this client.
@@ -328,6 +691,14 @@ impl RpcClient {
     /// down header parsing/merging behavior.
     pub fn custom_headers(&self) -> &HeaderMap {
         &self.headers
+    }
+
+    /// The custom HTTP headers attached to every outbound request, with
+    /// sensitive values replaced by `<redacted>`.
+    ///
+    /// Safe to print at any log level: credentials never reach the log.
+    pub fn redacted_headers(&self) -> HeaderMap {
+        redact_sensitive(&self.headers)
     }
 
     /// Validate that the RPC endpoint is reachable and healthy before any
@@ -341,7 +712,7 @@ impl RpcClient {
     ///
     /// # Network calls
     /// Makes at most one `getHealth` RPC call to the configured endpoint.
-    pub async fn health_check(&self) -> AppResult<()> {
+    pub async fn health_check(&self) -> AppResult<HealthMetadata> {
         let health: HealthResponse = self
             .call("getHealth", serde_json::json!({}))
             .await
@@ -357,7 +728,10 @@ impl RpcClient {
 
         if health.status == "healthy" {
             debug!(url = self.url, "RPC endpoint health check passed");
-            Ok(())
+            Ok(HealthMetadata {
+                network_passphrase: health.network_passphrase,
+                core_version: health.core_version,
+            })
         } else {
             Err(AppError::Rpc {
                 status: -1,
@@ -377,7 +751,7 @@ impl RpcClient {
     /// * a request identical to one that already **completed** returns the
     ///   cached result without sending anything;
     /// * a request identical to one currently **in flight** attaches to that
-    ///   request's [`SharedFuture`] and awaits it, so concurrent duplicates
+    ///   request's `SharedFuture` and awaits it, so concurrent duplicates
     ///   share a single underlying future and a single HTTP POST.
     ///
     /// A failed leader publishes no outcome, so its followers loop back and
@@ -447,6 +821,24 @@ impl RpcClient {
         }
     }
 
+    /// Send a JSON-RPC request, bypassing request deduplication.
+    ///
+    /// Every call reaches the network. This is what benchmarking paths (e.g.
+    /// `estimate --repeat`) use: otherwise an identical request would be
+    /// served from the dedup cache and only the first run would be measured.
+    ///
+    /// # Network calls
+    /// One HTTP POST (plus any transient-failure retries).
+    pub async fn call_uncached<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> AppResult<T> {
+        self.perform_call(method, params)
+            .await
+            .and_then(deserialize_result::<T>)
+    }
+
     /// Returns the cached result for `key`, if a prior identical request
     /// completed successfully.
     async fn cached_result(&self, key: &RequestKey) -> Option<Value> {
@@ -475,10 +867,28 @@ impl RpcClient {
             "params": params,
         });
 
-        trace!(method, "sending RPC request");
-        match self.post_and_parse(method, &body, &self.url).await {
+        let deadline = self.total_timeout.map(|d| tokio::time::Instant::now() + d);
+
+        trace!(
+            method,
+            header_count = self.headers.len(),
+            "sending RPC request"
+        );
+        match self
+            .post_and_parse(method, &body, &self.url, self.connect_timeout, deadline)
+            .await
+        {
             Ok(result) => Ok(result),
             Err(e) if Self::is_failover_trigger(&e) => {
+                if let Some(d) = deadline
+                    && tokio::time::Instant::now() >= d
+                {
+                    let timeout_ms = self
+                        .total_timeout
+                        .map(|t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX))
+                        .unwrap_or(0);
+                    return Err(AppError::TotalTimeout { timeout_ms });
+                }
                 if let Some(ref fallback) = self.fallback_url {
                     // The operator-facing notice goes to stderr so it never
                     // contaminates machine-readable stdout (json/csv/markdown).
@@ -490,7 +900,8 @@ impl RpcClient {
                         error = %e,
                         "primary RPC endpoint failed — failing over to fallback"
                     );
-                    self.post_and_parse(method, &body, fallback).await
+                    self.post_and_parse(method, &body, fallback, self.connect_timeout, deadline)
+                        .await
                 } else {
                     Err(e)
                 }
@@ -514,18 +925,33 @@ impl RpcClient {
                 // are the cases where a fallback endpoint might succeed.
                 e.is_connect() || e.is_timeout() || e.is_request()
             }
-            AppError::RpcUnavailable { .. } => true,
+            AppError::ConnectTimeout { .. } | AppError::RpcUnavailable { .. } => true,
+            // Transient gateway statuses surfaced as HttpStatus (502/503/504)
+            // are also failover triggers; other HttpStatus values (429/500 or
+            // deterministic 4xx) are not — 429/500 are retried but not failed
+            // over, matching the gateway-only failover contract.
+            AppError::HttpStatus { status, .. } => matches!(status, 502..=504),
             _ => false,
         }
     }
 
     /// POST `body` to `url` (with retries), parse the JSON-RPC response, and
     /// extract the raw `result` value.
-    async fn post_and_parse(&self, method: &str, body: &Value, url: &str) -> AppResult<Value> {
+    async fn post_and_parse(
+        &self,
+        method: &str,
+        body: &Value,
+        url: &str,
+        connect_timeout: Duration,
+        deadline: Option<tokio::time::Instant>,
+    ) -> AppResult<Value> {
         let client = self.client.clone();
         let url = url.to_string();
         let request_body = body.clone();
         let limiter = self.limiter.clone();
+        // Custom headers are attached per request (rather than as client
+        // defaults) so the stored configuration stays authoritative.
+        let headers = self.headers.clone();
 
         let start = std::time::Instant::now();
         let request_body_str = serde_json::to_string(&request_body).unwrap_or_default();
@@ -535,11 +961,12 @@ impl RpcClient {
             eprintln!("[RPC] -> {}", request_body_str);
         }
 
-        let response = with_retry(self.max_retries, || {
+        let response = with_retry_deadline(self.max_retries, deadline, self.total_timeout, || {
             let client = client.clone();
             let url = url.clone();
             let request_body = request_body.clone();
             let limiter = limiter.clone();
+            let headers = headers.clone();
 
             async move {
                 // Every outbound attempt (including retries) consumes a
@@ -548,12 +975,26 @@ impl RpcClient {
                 if let Some(limiter) = &limiter {
                     limiter.until_ready().await;
                 }
-                client
+                let response = client
                     .post(&url)
+                    .headers(headers)
                     .json(&request_body)
                     .send()
                     .await
-                    .map_err(AppError::from)
+                    .map_err(|e| connect_timeout_error(e, connect_timeout))?;
+
+                // Transient statuses (429/5xx) must be turned into errors so
+                // `with_retry` can back off and retry them. Non-transient
+                // statuses fall through and are parsed as JSON-RPC below.
+                let status = response.status();
+                if is_transient_status(status) {
+                    return Err(AppError::HttpStatus {
+                        status: status.as_u16(),
+                        retry_after: parse_retry_after(response.headers()),
+                        message: format!("RPC endpoint returned transient HTTP status {status}"),
+                    });
+                }
+                Ok::<reqwest::Response, AppError>(response)
             }
         })
         .await?;
@@ -575,7 +1016,18 @@ impl RpcClient {
             });
         }
 
-        let response_body: Value = response.json().await?;
+        let response_body: Value = if let Some(d) = deadline {
+            let timeout_ms = self
+                .total_timeout
+                .map(|t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            match tokio::time::timeout_at(d, response.json()).await {
+                Ok(res) => res?,
+                Err(_) => return Err(AppError::TotalTimeout { timeout_ms }),
+            }
+        } else {
+            response.json().await?
+        };
 
         if let Some(error) = response_body.get("error") {
             let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
@@ -614,6 +1066,26 @@ impl RpcClient {
     }
 }
 
+/// Rewrap a reqwest error whose connect phase timed out into an
+/// [`AppError::ConnectTimeout`], so an unreachable host produces a distinct,
+/// actionable message instead of a generic request timeout.
+///
+/// In reqwest, an expired `connect_timeout` surfaces as a timeout-flagged
+/// error whose source chain also carries a connect error (a `TimedOut` marker
+/// inside a hyper connect error), so `is_timeout() && is_connect()` separates
+/// it from a whole-request timeout (`is_timeout()` without `is_connect()`).
+/// Every other error maps to [`AppError::Http`] as before.
+fn connect_timeout_error(error: reqwest::Error, connect_timeout: Duration) -> AppError {
+    if !connect_timeout.is_zero() && error.is_timeout() && error.is_connect() {
+        AppError::ConnectTimeout {
+            seconds: connect_timeout.as_secs(),
+            source: error,
+        }
+    } else {
+        AppError::from(error)
+    }
+}
+
 /// Builds an optional fixed-rate limiter for `rps` requests per second.
 ///
 /// Returns `None` when `rps` is zero (no limit) or when a valid period
@@ -630,45 +1102,165 @@ fn build_rate_limiter(rps: u64) -> Option<Arc<governor::DefaultDirectRateLimiter
     Some(Arc::new(RateLimiter::direct(quota)))
 }
 
+/// Returns `true` when `status` is a transient HTTP failure worth retrying.
+///
+/// Rate limiting (429) and server-side errors (500/502/503/504) are
+/// transient; everything else — including deterministic 4xx client errors —
+/// is returned to the caller as-is.
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
+}
+
+/// Parses a `Retry-After` response header into a delay, if present.
+///
+/// Only the delta-seconds form (e.g. `Retry-After: 5`) is supported; the
+/// HTTP-date form and unparseable values yield `None`, falling back to the
+/// retry loop's computed backoff.
+fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let seconds: u64 = value.trim().parse().ok()?;
+    Some(Duration::from_secs(seconds))
+}
+
 /// Deserializes a raw JSON-RPC `result` value into the caller's type.
 fn deserialize_result<T: serde::de::DeserializeOwned>(value: Value) -> AppResult<T> {
     serde_json::from_value(value)
         .map_err(|e| AppError::General(format!("failed to deserialize RPC response: {e}")))
 }
 
-/// Parse a `"Key: Value"` string into an HTTP header name and value.
+/// Header names whose values are credentials and must never be logged.
 ///
-/// Returns an error if the format is invalid (missing colon, empty key,
-/// or non-ASCII characters in the header name).
-fn parse_header(raw: &str) -> Result<(HeaderName, HeaderValue), String> {
-    let colon_pos = raw.find(':').ok_or("missing ':' separator")?;
-    let name_str = raw[..colon_pos].trim();
-    let value_str = raw[colon_pos + 1..].trim();
+/// Matching is case-insensitive (HTTP header names are), so `X-Api-Key` and
+/// `x-api-key` are both redacted.
+const SENSITIVE_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "api-key",
+    "cookie",
+];
+
+/// Placeholder substituted for a sensitive header value in logs.
+const REDACTED: &str = "<redacted>";
+
+/// True when `name` identifies a header whose value must never be logged.
+#[must_use]
+pub fn is_sensitive_header(name: &HeaderName) -> bool {
+    let lower = name.as_str().to_ascii_lowercase();
+    SENSITIVE_HEADERS.iter().any(|s| *s == lower)
+}
+
+/// Returns a copy of `headers` with every sensitive value replaced by
+/// `<redacted>`.
+///
+/// Used for diagnostics (`--verbose` / `debug!` logs) so an API key or bearer
+/// token is never written to a terminal, log file, or CI transcript.
+#[must_use]
+pub fn redact_sensitive(headers: &HeaderMap) -> HeaderMap {
+    let mut redacted = HeaderMap::with_capacity(headers.len());
+    for (name, value) in headers {
+        if is_sensitive_header(name) {
+            let placeholder = HeaderValue::from_static(REDACTED);
+            redacted.insert(name.clone(), placeholder);
+        } else {
+            redacted.insert(name.clone(), value.clone());
+        }
+    }
+    redacted
+}
+
+/// Renders raw `"Key: Value"` / `"Key=Value"` CLI arguments for logging, with
+/// sensitive values redacted before they ever reach a log sink.
+///
+/// Operates on the raw strings (rather than a parsed `HeaderMap`) so it can be
+/// called before validation, while a malformed argument is still being
+/// reported.
+fn redacted_headers(raw_headers: &[String]) -> String {
+    if raw_headers.is_empty() {
+        return "(none)".to_string();
+    }
+    let rendered: Vec<String> = raw_headers
+        .iter()
+        .map(|raw| match split_header(raw) {
+            Some((name, _)) if is_sensitive_header_text(name) => format!("{name}={REDACTED}"),
+            _ => raw.clone(),
+        })
+        .collect();
+    rendered.join(", ")
+}
+
+/// True when the (case-insensitive) `name` is a credential-bearing header.
+fn is_sensitive_header_text(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    SENSITIVE_HEADERS.iter().any(|s| *s == lower)
+}
+
+/// Splits a raw header argument into `(name, value)`.
+///
+/// Both spellings are accepted: `KEY=VALUE` (documented) and `KEY: VALUE`
+/// (the conventional HTTP form). The **earliest** separator wins, so
+/// `Authorization=Bearer a:b` and `Authorization: Bearer a=b` both split after
+/// the header name instead of truncating the value at a later separator.
+fn split_header(raw: &str) -> Option<(&str, &str)> {
+    let equals = raw.find('=');
+    let colon = raw.find(':');
+    let position = match (equals, colon) {
+        (Some(equals), Some(colon)) => equals.min(colon),
+        (Some(equals), None) => equals,
+        (None, Some(colon)) => colon,
+        (None, None) => return None,
+    };
+    let (name, value) = raw.split_at(position);
+    Some((name.trim(), value[1..].trim()))
+}
+
+/// Parse a single raw header argument into an HTTP header name and value.
+///
+/// # Errors
+/// Returns [`AppError::InvalidHeader`] when the argument has no `=`/`:`
+/// separator, when the header name is empty, or when `reqwest` rejects the
+/// name or value (illegal characters, non-visible ASCII, …).
+pub fn parse_header(raw: &str) -> AppResult<(HeaderName, HeaderValue)> {
+    let Some((name_str, value_str)) = split_header(raw) else {
+        return Err(AppError::InvalidHeader(format!(
+            "'{raw}' is not a KEY=VALUE pair (or KEY: VALUE)"
+        )));
+    };
 
     if name_str.is_empty() {
-        return Err("empty header name".to_string());
+        return Err(AppError::InvalidHeader(format!(
+            "'{raw}' has an empty header name"
+        )));
     }
 
     let name = HeaderName::from_bytes(name_str.as_bytes())
-        .map_err(|e| format!("invalid header name: {e}"))?;
-    let value =
-        HeaderValue::from_str(value_str).map_err(|e| format!("invalid header value: {e}"))?;
+        .map_err(|e| AppError::InvalidHeader(format!("invalid header name '{name_str}': {e}")))?;
+
+    if value_str.is_empty() {
+        return Err(AppError::InvalidHeader(format!(
+            "header '{name_str}' has an empty value"
+        )));
+    }
+
+    let value = HeaderValue::from_str(value_str).map_err(|e| {
+        AppError::InvalidHeader(format!("invalid header value for '{name_str}': {e}"))
+    })?;
 
     Ok((name, value))
 }
 
-/// Parse a list of `"Key: Value"` strings into a [`HeaderMap`], skipping any
-/// entry that cannot be parsed or that has an empty value.
-fn parseheaders(rawheaders: &[String]) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    for raw in rawheaders {
-        if let Ok((name, value)) = parse_header(raw) {
-            if !value.as_bytes().is_empty() {
-                headers.insert(name, value);
-            }
-        }
+/// Parse a list of raw header arguments into a [`HeaderMap`].
+///
+/// # Errors
+/// Returns the first [`AppError::InvalidHeader`] encountered, so a malformed
+/// `--header` argument fails the command before any network traffic.
+pub fn parse_headers(raw_headers: &[String]) -> AppResult<HeaderMap> {
+    let mut headers = HeaderMap::with_capacity(raw_headers.len());
+    for raw in raw_headers {
+        let (name, value) = parse_header(raw)?;
+        headers.insert(name, value);
     }
-    headers
+    Ok(headers)
 }
 
 #[cfg(test)]
@@ -684,7 +1276,10 @@ mod tests {
     use crate::error::{AppError, AppResult};
     use crate::rpc::retry::DEFAULT_MAX_RETRIES;
 
-    use super::{RpcClient, resolve_ws_endpoint};
+    use super::{
+        RpcClient, resolve_endpoint, resolve_ws_endpoint, set_endpoint_overrides, to_http_url,
+        to_websocket_url, validate_rpc_url,
+    };
 
     /// Spawns a tiny HTTP server that answers JSON-RPC
     /// `simulateTransaction`-style calls with `{"result":{"pong":true}}`,
@@ -734,7 +1329,7 @@ mod tests {
                 };
                 let counter = Arc::clone(&server_counter);
                 tokio::spawn(async move {
-                    let _ = handle_conn(stream, counter, fail_times, result_body, delay).await;
+                    let _ = handle_conn(stream, counter, fail_times, 200, result_body, delay).await;
                 });
             }
         });
@@ -742,10 +1337,61 @@ mod tests {
         (format!("http://{addr}"), counter)
     }
 
+    /// Spawns a stub server whose first `fail_times` responses carry HTTP
+    /// `fail_status` (e.g. 503) and whose later responses are 200 JSON-RPC
+    /// successes. Exercises the transient-status retry path.
+    async fn spawn_stub(
+        fail_times: u32,
+        fail_status: u16,
+        result_body: &'static str,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind stub server");
+        let addr = listener.local_addr().expect("no local address");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let server_counter = Arc::clone(&counter);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let counter = Arc::clone(&server_counter);
+                tokio::spawn(async move {
+                    let _ = handle_conn(
+                        stream,
+                        counter,
+                        fail_times,
+                        fail_status,
+                        result_body,
+                        Duration::ZERO,
+                    )
+                    .await;
+                });
+            }
+        });
+
+        (format!("http://{addr}"), counter)
+    }
+
+    /// HTTP reason phrase for the stubbed failure status.
+    fn status_reason(status: u16) -> &'static str {
+        match status {
+            429 => "Too Many Requests",
+            500 => "Internal Server Error",
+            502 => "Bad Gateway",
+            503 => "Service Unavailable",
+            504 => "Gateway Timeout",
+            _ => "OK",
+        }
+    }
+
     async fn handle_conn(
         mut stream: TcpStream,
         counter: Arc<AtomicUsize>,
         fail_times: u32,
+        fail_status: u16,
         result_body: &'static str,
         delay: Duration,
     ) -> std::io::Result<()> {
@@ -788,14 +1434,29 @@ mod tests {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let body = if (call_no as u32) < fail_times {
-            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure"}}"#
-                .to_string()
+        let (status, body) = if (call_no as u32) < fail_times {
+            if fail_status == 200 {
+                (
+                    200u16,
+                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure"}}"#
+                        .to_string(),
+                )
+            } else {
+                (
+                    fail_status,
+                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure"}}"#
+                        .to_string(),
+                )
+            }
         } else {
-            format!(r#"{{"jsonrpc":"2.0","id":1,"result":{result_body}}}"#)
+            (
+                200u16,
+                format!(r#"{{"jsonrpc":"2.0","id":1,"result":{result_body}}}"#),
+            )
         };
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            status_reason(status),
             body.len()
         );
         stream.write_all(response.as_bytes()).await?;
@@ -858,6 +1519,30 @@ mod tests {
             counter.load(Ordering::SeqCst),
             1,
             "identical requests must hit the network once"
+        );
+    }
+
+    /// `call_uncached` must bypass dedup: identical requests both reach the
+    /// network, which is what makes `estimate --repeat` benchmark N real runs.
+    #[tokio::test]
+    async fn test_call_uncached_bypasses_dedup() {
+        let (url, counter) = spawn_json_rpc_stub(0).await;
+        let client = RpcClient::new(&url);
+        let params = serde_json::json!({"k": "v"});
+
+        let _: Value = client
+            .call_uncached("test.method", params.clone())
+            .await
+            .expect("first uncached call");
+        let _: Value = client
+            .call_uncached("test.method", params)
+            .await
+            .expect("second uncached call");
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "identical uncached requests must both hit the network"
         );
     }
 
@@ -1126,6 +1811,101 @@ mod tests {
             "a hanging server must eventually produce a timeout error"
         );
     }
+    /// The `connect_timeout` supplied to `with_connect_timeout` must be
+    /// stored verbatim on the client (asserts the configuration is actually
+    /// wired through, per the issue's acceptance criteria).
+    #[test]
+    fn test_connect_timeout_config_is_stored() {
+        let client = RpcClient::with_connect_timeout(
+            "http://localhost",
+            None,
+            Duration::from_secs(30),
+            Duration::from_secs(7),
+            3,
+        );
+        assert_eq!(client.connect_timeout, Duration::from_secs(7));
+    }
+
+    /// Constructors without an explicit connect timeout must fall back to
+    /// [`super::DEFAULT_CONNECT_TIMEOUT`], which matches the CLI's
+    /// `--connect-timeout` default of 5 seconds.
+    #[test]
+    fn test_default_connect_timeout_is_five_seconds() {
+        let client =
+            RpcClient::with_options("http://localhost", None, Duration::from_secs(30), 3, false);
+        assert_eq!(client.connect_timeout, Duration::from_secs(5));
+
+        let client = RpcClient::with_fallback_headers(
+            "http://localhost",
+            None,
+            None,
+            Duration::from_secs(30),
+            3,
+            &[],
+            false,
+        )
+        .expect("valid headers");
+        assert_eq!(client.connect_timeout, Duration::from_secs(5));
+    }
+
+    /// A zero connect timeout is the documented "disabled" sentinel: it must
+    /// be preserved as-is so callers can observe the disable convention.
+    #[test]
+    fn test_zero_connect_timeout_is_preserved_as_disabled() {
+        let client = RpcClient::with_connect_timeout(
+            "http://localhost",
+            None,
+            Duration::from_secs(30),
+            Duration::ZERO,
+            3,
+        );
+        assert_eq!(client.connect_timeout, Duration::ZERO);
+    }
+
+    /// A connect timeout failure must surface the distinct, actionable
+    /// message (acceptance criterion), separate from the generic request
+    /// timeout error.
+    #[tokio::test]
+    async fn test_connect_timeout_error_message_is_distinct() {
+        let source = reqwest::get("http://127.0.0.1:1")
+            .await
+            .expect_err("port 1 must refuse");
+        let error = AppError::ConnectTimeout { seconds: 5, source };
+        let message = error.to_string();
+        assert_eq!(
+            message,
+            "failed to establish connection to RPC host within 5 seconds"
+        );
+    }
+
+    /// Only a genuine "connect phase timed out" error (timeout-flagged AND
+    /// connect-flagged) may be rewrapped as [`AppError::ConnectTimeout`]. A
+    /// connection-refused error is connect-flagged but not timeout-flagged,
+    /// so it must stay a plain [`AppError::Http`].
+    #[tokio::test]
+    async fn test_connect_timeout_error_does_not_absorb_refused_connections() {
+        let refused = reqwest::get("http://127.0.0.1:1")
+            .await
+            .expect_err("port 1 must refuse");
+
+        let mapped = super::connect_timeout_error(refused, Duration::from_secs(5));
+        assert!(
+            matches!(mapped, AppError::Http(_)),
+            "connection refused must not be rewrapped as a connect timeout: {mapped}"
+        );
+    }
+
+    /// With the connect timeout disabled (zero), even a timeout-flagged,
+    /// connect-flagged error must stay a plain [`AppError::Http`].
+    #[tokio::test]
+    async fn test_disabled_connect_timeout_skips_rewrapping() {
+        let refused = reqwest::get("http://127.0.0.1:1")
+            .await
+            .expect_err("port 1 must refuse");
+
+        let mapped = super::connect_timeout_error(refused, Duration::ZERO);
+        assert!(matches!(mapped, AppError::Http(_)));
+    }
 
     /// Reserves a port and immediately closes it, so connecting to it yields
     /// a network-level connection-refused error (rather than a timeout).
@@ -1261,10 +2041,33 @@ mod tests {
             spawn_json_rpc_stub_with_result(0, r#"{"status":"healthy","latestLedger":42}"#).await;
         let client = RpcClient::new(&url);
 
-        client
+        let meta = client
             .health_check()
             .await
             .expect("healthy endpoint passes");
+        assert_eq!(meta.network_passphrase, None);
+        assert_eq!(meta.core_version, None);
+    }
+
+    /// A reachable endpoint reporting health metadata must populate `HealthMetadata`.
+    #[tokio::test]
+    async fn test_health_check_captures_node_metadata() {
+        let (url, _) = spawn_json_rpc_stub_with_result(
+            0,
+            r#"{"status":"healthy","networkPassphrase":"Test SDF Network ; September 2015","coreVersion":"v21.1.0"}"#,
+        )
+        .await;
+        let client = RpcClient::new(&url);
+
+        let meta = client
+            .health_check()
+            .await
+            .expect("healthy endpoint passes");
+        assert_eq!(
+            meta.network_passphrase.as_deref(),
+            Some("Test SDF Network ; September 2015")
+        );
+        assert_eq!(meta.core_version.as_deref(), Some("v21.1.0"));
     }
 
     /// A reachable endpoint reporting anything other than `healthy` (e.g.
@@ -1307,6 +2110,50 @@ mod tests {
         );
     }
 
+    /// A transient HTTP status (503) must be retried; once the stub starts
+    /// answering 200 the call succeeds.
+    #[tokio::test]
+    async fn test_transient_status_is_retried_then_succeeds() {
+        let (url, counter) = spawn_stub(1, 503, r#"{"pong":true}"#).await;
+        let client = RpcClient::with_options(&url, None, Duration::from_secs(5), 3, false);
+
+        let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
+
+        assert!(
+            result.is_ok(),
+            "503 should be retried then succeed: {result:?}"
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    /// Persistent transient statuses consume every retry, and the final error
+    /// preserves the HTTP status.
+    #[tokio::test]
+    async fn test_transient_status_exhausts_retries() {
+        let (url, counter) = spawn_stub(100, 503, r#"{"pong":true}"#).await;
+        let client = RpcClient::with_options(&url, None, Duration::from_secs(5), 2, false);
+
+        let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
+
+        match result {
+            Err(AppError::HttpStatus { status, .. }) => assert_eq!(status, 503),
+            other => panic!("expected HttpStatus(503), got {other:?}"),
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+
+    /// A deterministic 4xx client error must not be retried.
+    #[tokio::test]
+    async fn test_client_error_status_is_not_retried() {
+        let (url, counter) = spawn_stub(100, 400, r#"{"pong":true}"#).await;
+        let client = RpcClient::with_options(&url, None, Duration::from_secs(5), 3, false);
+
+        let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
+
+        assert!(result.is_err(), "400 must surface as an error");
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "400 must not be retried");
+    }
+
     #[test]
     fn test_resolve_ws_endpoint_derives_well_known_urls() {
         assert_eq!(
@@ -1332,11 +2179,164 @@ mod tests {
     }
 
     #[test]
+    fn test_config_endpoint_override_sits_between_custom_and_builtin() {
+        // Uses a network name no other test resolves, since the override map
+        // is process-wide.
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("overridenet".to_string(), "https://cfg.example".to_string());
+        set_endpoint_overrides(overrides).unwrap();
+
+        assert_eq!(
+            resolve_endpoint("overridenet", None).unwrap(),
+            "https://cfg.example"
+        );
+        assert_eq!(
+            resolve_endpoint("overridenet", Some("http://cli.example")).unwrap(),
+            "http://cli.example"
+        );
+        assert_eq!(
+            resolve_ws_endpoint("overridenet", None).unwrap(),
+            "wss://cfg.example/ws"
+        );
+        assert_eq!(
+            resolve_endpoint("testnet", None).unwrap(),
+            "https://soroban-testnet.stellar.org"
+        );
+
+        set_endpoint_overrides(std::collections::BTreeMap::new()).unwrap();
+        assert!(matches!(
+            resolve_endpoint("overridenet", None),
+            Err(AppError::UnknownNetwork(_))
+        ));
+    }
+
+    #[test]
     fn test_resolve_ws_endpoint_custom_url_passthrough() {
         assert_eq!(
             resolve_ws_endpoint("testnet", Some("ws://localhost:8000/ws")).unwrap(),
             "ws://localhost:8000/ws"
         );
+    }
+
+    #[test]
+    fn test_resolve_ws_endpoint_accepts_https_custom_url() {
+        assert_eq!(
+            resolve_ws_endpoint("testnet", Some("https://soroban-testnet.stellar.org")).unwrap(),
+            "wss://soroban-testnet.stellar.org/ws"
+        );
+        assert_eq!(
+            resolve_ws_endpoint("testnet", Some("https://soroban-testnet.stellar.org/")).unwrap(),
+            "wss://soroban-testnet.stellar.org/ws"
+        );
+    }
+
+    #[test]
+    fn test_validate_rpc_url_accepts_supported_schemes() {
+        for url in [
+            "https://soroban-testnet.stellar.org",
+            "https://soroban-testnet.stellar.org/soroban/rpc",
+            "http://localhost:8000",
+            "ws://127.0.0.1:8000/ws",
+            "wss://example.org/ws",
+        ] {
+            assert!(validate_rpc_url(url).is_ok(), "{url} should be accepted");
+        }
+    }
+
+    #[test]
+    fn test_validate_rpc_url_rejects_other_schemes() {
+        for url in [
+            "ftp://example.org/rpc",
+            "file:///etc/passwd",
+            "soroban-testnet.stellar.org",
+        ] {
+            let err = validate_rpc_url(url).expect_err("{url} should be rejected");
+            assert!(matches!(err, AppError::InvalidRpcUrl(_)), "got: {err:?}");
+            assert!(
+                err.to_string().contains(url),
+                "message should name the URL: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_rpc_url_rejects_missing_host_and_bad_ports() {
+        for url in [
+            "https://",
+            "https://host:99999",
+            "https://host:not-a-port",
+            "http://host:0",
+        ] {
+            let err = validate_rpc_url(url).expect_err("{url} should be rejected");
+            assert!(matches!(err, AppError::InvalidRpcUrl(_)), "got: {err:?}");
+        }
+    }
+
+    #[test]
+    fn test_resolve_endpoint_validates_custom_url_before_use() {
+        let err = resolve_endpoint("testnet", Some("ftp://example.org/rpc"))
+            .expect_err("non-HTTP schemes must be rejected up front");
+        assert!(matches!(err, AppError::InvalidRpcUrl(_)), "got: {err:?}");
+        assert!(
+            err.to_string().contains("ftp"),
+            "message should name the offending scheme: {err}"
+        );
+    }
+
+    #[test]
+    fn test_to_websocket_url_converts_schemes_and_defaults_path() {
+        assert_eq!(
+            to_websocket_url("https://soroban.stellar.org").unwrap(),
+            "wss://soroban.stellar.org/ws"
+        );
+        assert_eq!(
+            to_websocket_url("http://127.0.0.1:8000").unwrap(),
+            "ws://127.0.0.1:8000/ws"
+        );
+        assert_eq!(
+            to_websocket_url("wss://example.org/ws").unwrap(),
+            "wss://example.org/ws"
+        );
+    }
+
+    #[test]
+    fn test_to_websocket_url_keeps_explicit_path() {
+        assert_eq!(
+            to_websocket_url("https://example.org/custom/stream").unwrap(),
+            "wss://example.org/custom/stream"
+        );
+    }
+
+    #[test]
+    fn test_to_websocket_url_rejects_unknown_scheme() {
+        assert!(to_websocket_url("ftp://example.org").is_err());
+        assert!(to_websocket_url("soroban-testnet.stellar.org").is_err());
+    }
+
+    #[test]
+    fn test_to_http_url_is_the_inverse_for_local_endpoints() {
+        // A single `--rpc-url` value drives both the WebSocket subscription and
+        // the request/response JSON-RPC calls.
+        assert_eq!(
+            to_http_url("ws://127.0.0.1:8000/ws").unwrap(),
+            "http://127.0.0.1:8000"
+        );
+        assert_eq!(
+            to_http_url("wss://soroban-testnet.stellar.org/ws").unwrap(),
+            "https://soroban-testnet.stellar.org"
+        );
+        assert_eq!(
+            to_http_url("https://soroban-testnet.stellar.org").unwrap(),
+            "https://soroban-testnet.stellar.org"
+        );
+        assert!(to_http_url("ftp://example.org").is_err());
+    }
+
+    #[test]
+    fn test_ws_and_http_round_trip() {
+        let http = "http://127.0.0.1:8000";
+        let ws = to_websocket_url(http).unwrap();
+        assert_eq!(to_http_url(&ws).unwrap(), http);
     }
 }
 
@@ -1344,63 +2344,141 @@ mod tests {
 mod header_tests {
     use super::*;
 
+    fn parse_ok(raw: &str) -> (String, String) {
+        let (name, value) =
+            parse_header(raw).unwrap_or_else(|e| panic!("expected {raw:?} to parse: {e}"));
+        (
+            name.as_str().to_string(),
+            value.to_str().unwrap_or_default().to_string(),
+        )
+    }
+
+    fn parse_err(raw: &str) -> AppError {
+        parse_header(raw).expect_err(&format!("expected {raw:?} to be rejected"))
+    }
+
     #[test]
-    fn test_parse_header_valid() {
-        let (name, value) = parse_header("X-API-Key: secret123").unwrap();
-        assert_eq!(name.as_str(), "x-api-key");
-        assert_eq!(value.to_str().unwrap(), "secret123");
+    fn test_parse_header_equals_separator() {
+        assert_eq!(
+            parse_ok("X-API-Key=secret123"),
+            ("x-api-key".to_string(), "secret123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_header_colon_separator_still_accepted() {
+        assert_eq!(
+            parse_ok("X-API-Key: secret123"),
+            ("x-api-key".to_string(), "secret123".to_string())
+        );
     }
 
     #[test]
     fn test_parse_header_with_spaces() {
-        let (name, value) = parse_header(" Authorization : Bearer tok ").unwrap();
-        assert_eq!(name.as_str(), "authorization");
-        assert_eq!(value.to_str().unwrap(), "Bearer tok");
+        assert_eq!(
+            parse_ok(" Authorization = Bearer tok "),
+            ("authorization".to_string(), "Bearer tok".to_string())
+        );
+        assert_eq!(
+            parse_ok(" Authorization : Bearer tok "),
+            ("authorization".to_string(), "Bearer tok".to_string())
+        );
     }
 
-    #[test]
-    fn test_parse_header_missing_colon() {
-        assert!(parse_header("NoColon").is_err());
-    }
-
-    #[test]
-    fn test_parse_header_empty_name() {
-        assert!(parse_header(": value").is_err());
-    }
-
-    #[test]
-    fn test_parse_header_empty_value() {
-        let (name, value) = parse_header("X-Custom:").unwrap();
-        assert_eq!(name.as_str(), "x-custom");
-        assert_eq!(value.to_str().unwrap(), "");
-    }
-
+    /// A `Bearer` token may legitimately contain both `=` and `:`. The earliest
+    /// separator must win so the value is never truncated.
     #[test]
     fn test_parse_header_value_with_colons() {
-        let (name, value) = parse_header("X-Auth: token:with:colons").unwrap();
-        assert_eq!(name.as_str(), "x-auth");
-        assert_eq!(value.to_str().unwrap(), "token:with:colons");
+        assert_eq!(
+            parse_ok("X-Auth=token:with:colons"),
+            ("x-auth".to_string(), "token:with:colons".to_string())
+        );
+        assert_eq!(
+            parse_ok("X-Auth: token:with:colons"),
+            ("x-auth".to_string(), "token:with:colons".to_string())
+        );
+    }
+
+    /// `=` is documented, but `:` is the conventional HTTP spelling and both
+    /// appear in the wild. The earliest separator wins in either direction.
+    #[test]
+    fn test_parse_header_accepts_both_separators() {
+        assert_eq!(
+            parse_ok("X-Auth: Bearer a=b"),
+            ("x-auth".to_string(), "Bearer a=b".to_string())
+        );
+        assert_eq!(
+            parse_ok("X-Auth=Bearer a:b"),
+            ("x-auth".to_string(), "Bearer a:b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_header_missing_separator_is_rejected() {
+        let err = parse_err("NoSeparator");
+        assert!(matches!(err, AppError::InvalidHeader(_)));
+        assert!(
+            err.to_string().contains("KEY=VALUE"),
+            "the error should name the expected format; got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_header_empty_name_is_rejected() {
+        assert!(matches!(parse_err("= value"), AppError::InvalidHeader(_)));
+        assert!(matches!(parse_err(": value"), AppError::InvalidHeader(_)));
+    }
+
+    #[test]
+    fn test_parse_header_empty_value_is_rejected() {
+        let err = parse_err("X-Custom=");
+        assert!(matches!(err, AppError::InvalidHeader(_)));
+        assert!(err.to_string().contains("empty value"), "got: {err}");
+    }
+
+    /// A header name with a space is not a legal HTTP token, so `reqwest`
+    /// rejects it — the error must surface rather than be dropped.
+    #[test]
+    fn test_parse_header_illegal_name_is_rejected() {
+        let err = parse_err("X Custom=value");
+        assert!(matches!(err, AppError::InvalidHeader(_)));
+        assert!(
+            err.to_string().contains("invalid header name"),
+            "got: {err}"
+        );
+    }
+
+    /// A value containing a raw newline is not a legal header value.
+    #[test]
+    fn test_parse_header_illegal_value_is_rejected() {
+        let err = parse_err("X-Custom=bad\nvalue");
+        assert!(matches!(err, AppError::InvalidHeader(_)));
+        assert!(
+            err.to_string().contains("invalid header value"),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn test_parse_headers_empty() {
-        assert!(parseheaders(&[]).is_empty());
+        assert!(parse_headers(&[]).expect("no headers").is_empty());
     }
 
     #[test]
     fn test_parse_headers_stores_parsed() {
-        let headers = parseheaders(&[
+        let headers = parse_headers(&[
             "X-API-Key: secret".to_string(),
             "Authorization: Bearer tok".to_string(),
-        ]);
+        ])
+        .expect("valid headers");
         assert_eq!(headers.len(), 2);
     }
 
     #[test]
     fn test_with_headers_empty() {
-        let client = RpcClient::with_headers("http://localhost", &[], false);
+        let client =
+            RpcClient::with_headers("http://localhost", &[], false).expect("valid headers");
         assert!(client.custom_headers().is_empty());
-        let client = RpcClient::with_headers("http://localhost", &[], false);
         assert!(client.headers.is_empty());
     }
 
@@ -1409,11 +2487,12 @@ mod header_tests {
         let client = RpcClient::with_headers(
             "http://localhost",
             &[
-                "X-API-Key: secret".to_string(),
-                "Authorization: Bearer tok".to_string(),
+                "X-API-Key=secret".to_string(),
+                "Authorization=Bearer tok".to_string(),
             ],
             false,
-        );
+        )
+        .expect("valid headers");
         assert_eq!(client.custom_headers().len(), 2);
         assert_eq!(
             client
@@ -1435,37 +2514,142 @@ mod header_tests {
         );
     }
 
+    /// Malformed arguments must fail the command: silently dropping them would
+    /// send unauthenticated requests to a private endpoint.
     #[test]
-    fn test_parse_headers_skips_malformed() {
-        let headers = parseheaders(&[
+    fn test_parse_headers_rejects_malformed() {
+        let err = parse_headers(&[
             "Good: ok".to_string(),
             "NoColonHere".to_string(),
             "Also-Bad:".to_string(),
-        ]);
-        // Only the valid header should be kept.
-        assert_eq!(headers.len(), 1);
-        assert!(headers.contains_key("good"));
+        ])
+        .expect_err("a malformed entry must be rejected");
+        assert!(matches!(err, AppError::InvalidHeader(_)));
+        assert!(err.to_string().contains("NoColonHere"), "got: {err}");
     }
 
     #[test]
-    fn test_with_headers_skips_malformed() {
-        let client = RpcClient::with_headers(
+    fn test_with_headers_rejects_malformed() {
+        let err = RpcClient::with_headers(
             "http://localhost",
             &[
-                "Good: ok".to_string(),
-                "NoColonHere".to_string(),
-                "Also-Bad:".to_string(),
+                "Good=ok".to_string(),
+                "NoSeparator".to_string(),
+                "Also-Bad=".to_string(),
             ],
             false,
-        );
-        // Only the valid header should be stored.
-        assert_eq!(client.custom_headers().len(), 1);
-        assert!(client.custom_headers().contains_key("good"));
+        )
+        .expect_err("a malformed entry must be rejected");
+        assert!(matches!(err, AppError::InvalidHeader(_)));
+        assert!(err.to_string().contains("NoSeparator"), "got: {err}");
     }
 
     #[test]
     fn test_rpc_client_new_has_no_customheaders() {
         let client = RpcClient::new("http://localhost");
         assert!(client.custom_headers().is_empty());
+    }
+
+    // ── Redaction ────────────────────────────────────────────────
+
+    #[test]
+    fn test_sensitive_header_detection_is_case_insensitive() {
+        for name in [
+            "Authorization",
+            "authorization",
+            "AUTHORIZATION",
+            "X-API-Key",
+            "x-api-key",
+            "Api-Key",
+            "Proxy-Authorization",
+            "Cookie",
+        ] {
+            let parsed = HeaderName::from_bytes(name.as_bytes()).expect("valid name");
+            assert!(is_sensitive_header(&parsed), "{name} must be redacted");
+        }
+        for name in ["X-Trace-Id", "User-Agent", "Accept"] {
+            let parsed = HeaderName::from_bytes(name.as_bytes()).expect("valid name");
+            assert!(!is_sensitive_header(&parsed), "{name} must not be redacted");
+        }
+    }
+
+    #[test]
+    fn test_redact_sensitive_replaces_values_but_keeps_names() {
+        let raw = vec![
+            "Authorization=Bearer super-secret".to_string(),
+            "X-API-Key=key-123".to_string(),
+            "X-Trace-Id=trace-9".to_string(),
+        ];
+        let parsed = parse_headers(&raw).expect("valid headers");
+        let redacted = redact_sensitive(&parsed);
+
+        assert_eq!(
+            redacted.get("authorization").unwrap().to_str().unwrap(),
+            REDACTED
+        );
+        assert_eq!(
+            redacted.get("x-api-key").unwrap().to_str().unwrap(),
+            REDACTED
+        );
+        // Non-sensitive headers stay readable — that is the point of logging them.
+        assert_eq!(
+            redacted.get("x-trace-id").unwrap().to_str().unwrap(),
+            "trace-9"
+        );
+    }
+
+    #[test]
+    fn test_client_exposes_redacted_headers_only() {
+        let client = RpcClient::with_headers(
+            "http://localhost",
+            &["Authorization=Bearer super-secret".to_string()],
+            false,
+        )
+        .expect("valid headers");
+        let redacted = client.redacted_headers();
+        assert_eq!(
+            redacted.get("authorization").unwrap().to_str().unwrap(),
+            REDACTED
+        );
+        // The live value is still on the client — only the log copy is masked.
+        assert_eq!(
+            client
+                .headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer super-secret"
+        );
+    }
+
+    /// The debug log renders raw CLI arguments, so it must not leak a secret
+    /// even before/without parsing.
+    #[test]
+    fn test_redacted_headers_renders_raw_arguments_safely() {
+        let raw = vec![
+            "Authorization=Bearer super-secret".to_string(),
+            "X-API-Key: key-123".to_string(),
+            "X-Trace-Id=trace-9".to_string(),
+        ];
+        let rendered = redacted_headers(&raw);
+        assert!(!rendered.contains("super-secret"), "leaked: {rendered}");
+        assert!(!rendered.contains("key-123"), "leaked: {rendered}");
+        assert!(
+            rendered.contains("trace-9"),
+            "lost a safe value: {rendered}"
+        );
+        assert!(
+            rendered.contains("Authorization"),
+            "lost the name: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_redacted_headers_handles_empty_and_malformed() {
+        assert_eq!(redacted_headers(&[]), "(none)");
+        // A malformed argument has no name to classify; it is echoed verbatim
+        // because it cannot carry a parsed credential name.
+        assert_eq!(redacted_headers(&["garbage".to_string()]), "garbage");
     }
 }

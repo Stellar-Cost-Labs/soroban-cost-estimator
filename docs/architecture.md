@@ -59,8 +59,9 @@ src/
 │   └── gen_test_wasm.rs  # Utility binary: generates minimal test WASM fixtures
 ├── rpc/
 │   ├── mod.rs            # Module re-exports
-│   ├── client.rs         # JSON-RPC 2.0 client, network-to-URL resolution
+│   ├── client.rs         # JSON-RPC 2.0 client, network-to-URL (HTTP/WS) resolution
 │   ├── simulate.rs       # simulateTransaction call + response parsing
+│   ├── ws.rs             # WebSocket JSON-RPC client, events + ledger-close subscriptions
 │   └── config.rs         # getLedgerEntries for ConfigSetting* entries
 ├── wasm/
 │   ├── mod.rs            # Module re-exports
@@ -104,7 +105,7 @@ struct contains a `Command` enum with five subcommands:
 | `config diff` | Compare current config against a stored snapshot |
 | `config history` | Show the full chronological change log |
 | `config last-changed` | Show when each setting last changed |
-| `watch` | Poll network config on an interval and print diffs |
+| `watch` | Watch network config over WebSocket ledger-close notifications (HTTP polling fallback) and print diffs |
 | `cache verify` | Check every cache entry for corruption |
 
 `main.rs` parses the CLI args, then dispatches to `cmd_estimate`,
@@ -138,6 +139,21 @@ JSON-RPC 2.0 requests to a Stellar Soroban RPC endpoint. The `call` method:
 `resolve_endpoint` maps a network name (`"testnet"`, `"mainnet"`,
 `"futurenet"`) to a well-known URL. A custom `--rpc-url` overrides this
 resolution.
+
+### `rpc/ws.rs` — WebSocket Client
+
+`WsRpcClient` speaks JSON-RPC 2.0 over a WebSocket (`wss://…/ws`), where the
+server pushes notifications in addition to answering requests. It backs two
+subscriptions:
+
+- `subscribe_events` / `next_event` — contract and diagnostic events.
+- `subscribe_ledger_closes` / `next_ledger_close` — ledger-close
+  notifications, which `watch` uses to re-check the network config the moment a
+  new ledger lands.
+
+`resolve_ws_endpoint` derives the WebSocket URL from the HTTP one, and
+`to_websocket_url` / `to_http_url` convert between the two schemes so a single
+`--rpc-url` value works for both transports.
 
 ### `rpc/simulate.rs` — Simulation
 
@@ -179,20 +195,44 @@ returned entries back by re-encoding keys and comparing against the response's
 
 ### `wasm/parser.rs` — WASM Parsing
 
-`load_wasm` reads a `.wasm` file from disk and performs three steps:
+`load_wasm` reads a `.wasm` file from disk and performs four steps:
 
 1. **Validation**: `wasmparser::validate` checks structural correctness.
-2. **Function enumeration**: Walks the WASM type, function, and export
-   sections to build a `Vec<FunctionInfo>` with name, param count, and
-   result count for each exported function.
+2. **Module walk**: Walks the WASM type, import, function, memory, and export
+   sections to build a `Vec<FunctionInfo>` (name, param count, result count)
+   for each exported function, plus the start function, memory limits,
+   imports, exports, and a per-section byte summary
+   (`SectionInfo`: id, name, custom flag, offset, end, content size, header
+   size). Export arities are resolved against the *defined* function index
+   space, so modules that import functions are handled correctly.
 3. **Contract spec decoding**: Looks for a `contractspecv0` custom section
-   and decodes `ScSpecEntry::FunctionV0` XDR entries to extract typed
-   parameter lists (name + type name) that the bare WASM export section
-   cannot express.
+   and decodes **every** `ScSpecEntry` — functions, UDT structs, unions,
+   enums, error enums, and events. Function entries contribute typed
+   parameters *and* return types (name + `ScSpecTypeDef`) that the bare WASM
+   export section cannot express. A malformed section fails the load with the
+   section name in the error rather than being silently discarded.
+4. **Contract metadata**: Decodes the `contractmetav0` custom section into
+   name, version, description, SDK version, and the full ordered key/value
+   list.
 
-The `WasmInfo` struct carries the raw bytes, the function list, and a
-`has_spec` flag. The SHA-256 of the WASM bytes serves as the identity key
-for caching.
+`SectionSizeBreakdown` turns the section list into whole-file size accounting:
+one `SectionSize` row per section plus a row for the fixed 8-byte module
+header, each carrying `size` (contents), `header_size`, `total_size`, and its
+`percent` share of the file. Because a module is that header plus its
+sections, `header_size + sum(row.total_size)` equals the file length exactly —
+which `test_section_sizes_sum_to_total_wasm_byte_length` pins down. The
+breakdown drives the `wasm info` table, the `section_sizes` JSON map, and the
+`WASM sections` table in cost reports.
+
+`spec_type_json` / `spec_entry_json` project the decoded spec into JSON,
+keeping nested type trees (`option`/`result`/`vec`/`map`/`tuple`/`bytes_n`/
+`udt`) structured rather than flattening them to a name.
+
+The `WasmInfo` struct carries the raw bytes, the function list, the decoded
+spec entries, the section list, and a `has_spec` flag;
+`WasmInfo::section_breakdown` derives the size accounting from those. The SHA-256 of the
+WASM bytes serves as the identity key for caching and is printed by
+`wasm info`.
 
 ### `xdr_helper.rs` — XDR and Transaction Construction
 
@@ -457,7 +497,7 @@ The CLI prints errors to stderr and exits with code 1 on failure.
 | Unit tests | In-module `#[cfg(test)]` blocks for pure functions | Most `src/` files |
 | Integration tests | Separate `tests/` directory, exercises CLI end-to-end | `cli_tests.rs`, `parser_tests.rs`, `fee_calc_tests.rs`, `cache_tests.rs` |
 | Snapshot tests | `insta` crate for deterministic formatter output | `report_snapshots.rs`, `tests/snapshots/` |
-| Property tests | `proptest` for fee calculation edge cases | `fee_calc_tests.rs` |
+| Property tests | `proptest` for fee calculation edge cases | `fee_calc_proptest.rs` |
 | Benchmarks | `criterion` for WASM parsing throughput | `benches/wasm_parse.rs` |
 
 CI runs `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,

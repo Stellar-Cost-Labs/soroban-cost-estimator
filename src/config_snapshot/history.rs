@@ -7,11 +7,17 @@ use crate::error::AppResult;
 /// A single field change observed between two consecutive snapshots.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldHistoryEntry {
+    /// Dotted path of the field that changed.
     pub field_path: String,
+    /// RFC 3339 timestamp of the snapshot where the change was observed.
     pub timestamp: String,
+    /// Ledger sequence of the snapshot where the change was observed.
     pub ledger: u32,
+    /// Value before the change, rendered for display.
     pub old_value: String,
+    /// Value after the change, rendered for display.
     pub new_value: String,
+    /// Whether the field affects what a contract invocation costs.
     pub is_pricing_change: bool,
 }
 
