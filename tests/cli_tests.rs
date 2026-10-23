@@ -3225,7 +3225,9 @@ fn start_mock_rpc_server_delayed(
                     }
 
                     let resp_body = if req_str.contains("simulateTransaction") {
-                        if live_tx_data.is_empty() {
+                        if live_tx_data.is_empty() && min_fee.is_empty() && ledger == 0 {
+                            r#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_string()
+                        } else if live_tx_data.is_empty() {
                             format!(
                                 r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":"{ledger}","minResourceFee":"{min_fee}"}}}}"#
                             )
@@ -5328,4 +5330,316 @@ fn test_cache_delete_all_cannot_be_combined_with_a_filter() {
         2,
         "a rejected deletion must not remove anything"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// stable exit codes and stream separation (issue #484)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[allow(clippy::too_many_lines)]
+#[test]
+fn test_stable_exit_codes_for_automation() {
+    use soroban_cost_estimator::error::{EXIT_FAILURE, EXIT_SUCCESS, EXIT_USAGE};
+
+    let home = temp_home("stable-exit-codes");
+
+    // 1. Success (0): normal report on stdout, no `Error:` on stderr.
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "wasm-info",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, EXIT_SUCCESS,
+        "successful command must exit 0; stderr: {stderr}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must contain pure JSON report");
+    assert_eq!(parsed["size"], 44);
+    assert!(
+        !stderr.contains("Error:"),
+        "stderr must not contain Error on success"
+    );
+
+    // 2. CLI usage error (2): missing required `--wasm` flag.
+    let (stdout, stderr, code) = run_cli_in_home(&["estimate"], Some(&home));
+    assert_eq!(
+        code, EXIT_USAGE,
+        "clap usage error must exit 2; stderr: {stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "stdout must be empty on usage error; got: {stdout}"
+    );
+    assert!(
+        stderr.contains("Usage"),
+        "stderr must contain usage help; got: {stderr}"
+    );
+
+    // 3. Invalid invocation arguments (1): `--fn` without `--id`.
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--fn",
+            "increment",
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, EXIT_FAILURE,
+        "invalid arguments must exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "stdout must be empty on argument error; got: {stdout}"
+    );
+    assert!(
+        stderr.contains("Error:"),
+        "stderr must contain Error prefix; got: {stderr}"
+    );
+
+    // 4. RPC failure (1): unreachable loopback endpoint.
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "--max-retries",
+            "0",
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--rpc-url",
+            DEAD_RPC,
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, EXIT_FAILURE,
+        "RPC failure must exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "stdout must be empty on RPC error; got: {stdout}"
+    );
+    assert!(
+        stderr.contains("Error:"),
+        "stderr must contain Error prefix; got: {stderr}"
+    );
+
+    // 5. Simulation failure (1): mock RPC returns empty simulation payload (no cost data).
+    let (mock_url, stop) = start_mock_rpc_server("", "", 0);
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "--max-retries",
+            "0",
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--rpc-url",
+            &mock_url,
+            "--json",
+        ],
+        Some(&home),
+    );
+    let _ = stop.send(());
+    assert_eq!(
+        code, EXIT_FAILURE,
+        "simulation failure must exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "stdout must be empty on simulation failure; got: {stdout}"
+    );
+    assert!(
+        stderr.contains("Error: failed to simulate transaction"),
+        "stderr must report simulation failure; got: {stderr}"
+    );
+
+    // 6. Diff regression (1): snapshot diff with pricing change.
+    let snap_a = write_snapshot_file(
+        &home,
+        "snap-a.json",
+        &snapshot_json_fee("testnet", 100, 100),
+    );
+    let snap_b = write_snapshot_file(
+        &home,
+        "snap-b.json",
+        &snapshot_json_fee("testnet", 101, 250),
+    );
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "config",
+            "snapshot",
+            "diff",
+            snap_a.to_str().unwrap(),
+            snap_b.to_str().unwrap(),
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, EXIT_FAILURE,
+        "diff regression must exit 1; stderr: {stderr}"
+    );
+    let diff_json: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("diff report must be written to stdout");
+    assert_eq!(diff_json["has_pricing_changes"], true);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// config show / config explain (issue #485)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_config_show_defaults_and_deterministic_ordering() {
+    let home = temp_home("config-show-defaults");
+    let missing_cfg = home.join("nonexistent-config.toml");
+
+    let (stdout1, stderr1, code1) = run_cli_quiet(
+        &[
+            "--config",
+            missing_cfg.to_str().unwrap(),
+            "config",
+            "show",
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code1, 0, "config show --json should succeed: {stderr1}");
+
+    let (stdout2, stderr2, code2) = run_cli_quiet(
+        &[
+            "--config",
+            missing_cfg.to_str().unwrap(),
+            "config",
+            "explain",
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code2, 0, "config explain --json should succeed: {stderr2}");
+    assert_eq!(
+        stdout1, stdout2,
+        "config show and config explain must produce identical deterministic JSON"
+    );
+
+    let parsed: serde_json::Value = serde_json::from_str(&stdout1).expect("valid JSON");
+    assert_eq!(parsed["config_file"]["exists"], false);
+    assert_eq!(parsed["config_file"]["source"], "cli");
+    assert_eq!(parsed["settings"]["network"]["value"], "testnet");
+    assert_eq!(parsed["settings"]["network"]["source"], "default");
+    assert_eq!(parsed["settings"]["timeout"]["value"], 30);
+    assert_eq!(parsed["settings"]["timeout"]["source"], "default");
+    assert_eq!(parsed["settings"]["connect_timeout"]["value"], 5);
+    assert_eq!(parsed["settings"]["connect_timeout"]["source"], "default");
+}
+
+#[test]
+fn test_config_show_precedence_and_credential_redaction() {
+    let home = temp_home("config-show-precedence");
+    let cfg_path = home.join("config.toml");
+    std::fs::write(
+        &cfg_path,
+        r#"
+network = "futurenet"
+rpc_url = "https://admin:super_secret_pw@rpc.example.com/soroban?api_key=file_secret_key&mode=fast"
+timeout = 45
+rps = 12
+headers = ["Authorization=Bearer file_secret_token", "X-Custom=visible"]
+"#,
+    )
+    .expect("write config.toml");
+
+    // 1. Config file values override defaults and redact secrets.
+    let (stdout_file, stderr_file, code_file) = run_cli_quiet(
+        &[
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "config",
+            "show",
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code_file, 0, "config show with file failed: {stderr_file}");
+    assert!(
+        !stdout_file.contains("super_secret_pw")
+            && !stdout_file.contains("file_secret_key")
+            && !stdout_file.contains("file_secret_token"),
+        "credentials must be redacted from output: {stdout_file}"
+    );
+
+    let file_json: serde_json::Value = serde_json::from_str(&stdout_file).expect("valid JSON");
+    assert_eq!(file_json["config_file"]["exists"], true);
+    assert_eq!(file_json["settings"]["network"]["value"], "futurenet");
+    assert_eq!(file_json["settings"]["network"]["source"], "config_file");
+    assert_eq!(file_json["settings"]["timeout"]["value"], 45);
+    assert_eq!(file_json["settings"]["timeout"]["source"], "config_file");
+    assert_eq!(file_json["settings"]["rps"]["value"], 12);
+    assert_eq!(file_json["settings"]["rps"]["source"], "config_file");
+    assert_eq!(
+        file_json["settings"]["rpc_url"]["value"],
+        "https://admin:<redacted>@rpc.example.com/soroban?api_key=<redacted>&mode=fast"
+    );
+    assert_eq!(file_json["settings"]["rpc_url"]["source"], "config_file");
+    assert_eq!(
+        file_json["settings"]["headers"]["value"],
+        serde_json::json!(["Authorization=<redacted>", "X-Custom=visible"])
+    );
+    assert_eq!(file_json["settings"]["headers"]["source"], "config_file");
+
+    // 2. CLI overrides beat config file values and also redact credentials.
+    let (stdout_cli, stderr_cli, code_cli) = run_cli_quiet(
+        &[
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--timeout",
+            "90",
+            "--header",
+            "x-api-key: cli_top_secret",
+            "config",
+            "show",
+            "--network",
+            "mainnet",
+            "--rpc-url",
+            "https://token_only@mainnet.example.com?token=cli_secret_tok",
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code_cli, 0,
+        "config show with CLI overrides failed: {stderr_cli}"
+    );
+    assert!(
+        !stdout_cli.contains("cli_top_secret")
+            && !stdout_cli.contains("token_only")
+            && !stdout_cli.contains("cli_secret_tok"),
+        "CLI credentials must be redacted: {stdout_cli}"
+    );
+
+    let cli_json: serde_json::Value = serde_json::from_str(&stdout_cli).expect("valid JSON");
+    assert_eq!(cli_json["settings"]["network"]["value"], "mainnet");
+    assert_eq!(cli_json["settings"]["network"]["source"], "cli");
+    assert_eq!(cli_json["settings"]["timeout"]["value"], 90);
+    assert_eq!(cli_json["settings"]["timeout"]["source"], "cli");
+    assert_eq!(
+        cli_json["settings"]["rpc_url"]["value"],
+        "https://<redacted>@mainnet.example.com?token=<redacted>"
+    );
+    assert_eq!(cli_json["settings"]["rpc_url"]["source"], "cli");
+    assert_eq!(
+        cli_json["settings"]["headers"]["value"],
+        serde_json::json!(["x-api-key=<redacted>"])
+    );
+    assert_eq!(cli_json["settings"]["headers"]["source"], "cli");
+    // rps was not overridden on CLI, so it still comes from config_file
+    assert_eq!(cli_json["settings"]["rps"]["value"], 12);
+    assert_eq!(cli_json["settings"]["rps"]["source"], "config_file");
 }

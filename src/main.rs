@@ -9,6 +9,7 @@ use soroban_cost_estimator::config;
 use soroban_cost_estimator::config_snapshot;
 use soroban_cost_estimator::error;
 use soroban_cost_estimator::interactive;
+use soroban_cost_estimator::paths;
 use soroban_cost_estimator::report;
 use soroban_cost_estimator::report::formatter::{
     ReportFormatter, ReportOptions, TableFormatter, formatter_by_name,
@@ -196,6 +197,29 @@ fn aggregate_format(format: cli::OutputFormat) -> cli::OutputFormat {
     }
 }
 
+fn cli_flag_was_passed(long_name: &str, short_name: Option<&str>) -> bool {
+    let long_exact = format!("--{long_name}");
+    let long_prefix = format!("--{long_name}=");
+    let short_exact = short_name.map(|s| format!("-{s}"));
+    for arg in std::env::args_os() {
+        let Some(text) = arg.to_str() else {
+            continue;
+        };
+        if text == "--" {
+            break;
+        }
+        if text == long_exact || text.starts_with(&long_prefix) {
+            return true;
+        }
+        if let Some(ref s) = short_exact {
+            if text == s {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn env_string(cli_value: String, file_value: &str, env: &str) -> String {
     let val = std::env::var(env).unwrap_or(cli_value);
     let trimmed = val.trim();
@@ -265,27 +289,34 @@ async fn run_cli() -> i32 {
     cli::init_color(args.color);
     cli::init_quiet(args.quiet);
 
-    let default_level = if args.quiet {
-        "warn"
-    } else if args.verbose {
-        "debug"
+    let (filter, writer): (
+        EnvFilter,
+        Box<dyn Fn() -> Box<dyn std::io::Write + Send> + Send + Sync>,
+    ) = if args.verbose {
+        (
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("soroban_cost_estimator=debug")),
+            Box::new(|| Box::new(std::io::stderr())),
+        )
     } else {
-        "info"
+        (
+            EnvFilter::new("off"),
+            Box::new(|| Box::new(std::io::stderr())),
+        )
     };
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level)),
-        )
+        .with_env_filter(filter)
+        .with_writer(writer)
         .init();
 
-    if !args.quiet {
+    if !args.quiet && args.verbose {
         info!(command = ?args.command, verbose = args.verbose, quiet = args.quiet, "starting soroban-cost-estimator");
     }
 
     if let Err(err) = run(args, file).await {
         error!(error = %err, "command failed");
         eprintln!("Error: {err}");
-        return 1;
+        return err.exit_code();
     }
 
     0
@@ -293,13 +324,48 @@ async fn run_cli() -> i32 {
 
 #[allow(clippy::too_many_lines)]
 async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> error::AppResult<()> {
-    let file = file?;
+    let file = match file {
+        Ok(f) => f,
+        Err(e) => {
+            if let cli::Command::Config {
+                action: cli::ConfigAction::Show { .. },
+            } = &args.command
+            {
+                match &e {
+                    error::AppError::FileNotFound(_) => config::UserConfig::default(),
+                    error::AppError::Config(msg) if msg.contains("config file not found") => {
+                        config::UserConfig::default()
+                    }
+                    _ => return Err(e),
+                }
+            } else {
+                return Err(e);
+            }
+        }
+    };
+    let cli_config_path = args.config.clone();
     rpc::client::set_endpoint_overrides(file.rpc_urls.clone())?;
-    let rps = args.rps;
-    let timeout = args.timeout;
-    let connect_timeout = args.connect_timeout;
+    let rps = if cli_flag_was_passed("rps", None) {
+        args.rps
+    } else {
+        file.rps.or(args.rps)
+    };
+    let timeout = if cli_flag_was_passed("timeout", None) {
+        args.timeout
+    } else {
+        file.timeout_secs.unwrap_or(args.timeout)
+    };
+    let connect_timeout = if cli_flag_was_passed("connect-timeout", None) {
+        args.connect_timeout
+    } else {
+        file.connect_timeout.unwrap_or(args.connect_timeout)
+    };
     rpc::client::set_default_total_timeout(args.total_timeout.map(std::time::Duration::from_secs));
-    let max_retries = args.max_retries;
+    let max_retries = if cli_flag_was_passed("max-retries", None) {
+        args.max_retries
+    } else {
+        file.max_retries.unwrap_or(args.max_retries)
+    };
     let verbose = args.verbose;
     // `--precision` is a single global flag; read it once so every command
     // reads the same value.
@@ -324,8 +390,9 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
     let config_format = file.format.unwrap_or_default();
     let default_network = file
         .default_network
+        .clone()
         .unwrap_or_else(|| "testnet".to_string());
-    let default_rpc_url = file.rpc_url;
+    let default_rpc_url = file.rpc_url.clone();
     // Validate an explicit `--rpc-url` before any command parses WASM or
     // opens the cache, so a typo fails immediately with a clear message.
     if let Some(url) = args.command.rpc_url() {
@@ -670,6 +737,29 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
                 )
                 .await
             }
+            cli::ConfigAction::Show {
+                network,
+                rpc_url,
+                json,
+            } => cmd_config_show(
+                cli_config_path.as_deref(),
+                &file,
+                network.as_deref(),
+                rpc_url.as_deref(),
+                fallback,
+                cli_format,
+                json,
+                rps,
+                timeout,
+                connect_timeout,
+                max_retries,
+                precision,
+                args.max_cache_size_mb,
+                args.max_cache_entries,
+                &headers,
+                quiet,
+                verbose,
+            ),
         },
         cli::Command::Cache { action } => {
             handle_cache_action(
@@ -716,6 +806,402 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
             Ok(())
         }
     }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct EffectiveSettingEntry {
+    value: serde_json::Value,
+    source: &'static str,
+}
+
+fn is_sensitive_credential_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "authorization" | "proxy-authorization" | "x-api-key" | "api-key" | "cookie"
+    ) || lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("key")
+        || lower.contains("auth")
+        || lower.contains("password")
+        || lower.contains("credential")
+}
+
+fn redact_header_entry(raw: &str) -> String {
+    let sep_pos = match (raw.find('='), raw.find(':')) {
+        (Some(eq), Some(colon)) => Some(eq.min(colon)),
+        (Some(eq), None) => Some(eq),
+        (None, Some(colon)) => Some(colon),
+        (None, None) => None,
+    };
+    if let Some(pos) = sep_pos {
+        let name = raw[..pos].trim();
+        if is_sensitive_credential_name(name) {
+            return format!("{name}=<redacted>");
+        }
+    }
+    raw.to_string()
+}
+
+fn redact_url_credentials(url: &str) -> String {
+    let (scheme_prefix, after_scheme) = match url.split_once("://") {
+        Some((scheme, rest)) => (format!("{scheme}://"), rest),
+        None => (String::new(), url),
+    };
+
+    let auth_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..auth_end];
+    let path_and_more = &after_scheme[auth_end..];
+
+    let redacted_authority = if let Some((userinfo, host_port)) = authority.rsplit_once('@') {
+        if let Some((user, _pass)) = userinfo.split_once(':') {
+            format!("{user}:<redacted>@{host_port}")
+        } else {
+            format!("<redacted>@{host_port}")
+        }
+    } else {
+        authority.to_string()
+    };
+
+    let redacted_tail = if let Some((before_query, query_and_frag)) = path_and_more.split_once('?')
+    {
+        let (query, frag) = match query_and_frag.split_once('#') {
+            Some((q, f)) => (q, format!("#{f}")),
+            None => (query_and_frag, String::new()),
+        };
+        let redacted_params: Vec<String> = query
+            .split('&')
+            .map(|pair| {
+                if let Some((k, _)) = pair.split_once('=') {
+                    if is_sensitive_credential_name(k) {
+                        return format!("{k}=<redacted>");
+                    }
+                }
+                pair.to_string()
+            })
+            .collect();
+        format!("{before_query}?{}{frag}", redacted_params.join("&"))
+    } else {
+        path_and_more.to_string()
+    };
+
+    format!("{scheme_prefix}{redacted_authority}{redacted_tail}")
+}
+
+#[allow(clippy::too_many_lines, clippy::fn_params_excessive_bools)]
+fn cmd_config_show(
+    cli_config_path: Option<&str>,
+    file: &config::UserConfig,
+    cli_network: Option<&str>,
+    cli_rpc_url: Option<&str>,
+    cli_fallback_url: Option<&str>,
+    cli_format: Option<cli::OutputFormat>,
+    json_flag: bool,
+    cli_rps: Option<u64>,
+    timeout: u64,
+    connect_timeout: u64,
+    max_retries: usize,
+    precision: u32,
+    max_cache_size_mb: u64,
+    max_cache_entries: usize,
+    cli_headers: &[String],
+    quiet: bool,
+    verbose: bool,
+) -> error::AppResult<()> {
+    use std::collections::BTreeMap;
+
+    let (cfg_path, cfg_source) = paths::config_file_path_with_source(cli_config_path);
+    let cfg_exists = cfg_path.exists();
+    let data_dir_path = paths::data_dir()?;
+
+    let env_network = std::env::var("SOROBAN_NETWORK")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let (network_val, network_source) = if let Some(net) = cli_network {
+        (net.to_string(), "cli")
+    } else if let Some(net) = env_network {
+        (net, "env")
+    } else if let Some(ref net) = file.default_network {
+        (net.clone(), "config_file")
+    } else {
+        ("testnet".to_string(), "default")
+    };
+
+    let (raw_rpc_url, rpc_url_source) = if let Some(url) = cli_rpc_url {
+        (url.to_string(), "cli")
+    } else if let Some(ref url) = file.rpc_url {
+        (url.clone(), "config_file")
+    } else {
+        let default_ep = rpc::client::resolve_endpoint(&network_val, None)
+            .unwrap_or_else(|_| "https://soroban-testnet.stellar.org".to_string());
+        (default_ep, "default")
+    };
+    let redacted_rpc_url = redact_url_credentials(&raw_rpc_url);
+
+    let (fallback_val, fallback_source) = if let Some(url) = cli_fallback_url {
+        (
+            serde_json::Value::String(redact_url_credentials(url)),
+            "cli",
+        )
+    } else if let Some(ref url) = file.rpc_fallback_url {
+        (
+            serde_json::Value::String(redact_url_credentials(url)),
+            "config_file",
+        )
+    } else {
+        (serde_json::Value::Null, "default")
+    };
+
+    let env_json = std::env::var("SOROBAN_JSON")
+        .ok()
+        .and_then(|v| v.parse::<bool>().ok());
+    let (format_val, format_source) = if let Some(fmt) = cli_format {
+        (fmt.as_str().to_string(), "cli")
+    } else if json_flag {
+        ("json".to_string(), "cli")
+    } else if let Some(b) = env_json {
+        (if b { "json" } else { "table" }.to_string(), "env")
+    } else if let Some(fmt) = file.format {
+        (fmt.as_str().to_ascii_lowercase(), "config_file")
+    } else if let Some(b) = file.json {
+        (if b { "json" } else { "table" }.to_string(), "config_file")
+    } else {
+        ("table".to_string(), "default")
+    };
+
+    let timeout_source = if cli_flag_was_passed("timeout", None) {
+        "cli"
+    } else if file.timeout_secs.is_some() {
+        "config_file"
+    } else {
+        "default"
+    };
+    let connect_timeout_source = if cli_flag_was_passed("connect-timeout", None) {
+        "cli"
+    } else if file.connect_timeout.is_some() {
+        "config_file"
+    } else {
+        "default"
+    };
+    let max_retries_source = if cli_flag_was_passed("max-retries", None) {
+        "cli"
+    } else if file.max_retries.is_some() {
+        "config_file"
+    } else {
+        "default"
+    };
+    let (rps_val, rps_source) = if cli_flag_was_passed("rps", None) {
+        (
+            cli_rps
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
+            "cli",
+        )
+    } else if let Some(r) = file.rps {
+        (serde_json::Value::from(r), "config_file")
+    } else {
+        (serde_json::Value::Null, "default")
+    };
+
+    let (raw_headers, headers_source): (Vec<String>, &'static str) = if !cli_headers.is_empty() {
+        (cli_headers.to_vec(), "cli")
+    } else if let Some(ref h) = file.headers {
+        (h.clone(), "config_file")
+    } else {
+        (Vec::new(), "default")
+    };
+    let redacted_headers: Vec<String> =
+        raw_headers.iter().map(|h| redact_header_entry(h)).collect();
+
+    let precision_source = if cli_flag_was_passed("precision", None) {
+        "cli"
+    } else if file.precision.is_some() {
+        "config_file"
+    } else {
+        "default"
+    };
+    let max_cache_size_source = if cli_flag_was_passed("max-cache-size-mb", None) {
+        "cli"
+    } else if file.max_cache_size_mb.is_some() {
+        "config_file"
+    } else {
+        "default"
+    };
+    let max_cache_entries_source = if cli_flag_was_passed("max-cache-entries", None) {
+        "cli"
+    } else if file.max_cache_entries.is_some() {
+        "config_file"
+    } else {
+        "default"
+    };
+    let quiet_source = if quiet || cli_flag_was_passed("quiet", Some("q")) {
+        "cli"
+    } else {
+        "default"
+    };
+    let verbose_source = if verbose || cli_flag_was_passed("verbose", Some("v")) {
+        "cli"
+    } else {
+        "default"
+    };
+
+    let mut settings: BTreeMap<String, EffectiveSettingEntry> = BTreeMap::new();
+    settings.insert(
+        "config_file".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::String(cfg_path.display().to_string()),
+            source: cfg_source,
+        },
+    );
+    settings.insert(
+        "connect_timeout".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::from(connect_timeout),
+            source: connect_timeout_source,
+        },
+    );
+    settings.insert(
+        "data_dir".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::String(data_dir_path.display().to_string()),
+            source: "default",
+        },
+    );
+    settings.insert(
+        "format".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::String(format_val.clone()),
+            source: format_source,
+        },
+    );
+    settings.insert(
+        "headers".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::from(redacted_headers),
+            source: headers_source,
+        },
+    );
+    settings.insert(
+        "max_cache_entries".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::from(max_cache_entries),
+            source: max_cache_entries_source,
+        },
+    );
+    settings.insert(
+        "max_cache_size_mb".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::from(max_cache_size_mb),
+            source: max_cache_size_source,
+        },
+    );
+    settings.insert(
+        "max_retries".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::from(max_retries),
+            source: max_retries_source,
+        },
+    );
+    settings.insert(
+        "network".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::String(network_val),
+            source: network_source,
+        },
+    );
+    settings.insert(
+        "precision".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::from(precision),
+            source: precision_source,
+        },
+    );
+    settings.insert(
+        "quiet".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::Bool(quiet),
+            source: quiet_source,
+        },
+    );
+    settings.insert(
+        "rpc_fallback_url".to_string(),
+        EffectiveSettingEntry {
+            value: fallback_val,
+            source: fallback_source,
+        },
+    );
+    settings.insert(
+        "rpc_url".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::String(redacted_rpc_url),
+            source: rpc_url_source,
+        },
+    );
+    settings.insert(
+        "rps".to_string(),
+        EffectiveSettingEntry {
+            value: rps_val,
+            source: rps_source,
+        },
+    );
+    settings.insert(
+        "timeout".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::from(timeout),
+            source: timeout_source,
+        },
+    );
+    settings.insert(
+        "verbose".to_string(),
+        EffectiveSettingEntry {
+            value: serde_json::Value::Bool(verbose),
+            source: verbose_source,
+        },
+    );
+
+    if format_val == "json" || json_flag {
+        let doc = serde_json::json!({
+            "config_file": {
+                "path": cfg_path.display().to_string(),
+                "exists": cfg_exists,
+                "source": cfg_source,
+            },
+            "data_dir": data_dir_path.display().to_string(),
+            "settings": settings,
+        });
+        println!("{}", serde_json::to_string_pretty(&doc)?);
+        return Ok(());
+    }
+
+    let mut table = Table::new();
+    table.set_header(vec!["Setting", "Value", "Source"]);
+    for (key, entry) in &settings {
+        let display_val = match &entry.value {
+            serde_json::Value::Null => "(none)".to_string(),
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Array(arr) => {
+                if arr.is_empty() {
+                    "[]".to_string()
+                } else {
+                    arr.iter()
+                        .map(|v| v.as_str().unwrap_or_default())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            }
+            other => other.to_string(),
+        };
+        table.add_row(vec![
+            Cell::new(key),
+            Cell::new(display_val),
+            Cell::new(entry.source),
+        ]);
+    }
+    println!("{table}");
+    Ok(())
 }
 
 /// `completions` command: generate shell completion script to stdout.

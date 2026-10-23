@@ -233,3 +233,18 @@ summary is already minimal, `--quiet` changes nothing about it.
 batch runs (`--wasm` repeated, or `--wasm-dir`) only build aggregates, so they
 render their existing **table** output when `summary` is requested; their
 `table`, `json`, `csv`, and `markdown` output is unchanged.
+
+## Exit Status
+
+`soroban-cost-estimator` adheres to a stable exit code contract for CI and automation:
+
+| Exit Code | Meaning | Triggering Conditions |
+|-----------|---------|-----------------------|
+| `0` | Success | Command completed successfully; report or data emitted to `stdout`. |
+| `1` | Operational / Runtime Error | Invalid invocation flags/arguments, contract file not found, RPC unavailable or network timeout, simulation failure or rejection, fee calculation failure, or pricing regression detected during `config diff`. |
+| `2` | Usage Error | CLI syntax error, unrecognised flag, or missing required command-line argument (reported by argument parser to `stderr`). |
+
+### Stream Separation Contract
+
+- **`stdout`**: Strictly reserved for command results and reports (e.g. human-readable tables, JSON output, or shell completions). When a command fails before producing output, `stdout` remains clean.
+- **`stderr`**: Reserved for errors (`Error: ...`), diagnostic warnings, and logging events. Automation should parse reports exclusively from `stdout` and capture failures from `stderr`.

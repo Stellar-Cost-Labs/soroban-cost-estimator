@@ -72,13 +72,30 @@ pub struct UserConfig {
     #[serde(default, deserialize_with = "deserialize_format")]
     pub format: Option<OutputFormat>,
     /// RPC timeout in seconds used when `--timeout` is not given.
+    #[serde(alias = "timeout")]
     pub timeout_secs: Option<u64>,
     /// Legacy: RPC URL applied to commands that accept `--rpc-url`,
     /// regardless of network. Prefer `[rpc_urls]`.
     pub rpc_url: Option<String>,
+    /// Fallback RPC URL used when primary endpoint is unreachable.
+    pub rpc_fallback_url: Option<String>,
     /// Legacy: `json = true` selects JSON as the global output format.
     /// Prefer `format = "json"`.
     pub json: Option<bool>,
+    /// TCP connection timeout in seconds.
+    pub connect_timeout: Option<u64>,
+    /// Maximum RPC retry attempts.
+    pub max_retries: Option<usize>,
+    /// Request rate limit (requests per second).
+    pub rps: Option<u64>,
+    /// Custom HTTP headers to include with RPC requests.
+    pub headers: Option<Vec<String>>,
+    /// Decimal precision for XLM fee formatting.
+    pub precision: Option<u32>,
+    /// Maximum cache size in megabytes.
+    pub max_cache_size_mb: Option<u64>,
+    /// Maximum cache entries.
+    pub max_cache_entries: Option<usize>,
 }
 
 fn deserialize_format<'de, D>(deserializer: D) -> Result<Option<OutputFormat>, D::Error>

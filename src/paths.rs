@@ -71,3 +71,19 @@ fn env_home() -> Option<PathBuf> {
 
     var.filter(|h| !h.is_empty()).map(PathBuf::from)
 }
+
+/// Resolves the TOML configuration file path and identifies whether the path
+/// came from a CLI `--config` override (`"cli"`) or the platform default
+/// (`"default"`).
+#[must_use]
+pub fn config_file_path_with_source(cli_path: Option<&str>) -> (PathBuf, &'static str) {
+    if let Some(path) = cli_path {
+        (PathBuf::from(path), "cli")
+    } else {
+        let default_path = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("soroban-cost-estimator")
+            .join("config.toml");
+        (default_path, "default")
+    }
+}

@@ -904,6 +904,24 @@ pub enum ConfigAction {
         #[command(subcommand)]
         action: CacheAction,
     },
+
+    /// Print the effective runtime configuration settings and identify whether
+    /// each value came from defaults, a config file, an environment variable,
+    /// or a CLI override, with credential-bearing values redacted.
+    #[command(visible_alias = "explain")]
+    Show {
+        /// Optional network override to evaluate when resolving effective settings.
+        #[arg(long, value_parser = NetworkValueParser)]
+        network: Option<String>,
+
+        /// Optional RPC URL override to evaluate when resolving effective settings.
+        #[arg(long)]
+        rpc_url: Option<String>,
+
+        /// Output as JSON instead of a human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
