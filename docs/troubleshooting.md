@@ -35,6 +35,25 @@ This guide covers common errors, their causes, and solutions when using the soro
 - `-32000` to `-32099`: Server-defined errors (e.g., contract not found, out of gas)
 **Solution**: Check the RPC error message for details. Verify the contract ID is correct, the network matches the contract deployment, and the function arguments match the contract's interface.
 
+#### Error: `HTTP 429 Too Many Requests`
+**Cause**: The RPC provider is rate-limiting this client. Public endpoints apply per-IP limits that a burst of `estimate-all` or `watch` calls can exceed.
+**Solution**:
+- Throttle requests with the global `--rps` flag:
+  ```bash
+  soroban-cost-estimator --rps 2 estimate-all --wasm contract.wasm --network testnet
+  ```
+- Keep retries enabled (the default is `--max-retries 3`); the client honors the
+  endpoint's `Retry-After` header before retrying.
+- Point at a less busy provider with `--rpc-url`, or configure
+  `--rpc-fallback-url` so transient failures fail over automatically.
+- Space out `watch` iterations with a larger `--interval`.
+
+#### Error: `RPC HTTP error: status 429 - Too Many Requests` / `RPC HTTP error: status 5xx - ...`
+**Cause**: The endpoint kept returning a transient status after the retry budget
+was exhausted.
+**Solution**: Raise `--max-retries`, lower `--rps`, or switch providers. These
+statuses are considered transient, so a retry usually clears them.
+
 #### Error: `HTTP request failed: <details>`
 **Cause**: Network-level failure connecting to the RPC endpoint (DNS resolution, connection timeout, TLS error, etc.).
 **Solution**: 
@@ -126,6 +145,24 @@ This guide covers common errors, their causes, and solutions when using the soro
 **Cause**: A specific config setting (e.g., `ContractComputeV0`) is not present on the network.
 **Solution**: The network may be on an older protocol version. Some settings are only available after certain protocol upgrades.
 
+#### Error: `failed to retrieve config setting: <NAME> not found` (`ConfigSettingNotFound`)
+**Cause**: The RPC node does not return the requested `ConfigSetting*` ledger
+entry. The common reason is a **protocol version mismatch** between the node and
+the tool (the entry was introduced, renamed, or removed in a newer protocol), or
+the node is not a full Soroban RPC node.
+**Solution**:
+- Confirm the RPC endpoint is a Soroban RPC (not Horizon) for the intended network:
+  ```bash
+  curl -s -X POST "$RPC_URL" -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'
+  ```
+- Use the network's canonical RPC endpoint, or a provider that runs a recent
+  protocol version, via `--rpc-url`.
+- Re-run `config snapshot` after a network protocol upgrade so the stored
+  snapshot matches the live settings.
+- If only one setting is missing, the report still succeeds but names the
+  unavailable fee-rate source in a warning — treat that estimate as understated.
+
 ---
 
 ### Simulation & Fee Calculation Errors
@@ -138,6 +175,64 @@ This guide covers common errors, their causes, and solutions when using the soro
 - "Invalid arguments" → Argument types don't match contract interface
 - "Out of gas" → Transaction exceeds gas limits
 **Solution**: Check the specific error message and verify contract ID, function name, and arguments.
+
+#### Error: `HostError: Error(Contract, #X)` in the simulation result
+**Cause**: The contract itself panicked or trapped during simulation. `#X` is the
+contract-defined error code (for example a `#[contracterror]` variant), not an
+RPC failure — the simulation ran and the contract rejected it.
+**Solution**:
+- Map `#X` to the contract's error enum and fix the input or contract state
+  that triggered it (missing initialization, unauthorized caller, zero amount,
+  paused contract, and so on).
+- Check that the ledger state you are simulating against actually contains the
+  contract instance and the accounts/trustlines the call needs.
+- Reproduce with extra detail:
+  ```bash
+  soroban-cost-estimator --verbose estimate \
+    --wasm contract.wasm --id <contract-id> --fn <fn> --arg k=v --network testnet
+  ```
+- If the contract should have succeeded, test the same call directly with
+  `stellar contract invoke --sim` on the same network to confirm it is
+  contract logic rather than a tool input problem.
+
+#### Error: `TransactionSimulationFailed`
+**Cause**: The RPC rejected the simulation before execution, most often because
+the transaction footprint or authorization entries were incomplete. The classic
+cases are:
+- a missing source-account signature/authorization for `require_auth()`
+- a ledger key the invocation reads or writes that is absent from the
+  footprint
+- a source account that does not exist or cannot pay the inclusion fee
+**Solution**:
+- Make sure `--id` points at a deployed contract on the selected network.
+- For functions guarded by `require_auth()`, the simulated source must be the
+  authorized account; simulation does not prompt for signatures.
+- Fund/create the source account on testnet with Friendbot:
+  ```bash
+  curl "https://friendbot.stellar.org/?addr=$SOURCE_ACCOUNT"
+  ```
+- Re-run with `--verbose` to print the request/response payloads and identify
+  the missing ledger key or auth entry.
+
+#### Error: `InvalidSpec` / contract spec missing from the WASM
+**Cause**: The `.wasm` has no readable `contractspecv0` custom section, so
+function signatures and argument types cannot be decoded. This happens when the
+contract was built without `#[contractimpl]`/`#[contracttype]` metadata, an
+optimizer stripped custom sections, or the file is not the contract artifact
+(for example a dependency or an already-optimized WASM that dropped the spec).
+**Solution**:
+- Rebuild from the contract crate with the Soroban SDK:
+  ```bash
+  cargo build --release --target wasm32v1-none
+  ```
+- Inspect what the tool sees before trusting the output:
+  ```bash
+  soroban-cost-estimator --wasm-info estimate --wasm contract.wasm --network testnet
+  ```
+- Do not strip custom sections; if you post-process the WASM, preserve
+  `contractspecv0` and `contractmetav0`.
+- `estimate` can still simulate an upload without a spec; signature-driven
+  `estimate-all` needs it.
 
 #### Error: `Fee calculation error: <details>`
 **Cause**: Internal error computing the fee breakdown from simulation results.
@@ -159,11 +254,34 @@ This guide covers common errors, their causes, and solutions when using the soro
 
 ## Debugging Tips
 
+### Enable verbose output
+
+`--verbose` (short: `-v`) is a global flag. It turns on debug-level logs,
+including RPC request payloads and response summaries, with credential headers
+redacted:
+
+```bash
+soroban-cost-estimator --verbose estimate --wasm contract.wasm --network testnet
+```
+
 ### Enable Debug Logging
-Set the `RUST_LOG` environment variable for verbose output:
+Set the `RUST_LOG` environment variable for verbose output (the value below
+overrides the level `--verbose` would set, and accepts `tracing` filter
+directives):
+
 ```bash
 RUST_LOG=debug soroban-cost-estimator estimate --wasm contract.wasm --network testnet
 ```
+
+Narrow the output to the RPC layer when the full log is too noisy:
+
+```bash
+RUST_LOG=soroban_cost_estimator::rpc=trace soroban-cost-estimator \
+  estimate --wasm contract.wasm --network testnet
+```
+
+`--verbose` and `RUST_LOG` can be combined: `--verbose` sets the default level,
+while `RUST_LOG` selects which modules emit logs.
 
 ### Enable RPC Debugging
 Log raw RPC requests and responses:
@@ -180,8 +298,56 @@ SCE_DEBUG_RPC=1 soroban-cost-estimator estimate --wasm contract.wasm --network t
 | Fee shows 0 or very low | Fee rate config not fetched | Check warnings about "fee rate source unavailable" |
 | Different results on re-run | Network state changed | Normal — ledger state affects simulation |
 
+### FAQ
+
+#### Which Rust target should I build the contract for?
+For current Soroban SDKs, `wasm32v1-none` is the recommended target. Older
+toolchains use `wasm32-unknown-unknown`. Either works as long as the resulting
+`.wasm` is the contract artifact and still contains the `contractspecv0`
+section.
+
+#### Do I need a funded account or a wallet to estimate costs?
+No. `estimate` only calls `simulateTransaction`; it never signs or submits a
+transaction, so no wallet or balance is required. The simulated source account
+must exist on the network, which is why a missing source account can surface as
+`TransactionSimulationFailed`.
+
+#### Does running the tool spend XLM or change the chain?
+No. Simulation is read-only and free. The reported fee is what a real
+transaction *would* cost, not a charge.
+
+#### Why does the estimate differ from what `stellar contract invoke` reports?
+Both use simulation, but the numbers depend on the ledger state at simulation
+time, the exact footprint, and whether refundable rent is included. Re-run both
+against the same ledger sequence before comparing.
+
+#### Can I use the tool offline?
+Only the offline commands: `config diff --against-previous`, `config snapshot`
+pruning, and the cache subcommands. `estimate`, `estimate-all`, and `watch`
+need a reachable Soroban RPC endpoint.
+
+#### Where does the tool store its data, and how do I reset it?
+Cache, snapshots, and configuration live under
+`~/.soroban-cost-estimator/` (`$USERPROFILE` on Windows). Delete that directory
+to reset everything, or use `cache delete` / `config snapshot` commands to
+remove individual entries. Use `--max-cache-size-mb` and `--max-cache-entries`
+to bound growth.
+
+#### Which networks are supported?
+`testnet`, `mainnet`, and `futurenet` have built-in endpoints. Any other network
+(including a local quickstart) is supported by passing `--rpc-url`.
+
+#### Why are some functions skipped by `estimate-all`?
+Functions that require arguments cannot be simulated without values.
+`estimate-all` skips them; use `estimate --fn <name> --arg key=value` for those
+functions.
+
+#### Does it work on Windows?
+Yes. An earlier release overflowed the main thread stack while building the CLI
+command tree; the CLI now runs on a dedicated 8 MiB thread.
+
 ### Getting Help
 
-1. Check existing issues: https://github.com/your-repo/soroban-cost-estimator/issues
-2. Run with `RUST_LOG=debug` and include output when filing a bug
+1. Check existing issues: https://github.com/Stellar-Cost-Labs/soroban-cost-estimator/issues
+2. Run with `--verbose` (or `RUST_LOG=debug`) and include the output when filing a bug
 3. Include: command run, network, contract ID (if public), and full error message
