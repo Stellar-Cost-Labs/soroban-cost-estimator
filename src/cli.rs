@@ -449,6 +449,7 @@ pub enum Command {
         /// Network to watch.
         #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
+
         /// RPC endpoint to watch (e.g. a `ws://` URL). Defaults to the
         /// network's public endpoint.
         #[arg(long)]

@@ -14,8 +14,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use clap::CommandFactory;
 use sha2::Digest;
 use soroban_cost_estimator::cache;
+use soroban_cost_estimator::cli::Cli;
 
 /// An RPC URL that is guaranteed not to answer: port 1 on loopback.
 /// Used to drive the network error path without leaving the machine.
@@ -5327,5 +5329,144 @@ fn test_cache_delete_all_cannot_be_combined_with_a_filter() {
         parsed.as_array().expect("JSON array").len(),
         2,
         "a rejected deletion must not remove anything"
+    );
+}
+
+// ── CLI definition assertions (issue #364) ───────────────────────────────────
+//
+// `clap` can validate its own command definitions: `debug_assert` panics on
+// duplicate flags, broken aliases, conflicts against missing arguments, or a
+// subcommand definition that can never parse. These tests run on every
+// `cargo test` and fail fast when the definition drifts.
+
+/// Runs clap's built-in self-check over the whole command tree.
+#[test]
+fn verify_cli() {
+    Cli::command().debug_assert();
+}
+
+/// Recursively asserts that every command carries a non-empty `--help`
+/// description and every visible flag carries non-empty help text.
+fn assert_help_text_complete(cmd: &clap::Command, scope: &str, failures: &mut Vec<String>) {
+    let command_name = if scope.is_empty() {
+        cmd.get_name().to_string()
+    } else {
+        format!("{scope} {}", cmd.get_name())
+    };
+    let about = cmd
+        .get_about()
+        .or_else(|| cmd.get_long_about())
+        .map(std::string::ToString::to_string)
+        .unwrap_or_default();
+    if about.trim().is_empty() {
+        failures.push(format!("`{command_name}` has no --help description"));
+    }
+    for arg in cmd.get_arguments() {
+        if arg.is_hide_set() {
+            continue;
+        }
+        let help = arg
+            .get_help()
+            .or_else(|| arg.get_long_help())
+            .map(std::string::ToString::to_string)
+            .unwrap_or_default();
+        if help.trim().is_empty() {
+            let flag = arg
+                .get_long()
+                .map(|long| format!("--{long}"))
+                .unwrap_or_else(|| format!("<{}>", arg.get_id()));
+            failures.push(format!("`{command_name}` {flag} has no help text"));
+        }
+    }
+    for sub in cmd.get_subcommands() {
+        if sub.is_hide_set() {
+            continue;
+        }
+        assert_help_text_complete(sub, &command_name, failures);
+    }
+}
+
+/// Every command and every visible flag must have non-empty help, so
+/// `--help` never prints a blank description.
+#[test]
+fn test_all_commands_and_flags_have_help_text() {
+    let mut cmd = Cli::command();
+    cmd.build();
+
+    let mut failures = Vec::new();
+    assert_help_text_complete(&cmd, "", &mut failures);
+    assert!(
+        failures.is_empty(),
+        "missing help descriptions:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// Asserts no short flag is claimed twice within one parse scope. `scope`
+/// names the command under test for diagnostics; `globals` are the short
+/// flags of globally propagated args, which are also visible inside every
+/// subcommand and therefore share its scope.
+fn assert_short_flags_unique(
+    cmd: &clap::Command,
+    globals: &[char],
+    scope: &str,
+    failures: &mut Vec<String>,
+) {
+    // The scope's shorts: flags declared on this command (including its
+    // auto-generated `--help`/`--version` after build) plus inherited globals.
+    let mut seen: Vec<(char, String)> = Vec::new();
+    for arg in cmd.get_arguments() {
+        if arg.is_hide_set() {
+            continue;
+        }
+        if let Some(short) = arg.get_short() {
+            let name = arg
+                .get_long()
+                .map(|long| format!("--{long}"))
+                .unwrap_or_else(|| arg.get_id().to_string());
+            seen.push((short, name));
+        }
+    }
+    for short in globals {
+        if !seen.iter().any(|(existing, _)| existing == short) {
+            seen.push((*short, format!("(global -{short})")));
+        }
+    }
+    for (index, (short, name)) in seen.iter().enumerate() {
+        if seen[..index].iter().any(|(other, _)| other == short) {
+            failures.push(format!(
+                "`{scope}` maps -{short} more than once ({name} collides with an earlier flag)"
+            ));
+        }
+    }
+
+    for sub in cmd.get_subcommands() {
+        if sub.is_hide_set() {
+            continue;
+        }
+        let sub_scope = format!("{scope} {}", sub.get_name());
+        assert_short_flags_unique(sub, globals, &sub_scope, failures);
+    }
+}
+
+/// Short flags must be unique per parse scope: within the global/top-level
+/// arguments, and within each subcommand combined with the inherited globals.
+#[test]
+fn test_short_flags_are_unique_within_each_scope() {
+    let mut cmd = Cli::command();
+    cmd.build();
+
+    let global_shorts: Vec<char> = cmd
+        .get_arguments()
+        .filter(|arg| arg.is_global_set() && !arg.is_hide_set())
+        .filter_map(clap::Arg::get_short)
+        .collect();
+
+    let mut failures = Vec::new();
+    assert_short_flags_unique(&cmd, &global_shorts, cmd.get_name(), &mut failures);
+    assert!(
+        failures.is_empty(),
+        "duplicate short flags:\n{}",
+        failures.join("\n")
     );
 }
