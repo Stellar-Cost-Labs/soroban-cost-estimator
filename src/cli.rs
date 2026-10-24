@@ -60,6 +60,7 @@ impl OutputFormat {
         match self {
             Self::Table => "table",
             Self::Json => "json",
+            Self::Ndjson => "ndjson",
             Self::Csv => "csv",
             Self::Markdown => "markdown",
             Self::Summary => "summary",
