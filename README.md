@@ -22,7 +22,7 @@
 
 # Soroban Cost Estimator
 
-[📚 Documentation](https://soroban-cost-estimator.gitbook.io/soroban-cost_estimator-docs) · [📖 CLI Reference](docs/commands/reference.md) · [🔄 Migration Guide](docs/migration.md) · [🩺 Troubleshooting](docs/troubleshooting.md)
+[📚 Documentation](https://soroban-cost-estimator.gitbook.io/soroban-cost_estimator-docs) · [📖 CLI Reference](docs/commands/reference.md) · [🔄 Migration Guide](docs/migration-guide.md) · [🩺 Troubleshooting](docs/troubleshooting.md)
 
 **Estimate Soroban contract resource costs & track network pricing changes over time.**
 
@@ -712,6 +712,9 @@ now stale after a network pricing change. Run `cache verify` to check the
 cache has not been corrupted.
 
 ## ✅ Verified against live testnet
+
+For side-by-side Stellar CLI and estimator commands, with representative output
+comparisons and the batch workflow, see the [migration guide](docs/migration-guide.md).
 
 The invocation path is proven end-to-end against a **real deployed contract**
 on Stellar testnet, cross-checked against the native Stellar CLI:
