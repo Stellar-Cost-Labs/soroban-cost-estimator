@@ -13,7 +13,7 @@ These options are available before or after a subcommand.
 | `--rps <N>` | — | unset | Maximum RPC requests per second; `0` disables the limit. | `--rps 5` |
 | `--timeout <SECS>` | — | `30` | HTTP request timeout in seconds. | `--timeout 60` |
 | `--connect-timeout <SECS>` | — | `5` | TCP connection timeout in seconds; `0` disables this separate limit. | `--connect-timeout 10` |
-| `--verbose` | `-v` | `false` | Enable debug logging. | `-v` |
+| `--verbose` | `-v` | `false` | Enable debug logging, including every JSON-RPC request and the raw response on standard error (credentials redacted). | `-v` |
 | `--quiet` | `-q` | `false` | Suppress progress indicators and informational notices. | `-q` |
 | `--header <KEY=VALUE>` | `-H` | none | Add an HTTP header to RPC requests. Repeat for multiple headers; `KEY: VALUE` is also accepted. | `-H 'Authorization=Bearer TOKEN'` |
 | `--rpc-fallback-url <URL>` | — | none | Retry transient failures through this fallback RPC endpoint. | `--rpc-fallback-url https://backup.example/rpc` |

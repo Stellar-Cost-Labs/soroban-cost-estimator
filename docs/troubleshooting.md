@@ -284,10 +284,42 @@ RUST_LOG=soroban_cost_estimator::rpc=trace soroban-cost-estimator \
 while `RUST_LOG` selects which modules emit logs.
 
 ### Enable RPC Debugging
-Log raw RPC requests and responses:
+Print every JSON-RPC request and the raw response the endpoint returned:
 ```bash
-SCE_DEBUG_RPC=1 soroban-cost-estimator estimate --wasm contract.wasm --network testnet
+soroban-cost-estimator estimate --wasm contract.wasm --network testnet --verbose
 ```
+
+`--verbose` (or `RUST_LOG=debug`) writes the exchange to **standard error**, so
+the payload dump never mixes into the estimate table or `--json` document
+written to standard output. Each call produces a request block and a response
+block:
+
+```
+[RPC REQ] POST https://soroban-testnet.stellar.org (412 bytes)
+[RPC REQ] method=simulateTransaction id=1
+[RPC REQ] params={"transaction":"AAAA…"}
+[RPC REQ] headers: content-type: application/json
+[RPC REQ] body: {"id":1,"jsonrpc":"2.0","method":"simulateTransaction",…}
+[RPC RES] HTTP 200 OK (184 ms)
+[RPC RES] headers: content-type: application/json
+[RPC RES] body: {"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"…"}}
+```
+
+The response body is logged verbatim — including an HTML gateway error page —
+and is printed *before* the payload is parsed, so a body that fails to
+deserialize is visible instead of being lost. Responses to transient
+`429`/`5xx` retries and `502`/`503`/`504` gateway errors are logged too, even
+though the retry loop replaces them with a later attempt.
+
+Credential headers (`Authorization`, `Proxy-Authorization`, `X-API-Key`,
+`API-Key`, `Cookie`, `Set-Cookie`) are shown as `<redacted>`, so a token never
+reaches a terminal, log file, or issue tracker. The body itself is logged
+verbatim, though — a `simulateTransaction` request carries the whole transaction
+envelope, contract arguments included — so skim a transcript before publishing
+it.
+
+Nothing is printed unless `--verbose` or a `RUST_LOG` filter that enables
+`DEBUG` is set.
 
 ### Common Workflow Issues
 

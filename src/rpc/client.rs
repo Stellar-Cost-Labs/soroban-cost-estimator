@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use governor::{Quota, RateLimiter};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify};
@@ -701,6 +701,30 @@ impl RpcClient {
         redact_sensitive(&self.headers)
     }
 
+    /// The headers actually attached to every outbound request.
+    ///
+    /// `reqwest` adds `content-type: application/json` itself for a
+    /// `.json(...)` body, so it is made explicit here: the diagnostic log then
+    /// shows the header set that really goes on the wire.
+    fn outbound_headers(&self) -> HeaderMap {
+        let mut headers = self.headers.clone();
+        if !headers.contains_key(CONTENT_TYPE) {
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        }
+        headers
+    }
+
+    /// True when raw JSON-RPC payload diagnostics must be written to stderr.
+    ///
+    /// Two independent switches turn them on: the client's `verbose` flag
+    /// (`--verbose`) and a tracing filter that enables `DEBUG` for this module
+    /// (`RUST_LOG=debug`). Diagnostics always go through `eprint!`/`eprintln!`
+    /// — never through `tracing`'s writer, which is stdout here — so
+    /// machine-readable stdout (`--json`) stays parseable in debug mode.
+    fn payload_logging_enabled(&self) -> bool {
+        self.verbose || tracing::enabled!(tracing::Level::DEBUG)
+    }
+
     /// Validate that the RPC endpoint is reachable and healthy before any
     /// simulation is run.
     ///
@@ -957,11 +981,12 @@ impl RpcClient {
         let headers = self.headers.clone();
 
         let start = std::time::Instant::now();
-        let request_body_str = serde_json::to_string(&request_body).unwrap_or_default();
-        let payload_size = request_body_str.len();
-        if self.verbose {
-            eprintln!("[RPC] POST {} ({} bytes)", url, payload_size);
-            eprintln!("[RPC] -> {}", request_body_str);
+        let log_payloads = self.payload_logging_enabled();
+        if log_payloads {
+            eprint!(
+                "{}",
+                format_request_payload(&url, &request_body, &self.outbound_headers())
+            );
         }
 
         let response = with_retry_deadline(self.max_retries, deadline, self.total_timeout, || {
@@ -991,9 +1016,23 @@ impl RpcClient {
                 // statuses fall through and are parsed as JSON-RPC below.
                 let status = response.status();
                 if is_transient_status(status) {
+                    let retry_after = parse_retry_after(response.headers());
+                    // The retry loop replaces this response with the next
+                    // attempt, so this is the last chance to surface the body.
+                    if log_payloads {
+                        let headers = response.headers().clone();
+                        let body = response
+                            .text()
+                            .await
+                            .unwrap_or_else(|e| format!("<unreadable response body: {e}>"));
+                        eprint!(
+                            "{}",
+                            format_response_payload(status, &headers, &body, start.elapsed())
+                        );
+                    }
                     return Err(AppError::HttpStatus {
                         status: status.as_u16(),
-                        retry_after: parse_retry_after(response.headers()),
+                        retry_after,
                         message: format!("RPC endpoint returned transient HTTP status {status}"),
                     });
                 }
@@ -1009,6 +1048,17 @@ impl RpcClient {
         // retry loop and the failover logic key off this variant.
         let status_code = status.as_u16();
         if matches!(status_code, 502..=504) {
+            if log_payloads {
+                let headers = response.headers().clone();
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|e| format!("<unreadable response body: {e}>"));
+                eprint!(
+                    "{}",
+                    format_response_payload(status, &headers, &body, start.elapsed())
+                );
+            }
             debug!(
                 method,
                 status = status_code,
@@ -1019,18 +1069,37 @@ impl RpcClient {
             });
         }
 
-        let response_body: Value = if let Some(d) = deadline {
+        // Read the body as text first (rather than `response.json()`) so the
+        // diagnostics below can show exactly what the node sent — including a
+        // payload that fails to parse as JSON, which would otherwise be lost.
+        // The headers are cloned only when they are about to be logged because
+        // this runs on every RPC call.
+        let logged_headers = if log_payloads {
+            Some(response.headers().clone())
+        } else {
+            None
+        };
+        let raw_body = if let Some(d) = deadline {
             let timeout_ms = self
                 .total_timeout
                 .map(|t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX))
                 .unwrap_or(0);
-            match tokio::time::timeout_at(d, response.json()).await {
+            match tokio::time::timeout_at(d, response.text()).await {
                 Ok(res) => res?,
                 Err(_) => return Err(AppError::TotalTimeout { timeout_ms }),
             }
         } else {
-            response.json().await?
+            response.text().await?
         };
+        if let Some(headers) = logged_headers {
+            eprint!(
+                "{}",
+                format_response_payload(status, &headers, &raw_body, start.elapsed())
+            );
+        }
+
+        let response_body: Value = serde_json::from_str(&raw_body)
+            .map_err(|e| AppError::General(format!("failed to deserialize RPC response: {e}")))?;
 
         if let Some(error) = response_body.get("error") {
             let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
@@ -1054,17 +1123,10 @@ impl RpcClient {
             data: None,
         })?;
 
-        let elapsed = start.elapsed();
-        if self.verbose {
-            let response_str = serde_json::to_string(&result).unwrap_or_default();
-            eprintln!("[RPC] <- HTTP {} ({} ms)", status, elapsed.as_millis());
-            eprintln!("[RPC] <- {}", response_str);
-        }
-
         debug!(
             method,
             status = %status,
-            result = %serde_json::to_string(result).unwrap_or_default(),
+            result = %serde_json::to_string(&result).unwrap_or_default(),
             "RPC response received"
         );
         trace!(method, "RPC call succeeded");
@@ -1134,6 +1196,89 @@ fn deserialize_result<T: serde::de::DeserializeOwned>(value: Value) -> AppResult
         .map_err(|e| AppError::General(format!("failed to deserialize RPC response: {e}")))
 }
 
+/// Prefix on every outgoing JSON-RPC request diagnostic line.
+///
+/// Stable and greppable so a CI transcript can be searched for `[RPC REQ]`
+/// (and `[RPC RES]`) without matching unrelated log lines.
+const RPC_REQUEST_LOG_PREFIX: &str = "[RPC REQ]";
+
+/// Prefix on every incoming JSON-RPC response diagnostic line.
+const RPC_RESPONSE_LOG_PREFIX: &str = "[RPC RES]";
+
+/// Renders the outgoing JSON-RPC request diagnostics written to stderr.
+///
+/// The method name, JSON-RPC ID, and params each get their own line because
+/// they are what identifies an unexpected or rejected simulation; the exact
+/// JSON body follows so the payload on the wire is available verbatim too.
+/// Credential-bearing headers are masked by [`render_headers`].
+fn format_request_payload(url: &str, body: &Value, headers: &HeaderMap) -> String {
+    let method = body
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+    let id = body
+        .get("id")
+        .map_or_else(|| "null".to_string(), Value::to_string);
+    let params = body
+        .get("params")
+        .map_or_else(|| "null".to_string(), Value::to_string);
+    let rendered_body = body.to_string();
+    format!(
+        "{RPC_REQUEST_LOG_PREFIX} POST {url} ({} bytes)\n\
+         {RPC_REQUEST_LOG_PREFIX} method={method} id={id}\n\
+         {RPC_REQUEST_LOG_PREFIX} params={params}\n\
+         {RPC_REQUEST_LOG_PREFIX} headers: {}\n\
+         {RPC_REQUEST_LOG_PREFIX} body: {rendered_body}\n",
+        rendered_body.len(),
+        render_headers(headers),
+    )
+}
+
+/// Renders the incoming JSON-RPC response diagnostics written to stderr.
+///
+/// `body` is the raw response text, logged verbatim rather than re-serialized:
+/// the exact error string a node returned (including any HTML from a proxy) is
+/// usually the whole point of turning this on.
+fn format_response_payload(
+    status: reqwest::StatusCode,
+    headers: &HeaderMap,
+    body: &str,
+    elapsed: Duration,
+) -> String {
+    format!(
+        "{RPC_RESPONSE_LOG_PREFIX} HTTP {status} ({} ms)\n\
+         {RPC_RESPONSE_LOG_PREFIX} headers: {}\n\
+         {RPC_RESPONSE_LOG_PREFIX} body: {body}\n",
+        elapsed.as_millis(),
+        render_headers(headers),
+    )
+}
+
+/// Renders HTTP headers for a diagnostic line, masking credentials.
+///
+/// Uses the same [`is_sensitive_header`] rule as the `--header` handling, so a
+/// token never reaches a terminal, log file, or CI transcript. Lines are sorted
+/// to keep repeated runs of the same command byte-identical (header order is
+/// not stable in a `HeaderMap`), which keeps diffs of two transcripts readable.
+fn render_headers(headers: &HeaderMap) -> String {
+    if headers.is_empty() {
+        return "(none)".to_string();
+    }
+    let mut lines: Vec<String> = headers
+        .iter()
+        .map(|(name, value)| {
+            let value = if is_sensitive_header(name) {
+                REDACTED
+            } else {
+                value.to_str().unwrap_or("<non-UTF-8>")
+            };
+            format!("{name}: {value}")
+        })
+        .collect();
+    lines.sort();
+    lines.join("; ")
+}
+
 /// Header names whose values are credentials and must never be logged.
 ///
 /// Matching is case-insensitive (HTTP header names are), so `X-Api-Key` and
@@ -1144,6 +1289,7 @@ const SENSITIVE_HEADERS: &[&str] = &[
     "x-api-key",
     "api-key",
     "cookie",
+    "set-cookie",
 ];
 
 /// Placeholder substituted for a sensitive header value in logs.
@@ -2682,5 +2828,178 @@ mod header_tests {
         // A malformed argument has no name to classify; it is echoed verbatim
         // because it cannot carry a parsed credential name.
         assert_eq!(redacted_headers(&["garbage".to_string()]), "garbage");
+    }
+}
+
+#[cfg(test)]
+mod payload_logging_tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// Builds the JSON-RPC body the client would POST for `method`.
+    fn request_body(method: &str, params: &Value) -> Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        })
+    }
+
+    #[test]
+    fn test_request_payload_names_method_id_and_params() {
+        let body = request_body(
+            "simulateTransaction",
+            &serde_json::json!({ "transaction": "AAAA" }),
+        );
+        let rendered = format_request_payload("http://node.local/rpc", &body, &HeaderMap::new());
+
+        assert!(
+            rendered.contains("[RPC REQ] POST http://node.local/rpc"),
+            "the endpoint must be named: {rendered}"
+        );
+        assert!(
+            rendered.contains(" bytes)"),
+            "the payload size must be reported: {rendered}"
+        );
+        assert!(
+            rendered.contains("method=simulateTransaction"),
+            "the method must be named: {rendered}"
+        );
+        assert!(
+            rendered.contains("id=1"),
+            "the JSON-RPC id must be reported: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"params={"transaction":"AAAA"}"#),
+            "the params must be readable: {rendered}"
+        );
+        // The exact body is included too, so the wire payload is available.
+        assert!(
+            rendered.contains(r#""jsonrpc":"2.0""#),
+            "the raw body must be included: {rendered}"
+        );
+    }
+
+    /// A hand-built or future JSON-RPC request without the usual fields must
+    /// still render — diagnostics must never panic on an odd payload.
+    #[test]
+    fn test_request_payload_renders_when_fields_are_missing() {
+        let rendered = format_request_payload(
+            "http://node.local",
+            &serde_json::json!({}),
+            &HeaderMap::new(),
+        );
+
+        assert!(rendered.contains("method=<unknown>"), "{rendered}");
+        assert!(rendered.contains("id=null"), "{rendered}");
+        assert!(rendered.contains("params=null"), "{rendered}");
+        assert!(
+            rendered.contains("headers: (none)"),
+            "an empty header map must be stated explicitly: {rendered}"
+        );
+    }
+
+    /// The request diagnostic must show the header set that really goes on the
+    /// wire (including the `content-type` reqwest adds itself) with credentials
+    /// masked — the same guarantee the `--header` debug log makes.
+    #[test]
+    fn test_request_payload_masks_credential_headers() {
+        let client = RpcClient::with_headers(
+            "http://node.local",
+            &[
+                "Authorization=Bearer super-secret".to_string(),
+                "X-Trace-Id=trace-9".to_string(),
+            ],
+            true,
+        )
+        .expect("valid headers");
+        let body = request_body("getHealth", &serde_json::json!({}));
+
+        let rendered =
+            format_request_payload("http://node.local", &body, &client.outbound_headers());
+
+        assert!(
+            !rendered.contains("super-secret"),
+            "the bearer token leaked: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("authorization: {REDACTED}")),
+            "the credential header must be named but masked: {rendered}"
+        );
+        assert!(
+            rendered.contains("x-trace-id: trace-9"),
+            "non-sensitive headers must survive: {rendered}"
+        );
+        assert!(
+            rendered.contains("content-type: application/json"),
+            "the implicit JSON content-type must be shown: {rendered}"
+        );
+    }
+
+    /// The response diagnostic carries the status, the timing, and the body a
+    /// node actually returned.
+    #[test]
+    fn test_response_payload_reports_status_body_and_masked_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert("set-cookie", HeaderValue::from_static("session=secret"));
+        let raw =
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid transaction"}}"#;
+
+        let rendered = format_response_payload(
+            reqwest::StatusCode::BAD_REQUEST,
+            &headers,
+            raw,
+            Duration::from_millis(12),
+        );
+
+        assert!(
+            rendered.contains("[RPC RES] HTTP 400 Bad Request (12 ms)"),
+            "the status and timing must be reported: {rendered}"
+        );
+        assert!(
+            rendered.contains("content-type: application/json"),
+            "response headers must be reported: {rendered}"
+        );
+        assert!(
+            !rendered.contains("session=secret"),
+            "a session cookie leaked: {rendered}"
+        );
+        assert!(
+            rendered.contains(raw),
+            "the raw body must be logged verbatim: {rendered}"
+        );
+    }
+
+    /// Gateways answer 502 with HTML, not JSON. The diagnostic is the only
+    /// place that body survives, so it must be logged as-is.
+    #[test]
+    fn test_response_payload_keeps_non_json_bodies() {
+        let rendered = format_response_payload(
+            reqwest::StatusCode::BAD_GATEWAY,
+            &HeaderMap::new(),
+            "<html>502 Bad Gateway</html>",
+            Duration::from_millis(3),
+        );
+
+        assert!(rendered.contains("HTTP 502 Bad Gateway"), "{rendered}");
+        assert!(
+            rendered.contains("body: <html>502 Bad Gateway</html>"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("headers: (none)"), "{rendered}");
+    }
+
+    /// `--verbose` alone must enable the diagnostics: unit tests install no
+    /// tracing subscriber, so this pins that the flag does not depend on one.
+    #[test]
+    fn test_verbose_flag_enables_payload_logging() {
+        let verbose = RpcClient::with_rate_limit("http://localhost", None, true);
+        assert!(verbose.payload_logging_enabled());
+
+        let quiet = RpcClient::with_rate_limit("http://localhost", None, false);
+        assert!(!quiet.payload_logging_enabled());
     }
 }
