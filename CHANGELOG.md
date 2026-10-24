@@ -115,6 +115,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- RPC requests that exceed the configured `--timeout` now fail with the
+  descriptive `RPC request timed out after X seconds` error instead of the
+  generic `failed to send HTTP request` transport error. Request timeouts are
+  retried and trigger `--rpc-fallback-url` failover, while connect-phase
+  timeouts keep their distinct `--connect-timeout` handling (#294).
 - The CLI no longer overflows the stack on Windows. `clap`'s derive macros
   build the whole command tree on the stack, which needs close to a megabyte
   in an unoptimized build, while the main thread of a Windows process is

@@ -439,3 +439,24 @@ fn cli_timeout_overrides_config() {
     let elapsed = time_hung_snapshot(&sb, &["cfg=120", "--timeout", "1"]);
     assert!(elapsed < Duration::from_secs(15), "took {elapsed:?}");
 }
+
+/// A request that exhausts the configured `--timeout` must fail with an
+/// error naming that budget (issue #294), not a generic transport error.
+#[test]
+fn timeout_error_names_configured_budget() {
+    let sb = Sandbox::new("timeout-msg");
+    let ep = Endpoint::start(true);
+    sb.write_xdg_config(&format!(
+        "timeout_secs = 1\n[rpc_urls]\ntestnet = \"{}\"\n",
+        ep.url
+    ));
+
+    let run = sb.run(&["config", "snapshot", "--max-retries", "0"]);
+
+    assert_eq!(run.code, 1, "hung endpoint should fail: {}", run.stderr);
+    assert!(
+        run.stderr.contains("RPC request timed out after 1 seconds"),
+        "stderr should name the configured timeout budget: {}",
+        run.stderr
+    );
+}

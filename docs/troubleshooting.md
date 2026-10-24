@@ -62,6 +62,14 @@ statuses are considered transient, so a retry usually clears them.
 - Ensure the RPC node is operational (check status page)
 - Try a different network (`testnet`, `mainnet`, `futurenet`)
 
+#### Error: `RPC request timed out after <N> seconds`
+**Cause**: The RPC endpoint did not finish the request within the configured `--timeout` budget (default 30 seconds). Degraded networks, an overloaded node, or an unusually large simulation can exceed it.
+**Solution**:
+- Raise the budget for this run: `--timeout 60` (or set `timeout_secs` in `config.toml`)
+- Point `--rpc-url` at a healthy node if the current endpoint is slow
+- Add `--rpc-fallback-url <URL>` so a slow primary fails over automatically
+- Use `--connect-timeout` to fail fast when the host itself is unreachable
+
 #### Error: `RPC endpoint not configured for network: <network>`
 **Cause**: An unknown network name was provided (not `testnet`, `mainnet`, or `futurenet`) and no custom `--rpc-url` was given.
 **Solution**: Use a supported network name or provide a custom RPC URL with `--rpc-url https://your-rpc-endpoint`.
