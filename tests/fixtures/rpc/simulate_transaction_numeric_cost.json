@@ -1,0 +1,11 @@
+{
+  "transactionData": null,
+  "cost": {
+    "cpuInsns": 250000,
+    "memBytes": 4096
+  },
+  "latestLedger": 2539605,
+  "events": [],
+  "minResourceFee": "28500",
+  "stateChanges": []
+}

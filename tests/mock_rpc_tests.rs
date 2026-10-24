@@ -153,3 +153,177 @@ async fn mock_rpc_fixture_surfaces_rpc_errors_from_the_server() {
 
     assert!(matches!(err, AppError::Rpc { status: -32602, .. }));
 }
+
+#[test]
+fn protocol_fixture_simulate_transaction_modern_p22_parses_typed_response() {
+    use soroban_cost_estimator::rpc::simulate::{
+        SimulateTransactionResponse, parse_resource_fee, parse_transaction_data_resource_fee,
+        parse_transaction_data_resources,
+    };
+
+    let raw = include_str!("fixtures/rpc/simulate_transaction_modern_p22.json");
+    let resp: SimulateTransactionResponse =
+        serde_json::from_str(raw).expect("modern p22 fixture should deserialize");
+
+    assert_eq!(resp.ledger_sequence(), 3_894_195);
+    assert!(
+        resp.cost.is_none(),
+        "modern p22 responses omit top-level cost"
+    );
+    assert_eq!(
+        parse_resource_fee(&resp.min_resource_fee).expect("decimal fee should parse"),
+        Some(15_427)
+    );
+    assert_eq!(
+        parse_transaction_data_resource_fee(&resp.transaction_data)
+            .expect("transactionData resource_fee should parse"),
+        Some(15_427)
+    );
+
+    let resources = parse_transaction_data_resources(&resp.transaction_data)
+        .expect("transactionData resources should parse")
+        .expect("resources should be present");
+    assert_eq!(resources.cpu_insns, 532_502);
+    assert_eq!(resources.read_entries, 1);
+    assert_eq!(resources.write_entries, 1);
+    assert_eq!(resources.read_bytes, 0);
+    assert_eq!(resources.write_bytes, 136);
+}
+
+#[test]
+fn protocol_fixture_simulate_transaction_legacy_p20_parses_strings_and_xdr_fee() {
+    use soroban_cost_estimator::rpc::simulate::{SimulateTransactionResponse, parse_resource_fee};
+
+    let raw = include_str!("fixtures/rpc/simulate_transaction_legacy_p20.json");
+    let resp: SimulateTransactionResponse =
+        serde_json::from_str(raw).expect("legacy p20 fixture should deserialize");
+
+    assert_eq!(resp.ledger_sequence(), 1_842_910);
+    let cost = resp.cost.expect("legacy p20 fixture carries cost object");
+    assert_eq!(cost.cpu_insns, 100_000);
+    assert_eq!(cost.mem_bytes, 2_000);
+    assert_eq!(
+        parse_resource_fee(&resp.min_resource_fee).expect("base64 XDR int64 fee should parse"),
+        Some(42_000)
+    );
+}
+
+#[test]
+fn protocol_fixture_simulate_transaction_numeric_cost_parses_typed_response() {
+    use soroban_cost_estimator::rpc::simulate::{SimulateTransactionResponse, parse_resource_fee};
+
+    let raw = include_str!("fixtures/rpc/simulate_transaction_numeric_cost.json");
+    let resp: SimulateTransactionResponse =
+        serde_json::from_str(raw).expect("numeric cost fixture should deserialize");
+
+    assert_eq!(resp.ledger_sequence(), 2_539_605);
+    let cost = resp.cost.expect("numeric cost object should be present");
+    assert_eq!(cost.cpu_insns, 250_000);
+    assert_eq!(cost.mem_bytes, 4_096);
+    assert_eq!(
+        parse_resource_fee(&resp.min_resource_fee).expect("decimal fee should parse"),
+        Some(28_500)
+    );
+}
+
+#[test]
+fn protocol_fixtures_health_and_ledger_parse_across_versions() {
+    use soroban_cost_estimator::rpc::client::HealthResponse;
+    use soroban_cost_estimator::rpc::config::{GetLatestLedgerResponse, GetLedgerEntriesResponse};
+
+    let health_modern: HealthResponse =
+        serde_json::from_str(include_str!("fixtures/rpc/get_health_healthy.json"))
+            .expect("modern getHealth fixture should deserialize");
+    assert_eq!(health_modern.status, "healthy");
+    assert_eq!(health_modern.latest_ledger, Some(3_894_195));
+    assert_eq!(health_modern.oldest_ledger, Some(3_876_915));
+    assert_eq!(health_modern.ledger_retention_window, Some(17_280));
+
+    let health_legacy: HealthResponse =
+        serde_json::from_str(include_str!("fixtures/rpc/get_health_legacy_strings.json"))
+            .expect("legacy string getHealth fixture should deserialize");
+    assert_eq!(health_legacy.status, "healthy");
+    assert_eq!(health_legacy.latest_ledger, Some(1_842_910));
+    assert_eq!(health_legacy.oldest_ledger, Some(1_825_630));
+    assert_eq!(health_legacy.ledger_retention_window, Some(17_280));
+
+    let latest_ledger: GetLatestLedgerResponse =
+        serde_json::from_str(include_str!("fixtures/rpc/get_latest_ledger_p22.json"))
+            .expect("getLatestLedger fixture should deserialize");
+    assert_eq!(latest_ledger.protocol_version, 22);
+    assert_eq!(latest_ledger.sequence, 2_539_605);
+
+    let entries_modern: GetLedgerEntriesResponse =
+        serde_json::from_str(include_str!("fixtures/rpc/get_ledger_entries_p22.json"))
+            .expect("modern getLedgerEntries fixture should deserialize");
+    assert_eq!(entries_modern.latest_ledger, Some(2_539_605));
+    assert_eq!(entries_modern.entries.len(), 1);
+    assert_eq!(
+        entries_modern.entries[0].last_modified_ledger_seq,
+        Some(2_539_000)
+    );
+    assert_eq!(
+        entries_modern.entries[0].live_until_ledger_seq,
+        Some(2_600_000)
+    );
+
+    let entries_legacy: GetLedgerEntriesResponse = serde_json::from_str(include_str!(
+        "fixtures/rpc/get_ledger_entries_legacy_p20.json"
+    ))
+    .expect("legacy getLedgerEntries fixture should deserialize");
+    assert_eq!(entries_legacy.latest_ledger, Some(1_842_910));
+    assert_eq!(entries_legacy.entries.len(), 1);
+    assert_eq!(entries_legacy.entries[0].live_until_ledger_seq, None);
+}
+
+#[tokio::test]
+async fn mock_rpc_serves_checked_in_protocol_fixtures_end_to_end() {
+    use soroban_cost_estimator::rpc::config::{
+        ConfigSettingId, fetch_config_setting, fetch_protocol_version,
+    };
+    use soroban_cost_estimator::rpc::simulate::simulate_transaction;
+
+    let server = common::start_mock_rpc_server().await;
+
+    let sim_fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/rpc/simulate_transaction_modern_p22.json"
+    ))
+    .expect("valid JSON fixture");
+    let health_fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/rpc/get_health_legacy_strings.json"))
+            .expect("valid JSON fixture");
+    let ledger_fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/rpc/get_latest_ledger_p22.json"))
+            .expect("valid JSON fixture");
+    let entries_fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/rpc/get_ledger_entries_legacy_p20.json"
+    ))
+    .expect("valid JSON fixture");
+
+    common::stub_jsonrpc_success(&server, "simulateTransaction", sim_fixture).await;
+    common::stub_jsonrpc_success(&server, "getHealth", health_fixture).await;
+    common::stub_jsonrpc_success(&server, "getLatestLedger", ledger_fixture).await;
+    common::stub_jsonrpc_success(&server, "getLedgerEntries", entries_fixture).await;
+
+    let client = RpcClient::new(server.uri().as_str());
+
+    client
+        .health_check()
+        .await
+        .expect("health_check should accept legacy string ledger fields");
+
+    let protocol = fetch_protocol_version(&client)
+        .await
+        .expect("fetch_protocol_version should parse fixture");
+    assert_eq!(protocol, 22);
+
+    let setting = fetch_config_setting(&client, ConfigSettingId::ContractComputeV0)
+        .await
+        .expect("fetch_config_setting should parse legacy getLedgerEntries fixture");
+    assert_eq!(setting.last_modified_ledger, 1_842_000);
+
+    let sim = simulate_transaction(&client, "AAAA")
+        .await
+        .expect("simulate_transaction should parse modern p22 fixture");
+    assert_eq!(sim.ledger_sequence(), 3_894_195);
+}
