@@ -7,27 +7,71 @@ pub const DEFAULT_PRECISION: u32 = 7;
 
 /// The fee breakdown for a single simulation.
 ///
+/// # Component provenance and limitations (issue #526)
+///
+/// `simulateTransaction` reports a *single* authoritative resource fee —
+/// `minResourceFee`, equal to `resource_fee` in the returned
+/// `SorobanTransactionData` XDR. Per CAP-0046-07 that fee covers a
+/// non-refundable part (CPU instructions, ledger/disk I/O, transaction
+/// size) and a refundable allowance (ledger rent bumps, contract events
+/// and the invocation return value), but the response does **not** report
+/// that split, and it contains no per-component rent measurement (charged
+/// rent exists only in post-execution transaction metadata, which
+/// simulation does not provide). Every component below is therefore either
+/// the authoritative total or a value this crate derives from the
+/// network's published `ConfigSetting*` rates:
+///
+/// * `total_stroops` — the authoritative RPC resource fee plus the fixed
+///   base inclusion fee added locally (see [`Self::base_fee_stroops`]).
+/// * `non_refundable_stroops` and its `cpu_fee_stroops` /
+///   `storage_fee_stroops` / `bandwidth_fee_stroops` subsets — derived
+///   locally from config rates; they can diverge from the authoritative
+///   total when those rates are stale.
+/// * `refundable_stroops` — a **derived remainder** (`total −
+///   non_refundable`, floored at zero). It estimates the protocol's
+///   refundable allowance; it is **not** a protocol-measured rent fee and
+///   must not be presented as one (issue #526).
+///
 /// All values are in stroops (1 stroop = 10^{-7} XLM).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeeBreakdown {
-    /// Non-refundable resource fee (charged regardless of success).
+    /// Non-refundable resource fee — derived locally from the network's
+    /// config-sourced rates (CPU instructions + ledger/disk I/O +
+    /// transaction size), not a value the RPC reports directly. Charged
+    /// regardless of the transaction's outcome (CAP-0046-07).
     pub non_refundable_stroops: i64,
-    /// Refundable resource fee (refunded if not fully consumed).
+    /// Refundable-fee budget — the derived remainder of the authoritative
+    /// resource fee after the config-derived non-refundable components
+    /// (`total − non_refundable`, floored at 0). The simulation response
+    /// provides no refundable or rent breakdown, so this value *estimates*
+    /// the protocol's refundable allowance (ledger rent bumps, contract
+    /// events and the return value; only the unused allowance is refunded
+    /// after execution) and is **not** a measured rent fee (issue #526).
     pub refundable_stroops: i64,
-    /// CPU instruction fee (subset of non-refundable).
+    /// CPU instruction fee (derived locally from config rates; subset of
+    /// `non_refundable_stroops`).
     pub cpu_fee_stroops: i64,
     /// Storage I/O fee — read entries + write entries + disk read bytes
-    /// (subset of non-refundable).
+    /// (derived locally from config rates; subset of
+    /// `non_refundable_stroops`).
     pub storage_fee_stroops: i64,
-    /// Transaction size / bandwidth fee (subset of non-refundable).
+    /// Transaction size / bandwidth fee (derived locally from config rates;
+    /// subset of `non_refundable_stroops`).
     pub bandwidth_fee_stroops: i64,
-    /// Base inclusion fee.
+    /// Fixed base inclusion fee added locally — 100 stroops when the RPC
+    /// reported a fee, 0 otherwise. Not part of the RPC's resource fee.
     pub base_fee_stroops: i64,
-    /// Total resource fee.
+    /// Total fee shown: the authoritative RPC resource fee plus the local
+    /// base inclusion fee.
     pub total_stroops: i64,
     /// Total fee in XLM (as a string to avoid float precision issues).
     pub total_xlm: String,
-    /// Percentage contribution of each fee component, summing to exactly 100.0%.
+    /// Percentage contribution of each fee component, summing to exactly
+    /// 100.0%. Keys: `cpu_instructions`, `storage_read_write`,
+    /// `transaction_size`, `base_fee`, and `refundable` — the share of the
+    /// derived refundable remainder. (Issue #526 renamed the former
+    /// `rent` key: the value is an inferred remainder, not a measured
+    /// rent fee.)
     pub fee_percentages: std::collections::BTreeMap<String, String>,
 }
 
@@ -61,8 +105,11 @@ pub struct FeeRates {
 /// - a **non-refundable** portion: fees for CPU instructions, ledger I/O
 ///   and transaction size — derived independently here from the network's
 ///   own config-sourced rates;
-/// - a **refundable** portion: the remainder of the authoritative total,
-///   covering events and ledger rent bumps.
+/// - a **refundable** portion: the remainder of the authoritative total —
+///   an *estimate* of the allowance that funds ledger rent bumps, contract
+///   events and the return value (CAP-0046-07). The response reports no
+///   rent or refundable breakdown, so this remainder is never presented as
+///   a measured rent fee (issue #526).
 ///
 /// The fee rates from the network config are stored per 10K instructions
 /// and per 1KB. The formula `(units * rate) / scale` preserves precision
@@ -117,7 +164,9 @@ pub fn compute_fee_breakdown(
         .saturating_add(bandwidth_fee);
 
     // Refundable: the remainder of the authoritative total after the
-    // non-refundable costs (events, ledger rent bumps). `.max(0)` floors
+    // non-refundable costs (an estimate of the rent + events + return-value
+    // allowance; the response reports no such breakdown — issue #526).
+    // `.max(0)` floors
     // the one legitimate edge case: a simulation response that omits the
     // fee entirely (callers pass 0 for the total) while the config rates
     // still yield a positive non-refundable fee. In that case the
@@ -197,7 +246,7 @@ pub fn compute_fee_breakdown(
         format!("{:.1}%", permilles[3] as f64 / 10.0),
     );
     fee_percentages.insert(
-        "rent".to_string(),
+        "refundable".to_string(),
         format!("{:.1}%", permilles[4] as f64 / 10.0),
     );
 

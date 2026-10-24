@@ -25,7 +25,7 @@ expression: JsonFormatter.format(&report)
   "read_entries": 1,
   "simulation_duration_ms": 87,
   "suggestions": [
-    "Tip: 70% of the total fee is refundable, which comes from ledger rent bumps and contract events. Consider reducing state growth and the number or size of emitted events."
+    "Tip: 70% of the total fee is refundable — the remainder of the resource fee after the config-derived non-refundable components, which the protocol spends on ledger rent bumps, contract events and the return value. Consider reducing state growth and the number or size of emitted events."
   ],
   "tx_size": 156,
   "warnings": [],

@@ -33,8 +33,10 @@ expression: MarkdownFormatter.format(&empty)
 | Storage I/O | 0 |  |
 | Transaction Size | 0 |  |
 | Base Fee | 0 |  |
-| Rent Fee | 0 |  |
+| Refundable Fee | 0 |  |
 | **Total** | **0** (0.0000000) | **100.0%** |
+
+> Note: CPU, storage and transaction-size fees are derived from the network's config rates; the refundable fee is the remainder of the authoritative RPC total — an estimated rent + events budget, not a protocol-measured rent fee.
 
 ### Optimization Suggestions
 

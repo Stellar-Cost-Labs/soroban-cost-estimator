@@ -79,20 +79,22 @@ Fee Breakdown:
 |------------------+---------------------------|
 | Base Fee         | 100 stroops ()            |
 |------------------+---------------------------|
-| Rent Fee         | 10931 stroops ()          |
+| Refundable Fee   | 10931 stroops ()          |
 |------------------+---------------------------|
 | Total            | 15427 stroops (0.0015427) |
 +------------------+---------------------------+
+Note: CPU, storage and transaction-size fees are derived from the network's config rates; the refundable fee is the remainder of the authoritative RPC total — an estimated rent + events budget, not a protocol-measured rent fee.
+
 
 Fee Distribution:
 
   CPU         | █░                                                      |   2.4%
   Storage I/O | ██████████████▒                                         |  26.3%
   Bandwidth   | ░                                                       |   0.4%
-  Rent        | ███████████████████████████████████████                 |  70.9%
+  Refundable  | ███████████████████████████████████████                 |  70.9%
 
 Optimization Tips:
-  Tip: 70% of the total fee is refundable, which comes from ledger rent bumps and contract events. Consider reducing state growth and the number or size of emitted events.
+  Tip: 70% of the total fee is refundable — the remainder of the resource fee after the config-derived non-refundable components, which the protocol spends on ledger rent bumps, contract events and the return value. Consider reducing state growth and the number or size of emitted events.
 
 Optimization Suggestions:
   No cost optimizations identified (fee rates unavailable or no reducible resources).

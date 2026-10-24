@@ -42,10 +42,12 @@ Fee Breakdown:
 |------------------+-----------------------|
 | Base Fee         | 0 stroops ()          |
 |------------------+-----------------------|
-| Rent Fee         | 0 stroops ()          |
+| Refundable Fee   | 0 stroops ()          |
 |------------------+-----------------------|
 | Total            | 0 stroops (0.0000000) |
 +------------------+-----------------------+
+Note: CPU, storage and transaction-size fees are derived from the network's config rates; the refundable fee is the remainder of the authoritative RPC total — an estimated rent + events budget, not a protocol-measured rent fee.
+
 
 Optimization Suggestions:
   No cost optimizations identified (fee rates unavailable or no reducible resources).

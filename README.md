@@ -28,7 +28,8 @@
 
 
 This CLI tool wraps Stellar's `simulateTransaction` RPC to report real resource
-consumption (CPU instructions, memory, read/write entries/bytes, tx size, rent)
+consumption (CPU instructions, memory, read/write entries/bytes, tx size,
+refundable fees)
 and the fee in stroops/XLM for your compiled Soroban contract `.wasm` files.
 
 ## 🎯 What makes this different
