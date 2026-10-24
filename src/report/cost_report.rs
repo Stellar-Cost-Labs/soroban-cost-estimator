@@ -2065,7 +2065,7 @@ pub fn format_report_table(report: &CostReport) -> String {
         ),
     ]);
     fee_table.add_row(vec![
-        "Rent Fee",
+        "Refundable Fee (rent + events)",
         &format!(
             "{} stroops ({})",
             report.fee.refundable_stroops,
@@ -2082,6 +2082,7 @@ pub fn format_report_table(report: &CostReport) -> String {
 
     output.push_str(&fee_table.to_string());
     output.push('\n');
+    output.push_str(&format_fee_component_notes(&report.fee));
 
     // ASCII bar chart for visual cost breakdown
     output.push_str(&render_fee_bar_chart(&report.fee, DEFAULT_CHART_WIDTH));
@@ -2099,6 +2100,16 @@ pub fn format_report_table(report: &CostReport) -> String {
     }
 
     output
+}
+
+/// Explain the provenance of the refundable fee component when refundable
+/// stroops are present (#526).
+#[must_use]
+pub fn format_fee_component_notes(breakdown: &FeeBreakdown) -> String {
+    if breakdown.refundable_stroops <= 0 {
+        return String::new();
+    }
+    "Note: Refundable fee is inferred as the remainder of the RPC resource fee after rate-derived non-refundable components (CPU, storage I/O, transaction size); it covers both ledger rent bumps and contract events.\n".to_string()
 }
 
 /// Formats a cost report as a JSON string.

@@ -97,6 +97,16 @@ fn build_resource_table(report: &CostReport) -> comfy_table::Table {
 
 /// Builds the "Fee Breakdown" table, pairing each fee component with its
 /// share of the total.
+///
+/// # Component semantics (#526)
+/// * `CPU Instructions`, `Storage I/O`, and `Transaction Size` are derived
+///   locally from simulated resource counts and `ConfigSettingContract*` rates.
+/// * `Base Fee` is the fixed 100-stroop protocol inclusion fee.
+/// * `Rent Fee` displays `FeeBreakdown::refundable_stroops`, which is the
+///   inferred refundable remainder (`max(minResourceFee - non_refundable, 0)`)
+///   covering both ledger rent extensions and contract/diagnostic events; see
+///   [`crate::report::fee_calc::FeeBreakdown::component_semantics`] for the
+///   full structured provenance.
 fn fee_table(report: &CostReport) -> String {
     let pct = &report.fee.fee_percentages;
     let mut fee_table = comfy_table::Table::new();
