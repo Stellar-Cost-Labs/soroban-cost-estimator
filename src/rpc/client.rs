@@ -151,6 +151,13 @@ pub fn resolve_ws_endpoint(network: &str, custom_url: Option<&str>) -> AppResult
     Ok(ws_endpoint)
 }
 
+fn sanitize_host(url: &str) -> String {
+    let without_scheme = url.split("://").nth(1).unwrap_or(url);
+    let host_part = without_scheme.split('/').next().unwrap_or(without_scheme);
+    let host = host_part.split('@').last().unwrap_or(host_part);
+    host.split('?').next().unwrap_or(host).to_string()
+}
+
 /// Rewrites an RPC URL into its WebSocket form.
 ///
 /// * `ws://` / `wss://` URLs are kept as-is.
@@ -406,6 +413,7 @@ pub struct HealthMetadata {
 pub struct RpcClient {
     url: String,
     fallback_url: Option<String>,
+    used_fallback: Arc<AtomicBool>,
     client: reqwest::Client,
     dedup: Arc<Mutex<DedupState>>,
     /// Fixed-rate limiter shared by every network call, when enabled.
@@ -654,6 +662,7 @@ impl RpcClient {
         Self {
             url: url.to_string(),
             fallback_url: fallback_url.map(String::from),
+            used_fallback: Arc::new(AtomicBool::new(false)),
             // `ClientBuilder::build` only fails on invalid configuration (a
             // default builder cannot), so fall back to a plain client to keep
             // construction infallible.
@@ -895,6 +904,7 @@ impl RpcClient {
                     // The operator-facing notice goes to stderr so it never
                     // contaminates machine-readable stdout (json/csv/markdown).
                     eprintln!("Primary RPC failed, failing over to fallback endpoint: {fallback}");
+                    self.used_fallback.store(true, Ordering::SeqCst);
                     debug!(
                         method,
                         primary = %self.url,
@@ -910,6 +920,22 @@ impl RpcClient {
             }
             Err(e) => Err(e),
         }
+    }
+
+    pub fn served_role(&self) -> &'static str {
+        if self.used_fallback.load(Ordering::SeqCst) {
+            "fallback"
+        } else {
+            "primary"
+        }
+    }
+
+    pub fn sanitized_host(&self) -> String {
+        sanitize_host(if self.used_fallback.load(Ordering::SeqCst) {
+            self.fallback_url.as_deref().unwrap_or(&self.url)
+        } else {
+            &self.url
+        })
     }
 
     /// True when `error` should trigger a failover attempt against the
