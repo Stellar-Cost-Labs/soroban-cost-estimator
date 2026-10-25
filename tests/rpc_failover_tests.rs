@@ -15,9 +15,9 @@ use std::time::Duration;
 
 use serde_json::Value;
 use soroban_cost_estimator::error::AppResult;
-use soroban_cost_estimator::rpc::client::RpcClient;
 use soroban_cost_estimator::report::cost_report::{CostReport, FeeBreakdown};
 use soroban_cost_estimator::report::formatter::{JsonFormatter, ReportFormatter, TableFormatter};
+use soroban_cost_estimator::rpc::client::RpcClient;
 use soroban_cost_estimator::wasm::parser::ContractMeta;
 
 /// A hostname that is guaranteed never to resolve (RFC 6761 reserves the
@@ -285,7 +285,8 @@ async fn fallback_success_records_provenance_and_scrubs_credentials_in_cost_repo
     let (fallback_url, served) = spawn_rpc_stub();
     // Embed sensitive userinfo and query string tokens in both endpoints,
     // and provide an Authorization header with a secret token.
-    let primary_with_creds = "http://primary_user:primary_secret@primary.invalid:8080/rpc?token=prim_secret_tok";
+    let primary_with_creds =
+        "http://primary_user:primary_secret@primary.invalid:8080/rpc?token=prim_secret_tok";
     let fallback_with_creds = format!(
         "{}/rpc?key=fallback_secret_token",
         fallback_url.replace("http://", "http://fallback_user:fallback_pass@")
@@ -304,8 +305,15 @@ async fn fallback_success_records_provenance_and_scrubs_credentials_in_cost_repo
     .expect("valid client config");
 
     let result: AppResult<Value> = client.call("getHealth", serde_json::json!({})).await;
-    assert!(result.is_ok(), "fallback should successfully serve the request: {result:?}");
-    assert_eq!(served.load(Ordering::SeqCst), 1, "fallback server must have served 1 request");
+    assert!(
+        result.is_ok(),
+        "fallback should successfully serve the request: {result:?}"
+    );
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        1,
+        "fallback server must have served 1 request"
+    );
 
     // Endpoint provenance asserts
     assert_eq!(client.served_role(), "fallback");
