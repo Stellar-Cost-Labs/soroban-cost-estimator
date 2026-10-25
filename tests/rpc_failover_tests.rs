@@ -235,7 +235,7 @@ async fn overall_deadline_cancels_delayed_primary_before_per_attempt_timeout() {
         "operation should abort near 150ms deadline, took {elapsed:?}"
     );
     assert_eq!(hits.load(Ordering::SeqCst), 1);
-} 
+}
 
 #[tokio::test]
 async fn overall_deadline_stops_retry_backoff_and_returns_total_timeout() {
@@ -332,7 +332,10 @@ async fn circuit_breaker_disabled_does_not_affect_healthy_endpoint() {
         .with_circuit_breaker(Some(cb), None);
 
     let result: AppResult<Value> = client.call("getHealth", serde_json::json!({})).await;
-    assert!(result.is_ok(), "disabled breaker must not affect healthy calls");
+    assert!(
+        result.is_ok(),
+        "disabled breaker must not affect healthy calls"
+    );
     assert_eq!(served.load(Ordering::SeqCst), 1);
 }
 
@@ -349,13 +352,16 @@ async fn circuit_opens_after_threshold_and_fast_fails() {
         "primary",
     );
 
-    let client =
-        RpcClient::with_fallback(&dead_url, None, None, Duration::from_secs(5), 0, false)
-            .with_circuit_breaker(Some(cb.clone()), None);
+    let client = RpcClient::with_fallback(&dead_url, None, None, Duration::from_secs(5), 0, false)
+        .with_circuit_breaker(Some(cb.clone()), None);
 
     // First two calls fail with transport errors — circuit stays closed.
     let _ = client.call::<Value>("test", serde_json::json!({})).await;
-    assert_eq!(cb.state(), CircuitState::Closed, "one failure: still closed");
+    assert_eq!(
+        cb.state(),
+        CircuitState::Closed,
+        "one failure: still closed"
+    );
 
     let _ = client.call::<Value>("test", serde_json::json!({})).await;
     assert!(
@@ -447,9 +453,7 @@ async fn circuit_recovers_after_cooldown_with_successful_probe() {
     );
 
     // Open the circuit with one transport failure.
-    cb.record_failure(&soroban_cost_estimator::error::AppError::RpcUnavailable {
-        status: 503,
-    });
+    cb.record_failure(&soroban_cost_estimator::error::AppError::RpcUnavailable { status: 503 });
     assert!(matches!(cb.state(), CircuitState::Open { .. }));
 
     // Advance the fake clock past the cooldown.
@@ -464,8 +468,16 @@ async fn circuit_recovers_after_cooldown_with_successful_probe() {
 
     let result: AppResult<Value> = client.call("getHealth", serde_json::json!({})).await;
     assert!(result.is_ok(), "probe must succeed: {result:?}");
-    assert_eq!(cb.state(), CircuitState::Closed, "circuit must close after successful probe");
-    assert_eq!(served.load(Ordering::SeqCst), 1, "exactly one probe must reach the endpoint");
+    assert_eq!(
+        cb.state(),
+        CircuitState::Closed,
+        "circuit must close after successful probe"
+    );
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        1,
+        "exactly one probe must reach the endpoint"
+    );
 }
 
 /// The fallback circuit breaker is independent from the primary: opening the

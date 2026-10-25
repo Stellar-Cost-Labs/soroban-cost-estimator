@@ -194,11 +194,7 @@ impl CircuitBreaker {
 
     /// Creates a circuit breaker with the given configuration and the system
     /// clock. Use [`CircuitBreaker::with_clock`] for deterministic testing.
-    pub fn new(
-        config: CircuitBreakerConfig,
-        clock: Arc<dyn Clock>,
-        label: &'static str,
-    ) -> Self {
+    pub fn new(config: CircuitBreakerConfig, clock: Arc<dyn Clock>, label: &'static str) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner::new())),
             config,
@@ -208,7 +204,11 @@ impl CircuitBreaker {
     }
 
     /// Creates a circuit breaker with an injected clock (for testing).
-    pub fn with_clock(config: CircuitBreakerConfig, clock: Arc<dyn Clock>, label: &'static str) -> Self {
+    pub fn with_clock(
+        config: CircuitBreakerConfig,
+        clock: Arc<dyn Clock>,
+        label: &'static str,
+    ) -> Self {
         Self::new(config, clock, label)
     }
 
@@ -234,7 +234,10 @@ impl CircuitBreaker {
             CircuitState::Closed => false,
             CircuitState::HalfOpen => {
                 // A probe is already in flight; reject concurrent callers fast.
-                debug!(label = self.label, "circuit half-open: rejecting concurrent call");
+                debug!(
+                    label = self.label,
+                    "circuit half-open: rejecting concurrent call"
+                );
                 true
             }
             CircuitState::Open { opened_at } => {
@@ -393,8 +396,8 @@ pub fn is_transport_failure(error: &AppError) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -678,9 +681,15 @@ mod tests {
     #[test]
     fn connect_timeout_and_rpc_unavailable_are_transport_failures() {
         // `AppError::RpcUnavailable` covers the HTTP 502/503/504 gateway case.
-        assert!(is_transport_failure(&AppError::RpcUnavailable { status: 502 }));
-        assert!(is_transport_failure(&AppError::RpcUnavailable { status: 503 }));
-        assert!(is_transport_failure(&AppError::RpcUnavailable { status: 504 }));
+        assert!(is_transport_failure(&AppError::RpcUnavailable {
+            status: 502
+        }));
+        assert!(is_transport_failure(&AppError::RpcUnavailable {
+            status: 503
+        }));
+        assert!(is_transport_failure(&AppError::RpcUnavailable {
+            status: 504
+        }));
         // `AppError::ConnectTimeout` covers the TCP connect timeout case.
         // We verify the match arm is correct via the is_transport_failure
         // function which explicitly matches ConnectTimeout { .. }.

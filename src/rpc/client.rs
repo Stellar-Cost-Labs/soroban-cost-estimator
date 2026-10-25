@@ -12,8 +12,8 @@ use tokio::sync::{Mutex, Notify};
 use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
-use crate::rpc::retry::{DEFAULT_MAX_RETRIES, with_retry_deadline};
 use crate::rpc::circuit_breaker::CircuitBreaker;
+use crate::rpc::retry::{DEFAULT_MAX_RETRIES, with_retry_deadline};
 
 /// Default per-request HTTP timeout applied to every RPC call. Matches the
 /// CLI's `--timeout` default (30 seconds).
