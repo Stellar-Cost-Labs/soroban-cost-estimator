@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `wasm info --json` now includes a `function_signatures` block with each exported
+  function's spec presence, raw WASM param/result counts, and parameter and
+  return types; names and types are explicit `null`s when the contract spec is
+  absent (#495).
 - `estimate --history` — compare the current run against up to 5 previous
   cached runs of the same contract function, rendered as a trend table
   (regressions in red, improvements in green) with a `history` array in
