@@ -19,11 +19,17 @@ struct Manifest {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
+    /// Path to the compiled WASM contract.
     pub wasm: PathBuf,
+    /// Name of the contract function to invoke.
     pub function: String,
+    /// Ordered list of arguments for the function invocation.
     pub args: Vec<String>,
+    /// Optional network name override for this invocation.
     pub network: Option<String>,
+    /// Optional RPC endpoint URL override for this invocation.
     pub rpc_url: Option<String>,
+    /// Optional deployed contract ID (hex or strkey).
     pub id: Option<String>,
 }
 
