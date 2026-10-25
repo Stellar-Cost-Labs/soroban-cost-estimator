@@ -288,7 +288,7 @@ fn test_fixture_simulate_transaction_error_compatibility() {
         serde_json::from_str(&raw_json).expect("must deserialize error response");
 
     assert_eq!(
-        resp.error.as_deref(),
+        resp.error.as_ref().map(|e| e.message.as_str()),
         Some("HostError: Error(Contract, #1)")
     );
     assert_eq!(resp.ledger_sequence(), 3_894_195);
