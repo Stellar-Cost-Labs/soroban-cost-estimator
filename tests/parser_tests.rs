@@ -212,57 +212,6 @@ fn test_sections_captured_with_names_and_sizes() {
     assert!(summary.contains('%'), "shares missing from: {summary}");
 }
 
-    /// Verifies that custom-section names and byte sizes are serialized in the
-    /// structured WASM inspection output, and that repeated custom sections
-    /// appear as separate entries in the sections array.
-    #[test]
-    fn test_custom_sections_serialized_with_names_and_sizes() {
-        use serde_json::Value;
-
-        let path = Path::new("tests/fixtures/contract.wasm");
-        let wasm_info =
-            soroban_cost_estimator::wasm::parser::load_wasm(path)
-                .expect("failed to load contract fixture");
-
-        // Sections must be captured
-        assert!(
-            !wasm_info.sections.is_empty(),
-            "sections should be captured"
-        );
-
-        // Each section must have a name and size
-        for section in &wasm_info.sections {
-            assert!(
-                !section.name.is_empty(),
-                "section name must not be empty"
-            );
-            assert!(
-                section.size > 0,
-                "section {} has no size", section.name
-            );
-            assert!(
-                section.end > section.offset,
-                "section {} end must be after offset", section.name
-            );
-        }
-
-        // JSON serialization must include section names and sizes deterministically
-        let breakdown = wasm_info.section_breakdown();
-        let section_sizes_map = breakdown.size_map();
-        // size_map should have an entry for every section (repeated names are suffixed)
-        assert!(
-            section_sizes_map.len() == wasm_info.sections.len(),
-            "size_map entry count {} must match sections count {}",
-            section_sizes_map.len(),
-            wasm_info.sections.len()
-        );
-
-        // Human-readable output must retain current format
-        let summary = soroban_cost_estimator::wasm::parser::format_sections(&wasm_info);
-        assert!(
-            summary.contains("WASM sections:"),
-            "human-readable output must contain WASM
-
 #[test]
 fn test_section_sizes_sum_to_total_wasm_byte_length() {
     for fixture in [
@@ -1343,95 +1292,86 @@ fn test_fuzz_boundaries_malformed_wasm_inputs() {
     );
 }
 
+/// Verifies that custom-section names and byte sizes are serialized in the
+/// structured WASM inspection output, and that repeated custom sections
+/// appear as separate entries in the sections array.
+#[test]
+fn test_custom_sections_serialized_with_names_and_sizes() {
+    let path = Path::new("tests/fixtures/contract.wasm");
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(path)
+        .expect("failed to load contract fixture");
 
-    /// Verifies that custom-section names and byte sizes are serialized in the
-    /// structured WASM inspection output, and that repeated custom sections
-    /// appear as separate entries in the sections array.
-    #[test]
-    fn test_custom_sections_serialized_with_names_and_sizes() {
-        use serde_json::Value;
+    // Sections must be captured
+    assert!(
+        !wasm_info.sections.is_empty(),
+        "sections should be captured"
+    );
 
-        let path = Path::new("tests/fixtures/contract.wasm");
-        let wasm_info =
-            soroban_cost_estimator::wasm::parser::load_wasm(path)
-                .expect("failed to load contract fixture");
-
-        // Sections must be captured
+    // Each section must have a name and size
+    for section in &wasm_info.sections {
+        assert!(!section.name.is_empty(), "section name must not be empty");
+        assert!(section.size > 0, "section {} has no size", section.name);
         assert!(
-            !wasm_info.sections.is_empty(),
-            "sections should be captured"
-        );
-
-        // Each section must have a name and size
-        for section in &wasm_info.sections {
-            assert!(
-                !section.name.is_empty(),
-                "section name must not be empty"
-            );
-            assert!(
-                section.size > 0,
-                "section {} has no size", section.name
-            );
-            assert!(
-                section.end > section.offset,
-                "section {} end must be after offset", section.name
-            );
-        }
-
-        // JSON serialization must include section names and sizes deterministically
-        let breakdown = wasm_info.section_breakdown();
-        let section_sizes_map = breakdown.size_map();
-        // size_map should have an entry for every section (repeated names are suffixed)
-        assert!(
-            section_sizes_map.len() == wasm_info.sections.len(),
-            "size_map entry count {} must match sections count {}",
-            section_sizes_map.len(),
-            wasm_info.sections.len()
-        );
-
-        // Human-readable output must retain current format
-        let summary = soroban_cost_estimator::wasm::parser::format_sections(&wasm_info);
-        assert!(
-            summary.contains("WASM sections:"),
-            "human-readable output must contain 'WASM sections:'"
-        );
-        assert!(
-            summary.contains("contractspecv0"),
-            "human-readable output must contain 'contractspecv0'"
+            section.end > section.offset,
+            "section {} end must be after offset",
+            section.name
         );
     }
 
-    /// Tests that modules with unknown custom section ids are handled gracefully.
-    /// Unknown section ids (beyond the known set) should still produce a
-    /// SectionInfo with a generated name rather than panicking.
-    #[test]
-    fn test_unknown_custom_sections_handled_gracefully() {
-        let path = Path::new("tests/fixtures/minimal.wasm");
-        let wasm_info =
-            soroban_cost_estimator::wasm::parser::load_wasm(path)
-                .expect("failed to load minimal WASM fixture");
+    // JSON serialization must include section names and sizes deterministically
+    let breakdown = wasm_info.section_breakdown();
+    let section_sizes_map = breakdown.size_map();
+    // size_map should have an entry for every section (repeated names are suffixed)
+    assert!(
+        section_sizes_map.len() == wasm_info.sections.len(),
+        "size_map entry count {} must match sections count {}",
+        section_sizes_map.len(),
+        wasm_info.sections.len()
+    );
 
-        // Minimal WASM should have at least some sections
+    // Human-readable output must retain current format
+    let summary = soroban_cost_estimator::wasm::parser::format_sections(&wasm_info);
+    assert!(
+        summary.contains("WASM sections:"),
+        "human-readable output must contain 'WASM sections:'"
+    );
+    assert!(
+        summary.contains("contractspecv0"),
+        "human-readable output must contain 'contractspecv0'"
+    );
+}
+
+/// Tests that modules with unknown custom section ids are handled gracefully.
+/// Unknown section ids (beyond the known set) should still produce a
+/// SectionInfo with a generated name rather than panicking.
+#[test]
+fn test_unknown_custom_sections_handled_gracefully() {
+    let path = Path::new("tests/fixtures/minimal.wasm");
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(path)
+        .expect("failed to load minimal WASM fixture");
+
+    // Minimal WASM should have at least some sections
+    assert!(
+        !wasm_info.sections.is_empty(),
+        "minimal WASM should have sections"
+    );
+
+    // All sections should have valid names (even if generated for unknown ids)
+    for section in &wasm_info.sections {
+        // Section names should not be empty
         assert!(
-            !wasm_info.sections.is_empty(),
-            "minimal WASM should have sections"
+            !section.name.is_empty(),
+            "section name must not be empty, got: {:?}",
+            section
         );
-
-        // All sections should have valid names (even if generated for unknown ids)
-        for section in &wasm_info.sections {
-            // Section names should not be empty
-            assert!(
-                !section.name.is_empty(),
-                "section name must not be empty, got: {:?}",
-                section
-            );
-            // Sizes should be non-negative
-            assert!(
-                section.size >= 0,
-                "section size must be non-negative"
-            );
-        )
+        // Sizes should be non-negative
+        assert!(
+            section.end >= section.offset,
+            "section {} end must be after or equal to offset",
+            section.name
+        );
     }
+}
 
 fn test_fuzz_seed_corpus_fixtures_succeed() {
     use soroban_cost_estimator::wasm::parser::{
@@ -1461,4 +1401,47 @@ fn test_fuzz_seed_corpus_fixtures_succeed() {
             "spec entries: {path_str}"
         );
     }
+}
+
+/// Golden test: the `function_signatures` block for the fixture contract is
+/// stable JSON that keeps Soroban spec types apart from raw WASM counts.
+#[test]
+fn test_function_signatures_json_golden_contract_fixture() {
+    let info =
+        soroban_cost_estimator::wasm::parser::load_wasm(Path::new("tests/fixtures/contract.wasm"))
+            .expect("failed to load contract fixture");
+    let json = soroban_cost_estimator::wasm::parser::function_signatures_json(&info);
+    insta::assert_snapshot!(
+        "function_signatures_contract_fixture",
+        serde_json::to_string_pretty(&json).expect("serialize signatures")
+    );
+}
+
+/// A bare WASM module has no contract spec, so names and types must be
+/// explicit nulls while the raw WASM counts are preserved.
+#[test]
+fn test_function_signatures_json_marks_absent_spec_names() {
+    let info =
+        soroban_cost_estimator::wasm::parser::load_wasm(Path::new("tests/fixtures/minimal.wasm"))
+            .expect("failed to load minimal fixture");
+    let json = soroban_cost_estimator::wasm::parser::function_signatures_json(&info);
+    let add_one = json["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .find(|f| f["name"] == "add_one")
+        .expect("add_one function");
+    assert_eq!(add_one["spec_present"], false);
+    let param_count = add_one["wasm"]["param_count"].as_u64().expect("count");
+    assert_eq!(
+        add_one["params"].as_array().expect("params").len() as u64,
+        param_count
+    );
+    assert!(
+        add_one["params"]
+            .as_array()
+            .expect("params")
+            .iter()
+            .all(|p| p["name"].is_null() && p["type"].is_null())
+    );
 }
