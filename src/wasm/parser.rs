@@ -1046,6 +1046,28 @@ pub struct FunctionInfo {
 /// Schema version of the `function_signatures` JSON block.
 pub const FUNCTION_SIGNATURES_SCHEMA_VERSION: u32 = 1;
 
+/// Renders every custom section's name and byte size as JSON.
+///
+/// Preserves repeated custom sections as separate entries and preserves
+/// deterministic ordering matching the WASM binary sequence.
+#[must_use]
+pub fn custom_sections_json(info: &WasmInfo) -> serde_json::Value {
+    let entries: Vec<serde_json::Value> = info
+        .sections
+        .iter()
+        .filter(|s| s.custom)
+        .map(|s| {
+            json!({
+                "name": s.name,
+                "size": s.size,
+                "offset": s.offset,
+                "end": s.end,
+            })
+        })
+        .collect();
+    json!(entries)
+}
+
 /// Renders every exported function's signature as stable JSON.
 ///
 /// Soroban spec types (`type`/`type_def`) are kept separate from the raw WASM
@@ -1364,6 +1386,11 @@ impl WasmInfo {
         self.imports
             .iter()
             .filter(|imp| imp.module == HOST_IMPORT_MODULE)
+    }
+
+    /// Returns an iterator over custom sections (`id == 0`), in binary order.
+    pub fn custom_sections(&self) -> impl Iterator<Item = &SectionInfo> {
+        self.sections.iter().filter(|s| s.custom)
     }
 
     /// Size accounting for the whole file: the module header plus one entry

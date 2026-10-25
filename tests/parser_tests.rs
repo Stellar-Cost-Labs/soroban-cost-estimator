@@ -1318,6 +1318,19 @@ fn test_custom_sections_serialized_with_names_and_sizes() {
         );
     }
 
+    // JSON serialization must include custom section names and sizes
+    let custom_json = soroban_cost_estimator::wasm::parser::custom_sections_json(&wasm_info);
+    let custom_array = custom_json.as_array().expect("custom_sections array");
+    assert!(
+        !custom_array.is_empty(),
+        "contract.wasm must have custom sections"
+    );
+    let spec = custom_array
+        .iter()
+        .find(|s| s["name"] == "contractspecv0")
+        .expect("contractspecv0 section must be in custom_sections");
+    assert!(spec["size"].as_u64().unwrap_or(0) > 0);
+
     // JSON serialization must include section names and sizes deterministically
     let breakdown = wasm_info.section_breakdown();
     let section_sizes_map = breakdown.size_map();
@@ -1341,36 +1354,77 @@ fn test_custom_sections_serialized_with_names_and_sizes() {
     );
 }
 
-/// Tests that modules with unknown custom section ids are handled gracefully.
-/// Unknown section ids (beyond the known set) should still produce a
-/// SectionInfo with a generated name rather than panicking.
+/// Tests that modules with repeated custom sections preserve each section as a separate entry.
+#[test]
+fn test_repeated_custom_sections_preserved_as_separate_entries() {
+    let mut bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
+    bytes.extend_from_slice(&custom_section("custom_meta", b"alpha"));
+    bytes.extend_from_slice(&custom_section("custom_meta", b"beta_longer_payload"));
+
+    let temp = std::env::temp_dir().join(format!("sce-repeated-{}.wasm", std::process::id()));
+    std::fs::write(&temp, &bytes).expect("write temp fixture");
+
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(&temp)
+        .expect("load wasm with repeated custom sections");
+
+    let custom_sections: Vec<_> = wasm_info.custom_sections().collect();
+    assert_eq!(
+        custom_sections.len(),
+        2,
+        "both repeated custom sections must be preserved"
+    );
+    assert_eq!(custom_sections[0].name, "custom_meta");
+    assert_eq!(custom_sections[1].name, "custom_meta");
+
+    let custom_json = soroban_cost_estimator::wasm::parser::custom_sections_json(&wasm_info);
+    let custom_array = custom_json.as_array().expect("custom_sections array");
+    let repeated: Vec<_> = custom_array
+        .iter()
+        .filter(|s| s["name"] == "custom_meta")
+        .collect();
+    assert_eq!(
+        repeated.len(),
+        2,
+        "repeated custom sections must be serialized as separate entries"
+    );
+    assert!(repeated[0]["size"].as_u64().unwrap() < repeated[1]["size"].as_u64().unwrap());
+    assert!(repeated[0]["offset"].as_u64().unwrap() < repeated[1]["offset"].as_u64().unwrap());
+
+    let _ = std::fs::remove_file(&temp);
+}
+
+/// Tests that modules with unknown custom section names are handled gracefully.
 #[test]
 fn test_unknown_custom_sections_handled_gracefully() {
-    let path = Path::new("tests/fixtures/minimal.wasm");
-    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(path)
-        .expect("failed to load minimal WASM fixture");
+    let mut bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
+    bytes.extend_from_slice(&custom_section(
+        "unknown_custom_xyz",
+        b"payload_bytes_for_test",
+    ));
 
-    // Minimal WASM should have at least some sections
-    assert!(
-        !wasm_info.sections.is_empty(),
-        "minimal WASM should have sections"
-    );
+    let temp = std::env::temp_dir().join(format!("sce-unknown-{}.wasm", std::process::id()));
+    std::fs::write(&temp, &bytes).expect("write temp fixture");
 
-    // All sections should have valid names (even if generated for unknown ids)
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(&temp)
+        .expect("failed to load WASM with unknown custom section");
+
+    let custom_json = soroban_cost_estimator::wasm::parser::custom_sections_json(&wasm_info);
+    let custom_array = custom_json.as_array().expect("custom_sections array");
+    let unknown = custom_array
+        .iter()
+        .find(|s| s["name"] == "unknown_custom_xyz")
+        .expect("unknown custom section must be preserved");
+    assert!(unknown["size"].as_u64().unwrap() > 0);
+
     for section in &wasm_info.sections {
-        // Section names should not be empty
-        assert!(
-            !section.name.is_empty(),
-            "section name must not be empty, got: {:?}",
-            section
-        );
-        // Sizes should be non-negative
+        assert!(!section.name.is_empty(), "section name must not be empty");
         assert!(
             section.end >= section.offset,
-            "section {} end must be after or equal to offset",
-            section.name
+            "section end must be >= offset"
         );
     }
+
+    let _ = std::fs::remove_file(&temp);
 }
 
 fn test_fuzz_seed_corpus_fixtures_succeed() {
