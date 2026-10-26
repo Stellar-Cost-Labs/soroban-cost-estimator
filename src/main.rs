@@ -3,6 +3,7 @@ use std::path::Path;
 use clap::{CommandFactory, FromArgMatches};
 use comfy_table::Cell;
 use comfy_table::Table;
+use serde::Deserialize;
 use soroban_cost_estimator::cache;
 use soroban_cost_estimator::cli;
 use soroban_cost_estimator::config;
