@@ -368,7 +368,7 @@ pub enum Command {
         /// bounded hex previews (32 bytes, 4 topics, 10 entries) are added.
         /// Raw XDR/JSON payloads are never printed in full and are not
         /// cached.
-        #[arg(long)]
+        #[arg(long, global = true)]
         show_events: bool,
     },
 
