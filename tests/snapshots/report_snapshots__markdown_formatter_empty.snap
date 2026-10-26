@@ -8,7 +8,7 @@ expression: MarkdownFormatter.format(&empty)
 - **Simulated at ledger sequence:** `0`
 - **WASM hash:** `0000000000000000`
 - **WASM size:** 0 bytes
-- **RPC round-trip:** 0 ms
+- **Simulation latency:** 0 ms
 
 ### Resources
 
