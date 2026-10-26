@@ -187,6 +187,14 @@ impl TableFormatter {
             "Simulated at ledger sequence: {}\n",
             crate::report::cost_report::format_ledger_sequence(report.ledger)
         ));
+        if report.fee_rate_provenance.is_some() {
+            output.push_str(&format!(
+                "{}\n",
+                crate::report::cost_report::format_fee_rate_provenance(
+                    report.fee_rate_provenance.as_ref()
+                )
+            ));
+        }
         output.push_str(&format!(
             "RPC round-trip: {} ms\n",
             report.simulation_duration_ms
@@ -773,6 +781,7 @@ mod tests {
             history: None,
             projections: None,
             contract_meta: crate::wasm::parser::ContractMeta::default(),
+            fee_rate_provenance: None,
             diagnostics: None,
         }
     }
@@ -809,6 +818,7 @@ mod tests {
             history: None,
             projections: None,
             contract_meta: crate::wasm::parser::ContractMeta::default(),
+            fee_rate_provenance: None,
             diagnostics: None,
         }
     }
@@ -1702,6 +1712,64 @@ mod tests {
         let md_out = MarkdownFormatter.format(&report);
         assert!(md_out.contains("### Cost Projections"));
         assert!(md_out.contains("| 100 | 1,552,700 | 0.1552700 | $0.18 |"));
+    }
+
+    #[test]
+    fn test_fee_rate_provenance_normal_partial_and_unknown() {
+        use crate::report::cost_report::{FeeRateProvenance, format_fee_rate_provenance};
+
+        // Normal (complete) configuration fetch at a distinct ledger from simulation.
+        let complete = FeeRateProvenance::from_sources(
+            &[
+                ("ContractComputeV0", Some(3_894_190)),
+                ("ContractLedgerCostV0", Some(3_894_190)),
+                ("ContractBandwidthV0", Some(3_894_190)),
+            ],
+            &[],
+        );
+        assert_eq!(complete.source_ledger, Some(3_894_190));
+        assert_eq!(complete.source_ledger_display, "3,894,190");
+        assert_eq!(complete.snapshot_status, "complete");
+        assert!(complete.missing_settings.is_empty());
+
+        let mut report = sample_report();
+        report.fee_rate_provenance = Some(complete);
+        let table_out = TableFormatter.format(&report);
+        assert!(table_out.contains("Simulated at ledger sequence: 3,894,195"));
+        assert!(
+            table_out.contains("Fee-rate source ledger: 3,894,190 (config snapshot: complete)")
+        );
+
+        let json_out = JsonFormatter.format(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json_out).expect("valid JSON");
+        assert_eq!(parsed["ledger_sequence"], 3_894_195);
+        assert_eq!(parsed["fee_rate_provenance"]["source_ledger"], 3_894_190);
+        assert_eq!(parsed["fee_rate_provenance"]["snapshot_status"], "complete");
+
+        // Partial configuration fetch (one setting unavailable).
+        let partial = FeeRateProvenance::from_sources(
+            &[
+                ("ContractComputeV0", Some(3_894_190)),
+                ("ContractLedgerCostV0", Some(3_894_190)),
+            ],
+            &["ContractBandwidthV0"],
+        );
+        assert_eq!(partial.source_ledger, Some(3_894_190));
+        assert_eq!(partial.snapshot_status, "partial");
+        assert_eq!(partial.missing_settings, vec!["ContractBandwidthV0"]);
+        assert_eq!(
+            format_fee_rate_provenance(Some(&partial)),
+            "Fee-rate source ledger: 3,894,190 (config snapshot: partial, missing: ContractBandwidthV0)"
+        );
+
+        // Unknown / unavailable provenance.
+        let unknown = FeeRateProvenance::unknown();
+        assert_eq!(unknown.source_ledger, None);
+        assert_eq!(unknown.source_ledger_display, "unknown");
+        assert_eq!(
+            format_fee_rate_provenance(None),
+            "Fee-rate source ledger: unknown (config snapshot: unknown)"
+        );
     }
 
     // ── Simulation diagnostics (#525) ───────────────────────────────

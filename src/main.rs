@@ -789,9 +789,20 @@ async fn fetch_fee_rates(
     client: &rpc::client::RpcClient,
     quiet: bool,
 ) -> report::fee_calc::FeeRates {
+    fetch_fee_rates_with_provenance(client, quiet).await.0
+}
+
+async fn fetch_fee_rates_with_provenance(
+    client: &rpc::client::RpcClient,
+    quiet: bool,
+) -> (
+    report::fee_calc::FeeRates,
+    report::cost_report::FeeRateProvenance,
+) {
     use tracing::{debug, warn};
 
     let mut degraded: Vec<&'static str> = Vec::new();
+    let mut fetched_sources: Vec<(&'static str, Option<u32>)> = Vec::new();
 
     let raw_compute =
         rpc::config::fetch_config_setting(client, rpc::config::ConfigSettingId::ContractComputeV0)
@@ -814,6 +825,7 @@ async fn fetch_fee_rates(
     let compute_per_10k = match raw_compute {
         Ok(raw) => match xdr_helper::decode_config_entry_xdr(&raw.config_xdr, client.verbose) {
             Ok(stellar_xdr::ConfigSettingEntry::ContractComputeV0(s)) => {
+                fetched_sources.push(("ContractComputeV0", raw.source_ledger));
                 s.fee_rate_per_instructions_increment
             }
             _ => {
@@ -827,16 +839,16 @@ async fn fetch_fee_rates(
         }
     };
 
-    // ConfigSettingContractLedgerCostV0: per-entry read/write fees and the
-    // per-KB disk read fee â€” all part of the non-refundable fee in
-    // stellar-core's resource fee model.
     let (read_entry, write_entry, read_1kb) = match raw_ledger_cost {
         Ok(raw) => match xdr_helper::decode_config_entry_xdr(&raw.config_xdr, client.verbose) {
-            Ok(stellar_xdr::ConfigSettingEntry::ContractLedgerCostV0(s)) => (
-                s.fee_disk_read_ledger_entry,
-                s.fee_write_ledger_entry,
-                s.fee_disk_read1_kb,
-            ),
+            Ok(stellar_xdr::ConfigSettingEntry::ContractLedgerCostV0(s)) => {
+                fetched_sources.push(("ContractLedgerCostV0", raw.source_ledger));
+                (
+                    s.fee_disk_read_ledger_entry,
+                    s.fee_write_ledger_entry,
+                    s.fee_disk_read1_kb,
+                )
+            }
             _ => {
                 degraded.push("ContractLedgerCostV0");
                 (0, 0, 0)
@@ -852,7 +864,10 @@ async fn fetch_fee_rates(
     // is stroops per 1KB of tx size (not per byte).
     let bandwidth_per_kb = match raw_bandwidth {
         Ok(raw) => match xdr_helper::decode_config_entry_xdr(&raw.config_xdr, client.verbose) {
-            Ok(stellar_xdr::ConfigSettingEntry::ContractBandwidthV0(s)) => s.fee_tx_size1_kb,
+            Ok(stellar_xdr::ConfigSettingEntry::ContractBandwidthV0(s)) => {
+                fetched_sources.push(("ContractBandwidthV0", raw.source_ledger));
+                s.fee_tx_size1_kb
+            }
             _ => {
                 degraded.push("ContractBandwidthV0");
                 0
@@ -881,8 +896,10 @@ async fn fetch_fee_rates(
         fee_per_read_1kb: read_1kb,
         fee_per_1kb: bandwidth_per_kb,
     };
-    debug!(?rates, "fetched fee rates");
-    rates
+    let provenance =
+        report::cost_report::FeeRateProvenance::from_sources(&fetched_sources, &degraded);
+    debug!(?rates, ?provenance, "fetched fee rates");
+    (rates, provenance)
 }
 
 /// Outcome of one `estimate` run, letting the caller decide how to render it.
@@ -1087,7 +1104,8 @@ async fn simulate_report(
         memory_bytes, latest_ledger, total_fee_stroops, "simulation complete"
     );
 
-    let fee_rates = fetch_fee_rates(&client, req.quiet).await;
+    let (fee_rates, fee_rate_provenance) =
+        fetch_fee_rates_with_provenance(&client, req.quiet).await;
 
     let fee = report::fee_calc::compute_fee_breakdown(
         total_fee_stroops,
@@ -1144,6 +1162,7 @@ async fn simulate_report(
         history: None,
         projections: None,
         contract_meta: req.contract_meta.clone(),
+        fee_rate_provenance: Some(fee_rate_provenance),
         diagnostics,
     })
 }
@@ -1675,7 +1694,8 @@ async fn cmd_estimate_repeat(
             );
 
             if iteration == 1 {
-                let fee_rates = fetch_fee_rates(&client, quiet).await;
+                let (fee_rates, fee_rate_provenance) =
+                    fetch_fee_rates_with_provenance(&client, quiet).await;
                 let fee = report::fee_calc::compute_fee_breakdown(
                     total_fee_stroops,
                     cpu_instructions,
@@ -1726,6 +1746,7 @@ async fn cmd_estimate_repeat(
                     history: None,
                     projections: None,
                     contract_meta: wasm_info.contract_meta.clone(),
+                    fee_rate_provenance: Some(fee_rate_provenance),
                     diagnostics: None,
                 });
             }
@@ -6341,6 +6362,9 @@ mod tests {
     ];
 
     fn fetch_with(latest_ledger: Option<u64>) -> ConfigSettingsFetch {
+        let source_ledger = latest_ledger
+            .and_then(|ledger| u32::try_from(ledger).ok())
+            .filter(|&ledger| ledger > 0);
         ConfigSettingsFetch {
             entries: STALE_SETTING_LEDGERS
                 .iter()
@@ -6348,6 +6372,7 @@ mod tests {
                     id: **id,
                     config_xdr: "x".to_string(),
                     last_modified_ledger: *ledger,
+                    source_ledger,
                 })
                 .collect(),
             latest_ledger,
@@ -6956,6 +6981,7 @@ mod tests {
             history: None,
             projections: None,
             contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
+            fee_rate_provenance: None,
             diagnostics: None,
         }
     }
