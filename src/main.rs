@@ -6362,6 +6362,9 @@ mod tests {
     ];
 
     fn fetch_with(latest_ledger: Option<u64>) -> ConfigSettingsFetch {
+        let source_ledger = latest_ledger
+            .and_then(|ledger| u32::try_from(ledger).ok())
+            .filter(|&ledger| ledger > 0);
         ConfigSettingsFetch {
             entries: STALE_SETTING_LEDGERS
                 .iter()
@@ -6369,6 +6372,7 @@ mod tests {
                     id: **id,
                     config_xdr: "x".to_string(),
                     last_modified_ledger: *ledger,
+                    source_ledger,
                 })
                 .collect(),
             latest_ledger,
