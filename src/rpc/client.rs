@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use governor::{Quota, RateLimiter};
@@ -442,6 +442,10 @@ pub struct RpcClient {
     pub headers: HeaderMap,
     /// Whether to print verbose RPC request/response diagnostics to stderr.
     pub verbose: bool,
+    /// Number of RPC attempts made (including retries and failover).
+    last_attempt_count: AtomicU8,
+    /// Whether a fallback RPC endpoint was used during the last call.
+    fallback_used: AtomicBool,
     /// Optional overall deadline spanning retries, backoff, and failover for a
     /// single RPC operation.
     total_timeout: Option<Duration>,
@@ -690,6 +694,8 @@ impl RpcClient {
             connect_timeout,
             headers,
             verbose,
+            last_attempt_count: AtomicU8::new(0),
+            fallback_used: AtomicBool::new(false),
             total_timeout: default_total_timeout(),
         }
     }
@@ -742,6 +748,7 @@ impl RpcClient {
                         "unable to reach RPC endpoint {url}: {e}. Check --rpc-url / --network and that the node is reachable.",
                         url = self.url
                     ),
+                    data: None,
                 }
             })?;
 
@@ -759,6 +766,7 @@ impl RpcClient {
                     url = self.url,
                     status = health.status,
                 ),
+                data: None,
             })
         }
     }
@@ -891,6 +899,8 @@ impl RpcClient {
         trace!(
             method,
             header_count = self.headers.len(),
+            attempt_count = self.last_attempt_count.load(Ordering::Relaxed),
+            fallback_used = self.fallback_used.load(Ordering::Relaxed),
             "sending RPC request"
         );
         match self
@@ -912,6 +922,7 @@ impl RpcClient {
                     // The operator-facing notice goes to stderr so it never
                     // contaminates machine-readable stdout (json/csv/markdown).
                     eprintln!("Primary RPC failed, failing over to fallback endpoint: {fallback}");
+                    self.fallback_used.store(true, Ordering::Relaxed);
                     debug!(
                         method,
                         primary = %self.url,
@@ -956,6 +967,7 @@ impl RpcClient {
 
     /// POST `body` to `url` (with retries), parse the JSON-RPC response, and
     /// extract the raw `result` value.
+    #[allow(clippy::too_many_lines)]
     async fn post_and_parse(
         &self,
         method: &str,
@@ -980,42 +992,50 @@ impl RpcClient {
             eprintln!("[RPC] -> {}", request_body_str);
         }
 
-        let response = with_retry_deadline(self.max_retries, deadline, self.total_timeout, || {
-            let client = client.clone();
-            let url = url.clone();
-            let request_body = request_body.clone();
-            let limiter = limiter.clone();
-            let headers = headers.clone();
+        let response = with_retry_deadline(
+            self.max_retries,
+            deadline,
+            self.total_timeout,
+            || {
+                let client = client.clone();
+                let url = url.clone();
+                let request_body = request_body.clone();
+                let limiter = limiter.clone();
+                let headers = headers.clone();
 
-            async move {
-                // Every outbound attempt (including retries) consumes a
-                // token, so the wire rate never exceeds the configured
-                // requests-per-second cap.
-                if let Some(limiter) = &limiter {
-                    limiter.until_ready().await;
-                }
-                let response = client
-                    .post(&url)
-                    .headers(headers)
-                    .json(&request_body)
-                    .send()
-                    .await
-                    .map_err(|e| connect_timeout_error(e, connect_timeout))?;
+                async move {
+                    // Every outbound attempt (including retries) consumes a
+                    // token, so the wire rate never exceeds the configured
+                    // requests-per-second cap.
+                    if let Some(limiter) = &limiter {
+                        limiter.until_ready().await;
+                    }
+                    let response = client
+                        .post(&url)
+                        .headers(headers)
+                        .json(&request_body)
+                        .send()
+                        .await
+                        .map_err(|e| connect_timeout_error(e, connect_timeout))?;
 
-                // Transient statuses (429/5xx) must be turned into errors so
-                // `with_retry` can back off and retry them. Non-transient
-                // statuses fall through and are parsed as JSON-RPC below.
-                let status = response.status();
-                if is_transient_status(status) {
-                    return Err(AppError::HttpStatus {
-                        status: status.as_u16(),
-                        retry_after: parse_retry_after(response.headers()),
-                        message: format!("RPC endpoint returned transient HTTP status {status}"),
-                    });
+                    // Transient statuses (429/5xx) must be turned into errors so
+                    // `with_retry` can back off and retry them. Non-transient
+                    // statuses fall through and are parsed as JSON-RPC below.
+                    let status = response.status();
+                    if is_transient_status(status) {
+                        return Err(AppError::HttpStatus {
+                            status: status.as_u16(),
+                            retry_after: parse_retry_after(response.headers()),
+                            message: format!(
+                                "RPC endpoint returned transient HTTP status {status}"
+                            ),
+                        });
+                    }
+                    Ok::<reqwest::Response, AppError>(response)
                 }
-                Ok::<reqwest::Response, AppError>(response)
-            }
-        })
+            },
+            Some(&self.last_attempt_count),
+        )
         .await?;
         let status = response.status();
 
@@ -1055,16 +1075,19 @@ impl RpcClient {
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown error")
                 .to_string();
+            let data = error.get("data").cloned();
             debug!(method, code, message, "RPC error response");
             return Err(AppError::Rpc {
                 status: code,
                 message,
+                data,
             });
         }
 
         let result = response_body.get("result").ok_or_else(|| AppError::Rpc {
             status: status.as_u16() as i64,
             message: "response missing 'result' field".to_string(),
+            data: None,
         })?;
 
         let elapsed = start.elapsed();
@@ -1457,13 +1480,13 @@ mod tests {
             if fail_status == 200 {
                 (
                     200u16,
-                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure"}}"#
+                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure","data":{"retryable":true,"provider":"stub"}}}"#
                         .to_string(),
                 )
             } else {
                 (
                     fail_status,
-                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure"}}"#
+                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure","data":{"retryable":true,"provider":"stub"}}}"#
                         .to_string(),
                 )
             }
@@ -2143,6 +2166,31 @@ mod tests {
             "503 should be retried then succeed: {result:?}"
         );
         assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_rpc_error_preserves_code_message_and_data() {
+        let (url, counter) = spawn_stub(1, 200, r#"{"pong":true}"#).await;
+        let client = RpcClient::with_options(&url, None, Duration::from_secs(5), 0, false);
+
+        let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
+
+        match result {
+            Err(AppError::Rpc {
+                status,
+                message,
+                data,
+            }) => {
+                assert_eq!(status, -32000);
+                assert_eq!(message, "stubbed failure");
+                assert_eq!(
+                    data,
+                    Some(serde_json::json!({"retryable": true, "provider": "stub"}))
+                );
+            }
+            other => panic!("expected preserved RPC error, got {other:?}"),
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
     /// Persistent transient statuses consume every retry, and the final error

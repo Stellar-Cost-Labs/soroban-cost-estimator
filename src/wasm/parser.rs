@@ -1043,6 +1043,95 @@ pub struct FunctionInfo {
     pub returns: Vec<TypeInfo>,
 }
 
+/// Schema version of the `function_signatures` JSON block.
+pub const FUNCTION_SIGNATURES_SCHEMA_VERSION: u32 = 1;
+
+/// Renders every exported function's signature as stable JSON.
+///
+/// Soroban spec types (`type`/`type_def`) are kept separate from the raw WASM
+/// parameter and result counts (`wasm`), which are plain value-type counts and
+/// are always present. A function missing from the contract spec reports
+/// `"spec_present": false` and one placeholder entry per raw WASM parameter or
+/// result with `null` name and type, so absent spec data is explicit.
+#[must_use]
+pub fn function_signatures_json(info: &WasmInfo) -> serde_json::Value {
+    let spec_names: std::collections::BTreeSet<String> = info
+        .spec_entries
+        .iter()
+        .filter_map(|entry| match entry {
+            stellar_xdr::ScSpecEntry::FunctionV0(f) => {
+                Some(String::from_utf8_lossy(f.name.as_slice()).into_owned())
+            }
+            _ => None,
+        })
+        .collect();
+
+    let functions: Vec<serde_json::Value> = info
+        .functions
+        .iter()
+        .map(|f| {
+            let spec_present = spec_names.contains(&f.name);
+            let params: Vec<serde_json::Value> = if spec_present {
+                f.params
+                    .iter()
+                    .enumerate()
+                    .map(|(index, p)| {
+                        json!({
+                            "index": index,
+                            "name": p.name,
+                            "type": p.type_name,
+                            "type_def": spec_type_json(&p.type_def),
+                        })
+                    })
+                    .collect()
+            } else {
+                (0..f.param_count)
+                    .map(|index| {
+                        json!({
+                            "index": index,
+                            "name": null,
+                            "type": null,
+                            "type_def": null,
+                        })
+                    })
+                    .collect()
+            };
+            let returns: Vec<serde_json::Value> = if spec_present {
+                f.returns
+                    .iter()
+                    .enumerate()
+                    .map(|(index, r)| {
+                        json!({
+                            "index": index,
+                            "type": r.type_name,
+                            "type_def": spec_type_json(&r.type_def),
+                        })
+                    })
+                    .collect()
+            } else {
+                (0..f.result_count)
+                    .map(|index| json!({ "index": index, "type": null, "type_def": null }))
+                    .collect()
+            };
+            json!({
+                "name": f.name,
+                "spec_present": spec_present,
+                "wasm": {
+                    "param_count": f.param_count,
+                    "result_count": f.result_count,
+                },
+                "params": params,
+                "returns": returns,
+            })
+        })
+        .collect();
+
+    json!({
+        "schema_version": FUNCTION_SIGNATURES_SCHEMA_VERSION,
+        "functions": functions,
+    })
+}
+
 /// Renders a spec type definition as JSON, preserving the full type tree
 /// (nested `option`/`result`/`vec`/`map`/`tuple`/`bytes_n`/`udt` types keep
 /// their structure instead of collapsing to a flat name).

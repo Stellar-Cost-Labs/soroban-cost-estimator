@@ -536,10 +536,12 @@ fn rpc_result(body: &Value) -> AppResult<Value> {
             .and_then(Value::as_str)
             .unwrap_or("unknown error")
             .to_string();
+        let data = error.get("data").cloned();
         debug!(code, message, "WebSocket RPC error");
         return Err(AppError::Rpc {
             status: code,
             message,
+            data,
         });
     }
 

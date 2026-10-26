@@ -31,6 +31,8 @@
 
 - [Networks & RPC Providers](networks.md)
 - [Architecture](architecture.md)
+- [Migration guide: Stellar CLI cost checks](migration-guide.md)
+- [CI/CD integration guide](ci-cd-integration.md)
 - [Migrating from the Stellar CLI](migration.md)
 - [Verification](verification.md)
 - [Troubleshooting](troubleshooting.md)
