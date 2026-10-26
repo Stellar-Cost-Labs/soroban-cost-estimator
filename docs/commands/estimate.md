@@ -8,7 +8,7 @@ Simulate a single contract invocation and print the cost report.
 Usage: soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
 
 Options:
-      --format <FORMAT>    Output format: table, json, csv, or markdown [default: table]
+      --format <FORMAT>    Output format: table, json, csv, markdown, or summary [default: table]
   -w, --wasm <WASM>        Path to the compiled Soroban contract `.wasm` file
       --network <NETWORK>  Network to simulate against [default: testnet]
       --rpc-url <RPC_URL>  Explicit RPC URL (overrides network-based resolution)
@@ -157,5 +157,79 @@ so consumers can tell how fresh an estimate is. The human-readable header
 renders the same value with thousands separators as
 `Simulated at ledger sequence: 3,961,544`.
 
-Use `--format json`, `--format csv`, or `--format markdown` when feeding the result into CI, spreadsheets, or documentation. `--json` remains a backward-compatible alias for `--format json`. The
-result is also written to the estimate cache(see [Caching](../concepts/caching.md)).
+Use `--format json`, `--format csv`, `--format markdown`, or `--format summary`
+when feeding the result into CI, spreadsheets, or documentation. `--json`
+remains a backward-compatible alias for `--format json`. The result is also
+written to the estimate cache (see [Caching](../concepts/caching.md)).
+
+## The `summary` format
+
+`--format summary` prints **exactly one line per successful estimate**, for
+shell pipelines, batch logs, and repeated runs where the full table is too
+verbose. Nothing else from the report goes to stdout — no header row, no
+labels, no fee chart and no advisory sections. Diagnostics (progress,
+warnings, cache notices) go to **stderr** for this format, so the result line
+can be redirected on its own:
+
+```sh
+soroban-cost-estimator estimate --wasm contract.wasm --fn increment \
+    --format summary > costs.tsv
+```
+
+### Field order
+
+The line has eleven fields, always in this order and always present (an
+unknown value is `0`, never an omitted column):
+
+| # | Field | Meaning |
+|---|-------|---------|
+| 1 | `function` | Contract function, or `(wasm upload)` |
+| 2 | `network` | Network the simulation ran against |
+| 3 | `ledger` | Ledger sequence simulated against |
+| 4 | `total_stroops` | Total fee in stroops (integer) |
+| 5 | `total_xlm` | Total fee in XLM, at the current `--precision` |
+| 6 | `cpu_instructions` | CPU instructions consumed |
+| 7 | `read_entries` | Ledger entries read |
+| 8 | `write_entries` | Ledger entries written |
+| 9 | `read_bytes` | Ledger bytes read |
+| 10 | `write_bytes` | Ledger bytes written |
+| 11 | `tx_size` | Transaction envelope size, in XDR bytes |
+
+Fields are separated by a single **tab**, so `cut` and `awk` work without any
+custom parsing:
+
+```console
+$ soroban-cost-estimator estimate --wasm contract.wasm --fn increment --format summary
+increment<TAB>testnet<TAB>3961544<TAB>17122<TAB>0.0017122<TAB>524389<TAB>1<TAB>1<TAB>0<TAB>136<TAB>156
+$ soroban-cost-estimator estimate --wasm contract.wasm --fn increment --format summary | cut -f4
+17122
+```
+
+`<TAB>` marks the delimiter in the transcript above; the tool writes a real
+tab character.
+
+### Escaping rules
+
+A field value escapes exactly four characters, with a backslash, using the
+C-style convention already used by `ps` and `find -printf`:
+
+| Character in the value | Emitted as |
+|---|---|
+| backslash (`\`) | `\\` |
+| tab (the delimiter) | `\t` |
+| line feed | `\n` |
+| carriage return | `\r` |
+
+Every other character — spaces, commas, pipes, quotes, non-ASCII text — is
+emitted unchanged, so `transfer from` stays readable and a name containing a
+`|` or `,` needs no special handling. The escaping guarantees the fixed
+column count: splitting the line on tabs always yields exactly eleven fields.
+
+The summary never contains ANSI escape sequences, whether or not stdout is a
+terminal, so `> file.tsv` and terminal output are byte-identical. Because the
+summary is already minimal, `--quiet` changes nothing about it.
+
+`summary` describes a **single invocation**. `estimate-all` and multi-contract
+batch runs (`--wasm` repeated, or `--wasm-dir`) only build aggregates, so they
+render their existing **table** output when `summary` is requested; their
+`table`, `json`, `csv`, and `markdown` output is unchanged.
