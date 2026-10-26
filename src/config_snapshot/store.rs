@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, TimeDelta, Utc};
 use tracing::{debug, trace, warn};
 
-use crate::config_snapshot::model::{ConfigSnapshot, SnapshotPayload};
+use crate::config_snapshot::model::{
+    ConfigSnapshot, INITIAL_SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_SCHEMA_VERSION, SnapshotPayload,
+    ensure_supported_snapshot_schema,
+};
 use crate::error::{AppError, AppResult};
 
 /// Returns the base data directory: `~/.soroban-cost-estimator`.
@@ -140,6 +143,10 @@ pub fn write_snapshot_file(path: &Path, content: &str) -> AppResult<()> {
 ///
 /// The filename is `{network}-{timestamp}.json` within the snapshots directory,
 /// unless an explicit `--out` path is provided.
+/// The written file always declares the current snapshot schema version, so a
+/// new capture is never mistaken for a legacy unversioned one. Reading a
+/// snapshot never writes anything back, so older files keep their shape until
+/// the user explicitly saves over them.
 ///
 /// Newly created snapshot files are restricted to user read/write permissions (`0o600`
 /// on Unix systems) to prevent accidental exposure on shared machines. Existing
@@ -148,6 +155,9 @@ pub fn write_snapshot_file(path: &Path, content: &str) -> AppResult<()> {
 /// # Network calls
 /// None — pure file I/O.
 pub fn save_snapshot(snapshot: &ConfigSnapshot, out_path: Option<&str>) -> AppResult<PathBuf> {
+    let mut snapshot = snapshot.clone();
+    snapshot.schema_version = SNAPSHOT_SCHEMA_VERSION;
+
     let path = match out_path {
         Some(p) => PathBuf::from(p),
         None => {
@@ -161,10 +171,85 @@ pub fn save_snapshot(snapshot: &ConfigSnapshot, out_path: Option<&str>) -> AppRe
         }
     };
 
-    let json = serde_json::to_string_pretty(snapshot)?;
+    let json = serde_json::to_string_pretty(&snapshot)?;
     write_snapshot_file(&path, &json)?;
-    debug!(path = %path.display(), network = snapshot.network, ledger = snapshot.ledger, "snapshot saved");
+    debug!(
+        path = %path.display(),
+        network = snapshot.network,
+        ledger = snapshot.ledger,
+        schema_version = snapshot.schema_version,
+        "snapshot saved"
+    );
     Ok(path)
+}
+
+/// Result of [`save_snapshot_if_changed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotSaveOutcome {
+    /// A new snapshot file was written at this path.
+    Saved(PathBuf),
+    /// The fetched configuration matches the `latest` snapshot, so no file
+    /// was written.
+    Unchanged {
+        /// The newest snapshot on disk, which already records this
+        /// configuration.
+        latest: PathBuf,
+    },
+}
+
+/// Saves `snapshot` unless it records the same configuration as the latest
+/// snapshot already stored for its network.
+///
+/// This is the `config snapshot --skip-unchanged` path: a scheduled collector
+/// can run as often as it likes without filling the snapshots directory with
+/// identical files. The comparison is field-by-field
+/// ([`ConfigSnapshot::same_configuration`]) — never a string comparison — so a
+/// new timestamp, a different key order, or the same values re-published at a
+/// different ledger do not count as a change.
+///
+/// An explicit `out_path` always writes: the caller asked for a file at that
+/// path, and it is not part of the managed snapshot history.
+///
+/// Returns [`SnapshotSaveOutcome::Unchanged`] with the matching file when
+/// nothing was written; the first snapshot for a network is always saved.
+///
+/// # Errors
+/// Fails when the latest snapshot cannot be read, including when it was
+/// written by a newer release than this build ([`AppError::SnapshotSchemaUnsupported`]).
+/// Refusing to guess keeps the "unchanged" decision from silently comparing
+/// against a format this build does not understand.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn save_snapshot_if_changed(
+    snapshot: &ConfigSnapshot,
+    out_path: Option<&str>,
+) -> AppResult<SnapshotSaveOutcome> {
+    if let Some(out) = out_path {
+        return save_snapshot(snapshot, Some(out)).map(SnapshotSaveOutcome::Saved);
+    }
+
+    let dir = snapshots_dir()?;
+    match select_latest_snapshot(&snapshot.network, &dir) {
+        Ok(latest_path) => {
+            let latest = load_snapshot_from_path(&latest_path.to_string_lossy())?;
+            if latest.same_configuration(snapshot) {
+                debug!(
+                    network = snapshot.network,
+                    latest = %latest_path.display(),
+                    "configuration unchanged; not writing a new snapshot"
+                );
+                return Ok(SnapshotSaveOutcome::Unchanged {
+                    latest: latest_path,
+                });
+            }
+        }
+        // No history yet: the first capture is always written.
+        Err(AppError::NoSnapshots(_)) => {}
+        Err(e) => return Err(e),
+    }
+
+    save_snapshot(snapshot, None).map(SnapshotSaveOutcome::Saved)
 }
 
 /// Loads the most recent snapshot for a given network.
@@ -187,8 +272,7 @@ pub fn load_latest_snapshot(network: &str) -> AppResult<ConfigSnapshot> {
     let latest = select_latest_snapshot(network, &dir)?;
 
     let content = std::fs::read_to_string(&latest)?;
-    let snapshot: ConfigSnapshot =
-        serde_json::from_str(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))?;
+    let snapshot = parse_snapshot_at(&latest, &content)?;
     trace!(network, ledger = snapshot.ledger, "latest snapshot loaded");
     Ok(snapshot)
 }
@@ -321,8 +405,7 @@ pub fn load_last_two_snapshot_payloads(
 pub fn load_snapshot_from_path(path: &str) -> AppResult<ConfigSnapshot> {
     debug!(path, "loading snapshot from path");
     let content = std::fs::read_to_string(path)?;
-    let snapshot: ConfigSnapshot =
-        serde_json::from_str(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))?;
+    let snapshot = parse_snapshot_at(Path::new(path), &content)?;
     trace!(
         network = snapshot.network,
         ledger = snapshot.ledger,
@@ -341,7 +424,29 @@ pub fn load_snapshot_from_path(path: &str) -> AppResult<ConfigSnapshot> {
 /// None — pure file I/O.
 pub fn load_snapshot_payload_from_path(path: &str) -> AppResult<SnapshotPayload> {
     let content = std::fs::read_to_string(path)?;
-    SnapshotPayload::parse(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))
+    parse_snapshot_payload_at(Path::new(path), &content)
+}
+
+/// Parses snapshot JSON read from `path`, rejecting schema versions this build
+/// cannot interpret before any caller sees the value.
+///
+/// The schema check happens *before* the parsed snapshot is returned, so a
+/// newer file fails with its own path and a recommended action instead of
+/// surfacing as a confusing missing-field error.
+fn parse_snapshot_at(path: &Path, content: &str) -> AppResult<ConfigSnapshot> {
+    let snapshot: ConfigSnapshot =
+        serde_json::from_str(content).map_err(|e| AppError::SnapshotParse(e.to_string()))?;
+    ensure_supported_snapshot_schema(path, snapshot.schema_version)?;
+    Ok(snapshot)
+}
+
+/// [`parse_snapshot_at`] for callers that need unrecognized top-level fields
+/// preserved for a diff.
+fn parse_snapshot_payload_at(path: &Path, content: &str) -> AppResult<SnapshotPayload> {
+    let payload =
+        SnapshotPayload::parse(content).map_err(|e| AppError::SnapshotParse(e.to_string()))?;
+    ensure_supported_snapshot_schema(path, payload.snapshot.schema_version)?;
+    Ok(payload)
 }
 
 /// Lists all snapshots for a given network, oldest → newest.
@@ -507,9 +612,7 @@ pub fn load_snapshot_by_timestamp(network: &str, timestamp: &str) -> AppResult<C
     }
 
     let content = std::fs::read_to_string(&path)?;
-    let snapshot: ConfigSnapshot =
-        serde_json::from_str(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))?;
-    Ok(snapshot)
+    parse_snapshot_at(&path, &content)
 }
 
 /// Result of validating a single snapshot file.
@@ -622,6 +725,10 @@ fn validate_single_snapshot(path: &std::path::Path) -> AppResult<()> {
             path.display()
         ))
     })?;
+    // A file from a newer release is not corrupt — it is simply not readable
+    // here — so report it with the file and the upgrade path rather than as a
+    // generic validation failure.
+    ensure_supported_snapshot_schema(path, snapshot.schema_version)?;
 
     if snapshot.network.is_empty() {
         return Err(AppError::SnapshotParse(format!(
@@ -878,9 +985,21 @@ pub fn export_snapshots(network: Option<&str>, output_path: &str) -> AppResult<(
                 continue;
             }
         }
-        let content = std::fs::read_to_string(entry.path())?;
-        if let Ok(snapshot) = serde_json::from_str::<ConfigSnapshot>(&content) {
-            snapshots.push(snapshot);
+        let path = entry.path();
+        let content = std::fs::read_to_string(&path)?;
+        match parse_snapshot_at(&path, &content) {
+            Ok(snapshot) => snapshots.push(snapshot),
+            // Malformed files were always skipped by export. A file from a
+            // newer release is skipped too, but with a warning: exporting it
+            // would silently downgrade data this build cannot represent.
+            Err(e @ AppError::SnapshotSchemaUnsupported { .. }) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "skipping snapshot written by a newer release"
+                );
+            }
+            Err(_) => {}
         }
     }
 
@@ -899,6 +1018,7 @@ pub fn import_snapshots(bundle_path: &str) -> AppResult<usize> {
 
     let mut imported = 0;
     for snapshot in bundle.snapshots {
+        ensure_supported_snapshot_schema(Path::new(bundle_path), snapshot.schema_version)?;
         let ts_safe = snapshot.timestamp.replace(':', "-");
         let filename = format!("{}-{}.json", snapshot.network, ts_safe);
         let path = snapshots_dir()?.join(&filename);
@@ -937,6 +1057,10 @@ struct SnapshotHeader {
     ledger: u32,
     #[serde(default)]
     protocol_version: Option<u32>,
+    /// `None` for unversioned legacy files, which are treated as the initial
+    /// schema version.
+    #[serde(default)]
+    schema_version: Option<u32>,
 }
 
 /// Lists metadata for saved snapshots in the snapshots directory.
@@ -981,6 +1105,12 @@ pub fn list_snapshots_metadata(network: Option<&str>) -> AppResult<Vec<SnapshotM
             .map_err(|e| AppError::SnapshotParse(format!("cannot read {}: {e}", path.display())))?;
         let header: SnapshotHeader = serde_json::from_str(&text)
             .map_err(|e| AppError::SnapshotParse(format!("{}: {e}", path.display())))?;
+        ensure_supported_snapshot_schema(
+            &path,
+            header
+                .schema_version
+                .unwrap_or(INITIAL_SNAPSHOT_SCHEMA_VERSION),
+        )?;
         if network.is_some_and(|n| n != header.network) {
             continue;
         }
@@ -1086,8 +1216,7 @@ pub fn is_older_than(timestamp: DateTime<Utc>, days: u64, now: DateTime<Utc>) ->
 /// Returns `Ok(None)` when the field is missing or unparseable.
 fn snapshot_timestamp_utc(path: &Path) -> AppResult<Option<DateTime<Utc>>> {
     let content = std::fs::read_to_string(path)?;
-    let snapshot: ConfigSnapshot =
-        serde_json::from_str(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))?;
+    let snapshot = parse_snapshot_at(path, &content)?;
     Ok(parse_snapshot_timestamp(&snapshot.timestamp))
 }
 
@@ -1144,7 +1273,9 @@ pub fn load_snapshot_checked(path: &Path) -> AppResult<ConfigSnapshot> {
     })?;
 
     let parsed: Result<ConfigSnapshot, serde_json::Error> = serde_json::from_str(&content);
-    parsed.map_err(|e| AppError::SnapshotParse(format!("'{display}': {e}")))
+    let snapshot = parsed.map_err(|e| AppError::SnapshotParse(format!("'{display}': {e}")))?;
+    ensure_supported_snapshot_schema(path, snapshot.schema_version)?;
+    Ok(snapshot)
 }
 
 #[cfg(test)]
