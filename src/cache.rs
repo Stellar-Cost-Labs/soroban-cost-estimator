@@ -2102,6 +2102,7 @@ pub fn export_cache(network: Option<&str>) -> AppResult<CacheExport> {
 
 /// Restrict a newly created cache/backup file to owner-only permissions (`0600`)
 /// on Unix platforms so cache data is never world-readable.
+#[allow(clippy::unnecessary_wraps)]
 fn set_owner_only_file_permissions(path: &Path) -> AppResult<()> {
     #[cfg(unix)]
     {
@@ -2166,6 +2167,7 @@ pub fn backup_cache_db(dest_path: &Path) -> AppResult<usize> {
 /// The active database is kept untouched until the backup passes integrity,
 /// table-presence, and schema-version checks. Returns the number of restored
 /// estimates.
+#[allow(clippy::too_many_lines)]
 pub fn restore_cache_db(source_path: &Path) -> AppResult<usize> {
     if !source_path.is_file() {
         return Err(AppError::FileNotFound(source_path.display().to_string()));
