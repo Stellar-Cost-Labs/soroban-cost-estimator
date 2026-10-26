@@ -3,6 +3,8 @@ use comfy_table::{Cell, CellAlignment, Color, Table};
 use crate::report::fee_calc::{FeeBreakdown, FeeRates};
 use crate::wasm::parser::{ContractMeta, SectionSize, format_contract_meta};
 
+use stellar_xdr::ReadXdr;
+
 // fee_percentage removed since we now use the precalculated exact percentages
 
 /// Minimum terminal width (in columns) required before the fee bar chart is
@@ -348,6 +350,470 @@ pub fn format_resource_warnings(warnings: &[ResourceWarning]) -> String {
     out
 }
 
+/// Maximum number of event / state-change entries summarized individually
+/// (issue #525). Counts always reflect the full response, so rendered
+/// output stays bounded no matter how many entries a simulation produced.
+pub const MAX_SUMMARIZED_ENTRIES: usize = 10;
+
+/// Maximum number of payload bytes hex-encoded per preview (#525).
+pub const MAX_PREVIEW_BYTES: usize = 32;
+
+/// Maximum number of topics previewed per event (#525).
+pub const MAX_PREVIEW_TOPICS: usize = 4;
+
+/// A bounded, redaction-safe summary of one simulation event (issue #525).
+///
+/// Payload bytes are never carried by default: without the explicit
+/// `--show-events` opt-in, only counts and decoded sizes are recorded, so no
+/// raw XDR leaves the RPC layer into reports, logs, or JSON output. Previews
+/// are bounded hex prefixes ([`MAX_PREVIEW_BYTES`]), never full payloads.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EventSummary {
+    /// Event kind: `"contract"`, `"diagnostic"`, `"legacy-xdr"` for the
+    /// pre-object base64-string form, or a bounded raw value / `"unknown"`
+    /// for version-drifted or malformed items.
+    pub kind: String,
+    /// Number of topics the event carried (0 for unrecognized items).
+    pub topic_count: usize,
+    /// Decoded size of the data payload in bytes. `None` when the payload
+    /// is missing or not valid base64 (malformed payloads never fail the
+    /// estimate, issue #525).
+    pub data_bytes: Option<usize>,
+    /// Bounded hex previews of the first topics — details mode only
+    /// (`--show-events`); empty by default (redaction).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topic_previews: Vec<String>,
+    /// Bounded hex preview of the data payload — details mode only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_preview: Option<String>,
+}
+
+/// A bounded, redaction-safe summary of one simulated state change
+/// (issue #525). Same redaction rules as [`EventSummary`]: sizes by
+/// default, bounded hex previews only on explicit request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StateChangeSummary {
+    /// Ledger-entry kind decoded from the change key XDR (e.g.
+    /// `"ContractData"`, `"ContractCode"`), or `"unrecognized"` for
+    /// malformed or undecodable keys.
+    pub key_type: String,
+    /// The change verb: `"created"`, `"updated"`, `"deleted"`, `"unknown"`
+    /// (object without any change payload), or `"unrecognized"` for
+    /// malformed items.
+    pub change: String,
+    /// Decoded size of the created/updated payload in bytes. `None` for
+    /// deletions, missing payloads, and undecodable base64.
+    pub payload_bytes: Option<usize>,
+    /// Bounded hex preview of the change payload — details mode only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_preview: Option<String>,
+}
+
+/// Diagnostic counts — and, only on explicit request, bounded per-entry
+/// summaries — of a simulation's events and state changes (issue #525).
+///
+/// `simulateTransaction` can return events and `stateChanges` that explain
+/// *why* resource usage looks the way it does. Counts are always shown when
+/// present; the `events` / `state_changes` summary arrays are populated only
+/// when the user passes `--show-events`, keeping the default output (text
+/// and JSON) unchanged for reports without diagnostics.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SimulationDiagnostics {
+    /// Total number of events in the response (may exceed the summarized
+    /// number of entries).
+    pub event_count: usize,
+    /// Total number of state changes in the response (may exceed the
+    /// summarized number of entries).
+    pub state_change_count: usize,
+    /// Bounded per-event summaries — empty unless `--show-events` was given.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<EventSummary>,
+    /// Bounded per-state-change summaries — empty unless `--show-events`
+    /// was given.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state_changes: Vec<StateChangeSummary>,
+}
+
+/// Hex-encode a payload preview, bounded to [`MAX_PREVIEW_BYTES`] bytes with
+/// a truncation marker when more bytes followed (#525).
+fn hex_preview(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let shown = &bytes[..bytes.len().min(MAX_PREVIEW_BYTES)];
+    let mut out = String::with_capacity(shown.len() * 2 + 16);
+    for byte in shown {
+        // Writing into a String cannot fail.
+        let _ = write!(out, "{byte:02x}");
+    }
+    if bytes.len() > shown.len() {
+        let _ = write!(out, "…(+{} bytes)", bytes.len() - shown.len());
+    }
+    out
+}
+
+/// Base64-decode a payload for size/preview purposes (#525). Returns `None`
+/// for missing or malformed base64 — diagnostics must never fail the
+/// estimate.
+fn decode_payload(b64: &str) -> Option<Vec<u8>> {
+    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok()
+}
+
+/// Summarize one raw simulation event (#525). Lenient by design: raw JSON
+/// objects (`{ type, topic, data }`), legacy base64-XDR strings, and
+/// malformed items all produce a summary instead of an error.
+fn summarize_event(item: &serde_json::Value, include_previews: bool) -> EventSummary {
+    use serde_json::Value;
+
+    // Legacy RPC form: the whole event is one base64 XDR string.
+    if let Value::String(raw) = item {
+        let decoded = decode_payload(raw);
+        return EventSummary {
+            kind: "legacy-xdr".to_string(),
+            topic_count: 0,
+            data_bytes: decoded.as_ref().map(Vec::len),
+            topic_previews: Vec::new(),
+            data_preview: if include_previews {
+                decoded.as_deref().map(hex_preview)
+            } else {
+                None
+            },
+        };
+    }
+
+    let Value::Object(obj) = item else {
+        // Numbers, booleans, arrays, null — nothing recognizable.
+        return EventSummary {
+            kind: "unrecognized".to_string(),
+            ..EventSummary::default()
+        };
+    };
+
+    let kind = match obj.get("type").and_then(Value::as_str) {
+        Some(kind) if kind == "contract" || kind == "diagnostic" => kind.to_string(),
+        // Preserve unknown kinds but bound them: the value is remote input.
+        Some(other) => other.chars().take(24).collect(),
+        None => "unknown".to_string(),
+    };
+    let topics: Vec<&str> = obj
+        .get("topic")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let topic_count = obj
+        .get("topic")
+        .and_then(Value::as_array)
+        .map_or(topics.len(), Vec::len);
+
+    let data = obj
+        .get("data")
+        .and_then(Value::as_str)
+        .and_then(decode_payload);
+
+    let mut topic_previews = Vec::new();
+    let mut data_preview = None;
+    if include_previews {
+        for topic in topics.iter().take(MAX_PREVIEW_TOPICS) {
+            topic_previews.push(
+                decode_payload(topic)
+                    .map_or_else(|| "(undecodable)".to_string(), |b| hex_preview(&b)),
+            );
+        }
+        if topics.len() > MAX_PREVIEW_TOPICS {
+            topic_previews.push(format!("…(+{} topics)", topics.len() - MAX_PREVIEW_TOPICS));
+        }
+        data_preview = data.as_deref().map(hex_preview);
+    }
+
+    EventSummary {
+        kind,
+        topic_count,
+        data_bytes: data.as_ref().map(Vec::len),
+        topic_previews,
+        data_preview,
+    }
+}
+
+/// Summarize one raw simulated state change (#525) — a `LedgerEntryChange`
+/// object (`{ key, created?, updated?, deleted? }`). Malformed items
+/// summarize as `unrecognized` rather than failing.
+fn summarize_state_change(item: &serde_json::Value, include_previews: bool) -> StateChangeSummary {
+    use serde_json::Value;
+
+    let Value::Object(obj) = item else {
+        return StateChangeSummary {
+            key_type: "unrecognized".to_string(),
+            change: "unrecognized".to_string(),
+            ..StateChangeSummary::default()
+        };
+    };
+
+    // The change key decodes to a `LedgerKey`; its variant name (e.g.
+    // `ContractData`) is a safe, useful label. Undecodable keys are marked.
+    let key_type = obj
+        .get("key")
+        .and_then(Value::as_str)
+        .and_then(decode_payload)
+        .and_then(|bytes| {
+            stellar_xdr::LedgerKey::from_xdr(&bytes, stellar_xdr::Limits::none()).ok()
+        })
+        .map_or_else(|| "unrecognized".to_string(), |key| key.name().to_string());
+
+    let deleted = obj.get("deleted").and_then(Value::as_bool).unwrap_or(false);
+    let payload = obj
+        .get("created")
+        .or_else(|| obj.get("updated"))
+        .and_then(Value::as_str)
+        .and_then(decode_payload);
+
+    // Exactly one of created / updated / deleted identifies the change; a
+    // bare key (or an undecodable payload) leaves the verb `unknown`, and a
+    // non-object item is `unrecognized` (handled above).
+    let change = if deleted {
+        "deleted"
+    } else if obj.get("created").is_some() {
+        "created"
+    } else if obj.get("updated").is_some() {
+        "updated"
+    } else if obj.contains_key("key") {
+        "unknown"
+    } else {
+        "unrecognized"
+    };
+
+    StateChangeSummary {
+        key_type,
+        change: change.to_string(),
+        payload_bytes: payload.as_ref().map(Vec::len),
+        payload_preview: if include_previews {
+            payload.as_deref().map(hex_preview)
+        } else {
+            None
+        },
+    }
+}
+
+/// Summarize the raw simulation events (#525), bounded to
+/// [`MAX_SUMMARIZED_ENTRIES`] entries. `include_previews` adds bounded hex
+/// previews of decoded payloads; without it the summaries carry only kinds,
+/// counts, and sizes — payload bytes never leave the RPC layer by default.
+#[must_use]
+pub fn summarize_events(events: &[serde_json::Value], include_previews: bool) -> Vec<EventSummary> {
+    events
+        .iter()
+        .take(MAX_SUMMARIZED_ENTRIES)
+        .map(|item| summarize_event(item, include_previews))
+        .collect()
+}
+
+/// Summarize the raw simulated state changes (#525), bounded to
+/// [`MAX_SUMMARIZED_ENTRIES`] entries (same rules as [`summarize_events`]).
+#[must_use]
+pub fn summarize_state_changes(
+    changes: &[serde_json::Value],
+    include_previews: bool,
+) -> Vec<StateChangeSummary> {
+    changes
+        .iter()
+        .take(MAX_SUMMARIZED_ENTRIES)
+        .map(|item| summarize_state_change(item, include_previews))
+        .collect()
+}
+
+/// Build the simulation diagnostics section (#525), or `None` when the
+/// response carried neither events nor state changes — such reports keep
+/// their exact previous shape in text and JSON output.
+///
+/// `include_details` corresponds to the `--show-events` opt-in: only then
+/// are the bounded per-entry summaries attached; counts are always present.
+#[must_use]
+pub fn build_simulation_diagnostics(
+    events: &Option<Vec<serde_json::Value>>,
+    state_changes: &Option<Vec<serde_json::Value>>,
+    include_details: bool,
+) -> Option<SimulationDiagnostics> {
+    let events = events.as_deref().unwrap_or(&[]);
+    let state_changes = state_changes.as_deref().unwrap_or(&[]);
+    if events.is_empty() && state_changes.is_empty() {
+        return None;
+    }
+    Some(SimulationDiagnostics {
+        event_count: events.len(),
+        state_change_count: state_changes.len(),
+        events: if include_details {
+            summarize_events(events, true)
+        } else {
+            Vec::new()
+        },
+        state_changes: if include_details {
+            summarize_state_changes(state_changes, true)
+        } else {
+            Vec::new()
+        },
+    })
+}
+
+/// Render simulation diagnostics (#525) as a human-readable block: the
+/// counts always, per-entry summaries only when `--show-events` attached
+/// them. Returns an empty string when there is nothing to report, so callers
+/// can append the result unconditionally.
+#[must_use]
+pub fn format_simulation_diagnostics(diagnostics: Option<&SimulationDiagnostics>) -> String {
+    let Some(diagnostics) = diagnostics else {
+        return String::new();
+    };
+
+    let mut out = format!(
+        "\nSimulation diagnostics: {} {}, {} {}",
+        diagnostics.event_count,
+        if diagnostics.event_count == 1 {
+            "event"
+        } else {
+            "events"
+        },
+        diagnostics.state_change_count,
+        if diagnostics.state_change_count == 1 {
+            "state change"
+        } else {
+            "state changes"
+        },
+    );
+    if diagnostics.events.is_empty() && diagnostics.state_changes.is_empty() {
+        out.push_str(" (re-run with --show-events for per-entry summaries)");
+    }
+    out.push('\n');
+
+    if !diagnostics.events.is_empty() {
+        out.push_str(&entry_count_header(
+            "Events",
+            diagnostics.events.len(),
+            diagnostics.event_count,
+        ));
+        for (index, event) in diagnostics.events.iter().enumerate() {
+            out.push_str(&format!(
+                "  - event[{index}]: {}, {} topic{}",
+                event.kind,
+                event.topic_count,
+                if event.topic_count == 1 { "" } else { "s" }
+            ));
+            match event.data_bytes {
+                Some(bytes) => out.push_str(&format!(", data {bytes} bytes")),
+                None => out.push_str(", data unavailable"),
+            }
+            out.push('\n');
+            for (topic_index, topic) in event.topic_previews.iter().enumerate() {
+                out.push_str(&format!("      topic[{topic_index}]: {topic}\n"));
+            }
+            if let Some(preview) = &event.data_preview {
+                out.push_str(&format!("      data: {preview}\n"));
+            }
+        }
+    }
+
+    if !diagnostics.state_changes.is_empty() {
+        out.push_str(&entry_count_header(
+            "State changes",
+            diagnostics.state_changes.len(),
+            diagnostics.state_change_count,
+        ));
+        for (index, change) in diagnostics.state_changes.iter().enumerate() {
+            out.push_str(&format!(
+                "  - state change[{index}]: {}, {}",
+                change.key_type, change.change
+            ));
+            match change.payload_bytes {
+                Some(bytes) => out.push_str(&format!(", payload {bytes} bytes")),
+                None => {
+                    if change.change != "deleted" {
+                        out.push_str(", payload unavailable");
+                    }
+                }
+            }
+            out.push('\n');
+            if let Some(preview) = &change.payload_preview {
+                out.push_str(&format!("      payload: {preview}\n"));
+            }
+        }
+    }
+
+    out
+}
+
+/// Section header naming how many entries of a diagnostics list were
+/// summarized, when the cap truncated the list (#525).
+fn entry_count_header(title: &str, shown: usize, total: usize) -> String {
+    if shown < total {
+        format!("{title} (showing {shown} of {total}):\n")
+    } else {
+        format!("{title}:\n")
+    }
+}
+
+/// Render simulation diagnostics (#525) as a Markdown section with the same
+/// bounded, redaction-safe content as [`format_simulation_diagnostics`].
+/// Returns an empty string when there is nothing to report.
+#[must_use]
+pub fn format_simulation_diagnostics_markdown(
+    diagnostics: Option<&SimulationDiagnostics>,
+) -> String {
+    let Some(diagnostics) = diagnostics else {
+        return String::new();
+    };
+
+    let mut out = String::from("\n### Simulation Diagnostics\n\n");
+    out.push_str(&format!(
+        "- **Counts:** {} {}, {} {}\n",
+        diagnostics.event_count,
+        if diagnostics.event_count == 1 {
+            "event"
+        } else {
+            "events"
+        },
+        diagnostics.state_change_count,
+        if diagnostics.state_change_count == 1 {
+            "state change"
+        } else {
+            "state changes"
+        },
+    ));
+    if diagnostics.events.is_empty() && diagnostics.state_changes.is_empty() {
+        out.push_str("\n*Re-run with `--show-events` for per-entry summaries.*\n");
+        return out;
+    }
+    for (index, event) in diagnostics.events.iter().enumerate() {
+        let data = match event.data_bytes {
+            Some(bytes) => format!("data {bytes} bytes"),
+            None => "data unavailable".to_string(),
+        };
+        out.push_str(&format!(
+            "- `event[{index}]`: {}, {} topic{s}, {data}\n",
+            event.kind,
+            event.topic_count,
+            s = if event.topic_count == 1 { "" } else { "s" },
+        ));
+        for (topic_index, topic) in event.topic_previews.iter().enumerate() {
+            out.push_str(&format!("  - `topic[{topic_index}]`: `{topic}`\n"));
+        }
+        if let Some(preview) = &event.data_preview {
+            out.push_str(&format!("  - `data`: `{preview}`\n"));
+        }
+    }
+    for (index, change) in diagnostics.state_changes.iter().enumerate() {
+        let payload = match change.payload_bytes {
+            Some(bytes) => format!(", payload {bytes} bytes"),
+            None if change.change == "deleted" => String::new(),
+            None => ", payload unavailable".to_string(),
+        };
+        out.push_str(&format!(
+            "- `state change[{index}]`: {}, {}{payload}\n",
+            change.key_type, change.change,
+        ));
+        if let Some(preview) = &change.payload_preview {
+            out.push_str(&format!("  - `payload`: `{preview}`\n"));
+        }
+    }
+    out
+}
+
 /// Direction of a historical fee change relative to the current run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -372,8 +838,66 @@ impl CostTrend {
     }
 }
 
+/// Ledger I/O footprint of a simulated invocation.
+///
+/// Recorded with an estimate so a later run can explain a fee change by the
+/// ledger access that caused it, rather than by the fee delta alone (#530).
+/// Only runs that captured the footprint carry one; entries written before it
+/// was recorded leave it absent, and callers must treat that as *unknown*
+/// rather than as zero usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct IoFootprint {
+    /// Ledger entries read.
+    pub read_entries: u32,
+    /// Ledger entries written.
+    pub write_entries: u32,
+    /// Bytes read from the ledger.
+    pub read_bytes: u32,
+    /// Bytes written to the ledger.
+    pub write_bytes: u32,
+}
+
+/// Per-resource ledger I/O deltas between a historical run and the current
+/// one.
+///
+/// Every field is `historical - current`, the same sign convention as
+/// [`HistoryEntry::delta_stroops`]: positive means the historical run
+/// consumed **more** than the current run. The values are signed because a
+/// footprint can shrink (an entry no longer written, fewer bytes read).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct FootprintDelta {
+    /// Ledger read-entry delta (`historical - current`).
+    pub read_entries: i64,
+    /// Ledger write-entry delta (`historical - current`).
+    pub write_entries: i64,
+    /// Ledger read-byte delta (`historical - current`).
+    pub read_bytes: i64,
+    /// Ledger write-byte delta (`historical - current`).
+    pub write_bytes: i64,
+}
+
+impl FootprintDelta {
+    /// The delta between a historical and the current footprint, or `None`
+    /// when either side is unknown.
+    ///
+    /// A missing footprint is "not recorded", not "no ledger access":
+    /// subtracting a zero would invent a delta out of absent data, so the
+    /// pair is reported as unavailable instead.
+    #[must_use]
+    pub fn between(previous: Option<IoFootprint>, current: Option<IoFootprint>) -> Option<Self> {
+        let (previous, current) = (previous?, current?);
+        Some(Self {
+            read_entries: i64::from(previous.read_entries) - i64::from(current.read_entries),
+            write_entries: i64::from(previous.write_entries) - i64::from(current.write_entries),
+            read_bytes: i64::from(previous.read_bytes) - i64::from(current.read_bytes),
+            write_bytes: i64::from(previous.write_bytes) - i64::from(current.write_bytes),
+        })
+    }
+}
+
 /// One previous run of the same contract function, alongside its fee delta
-/// against the current run.
+/// and (when both runs recorded one) its ledger I/O delta against the current
+/// run.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HistoryEntry {
     /// ISO-8601 timestamp of the historical estimate.
@@ -390,17 +914,26 @@ pub struct HistoryEntry {
     pub delta_stroops: i64,
     /// Trend classification derived from `delta_stroops`.
     pub trend: CostTrend,
+    /// Ledger I/O deltas (`historical - current`), present only when this run
+    /// *and* the current run both recorded a footprint (#530).
+    ///
+    /// `None` marks a legacy (or uncaptured) entry whose I/O usage is
+    /// unknown; consumers render that as "unavailable" rather than as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footprint_delta: Option<FootprintDelta>,
 }
 
 /// Build [`HistoryEntry`] records from previous runs, computing each one's
-/// delta against the current run's total fee.
+/// deltas against the current run.
 ///
 /// Entries are returned in the order supplied (callers pass them
-/// newest-first) with `delta_stroops = entry_fee - current_fee`.
+/// newest-first) with `delta_stroops = entry_fee - current_fee` and, when
+/// both runs recorded one, `footprint_delta = entry_io - current_io`.
 #[must_use]
 pub fn build_history_entries(
     current_total_stroops: i64,
     current_xlm_precision: u32,
+    current_io: Option<IoFootprint>,
     runs: &[HistoricalRun],
 ) -> Vec<HistoryEntry> {
     runs.iter()
@@ -417,6 +950,7 @@ pub fn build_history_entries(
                 ),
                 delta_stroops,
                 trend: CostTrend::for_delta(delta_stroops),
+                footprint_delta: FootprintDelta::between(run.io, current_io),
             }
         })
         .collect()
@@ -436,6 +970,28 @@ pub struct HistoricalRun {
     pub cpu_instructions: u64,
     /// Total fee in stroops.
     pub total_stroops: i64,
+    /// Ledger I/O footprint recorded for the run, when it was captured.
+    pub io: Option<IoFootprint>,
+}
+
+/// Text shown in the I/O table for an entry whose footprint was never
+/// recorded.
+///
+/// Deliberately a word, not `0`: absent I/O data means "unknown", and a zero
+/// would read as "this run touched no ledger entries".
+pub const FOOTPRINT_UNAVAILABLE: &str = "unavailable";
+
+/// Render one signed footprint delta as a table cell.
+///
+/// Mirrors the fee delta's presentation: a `+` prefix for growth, a bare
+/// negative number for a shrink, and `0` for no change. Growth is red (more
+/// ledger access), a shrink green, and no change yellow.
+fn footprint_delta_cell(delta: i64) -> Cell {
+    match delta.cmp(&0) {
+        std::cmp::Ordering::Greater => Cell::new(format!("+{delta}")).fg(Color::Red),
+        std::cmp::Ordering::Less => Cell::new(delta).fg(Color::Green),
+        std::cmp::Ordering::Equal => Cell::new("0").fg(Color::Yellow),
+    }
 }
 
 /// Render the historical cost trend table.
@@ -444,6 +1000,12 @@ pub struct HistoricalRun {
 /// improvements (cost reductions) in green, and unchanged runs in yellow.
 /// Returns an empty string when there is no history, so callers can append the
 /// result unconditionally.
+///
+/// When at least one entry carries a ledger I/O delta (#530), a second table
+/// follows with the per-resource deltas. Entries without a recorded footprint
+/// appear there as [`FOOTPRINT_UNAVAILABLE`] so a legacy run is never
+/// misreported as zero usage; the table is omitted entirely when no entry has
+/// I/O data, keeping pre-#530 output unchanged.
 #[must_use]
 pub fn format_cost_history(entries: &[HistoryEntry]) -> String {
     if entries.is_empty() {
@@ -477,7 +1039,50 @@ pub fn format_cost_history(entries: &[HistoryEntry]) -> String {
     let mut out = String::from("\nCost history (previous runs, newest first):\n");
     out.push_str(&table.to_string());
     out.push('\n');
+
+    if entries.iter().any(|entry| entry.footprint_delta.is_some()) {
+        out.push_str(&format_cost_history_footprints(entries));
+    }
+
     out
+}
+
+/// Render the per-resource I/O delta table that follows the fee history.
+///
+/// Split from [`format_cost_history`] so the wide I/O table only appears when
+/// there is data for it, and so its rendering is testable on its own.
+#[must_use]
+pub fn format_cost_history_footprints(entries: &[HistoryEntry]) -> String {
+    let mut table = Table::new();
+    table.set_header(vec![
+        "Timestamp",
+        "Read Entries",
+        "Write Entries",
+        "Read Bytes",
+        "Write Bytes",
+    ]);
+
+    for entry in entries {
+        let row = match entry.footprint_delta {
+            Some(delta) => vec![
+                Cell::new(&entry.timestamp),
+                footprint_delta_cell(delta.read_entries),
+                footprint_delta_cell(delta.write_entries),
+                footprint_delta_cell(delta.read_bytes),
+                footprint_delta_cell(delta.write_bytes),
+            ],
+            None => vec![
+                Cell::new(&entry.timestamp),
+                Cell::new(FOOTPRINT_UNAVAILABLE),
+                Cell::new(FOOTPRINT_UNAVAILABLE),
+                Cell::new(FOOTPRINT_UNAVAILABLE),
+                Cell::new(FOOTPRINT_UNAVAILABLE),
+            ],
+        };
+        table.add_row(row);
+    }
+
+    format!("\nI/O footprint change (historical - current):\n{table}\n")
 }
 
 /// Serde helper: `wasm_size` is omitted when `0` so a report built without a
@@ -531,9 +1136,13 @@ pub struct CostReport {
     pub ledger: u32,
     /// Network the simulation ran on.
     pub network: String,
-    /// RPC round-trip time of the `simulateTransaction` call, in
-    /// milliseconds. Helps identify slow or overloaded RPC endpoints.
-    pub rpc_latency_ms: u64,
+    /// Wall-clock duration of the `simulateTransaction` round-trip, in
+    /// milliseconds, measured around the RPC call itself. Serialized as
+    /// `simulation_duration_ms` so CI logs can separate time spent waiting on
+    /// the network from local computation and decoding, and rendered as
+    /// `Simulation latency: X ms` in the table footer. Also helps identify
+    /// slow or overloaded RPC endpoints.
+    pub simulation_duration_ms: u64,
     /// Fee rates used to compute the breakdown (carried so optimization
     /// suggestions can quantify per-resource savings). Excluded from
     /// serialized output; `None` when the rates were unavailable.
@@ -557,6 +1166,13 @@ pub struct CostReport {
     /// decodable section; deserialized as empty from older payloads.
     #[serde(default)]
     pub contract_meta: ContractMeta,
+    /// Simulation event / state-change diagnostics (#525). `None` when the
+    /// response carried neither events nor state changes, so the default
+    /// text and JSON output stay unchanged. Counts are always present when
+    /// the section is; bounded per-entry summaries appear only under the
+    /// `--show-events` opt-in. Never persisted in the estimate cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<SimulationDiagnostics>,
 }
 
 /// A cost projection for a specific batch invocation count.
@@ -1364,7 +1980,10 @@ pub fn format_report_table(report: &CostReport) -> String {
         "Simulated at ledger sequence: {}\n",
         format_ledger_sequence(report.ledger)
     ));
-    output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
+    output.push_str(&format!(
+        "RPC round-trip: {} ms\n",
+        report.simulation_duration_ms
+    ));
     if report.wasm_size > 0 {
         output.push_str(&format!("WASM size: {} bytes\n", report.wasm_size));
     }
@@ -2144,12 +2763,13 @@ mod tests {
             },
             ledger: 3_894_195,
             network: "testnet".to_string(),
-            rpc_latency_ms: 87,
+            simulation_duration_ms: 87,
             rates: Some(rates),
             warnings: Vec::new(),
             history: None,
             projections: None,
             contract_meta: ContractMeta::default(),
+            diagnostics: None,
         }
     }
 
@@ -2265,12 +2885,13 @@ mod tests {
             },
             ledger: 0,
             network: "testnet".to_string(),
-            rpc_latency_ms: 0,
+            simulation_duration_ms: 0,
             rates: None,
             warnings: Vec::new(),
             history: None,
             projections: None,
             contract_meta: ContractMeta::default(),
+            diagnostics: None,
         };
 
         let table_out = format_report_table(&report);
@@ -2518,6 +3139,149 @@ mod tests {
         assert_eq!(format_thousands(500), "500");
     }
 
+    // ── History footprint deltas (#530) ──────────────────────────────
+
+    fn footprint(
+        read_entries: u32,
+        write_entries: u32,
+        read_bytes: u32,
+        write_bytes: u32,
+    ) -> IoFootprint {
+        IoFootprint {
+            read_entries,
+            write_entries,
+            read_bytes,
+            write_bytes,
+        }
+    }
+
+    /// Deltas are `historical - current`, so a run that read less than the
+    /// current one yields a negative value rather than a wrapped `u32`.
+    #[test]
+    fn test_footprint_delta_is_signed_and_historical_minus_current() {
+        let previous = footprint(5, 1, 4_096, 136);
+        let current = footprint(2, 3, 0, 136);
+        let delta = FootprintDelta::between(Some(previous), Some(current))
+            .expect("both sides recorded a footprint");
+
+        assert_eq!(delta.read_entries, 3, "5 previous - 2 current");
+        assert_eq!(delta.write_entries, -2, "1 previous - 3 current");
+        assert_eq!(delta.read_bytes, 4_096);
+        assert_eq!(delta.write_bytes, 0);
+    }
+
+    /// An entry without a recorded footprint is unavailable on either side:
+    /// no delta is invented from absent data.
+    #[test]
+    fn test_footprint_delta_absent_when_either_side_is_unknown() {
+        let known = footprint(1, 1, 0, 136);
+        assert_eq!(FootprintDelta::between(None, Some(known)), None);
+        assert_eq!(FootprintDelta::between(Some(known), None), None);
+        assert_eq!(FootprintDelta::between(None, None), None);
+    }
+
+    /// `build_history_entries` attaches the footprint delta only when both
+    /// sides recorded one, and keeps the fee delta independent of it.
+    #[test]
+    fn test_build_history_entries_attaches_footprint_delta() {
+        let current_io = footprint(1, 2, 0, 136);
+        let entries = build_history_entries(
+            10_000,
+            crate::report::fee_calc::DEFAULT_PRECISION,
+            Some(current_io),
+            &[
+                HistoricalRun {
+                    timestamp: "2026-01-02T00:00:00Z".to_string(),
+                    ledger: 20,
+                    cpu_instructions: 200,
+                    total_stroops: 12_000,
+                    io: Some(footprint(3, 1, 512, 136)),
+                },
+                HistoricalRun {
+                    timestamp: "2026-01-01T00:00:00Z".to_string(),
+                    ledger: 10,
+                    cpu_instructions: 100,
+                    total_stroops: 9_000,
+                    io: None,
+                },
+            ],
+        );
+
+        assert_eq!(entries.len(), 2);
+        let recorded = entries[0]
+            .footprint_delta
+            .expect("both runs recorded a footprint");
+        assert_eq!(recorded.read_entries, 2);
+        assert_eq!(recorded.write_entries, -1);
+        assert_eq!(recorded.read_bytes, 512);
+        assert_eq!(recorded.write_bytes, 0);
+        // The fee delta is untouched by the I/O comparison.
+        assert_eq!(entries[0].delta_stroops, 2_000);
+        assert_eq!(entries[0].trend, CostTrend::Regression);
+
+        assert!(
+            entries[1].footprint_delta.is_none(),
+            "a legacy run must be unavailable, not zero"
+        );
+        assert_eq!(entries[1].delta_stroops, -1_000);
+        assert_eq!(entries[1].trend, CostTrend::Improvement);
+    }
+
+    /// The I/O table only renders when at least one entry has a delta, and
+    /// marks the rest as unavailable.
+    #[test]
+    fn test_format_cost_history_footprints_marks_legacy_entries() {
+        let entries = build_history_entries(
+            10_000,
+            crate::report::fee_calc::DEFAULT_PRECISION,
+            Some(footprint(1, 1, 0, 136)),
+            &[
+                HistoricalRun {
+                    timestamp: "2026-01-02T00:00:00Z".to_string(),
+                    ledger: 20,
+                    cpu_instructions: 200,
+                    total_stroops: 12_000,
+                    io: Some(footprint(4, 1, 0, 136)),
+                },
+                HistoricalRun {
+                    timestamp: "2026-01-01T00:00:00Z".to_string(),
+                    ledger: 10,
+                    cpu_instructions: 100,
+                    total_stroops: 9_000,
+                    io: None,
+                },
+            ],
+        );
+
+        let out = format_cost_history(&entries);
+        assert!(out.contains("Cost history"));
+        assert!(out.contains("I/O footprint change (historical - current):"));
+        assert!(out.contains(FOOTPRINT_UNAVAILABLE));
+        assert!(out.contains("+3"), "four previous reads minus one: {out}");
+    }
+
+    /// Without any recorded footprint the rendering is byte-identical to the
+    /// pre-#530 output: no extra section.
+    #[test]
+    fn test_format_cost_history_omits_footprints_when_unknown() {
+        let entries = build_history_entries(
+            10_000,
+            crate::report::fee_calc::DEFAULT_PRECISION,
+            None,
+            &[HistoricalRun {
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                ledger: 10,
+                cpu_instructions: 100,
+                total_stroops: 9_000,
+                io: None,
+            }],
+        );
+
+        let out = format_cost_history(&entries);
+        assert!(!out.contains("I/O footprint change"), "{out}");
+        assert!(!out.contains(FOOTPRINT_UNAVAILABLE), "{out}");
+    }
+
     #[test]
     fn test_format_projections_table() {
         let projections = vec![
@@ -2676,6 +3440,272 @@ mod tests {
         assert!(
             cpu_row.ends_with(','),
             "percent column should be empty; got: {cpu_row}"
+        );
+    }
+
+    // ── Simulation diagnostics (#525) ─────────────────────────────────
+
+    use serde_json::json;
+
+    /// Base64 of a real `LedgerKey::Account` XDR, for state-change keys that
+    /// decode to a named variant.
+    fn account_key_b64(seed: u8) -> String {
+        use stellar_xdr::WriteXdr;
+        let key = stellar_xdr::LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
+            account_id: stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::Uint256([seed; 32]),
+            )),
+        });
+        let xdr = key.to_xdr(stellar_xdr::Limits::none()).expect("encode key");
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &xdr)
+    }
+
+    /// One well-formed contract event object as the RPC returns it.
+    fn contract_event(topics: usize, data: &str) -> serde_json::Value {
+        let topic: Vec<serde_json::Value> = (0..topics)
+            .map(|_| {
+                json!(base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    b"\0\0\0\0"
+                ))
+            })
+            .collect();
+        json!({ "type": "contract", "topic": topic, "data": data })
+    }
+
+    /// Empty / absent payloads must produce no diagnostics section at all, so
+    /// the default report shape is unchanged (AC: empty payloads).
+    #[test]
+    fn test_diagnostics_empty_payloads_render_nothing() {
+        assert!(build_simulation_diagnostics(&None, &None, false).is_none());
+        assert!(build_simulation_diagnostics(&None, &None, true).is_none());
+        assert!(
+            build_simulation_diagnostics(&Some(vec![]), &Some(vec![]), true).is_none(),
+            "empty arrays are not diagnostics"
+        );
+
+        assert_eq!(format_simulation_diagnostics(None), "");
+        assert_eq!(format_simulation_diagnostics_markdown(None), "");
+
+        // JSON: a report without diagnostics keeps its previous shape.
+        let report = report_with_rates(sample_rates());
+        let parsed: serde_json::Value =
+            serde_json::from_str(&format_report_json(&report)).expect("valid json");
+        assert!(
+            parsed.get("diagnostics").is_none(),
+            "default JSON output must not grow a diagnostics key"
+        );
+    }
+
+    /// Populated payloads: counts always present; per-entry summaries (and
+    /// previews) only under the `--show-events` opt-in (AC: populated).
+    #[test]
+    fn test_diagnostics_populated_counts_always_details_on_request() {
+        let events = vec![
+            contract_event(
+                2,
+                &base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"hello"),
+            ),
+            json!({ "type": "diagnostic", "topic": [], "data": null }),
+        ];
+        let changes = vec![json!({
+            "key": account_key_b64(9),
+            "created": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"entry")
+        })];
+
+        // Counts without details (default mode).
+        let counts =
+            build_simulation_diagnostics(&Some(events.clone()), &Some(changes.clone()), false)
+                .expect("diagnostics present");
+        assert_eq!(counts.event_count, 2);
+        assert_eq!(counts.state_change_count, 1);
+        assert!(counts.events.is_empty(), "details are opt-in");
+        assert!(counts.state_changes.is_empty(), "details are opt-in");
+
+        // Text mode: counts line plus the re-run hint.
+        let text = format_simulation_diagnostics(Some(&counts));
+        assert!(
+            text.contains("Simulation diagnostics: 2 events, 1 state change"),
+            "{text}"
+        );
+        assert!(text.contains("re-run with --show-events"), "{text}");
+
+        // Details mode: bounded per-entry summaries with previews.
+        let detailed =
+            build_simulation_diagnostics(&Some(events), &Some(changes), true).expect("present");
+        assert_eq!(detailed.events.len(), 2);
+        assert_eq!(detailed.state_changes.len(), 1);
+        assert_eq!(detailed.events[0].kind, "contract");
+        assert_eq!(detailed.events[0].topic_count, 2);
+        assert_eq!(detailed.events[0].data_bytes, Some(5));
+        assert_eq!(detailed.events[0].topic_previews.len(), 2);
+        assert!(detailed.events[0].data_preview.is_some());
+        assert_eq!(detailed.state_changes[0].key_type, "Account");
+        assert_eq!(detailed.state_changes[0].change, "created");
+        assert_eq!(detailed.state_changes[0].payload_bytes, Some(5));
+
+        let text = format_simulation_diagnostics(Some(&detailed));
+        assert!(text.contains("Events:"), "{text}");
+        assert!(!text.contains("re-run with --show-events"), "{text}");
+
+        // JSON mode: details serialize; counts mode keeps summaries absent
+        // (redaction), and the counts are always present.
+        let mut report = report_with_rates(sample_rates());
+        report.diagnostics = Some(counts);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&format_report_json(&report)).expect("valid json");
+        assert_eq!(parsed["diagnostics"]["event_count"], 2);
+        assert_eq!(parsed["diagnostics"]["state_change_count"], 1);
+        assert!(
+            parsed["diagnostics"].get("events").is_none(),
+            "summaries must be absent without --show-events"
+        );
+
+        report.diagnostics = Some(detailed);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&format_report_json(&report)).expect("valid json");
+        assert_eq!(parsed["diagnostics"]["events"][0]["kind"], "contract");
+        assert_eq!(
+            parsed["diagnostics"]["state_changes"][0]["key_type"],
+            "Account"
+        );
+    }
+
+    /// Malformed payloads must never fail the estimate: they summarize
+    /// leniently in both text and JSON modes (AC: malformed).
+    #[test]
+    fn test_diagnostics_malformed_payloads_are_lenient() {
+        let events = vec![
+            json!(42),                                         // number
+            json!(null),                                       // null
+            json!(["array"]),                                  // array
+            json!("not-valid-base64!!!"),                      // legacy string, bad b64
+            json!({ "type": 7, "topic": "nope", "data": 12 }), // wrong types
+            json!({ "type": "x".repeat(64) }),                 // oversized kind label
+        ];
+        let changes = vec![
+            json!("just a string"),
+            json!({ "key": "!!!not-xdr!!!", "created": "@@@" }),
+            json!({ "updated": "@@@" }),          // no key at all
+            json!({ "key": account_key_b64(3) }), // bare key, verb unknown
+            json!({ "key": account_key_b64(4), "deleted": true }),
+        ];
+
+        let diagnostics =
+            build_simulation_diagnostics(&Some(events), &Some(changes), true).expect("present");
+        assert_eq!(diagnostics.event_count, 6);
+        assert_eq!(diagnostics.state_change_count, 5);
+
+        // Events: every item summarized, none decoded as data.
+        assert_eq!(diagnostics.events[0].kind, "unrecognized");
+        assert_eq!(diagnostics.events[3].kind, "legacy-xdr");
+        assert_eq!(diagnostics.events[3].data_bytes, None);
+        assert_eq!(diagnostics.events[4].kind, "unknown");
+        assert_eq!(
+            diagnostics.events[5].kind.chars().count(),
+            24,
+            "unknown kind labels stay bounded"
+        );
+
+        // State changes: undecodable keys/payloads are marked, not fatal.
+        assert_eq!(diagnostics.state_changes[0].key_type, "unrecognized");
+        assert_eq!(diagnostics.state_changes[1].key_type, "unrecognized");
+        assert_eq!(diagnostics.state_changes[1].change, "created");
+        assert_eq!(diagnostics.state_changes[2].change, "updated");
+        assert_eq!(diagnostics.state_changes[3].change, "unknown");
+        assert_eq!(diagnostics.state_changes[4].change, "deleted");
+        assert_eq!(diagnostics.state_changes[4].payload_bytes, None);
+
+        // Text rendering does not panic and still reports counts.
+        let text = format_simulation_diagnostics(Some(&diagnostics));
+        assert!(text.contains("6 events, 5 state changes"), "{text}");
+
+        // JSON rendering round-trips.
+        let mut report = report_with_rates(sample_rates());
+        report.diagnostics = Some(diagnostics);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&format_report_json(&report)).expect("valid json");
+        assert_eq!(parsed["diagnostics"]["event_count"], 6);
+    }
+
+    /// Output stays bounded no matter how large the response is (AC: bound
+    /// output size).
+    #[test]
+    fn test_diagnostics_output_is_bounded() {
+        let big_payload = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            vec![0xAAu8; MAX_PREVIEW_BYTES * 4],
+        );
+        let events: Vec<serde_json::Value> = (0..MAX_SUMMARIZED_ENTRIES + 5)
+            .map(|_| contract_event(MAX_PREVIEW_TOPICS + 3, &big_payload))
+            .collect();
+
+        let diagnostics =
+            build_simulation_diagnostics(&Some(events), &None, true).expect("present");
+        assert_eq!(
+            diagnostics.event_count,
+            MAX_SUMMARIZED_ENTRIES + 5,
+            "counts reflect the full response"
+        );
+        assert_eq!(
+            diagnostics.events.len(),
+            MAX_SUMMARIZED_ENTRIES,
+            "per-entry summaries stay capped"
+        );
+
+        // Payload previews are truncated with an explicit marker.
+        let preview = diagnostics.events[0]
+            .data_preview
+            .as_deref()
+            .expect("preview present");
+        assert!(
+            preview.contains("(+"),
+            "truncation marker expected: {preview}"
+        );
+
+        // Topic previews are capped too.
+        assert_eq!(
+            diagnostics.events[0].topic_previews.len(),
+            MAX_PREVIEW_TOPICS + 1,
+            "capped topics plus the overflow marker"
+        );
+
+        // Text rendering names the cap instead of listing everything.
+        let text = format_simulation_diagnostics(Some(&diagnostics));
+        assert!(
+            text.contains(&format!(
+                "Events (showing {MAX_SUMMARIZED_ENTRIES} of {}):",
+                MAX_SUMMARIZED_ENTRIES + 5
+            )),
+            "{text}"
+        );
+    }
+
+    /// Redaction by default: without the opt-in no payload bytes appear
+    /// anywhere, not even bounded previews (AC: redact unsafe payloads).
+    #[test]
+    fn test_diagnostics_default_mode_carries_no_payload_bytes() {
+        let secret = b"super-secret-contract-data".to_vec();
+        let events = vec![contract_event(
+            1,
+            &base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &secret),
+        )];
+
+        let diagnostics =
+            build_simulation_diagnostics(&Some(events), &None, false).expect("present");
+        let text = format_simulation_diagnostics(Some(&diagnostics));
+        let json = serde_json::to_string(&diagnostics).expect("serialize");
+
+        let secret_hex = hex_preview(&secret);
+        for output in [&text, &json] {
+            assert!(
+                !output.contains(&secret_hex),
+                "raw payload bytes must never appear by default"
+            );
+        }
+        assert!(
+            diagnostics.events.is_empty() && diagnostics.state_changes.is_empty(),
+            "summaries (and their previews) are opt-in"
         );
     }
 }

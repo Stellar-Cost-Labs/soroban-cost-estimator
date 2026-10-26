@@ -5,10 +5,11 @@
 //!
 //! # Implementations
 //!
-//! - [`TableFormatter`] — human-readable table with fee breakdown
-//! - [`JsonFormatter`] — pretty-printed JSON
-//! - [`CsvFormatter`] — comma-separated values
-//! - [`MarkdownFormatter`] — GitHub-flavored Markdown table
+//! - [`crate::report::formatter::TableFormatter`] — human-readable table with fee breakdown
+//! - [`crate::report::formatter::JsonFormatter`] — pretty-printed JSON
+//! - [`crate::report::formatter::CsvFormatter`] — comma-separated values
+//! - [`crate::report::formatter::MarkdownFormatter`] — GitHub-flavored Markdown table
+//! - [`crate::report::formatter::SummaryFormatter`] — one pipe-delimited line per report (#533)
 
 use std::fmt;
 
@@ -20,7 +21,7 @@ use crate::report::cost_report::CostReport;
 /// `--quiet` flag, which drops every *advisory* section (optimization tips and
 /// the quantified savings breakdown) while leaving the measured cost data
 /// untouched. Machine consumers that already read the JSON keys are
-/// unaffected — see [`JsonFormatter`] — so a caller can always ask for the
+/// unaffected — see [`crate::report::formatter::JsonFormatter`] — so a caller can always ask for the
 /// structured data explicitly.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReportOptions {
@@ -186,7 +187,10 @@ impl TableFormatter {
             "Simulated at ledger sequence: {}\n",
             crate::report::cost_report::format_ledger_sequence(report.ledger)
         ));
-        output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
+        output.push_str(&format!(
+            "RPC round-trip: {} ms\n",
+            report.simulation_duration_ms
+        ));
         output.push_str(&format!("WASM hash: {}\n", report.wasm_hash));
         output.push_str(&format!("WASM size: {} bytes\n", report.wasm_size));
         output.push('\n');
@@ -229,6 +233,13 @@ impl TableFormatter {
             &report.warnings,
         ));
 
+        // Simulation diagnostics (#525) — counts always when the response
+        // carried events/state changes; per-entry summaries only under the
+        // `--show-events` opt-in. Empty string when absent.
+        output.push_str(&crate::report::cost_report::format_simulation_diagnostics(
+            report.diagnostics.as_ref(),
+        ));
+
         // Historical trend table (#321) — only populated with `--history`.
         if let Some(history) = &report.history {
             output.push_str(&crate::report::cost_report::format_cost_history(history));
@@ -253,6 +264,13 @@ impl TableFormatter {
                 &report.suggest_optimizations(),
             ));
         }
+
+        // Footer: how long the simulated RPC round-trip actually took, so the
+        // network wait is separable from local computation in CI logs (#304).
+        output.push_str(&format!(
+            "\nSimulation latency: {} ms\n",
+            report.simulation_duration_ms
+        ));
 
         output
     }
@@ -364,7 +382,7 @@ impl ReportFormatter for CsvFormatter {
             "function,network,ledger,wasm_hash,wasm_size,cpu_instructions,memory_bytes,\
              read_entries,write_entries,read_bytes,write_bytes,tx_size,\
              non_refundable_stroops,refundable_stroops,total_stroops,total_xlm,\
-             rpc_latency_ms\n",
+             simulation_duration_ms\n",
         );
 
         let row = csv_row(&[
@@ -384,7 +402,7 @@ impl ReportFormatter for CsvFormatter {
             &report.fee.refundable_stroops.to_string(),
             &report.fee.total_stroops.to_string(),
             &report.fee.total_xlm,
-            &report.rpc_latency_ms.to_string(),
+            &report.simulation_duration_ms.to_string(),
         ]);
         output.push_str(&row);
         output.push('\n');
@@ -426,8 +444,8 @@ impl ReportFormatter for MarkdownFormatter {
         output.push_str(&format!("- **WASM hash:** `{}`\n", report.wasm_hash));
         output.push_str(&format!("- **WASM size:** {} bytes\n", report.wasm_size));
         output.push_str(&format!(
-            "- **RPC round-trip:** {} ms\n\n",
-            report.rpc_latency_ms
+            "- **Simulation latency:** {} ms\n\n",
+            report.simulation_duration_ms
         ));
 
         // Resource table
@@ -452,6 +470,14 @@ impl ReportFormatter for MarkdownFormatter {
                 output.push_str(&format!("> **Warning:** {}\n\n", warning.message));
             }
         }
+
+        // Simulation diagnostics (#525) — counts always when present,
+        // per-entry summaries only under the `--show-events` opt-in.
+        output.push_str(
+            &crate::report::cost_report::format_simulation_diagnostics_markdown(
+                report.diagnostics.as_ref(),
+            ),
+        );
 
         // Fee breakdown, nested in a collapsible section so long reports stay
         // compact when posted as a GitHub PR comment (#325).
@@ -556,6 +582,123 @@ impl fmt::Display for MarkdownFormatter {
     }
 }
 
+/// Delimiter between [`SummaryFormatter`] fields.
+///
+/// A single ASCII tab is the established delimiter for line-oriented tool
+/// output (`ps`, `strace`, `find -printf`): it is extremely unlikely inside a
+/// contract function name, it is what `cut -f4` and `awk -F'\t'` expect, and
+/// any literal tab in a value is escaped, so a record always splits into
+/// exactly [`SUMMARY_FIELDS`]`.len()` fields.
+pub const SUMMARY_DELIMITER: char = '\t';
+
+/// The [`SummaryFormatter`] fields, in the order they are emitted.
+///
+/// This constant is the documented contract for the format: consumers may
+/// index by position, so the order must never change without a new format
+/// name. Every field is emitted for every report; a field that has no value
+/// is an empty string rather than being omitted, so the column count is
+/// always [`SUMMARY_FIELDS`]`.len()`.
+pub const SUMMARY_FIELDS: [&str; 11] = [
+    "function",
+    "network",
+    "ledger",
+    "total_stroops",
+    "total_xlm",
+    "cpu_instructions",
+    "read_entries",
+    "write_entries",
+    "read_bytes",
+    "write_bytes",
+    "tx_size",
+];
+
+/// Escape one [`SummaryFormatter`] field.
+///
+/// The delimiter would otherwise make the column count ambiguous, and a raw
+/// newline would turn one result into several lines. Both are backslash
+/// escaped along with the escape character itself, the C-style convention
+/// already used by `find -printf` and `ps`:
+///
+/// | Input | Output |
+/// | --- | --- |
+/// | `\` | `\\` |
+/// | tab (the delimiter) | `\t` |
+/// | newline | `\n` |
+/// | carriage return | `\r` |
+///
+/// Everything else — spaces, commas, pipes, quotes, non-ASCII text — is
+/// emitted unchanged, so a function name is readable as-is unless it carries
+/// a control character. ANSI escape sequences never reach this function: the
+/// summary is composed only from plain report values and no color is applied
+/// by any code path, so redirected output is byte-identical to terminal
+/// output.
+fn summary_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+/// Formats a cost report as a single line for shell pipelines (#533).
+///
+/// The line contains one field per entry of [`SUMMARY_FIELDS`], joined by
+/// [`SUMMARY_DELIMITER`] (a tab):
+///
+/// ```text
+/// function<TAB>network<TAB>ledger<TAB>total_stroops<TAB>total_xlm<TAB>cpu_instructions<TAB>read_entries<TAB>write_entries<TAB>read_bytes<TAB>write_bytes<TAB>tx_size
+/// ```
+///
+/// Nothing else is printed: no header row, no labels, no ANSI styling and no
+/// advisory sections (optimization tips, chart, projections), so a successful
+/// `estimate` emits exactly one result line whatever the terminal is. The
+/// `--quiet` switch changes nothing here — the summary is already minimal.
+pub struct SummaryFormatter;
+
+impl SummaryFormatter {
+    /// Render the single-line summary for `report`.
+    #[must_use]
+    pub fn format_line(report: &CostReport) -> String {
+        let fields = [
+            summary_escape(&report.function),
+            summary_escape(&report.network),
+            report.ledger.to_string(),
+            report.fee.total_stroops.to_string(),
+            summary_escape(&report.fee.total_xlm),
+            report.cpu_instructions.to_string(),
+            report.read_entries.to_string(),
+            report.write_entries.to_string(),
+            report.read_bytes.to_string(),
+            report.write_bytes.to_string(),
+            report.tx_size.to_string(),
+        ];
+        debug_assert_eq!(fields.len(), SUMMARY_FIELDS.len());
+        fields.join(&SUMMARY_DELIMITER.to_string())
+    }
+}
+
+impl ReportFormatter for SummaryFormatter {
+    fn format_with(&self, report: &CostReport, _options: ReportOptions) -> String {
+        Self::format_line(report)
+    }
+
+    fn name(&self) -> &'static str {
+        "summary"
+    }
+}
+
+impl fmt::Display for SummaryFormatter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "summary")
+    }
+}
+
 /// Escape a value for CSV output per RFC 4180.
 ///
 /// If the value contains a comma, double-quote, or newline, it is wrapped
@@ -580,14 +723,15 @@ fn csv_row(fields: &[&str]) -> String {
 
 /// Returns the formatter for the given format name.
 ///
-/// Recognized names: `"table"`, `"json"`, `"csv"`, `"markdown"`.
-/// Returns `None` for unknown names.
+/// Recognized names: `"table"`, `"json"`, `"csv"`, `"markdown"`,
+/// `"summary"`. Returns `None` for unknown names.
 pub fn formatter_by_name(name: &str) -> Option<Box<dyn ReportFormatter>> {
     match name {
         "table" => Some(Box::new(TableFormatter)),
         "json" => Some(Box::new(JsonFormatter)),
         "csv" => Some(Box::new(CsvFormatter)),
         "markdown" => Some(Box::new(MarkdownFormatter)),
+        "summary" => Some(Box::new(SummaryFormatter)),
         _ => None,
     }
 }
@@ -623,12 +767,13 @@ mod tests {
             },
             ledger: 3_894_195,
             network: "testnet".to_string(),
-            rpc_latency_ms: 87,
+            simulation_duration_ms: 87,
             rates: None,
             warnings: Vec::new(),
             history: None,
             projections: None,
             contract_meta: crate::wasm::parser::ContractMeta::default(),
+            diagnostics: None,
         }
     }
 
@@ -658,12 +803,13 @@ mod tests {
             },
             ledger: 0,
             network: "mainnet".to_string(),
-            rpc_latency_ms: 0,
+            simulation_duration_ms: 0,
             rates: None,
             warnings: Vec::new(),
             history: None,
             projections: None,
             contract_meta: crate::wasm::parser::ContractMeta::default(),
+            diagnostics: None,
         }
     }
 
@@ -698,7 +844,12 @@ mod tests {
     fn test_table_formatter_contains_rpc_latency() {
         let formatter = TableFormatter;
         let output = formatter.format(&sample_report());
-        assert!(output.contains("RPC round-trip: 87 ms"));
+        assert!(output.contains("Simulation latency: 87 ms"));
+        // The latency line is a footer summary: it closes out the report.
+        assert!(
+            output.trim_end().ends_with("Simulation latency: 87 ms"),
+            "latency should be the last line; got: {output}"
+        );
     }
 
     #[test]
@@ -837,7 +988,7 @@ mod tests {
         assert_eq!(parsed["wasm_hash"], "abc123def456");
         assert_eq!(parsed["ledger_sequence"], 3_894_195);
         assert_eq!(parsed["network"], "testnet");
-        assert_eq!(parsed["rpc_latency_ms"], 87);
+        assert_eq!(parsed["simulation_duration_ms"], 87);
         assert_eq!(parsed["fee"]["total_stroops"], 15_427);
         assert_eq!(parsed["fee"]["total_xlm"], "0.0015427");
     }
@@ -971,7 +1122,7 @@ mod tests {
         assert!(output.contains("**Network:** testnet (ledger 3894195)"));
         assert!(output.contains("- **Simulated at ledger sequence:** `3,894,195`"));
         assert!(output.contains("**WASM hash:** `abc123def456`"));
-        assert!(output.contains("**RPC round-trip:** 87 ms"));
+        assert!(output.contains("**Simulation latency:** 87 ms"));
     }
 
     #[test]
@@ -1003,6 +1154,7 @@ mod tests {
         assert_eq!(formatter_by_name("json").unwrap().name(), "json");
         assert_eq!(formatter_by_name("csv").unwrap().name(), "csv");
         assert_eq!(formatter_by_name("markdown").unwrap().name(), "markdown");
+        assert_eq!(formatter_by_name("summary").unwrap().name(), "summary");
     }
 
     #[test]
@@ -1021,6 +1173,7 @@ mod tests {
             Box::new(JsonFormatter),
             Box::new(CsvFormatter),
             Box::new(MarkdownFormatter),
+            Box::new(SummaryFormatter),
         ];
         for formatter in &formatters {
             let output = formatter.format(&report);
@@ -1135,6 +1288,7 @@ mod tests {
             Box::new(JsonFormatter),
             Box::new(CsvFormatter),
             Box::new(MarkdownFormatter),
+            Box::new(SummaryFormatter),
         ];
         for formatter in &formatters {
             assert_eq!(
@@ -1166,6 +1320,7 @@ mod tests {
             total_xlm: "0.0020000".to_string(),
             delta_stroops: 5_000,
             trend: crate::report::cost_report::CostTrend::Regression,
+            footprint_delta: None,
         }]);
 
         let output = JsonFormatter.format(&report);
@@ -1214,11 +1369,13 @@ mod tests {
         report.history = Some(crate::report::cost_report::build_history_entries(
             report.fee.total_stroops,
             7,
+            None,
             &[crate::report::cost_report::HistoricalRun {
                 timestamp: "2026-01-01T00:00:00Z".to_string(),
                 ledger: 100,
                 cpu_instructions: 1_000,
                 total_stroops: PREVIOUS_TOTAL_STROOPS,
+                io: None,
             }],
         ));
         let output = TableFormatter.format(&report);
@@ -1229,6 +1386,249 @@ mod tests {
         let delta = PREVIOUS_TOTAL_STROOPS - report.fee.total_stroops;
         assert!(delta > 0, "fixture must be a regression");
         assert!(output.contains(&format!("+{delta}")));
+    }
+
+    // ── History footprint deltas (#530) ──────────────────────────────
+
+    /// Builds a one-entry history whose previous run recorded `io`.
+    fn history_with_io(
+        current_io: Option<crate::report::cost_report::IoFootprint>,
+        previous_io: Option<crate::report::cost_report::IoFootprint>,
+    ) -> Vec<crate::report::cost_report::HistoryEntry> {
+        crate::report::cost_report::build_history_entries(
+            sample_report().fee.total_stroops,
+            7,
+            current_io,
+            &[crate::report::cost_report::HistoricalRun {
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                ledger: 100,
+                cpu_instructions: 1_000,
+                total_stroops: 20_000,
+                io: previous_io,
+            }],
+        )
+    }
+
+    /// Both runs recorded a footprint: the table gains a per-resource delta
+    /// table with signed values, and the JSON carries the same numbers.
+    #[test]
+    fn test_history_reports_footprint_deltas() {
+        use crate::report::cost_report::IoFootprint;
+
+        let current_io = IoFootprint {
+            read_entries: 2,
+            write_entries: 1,
+            read_bytes: 0,
+            write_bytes: 136,
+        };
+        let previous_io = IoFootprint {
+            read_entries: 5,
+            write_entries: 0,
+            read_bytes: 4_096,
+            write_bytes: 136,
+        };
+
+        let mut report = sample_report();
+        report.history = Some(history_with_io(Some(current_io), Some(previous_io)));
+
+        let output = TableFormatter.format(&report);
+        assert!(
+            output.contains("I/O footprint change (historical - current):"),
+            "{output}"
+        );
+        assert!(output.contains("Read Entries"), "{output}");
+        // historical - current: +3 read entries, -1 write entry, +4096 read
+        // bytes, unchanged write bytes.
+        assert!(output.contains("+3"), "{output}");
+        assert!(output.contains("-1"), "{output}");
+        assert!(output.contains("+4096"), "{output}");
+        // Assert on the I/O table itself: the rest of the report legitimately
+        // mentions "unavailable" in the advisory fee-rate note.
+        let io_table = crate::report::cost_report::format_cost_history_footprints(
+            report.history.as_deref().expect("history was set"),
+        );
+        assert!(
+            !io_table.contains(crate::report::cost_report::FOOTPRINT_UNAVAILABLE),
+            "{io_table}"
+        );
+
+        let json = JsonFormatter.format(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(parsed["history"][0]["footprint_delta"]["read_entries"], 3);
+        assert_eq!(parsed["history"][0]["footprint_delta"]["write_entries"], -1);
+        assert_eq!(parsed["history"][0]["footprint_delta"]["read_bytes"], 4_096);
+        assert_eq!(parsed["history"][0]["footprint_delta"]["write_bytes"], 0);
+    }
+
+    /// A legacy entry without a footprint is unavailable, never zero — and
+    /// the I/O table is still rendered because another entry has data.
+    #[test]
+    fn test_history_marks_legacy_footprint_unavailable() {
+        use crate::report::cost_report::IoFootprint;
+
+        let current_io = IoFootprint {
+            read_entries: 1,
+            write_entries: 1,
+            read_bytes: 0,
+            write_bytes: 136,
+        };
+        let mut entries = history_with_io(Some(current_io), Some(current_io));
+        entries.extend(history_with_io(Some(current_io), None));
+
+        let mut report = sample_report();
+        report.history = Some(entries.clone());
+        let output = TableFormatter.format(&report);
+
+        assert!(output.contains("I/O footprint change"), "{output}");
+        // The I/O table marks all four resources of the legacy entry as
+        // unavailable — and only those four cells.
+        let io_table = crate::report::cost_report::format_cost_history_footprints(&entries);
+        assert_eq!(
+            io_table
+                .matches(crate::report::cost_report::FOOTPRINT_UNAVAILABLE)
+                .count(),
+            4,
+            "legacy entry should be marked unavailable: {io_table}"
+        );
+
+        let json = JsonFormatter.format(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        // The current-footprint entry has deltas; the legacy one omits the key
+        // entirely, so no consumer can mistake it for zero usage.
+        assert!(
+            parsed["history"][0].get("footprint_delta").is_some(),
+            "{json}"
+        );
+        assert!(
+            parsed["history"][1].get("footprint_delta").is_none(),
+            "{json}"
+        );
+    }
+
+    /// Nothing recorded a footprint: pre-#530 output must be unchanged, so no
+    /// I/O table appears at all.
+    #[test]
+    fn test_history_without_footprints_has_no_io_table() {
+        let mut report = sample_report();
+        report.history = Some(history_with_io(None, None));
+        let output = TableFormatter.format(&report);
+
+        assert!(output.contains("Cost history"), "{output}");
+        // `format_cost_history` gates the I/O table on having at least one
+        // delta, so the section header must never appear without data.
+        assert!(!output.contains("I/O footprint change"), "{output}");
+    }
+
+    // ── Summary formatter (#533) ────────────────────────────────────
+
+    /// The documented field order is the format's contract: consumers index
+    /// by position, so pin every column of the sample report.
+    #[test]
+    fn test_summary_formatter_field_order() {
+        let output = SummaryFormatter.format(&sample_report());
+        let fields: Vec<&str> = output.split(SUMMARY_DELIMITER).collect();
+        assert_eq!(fields.len(), SUMMARY_FIELDS.len(), "got: {output}");
+        assert_eq!(
+            fields,
+            vec![
+                "increment",
+                "testnet",
+                "3894195",
+                "15427",
+                "0.0015427",
+                "532502",
+                "1",
+                "1",
+                "0",
+                "136",
+                "156",
+            ],
+            "summary field order must match SUMMARY_FIELDS"
+        );
+    }
+
+    /// `SUMMARY_FIELDS` and the emitted line must never drift apart.
+    #[test]
+    fn test_summary_formatter_matches_declared_fields() {
+        assert_eq!(SUMMARY_FIELDS.len(), 11);
+        assert_eq!(SUMMARY_FIELDS[0], "function");
+        assert_eq!(SUMMARY_FIELDS[10], "tx_size");
+        let empty = SummaryFormatter.format(&empty_report());
+        assert_eq!(empty.split(SUMMARY_DELIMITER).count(), SUMMARY_FIELDS.len());
+    }
+
+    /// The summary is one line, with no ANSI styling: redirected output must
+    /// be byte-identical to terminal output.
+    #[test]
+    fn test_summary_formatter_is_single_line_without_ansi() {
+        let output = SummaryFormatter.format(&sample_report());
+        assert!(!output.contains('\n'), "summary must be one line: {output}");
+        assert!(!output.contains('\r'), "summary must be one line: {output}");
+        assert!(!output.contains('\u{1b}'), "no ANSI escapes: {output}");
+    }
+
+    /// Spaces are ordinary characters in the summary; a function name that
+    /// contains the delimiter or a newline is escaped so the column count
+    /// stays exact and the output stays on one line.
+    #[test]
+    fn test_summary_formatter_escapes_delimiter_and_control_characters() {
+        let mut report = sample_report();
+        report.function = "transfer from x\nto y\tz\\w".to_string();
+        let output = SummaryFormatter.format(&report);
+
+        assert!(!output.contains('\n'), "newlines must be escaped: {output}");
+        let fields: Vec<&str> = output.split(SUMMARY_DELIMITER).collect();
+        assert_eq!(fields.len(), SUMMARY_FIELDS.len(), "got: {output}");
+        assert_eq!(fields[0], r"transfer from x\nto y\tz\\w");
+    }
+
+    /// Quotes, commas and pipes are *not* the delimiter, so they pass through
+    /// unchanged and a single-field name never needs shell-side quoting.
+    #[test]
+    fn test_summary_formatter_keeps_spaces_and_other_punctuation() {
+        let mut report = sample_report();
+        report.function = "transfer|from, \"me\"".to_string();
+        let output = SummaryFormatter.format(&report);
+        assert!(
+            output.starts_with("transfer|from, \"me\"\t"),
+            "got: {output}"
+        );
+    }
+
+    /// `cut -f` is the documented consumer: the Nth field is the Nth column.
+    #[test]
+    fn test_summary_formatter_splits_into_fixed_columns() {
+        let output = SummaryFormatter.format(&sample_report());
+        let columns: Vec<&str> = output.split('\t').collect();
+        assert_eq!(columns.len(), SUMMARY_FIELDS.len(), "got: {output}");
+        assert_eq!(columns[3], "15427", "4th column is total_stroops");
+    }
+
+    #[test]
+    fn test_summary_formatter_empty_report() {
+        let output = SummaryFormatter.format(&empty_report());
+        let fields: Vec<&str> = output.split(SUMMARY_DELIMITER).collect();
+        assert_eq!(fields[0], "(wasm upload)");
+        assert_eq!(fields[1], "mainnet");
+        assert_eq!(fields[2], "0");
+        assert_eq!(fields[3], "0");
+    }
+
+    /// `--quiet` only drops advisory sections; the summary has none, so both
+    /// option sets produce the same line.
+    #[test]
+    fn test_summary_formatter_ignores_quiet() {
+        let report = dominant_write_report();
+        assert_eq!(
+            SummaryFormatter.format(&report),
+            SummaryFormatter.format_with(&report, ReportOptions::quiet())
+        );
+    }
+
+    #[test]
+    fn test_summary_formatter_name_and_display() {
+        assert_eq!(SummaryFormatter.name(), "summary");
+        assert_eq!(SummaryFormatter.to_string(), "summary");
     }
 
     #[test]
@@ -1302,5 +1702,75 @@ mod tests {
         let md_out = MarkdownFormatter.format(&report);
         assert!(md_out.contains("### Cost Projections"));
         assert!(md_out.contains("| 100 | 1,552,700 | 0.1552700 | $0.18 |"));
+    }
+
+    // ── Simulation diagnostics (#525) ───────────────────────────────
+
+    /// A report carrying diagnostics with counts only (no `--show-events`).
+    fn counted_diagnostics_report() -> CostReport {
+        use crate::report::cost_report::{EventSummary, SimulationDiagnostics};
+        let mut report = sample_report();
+        report.diagnostics = Some(SimulationDiagnostics {
+            event_count: 3,
+            state_change_count: 1,
+            events: Vec::<EventSummary>::new(),
+            state_changes: Vec::new(),
+        });
+        report
+    }
+
+    /// Counts render in table mode and name the opt-in; JSON keeps summaries
+    /// absent until `--show-events` attached them.
+    #[test]
+    fn test_formatters_render_diagnostics_counts_by_default() {
+        let report = counted_diagnostics_report();
+
+        let table_out = TableFormatter.format(&report);
+        assert!(
+            table_out.contains("Simulation diagnostics: 3 events, 1 state change"),
+            "{table_out}"
+        );
+        assert!(
+            table_out.contains("re-run with --show-events"),
+            "{table_out}"
+        );
+
+        let json_out = JsonFormatter.format(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json_out).expect("valid json");
+        assert_eq!(parsed["diagnostics"]["event_count"], 3);
+        assert_eq!(parsed["diagnostics"]["state_change_count"], 1);
+        assert!(parsed["diagnostics"].get("events").is_none());
+
+        // A report without diagnostics keeps its exact previous output.
+        let clean = TableFormatter.format(&sample_report());
+        assert!(!clean.contains("Simulation diagnostics"), "{clean}");
+    }
+
+    /// `--show-events` details render as entries in both text formats.
+    #[test]
+    fn test_formatters_render_diagnostics_details_when_requested() {
+        use crate::report::cost_report::{EventSummary, SimulationDiagnostics};
+        let mut report = sample_report();
+        report.diagnostics = Some(SimulationDiagnostics {
+            event_count: 1,
+            state_change_count: 0,
+            events: vec![EventSummary {
+                kind: "contract".to_string(),
+                topic_count: 1,
+                data_bytes: Some(5),
+                topic_previews: vec!["00000000".to_string()],
+                data_preview: Some("68656c6c6f".to_string()),
+            }],
+            state_changes: Vec::new(),
+        });
+
+        let table_out = TableFormatter.format(&report);
+        assert!(table_out.contains("Events:"), "{table_out}");
+        assert!(table_out.contains("event[0]: contract"), "{table_out}");
+        assert!(table_out.contains("data: 68656c6c6f"), "{table_out}");
+
+        let md_out = MarkdownFormatter.format(&report);
+        assert!(md_out.contains("### Simulation Diagnostics"), "{md_out}");
+        assert!(md_out.contains("`event[0]`: contract"), "{md_out}");
     }
 }
