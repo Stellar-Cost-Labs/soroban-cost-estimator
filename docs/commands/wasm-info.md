@@ -117,8 +117,24 @@ The document has these top-level keys:
 | `sections` | One object per row, largest first: `id`, `name`, `custom`, `offset`, `end`, `size` (contents), `header_size`, `total_size`, `percent` |
 | `contract_meta` | `name`, `version`, `description`, `sdk_version`, and the full ordered `entries` list |
 | `functions` | Exported functions with `param_count`, `result_count`, `signature`, `params`, and `returns` |
+| `function_signatures` | Stable signature report for scripts: `schema_version` and a `functions` array (see below) |
 | `spec_entries` | Every decoded `contractspecv0` entry (`kind`, `name`, `doc`, plus kind-specific fields) |
 | `module` | `start_function`, `memories`, `imports`, and `exports` |
+
+### `function_signatures` schema
+
+`function_signatures.functions[]` has one object per exported function:
+
+| Field | Meaning |
+|-------|---------|
+| `name` | Exported function name |
+| `spec_present` | `true` when the function appears in `contractspecv0` |
+| `wasm.param_count` / `wasm.result_count` | Raw WASM value counts (always present; these are WASM value types, not Soroban types) |
+| `params[]` | `index`, `name`, `type`, `type_def` (Soroban spec types) |
+| `returns[]` | `index`, `type`, `type_def` |
+
+When `spec_present` is `false`, `params` and `returns` still contain one entry per
+raw WASM parameter/result, but `name`, `type` and `type_def` are `null`.
 
 Spec type definitions are rendered as structured JSON so nested types keep
 their shape:
