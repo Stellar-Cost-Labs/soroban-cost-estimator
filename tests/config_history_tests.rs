@@ -446,3 +446,79 @@ fn test_missing_snapshots_reports_an_error() {
         );
     });
 }
+
+#[test]
+fn test_atomic_snapshot_write_replaces_existing_file() {
+    let directory = tempfile::tempdir().expect("create temporary directory");
+    let destination = directory.path().join("snapshot.json");
+    std::fs::write(&destination, b"old snapshot").expect("write old snapshot");
+
+    store::write_snapshot_atomically(&destination, b"new snapshot")
+        .expect("replace snapshot atomically");
+
+    assert_eq!(
+        std::fs::read(&destination).expect("read replaced snapshot"),
+        b"new snapshot"
+    );
+    assert_eq!(
+        std::fs::read_dir(directory.path())
+            .expect("read temporary directory")
+            .count(),
+        1,
+        "successful replacement leaves no temporary file"
+    );
+}
+
+#[test]
+fn test_atomic_snapshot_write_failure_preserves_existing_file_and_cleans_temp() {
+    let directory = tempfile::tempdir().expect("create temporary directory");
+    let destination = directory.path().join("snapshot.json");
+    std::fs::write(&destination, b"previous snapshot").expect("write old snapshot");
+
+    let error = store::write_snapshot_atomically_with(&destination, |file| {
+        use std::io::Write;
+
+        file.write_all(b"partial snapshot")?;
+        Err(std::io::Error::other("simulated write failure"))
+    })
+    .expect_err("simulated write failure must be returned");
+
+    assert!(error.to_string().contains("simulated write failure"));
+    assert_eq!(
+        std::fs::read(&destination).expect("read previous snapshot"),
+        b"previous snapshot"
+    );
+    assert_eq!(
+        std::fs::read_dir(directory.path())
+            .expect("read temporary directory")
+            .count(),
+        1,
+        "failed write leaves no temporary file"
+    );
+}
+
+#[test]
+fn test_atomic_snapshot_rename_failure_preserves_destination_and_cleans_temp() {
+    let directory = tempfile::tempdir().expect("create temporary directory");
+    let destination = directory.path().join("destination.json");
+    std::fs::create_dir(&destination).expect("create conflicting destination directory");
+
+    let error = store::write_snapshot_atomically(&destination, b"snapshot")
+        .expect_err("rename over a directory must fail");
+
+    assert!(matches!(
+        error,
+        soroban_cost_estimator::error::AppError::Io(_)
+    ));
+    assert!(
+        destination.is_dir(),
+        "failed rename preserves the destination"
+    );
+    assert_eq!(
+        std::fs::read_dir(directory.path())
+            .expect("read temporary directory")
+            .count(),
+        1,
+        "failed rename leaves no temporary file"
+    );
+}

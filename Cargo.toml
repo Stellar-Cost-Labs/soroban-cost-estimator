@@ -98,6 +98,7 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 
 # Timestamps
 chrono = { version = "0.4.45", features = ["serde"] }
+tempfile = "3.27.0"
 
 # Directory paths
 dirs = "6.0.0"

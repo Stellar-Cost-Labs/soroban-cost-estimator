@@ -2333,6 +2333,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "stellar-xdr",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-tungstenite",
