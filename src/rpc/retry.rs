@@ -39,7 +39,7 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = AppResult<T>>,
 {
-    with_retry_deadline(max_retries, None, None, operation).await
+    with_retry_deadline(max_retries, None, None, operation, None).await
 }
 
 /// Executes an async operation with retries, bounded by an optional overall
@@ -54,6 +54,7 @@ pub async fn with_retry_deadline<F, Fut, T>(
     deadline: Option<tokio::time::Instant>,
     total_timeout: Option<Duration>,
     mut operation: F,
+    attempt_counter: Option<&std::sync::atomic::AtomicU8>,
 ) -> AppResult<T>
 where
     F: FnMut() -> Fut,
@@ -79,6 +80,13 @@ where
         } else {
             operation().await
         };
+
+        if let Some(counter) = attempt_counter {
+            counter.store(
+                (attempts + 1).min(u8::MAX as usize) as u8,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
 
         match attempt_result {
             Ok(value) => return Ok(value),
