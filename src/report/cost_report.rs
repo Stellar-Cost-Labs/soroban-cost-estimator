@@ -350,6 +350,51 @@ pub fn format_resource_warnings(warnings: &[ResourceWarning]) -> String {
     out
 }
 
+/// Separate state-archival restoration fee reported by `simulateTransaction`
+/// (#524). Kept distinct from [`FeeBreakdown::total_stroops`] so restoration
+/// costs are never double-counted in the execution resource fee.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ArchivalRestoreFee {
+    /// Restoration fee in stroops (`None` when the RPC omitted `restoreFee`).
+    pub stroops: Option<i64>,
+    /// Restoration fee in XLM when `stroops` is `Some`, or `"unknown"` when absent.
+    pub xlm: String,
+    /// Status string (`"present"` when reported by the RPC, `"unknown"` when absent).
+    pub status: String,
+}
+
+impl ArchivalRestoreFee {
+    /// Build an archival restoration fee record from an optional stroop value.
+    #[must_use]
+    pub fn from_stroops(stroops: Option<i64>, precision: u32) -> Self {
+        match stroops {
+            Some(s) => Self {
+                stroops: Some(s),
+                xlm: crate::report::fee_calc::stroops_to_xlm(s, precision),
+                status: "present".to_string(),
+            },
+            None => Self {
+                stroops: None,
+                xlm: "unknown".to_string(),
+                status: "unknown".to_string(),
+            },
+        }
+    }
+}
+
+/// Render the archival restoration fee section for human-readable table output
+/// (#524).
+#[must_use]
+pub fn format_restore_fee_section(restore: &ArchivalRestoreFee) -> String {
+    match restore.stroops {
+        Some(stroops) => format!(
+            "\nArchival Restoration Fee (separate from execution total): {} stroops ({} XLM)\n",
+            stroops, restore.xlm
+        ),
+        None => "\nArchival Restoration Fee: unknown (not reported by RPC)\n".to_string(),
+    }
+}
+
 /// Maximum number of event / state-change entries summarized individually
 /// (issue #525). Counts always reflect the full response, so rendered
 /// output stays bounded no matter how many entries a simulation produced.
@@ -2756,6 +2801,8 @@ pub fn format_pricing_sensitivity_json(report: &PricingSensitivityReport) -> Str
     serde_json::to_string(&json).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// Formats cost projections as a human-readable table.
+#[must_use]
 pub fn format_projections_table(projections: &[CostProjection]) -> String {
     if projections.is_empty() {
         return String::new();
