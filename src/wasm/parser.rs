@@ -50,24 +50,68 @@ pub fn wasm_sha256_hex(bytes: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
-/// Loads a compiled Soroban contract `.wasm` file from disk.
+/// Default upper bound on WASM file size before reading into memory (16 MiB).
 ///
-/// Reads the file bytes, performs basic structural validation via
-/// `wasmparser`, enumerates exported functions, and — when the WASM carries
-/// a Soroban contract spec (`contractspecv0` custom section) — decodes the
-/// typed parameter information from it.
-///
-/// # Network calls
-/// None — pure file I/O + parsing.
+/// Prevents denial-of-service via memory exhaustion when handling accidental or
+/// hostile oversized user-supplied binaries. Even unoptimized debug builds of
+/// large Soroban contracts rarely exceed 5-10 MiB, and deployed on-chain
+/// contracts are capped at protocol-level limits far below this.
+pub const DEFAULT_MAX_WASM_FILE_SIZE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Loads a compiled Soroban contract `.wasm` file from disk using the default
+/// maximum file size limit ([`DEFAULT_MAX_WASM_FILE_SIZE_BYTES`]).
 pub fn load_wasm(path: &Path) -> AppResult<WasmInfo> {
-    debug!(path = %path.display(), "loading WASM file");
-    let bytes = std::fs::read(path).map_err(|e| {
+    load_wasm_with_limit(path, DEFAULT_MAX_WASM_FILE_SIZE_BYTES)
+}
+
+/// Loads a compiled Soroban contract `.wasm` file from disk, enforcing a maximum
+/// size limit before and during file reading to avoid unbounded memory allocations.
+///
+/// Checks file metadata before allocation and reads with a bounded stream reader,
+/// returning [`AppError::WasmFileTooLarge`] if the file is oversized or grows during read.
+pub fn load_wasm_with_limit(path: &Path, max_bytes: u64) -> AppResult<WasmInfo> {
+    debug!(path = %path.display(), max_bytes, "loading WASM file with size limit");
+
+    let metadata = std::fs::metadata(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             AppError::FileNotFound(path.display().to_string())
         } else {
             AppError::Io(e)
         }
     })?;
+
+    let file_len = metadata.len();
+    if file_len > max_bytes {
+        return Err(AppError::WasmFileTooLarge {
+            path: path.display().to_string(),
+            size: file_len,
+            max_size: max_bytes,
+        });
+    }
+
+    // Guard against files that grow between metadata inspection and reading
+    // by bounding the read operation to `max_bytes + 1`.
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            AppError::FileNotFound(path.display().to_string())
+        } else {
+            AppError::Io(e)
+        }
+    })?;
+
+    let mut bytes = Vec::with_capacity(file_len.min(max_bytes) as usize);
+    file.by_ref()
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+
+    if bytes.len() as u64 > max_bytes {
+        return Err(AppError::WasmFileTooLarge {
+            path: path.display().to_string(),
+            size: bytes.len() as u64,
+            max_size: max_bytes,
+        });
+    }
     debug!(bytes = bytes.len(), "WASM bytes read");
 
     validate_wasm(&bytes)?;
@@ -560,6 +604,7 @@ pub fn parse_contract_spec_entries(
         let data = section.data();
         let mut cursor = Cursor::new(data);
         while (cursor.position() as usize) < data.len() {
+            let prev_pos = cursor.position();
             let mut limited = stellar_xdr::Limited::new(&mut cursor, stellar_xdr::Limits::none());
             let entry = stellar_xdr::ScSpecEntry::read_xdr(&mut limited).map_err(|e| {
                 AppError::WasmParse(format!(
@@ -567,6 +612,11 @@ pub fn parse_contract_spec_entries(
                     entries.len()
                 ))
             })?;
+            if cursor.position() <= prev_pos {
+                return Err(AppError::WasmParse(
+                    "zero-byte progress while decoding contractspecv0 entry".to_string(),
+                ));
+            }
             entries.push(entry);
         }
     }
@@ -932,13 +982,17 @@ pub struct MemoryInfo {
 }
 
 /// Information about an import declared by a WASM module.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Records the origin module (e.g. `"env"` for Soroban host functions), the symbol
+/// name, and the imported entity kind (`function`, `memory`, `table`, `global`, `tag`).
+/// Preserves deterministic declaration ordering from the binary's import section.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ImportInfo {
-    /// Module name the import is pulled from.
+    /// Module name the import is pulled from (e.g. `"env"` for Soroban host functions).
     pub module: String,
     /// Name of the imported item.
     pub name: String,
-    /// Human-readable kind, e.g. `function`, `memory`, `global`.
+    /// Human-readable kind, e.g. `function`, `memory`, `table`, `global`, `tag`.
     pub kind: String,
 }
 
@@ -987,6 +1041,95 @@ pub struct FunctionInfo {
     pub params: Vec<ParamInfo>,
     /// Typed return values from the contract spec, if the WASM has one.
     pub returns: Vec<TypeInfo>,
+}
+
+/// Schema version of the `function_signatures` JSON block.
+pub const FUNCTION_SIGNATURES_SCHEMA_VERSION: u32 = 1;
+
+/// Renders every exported function's signature as stable JSON.
+///
+/// Soroban spec types (`type`/`type_def`) are kept separate from the raw WASM
+/// parameter and result counts (`wasm`), which are plain value-type counts and
+/// are always present. A function missing from the contract spec reports
+/// `"spec_present": false` and one placeholder entry per raw WASM parameter or
+/// result with `null` name and type, so absent spec data is explicit.
+#[must_use]
+pub fn function_signatures_json(info: &WasmInfo) -> serde_json::Value {
+    let spec_names: std::collections::BTreeSet<String> = info
+        .spec_entries
+        .iter()
+        .filter_map(|entry| match entry {
+            stellar_xdr::ScSpecEntry::FunctionV0(f) => {
+                Some(String::from_utf8_lossy(f.name.as_slice()).into_owned())
+            }
+            _ => None,
+        })
+        .collect();
+
+    let functions: Vec<serde_json::Value> = info
+        .functions
+        .iter()
+        .map(|f| {
+            let spec_present = spec_names.contains(&f.name);
+            let params: Vec<serde_json::Value> = if spec_present {
+                f.params
+                    .iter()
+                    .enumerate()
+                    .map(|(index, p)| {
+                        json!({
+                            "index": index,
+                            "name": p.name,
+                            "type": p.type_name,
+                            "type_def": spec_type_json(&p.type_def),
+                        })
+                    })
+                    .collect()
+            } else {
+                (0..f.param_count)
+                    .map(|index| {
+                        json!({
+                            "index": index,
+                            "name": null,
+                            "type": null,
+                            "type_def": null,
+                        })
+                    })
+                    .collect()
+            };
+            let returns: Vec<serde_json::Value> = if spec_present {
+                f.returns
+                    .iter()
+                    .enumerate()
+                    .map(|(index, r)| {
+                        json!({
+                            "index": index,
+                            "type": r.type_name,
+                            "type_def": spec_type_json(&r.type_def),
+                        })
+                    })
+                    .collect()
+            } else {
+                (0..f.result_count)
+                    .map(|index| json!({ "index": index, "type": null, "type_def": null }))
+                    .collect()
+            };
+            json!({
+                "name": f.name,
+                "spec_present": spec_present,
+                "wasm": {
+                    "param_count": f.param_count,
+                    "result_count": f.result_count,
+                },
+                "params": params,
+                "returns": returns,
+            })
+        })
+        .collect();
+
+    json!({
+        "schema_version": FUNCTION_SIGNATURES_SCHEMA_VERSION,
+        "functions": functions,
+    })
 }
 
 /// Renders a spec type definition as JSON, preserving the full type tree
@@ -1161,13 +1304,20 @@ pub fn format_function(fn_info: &FunctionInfo) -> String {
     signature
 }
 
+/// A compact summary of a WASM module's memory and section structure.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WasmStructureSummary {
+    /// Initial linear-memory size, in 64 KiB pages.
     pub initial_pages: u64,
+    /// Maximum linear-memory size, in pages, when the module declares one.
     pub max_pages: Option<u64>,
+    /// Number of imported functions.
     pub imports_count: usize,
+    /// Number of exported functions.
     pub exports_count: usize,
+    /// Whether the module declares a start function.
     pub has_start_function: bool,
+    /// Number of tables declared by the module.
     pub tables_count: usize,
 }
 
@@ -1209,6 +1359,13 @@ pub struct WasmInfo {
 }
 
 impl WasmInfo {
+    /// Returns an iterator over imports from the Soroban host module ([`HOST_IMPORT_MODULE`]).
+    pub fn host_imports(&self) -> impl Iterator<Item = &ImportInfo> {
+        self.imports
+            .iter()
+            .filter(|imp| imp.module == HOST_IMPORT_MODULE)
+    }
+
     /// Size accounting for the whole file: the module header plus one entry
     /// per section, each with its share of the file.
     #[must_use]

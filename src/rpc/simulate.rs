@@ -34,23 +34,38 @@ pub struct SimulateTransactionResponse {
     /// Resource usage results.
     #[serde(default)]
     pub cost: Option<CostResult>,
-    /// Error message if simulation failed.
-    #[serde(default)]
-    pub error: Option<String>,
+    /// Failure details if the simulation could not execute (issue #532).
+    ///
+    /// The RPC has returned two shapes over its lifetime: the legacy
+    /// flattened string, and a structured object carrying a machine-readable
+    /// `code` plus an optional `data` payload. Both are accepted and
+    /// normalised into a [`SimulationError`] so callers never have to parse
+    /// the message to tell failure classes apart.
+    #[serde(default, deserialize_with = "deserialize_simulation_error")]
+    pub error: Option<SimulationError>,
     /// Latest ledger sequence number. May arrive as a JSON string or number
     /// depending on the RPC version, so both are accepted.
     #[serde(default, deserialize_with = "deserialize_u64_flexible_opt")]
     pub latest_ledger: Option<u64>,
-    /// Events emitted during simulation (base64-encoded XDR).
+    /// Events emitted during simulation (issue #525). Each item is the
+    /// RPC's raw JSON event object (`{ type, topic: [b64 ScVal XDR], data:
+    /// b64 ScVal XDR, … }`); older RPC versions returned plain base64 XDR
+    /// strings. Items are kept as raw `Value` so a version-drifted or
+    /// malformed payload can never fail the whole response —
+    /// [`crate::report::cost_report::build_simulation_diagnostics`]
+    /// summarizes them leniently.
     #[serde(default)]
-    pub events: Option<Vec<String>>,
+    pub events: Option<Vec<Value>>,
     /// Minimum resource fee (base64-encoded int64 XDR).
     #[serde(default)]
     pub min_resource_fee: Option<String>,
     /// Restore fee if state archival entry needs to be restored.
     #[serde(default)]
     pub restore_fee: Option<String>,
-    /// State changes produced by the simulation.
+    /// State changes produced by the simulation (issue #525): raw
+    /// `LedgerEntryChange` objects (`{ key, created?, updated?, deleted? }`,
+    /// payloads base64 XDR). Kept as raw `Value` for the same leniency
+    /// reason as `events`.
     #[serde(default)]
     pub state_changes: Option<Vec<Value>>,
 }
@@ -67,6 +82,268 @@ impl SimulateTransactionResponse {
         self.latest_ledger
             .and_then(|ledger| u32::try_from(ledger).ok())
             .unwrap_or(0)
+    }
+}
+
+/// Maximum number of bytes retained for a simulation error's structured
+/// `data` payload.
+///
+/// Error payloads come from the remote endpoint, so they are untrusted input.
+/// Keeping the retained details bounded means a misbehaving (or hostile)
+/// server cannot make the CLI buffer or print an unbounded blob, and keeps the
+/// error's JSON representation small enough to read.
+pub const MAX_SIMULATION_ERROR_DATA_BYTES: usize = 1_024;
+
+/// Maximum nesting depth retained inside a simulation error's `data`.
+const MAX_ERROR_DATA_DEPTH: usize = 4;
+
+/// Maximum number of array items (or object keys) retained per level.
+const MAX_ERROR_DATA_ITEMS: usize = 16;
+
+/// Maximum number of characters retained from one string in the payload.
+const MAX_ERROR_DATA_STRING_CHARS: usize = 128;
+
+/// A structured `simulateTransaction` failure.
+///
+/// Wraps the three fields the RPC may report: a machine-readable `code`, a
+/// human-readable `message`, and an optional structured `data` payload. The
+/// type is `Serialize` so integrators get a stable JSON representation — the
+/// keys are always `code`, `data`, and `message`, and `code`/`data` are
+/// omitted when the RPC did not supply them.
+///
+/// `data` is bounded by [`MAX_SIMULATION_ERROR_DATA_BYTES`] (and by depth,
+/// item count, and string length) when it is decoded, so serialising it
+/// cannot produce an unbounded document.
+///
+/// `Display` renders only the concise human message plus the code when one is
+/// present — the payload is accessible through the fields or the JSON
+/// representation, never dumped into an error line.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SimulationError {
+    /// Machine-readable error code, when the RPC supplied one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<i64>,
+    /// Human-readable failure message. Never empty.
+    pub message: String,
+    /// Structured details, bounded when decoded (see the type docs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+impl SimulationError {
+    /// A message-only failure, for callers that have no code or payload.
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            code: None,
+            message: message.into(),
+            data: None,
+        }
+    }
+
+    /// A stable JSON representation of this failure.
+    ///
+    /// The keys are always the same three (`code`, `data`, `message`), which
+    /// makes the document safe to index into from a pipeline. Serialisation of
+    /// an already-bounded `Value` cannot fail; the empty object is a defensive
+    /// fallback rather than a reachable path.
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        serde_json::to_value(self).unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
+    }
+}
+
+impl std::fmt::Display for SimulationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.code {
+            Some(code) => write!(f, "{} (error code {code})", self.message),
+            None => f.write_str(&self.message),
+        }
+    }
+}
+
+/// Untagged mirror of the two shapes the RPC's `error` field has taken.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SimulationErrorPayload {
+    /// Legacy shape: a single flattened message string.
+    Message(String),
+    /// Structured shape: an object with a code, a message and optional data.
+    Structured(SimulationErrorFields),
+}
+
+/// The structured variant of [`SimulationErrorPayload`].
+///
+/// Every field is optional at this layer: the RPC is free to omit `message`
+/// (falling back to a message derived from the code) and to send keys the
+/// tool does not know about, which are ignored.
+#[derive(Debug, Deserialize)]
+struct SimulationErrorFields {
+    #[serde(default, deserialize_with = "deserialize_i64_flexible_opt")]
+    code: Option<i64>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    data: Option<Value>,
+}
+
+/// Deserialize an optional `i64` that may arrive as a JSON string, number, or
+/// null.
+///
+/// RPC versions disagree on whether error codes are quoted (as the
+/// `latestLedger`/`cpuInsns` fields are), so both forms are accepted rather
+/// than failing the whole response over a quoting difference.
+fn deserialize_i64_flexible_opt<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(text)) => text
+            .trim()
+            .parse::<i64>()
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        Some(serde_json::Value::Number(number)) => number
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom("expected i64")),
+        Some(_) => Err(serde::de::Error::custom("expected string, number, or null")),
+    }
+}
+
+/// Deserialize the `error` field of a `simulateTransaction` response.
+///
+/// Accepts `null`, the legacy string form, and the structured object form,
+/// normalising all of them to `Option<SimulationError>`.
+fn deserialize_simulation_error<'de, D>(
+    deserializer: D,
+) -> Result<Option<SimulationError>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    let Ok(payload) = serde_json::from_value::<SimulationErrorPayload>(value.clone()) else {
+        // An error payload the tool does not recognise must not fail the whole
+        // response (that would hide the failure behind a JSON error). Keep it
+        // as bounded structured details instead.
+        return Ok(Some(SimulationError {
+            code: None,
+            message: "simulation failed with an unrecognized error payload".to_string(),
+            data: bound_error_data(value),
+        }));
+    };
+
+    Ok(Some(match payload {
+        SimulationErrorPayload::Message(message) => SimulationError {
+            code: None,
+            message,
+            data: None,
+        },
+        SimulationErrorPayload::Structured(fields) => {
+            let message = fields
+                .message
+                .filter(|message| !message.is_empty())
+                .unwrap_or_else(|| match fields.code {
+                    Some(code) => format!("simulation failed with error code {code}"),
+                    None => "simulation failed".to_string(),
+                });
+            SimulationError {
+                code: fields.code,
+                message,
+                data: fields.data.and_then(bound_error_data),
+            }
+        }
+    }))
+}
+
+/// Bound an untrusted error payload: cap its depth, item counts, per-string
+/// length, and finally its serialised size.
+///
+/// The common case (a small object such as `{"type": "invokeHostFunction"}`)
+/// passes through untouched. Anything larger is normalised into a smaller,
+/// deterministic value; when even the normalised form is too big for
+/// [`MAX_SIMULATION_ERROR_DATA_BYTES`], it is replaced by a truncated JSON
+/// string that states how many bytes were dropped, rather than being silently
+/// discarded.
+fn bound_error_data(value: Value) -> Option<Value> {
+    let bounded = bound_value(value, 0);
+    let serialized = serde_json::to_string(&bounded).ok()?;
+    if serialized.len() <= MAX_SIMULATION_ERROR_DATA_BYTES {
+        return Some(bounded);
+    }
+
+    // Serialising the retained fragment as a JSON string can escape every
+    // character it contains (worst case doubles its length), so only a
+    // quarter of the budget holds the fragment; the marker tail is fixed and
+    // short. That keeps the *serialised* payload inside
+    // `MAX_SIMULATION_ERROR_DATA_BYTES` even in the worst case.
+    let mut end = MAX_SIMULATION_ERROR_DATA_BYTES / 4;
+    while end > 0 && !serialized.is_char_boundary(end) {
+        end -= 1;
+    }
+    let dropped = serialized.len() - end;
+    Some(Value::String(format!(
+        "{}… ({dropped} bytes truncated)",
+        &serialized[..end]
+    )))
+}
+
+/// Recursive half of [`bound_error_data`].
+fn bound_value(value: Value, depth: usize) -> Value {
+    if depth >= MAX_ERROR_DATA_DEPTH {
+        return Value::String("… (nested value omitted)".to_string());
+    }
+
+    match value {
+        Value::String(text) => Value::String(truncate_chars(&text, MAX_ERROR_DATA_STRING_CHARS)),
+        Value::Array(items) => {
+            let total = items.len();
+            let mut bounded: Vec<Value> = items
+                .into_iter()
+                .take(MAX_ERROR_DATA_ITEMS)
+                .map(|item| bound_value(item, depth + 1))
+                .collect();
+            if total > MAX_ERROR_DATA_ITEMS {
+                bounded.push(Value::String(format!(
+                    "… ({} more items)",
+                    total - MAX_ERROR_DATA_ITEMS
+                )));
+            }
+            Value::Array(bounded)
+        }
+        Value::Object(map) => {
+            let total = map.len();
+            let mut bounded = serde_json::Map::new();
+            for (key, item) in map.into_iter().take(MAX_ERROR_DATA_ITEMS) {
+                bounded.insert(
+                    truncate_chars(&key, MAX_ERROR_DATA_STRING_CHARS),
+                    bound_value(item, depth + 1),
+                );
+            }
+            if total > MAX_ERROR_DATA_ITEMS {
+                bounded.insert(
+                    "…truncated".to_string(),
+                    Value::String(format!("{} more keys", total - MAX_ERROR_DATA_ITEMS)),
+                );
+            }
+            Value::Object(bounded)
+        }
+        other => other,
+    }
+}
+
+/// Truncate `text` to at most `max_chars` characters, appending an ellipsis
+/// marker when anything was dropped.
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    match text.char_indices().nth(max_chars) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.to_string(),
     }
 }
 
@@ -169,8 +446,14 @@ async fn simulate_transaction_inner(
     };
 
     if let Some(ref error) = response.error {
-        debug!(error, "simulation returned error");
-        return Err(AppError::SimulationFailed(error.clone()));
+        // The structured details are logged, never spliced into the error
+        // line: `Display` for the error is the concise human message.
+        debug!(
+            code = ?error.code,
+            message = %error.message,
+            "simulation returned error"
+        );
+        return Err(AppError::SimulationFailed(Box::new(error.clone())));
     }
 
     trace!(
@@ -424,6 +707,190 @@ mod tests {
             let resp: SimulateTransactionResponse =
                 serde_json::from_str(json).expect("response should parse");
             assert_eq!(resp.ledger_sequence(), 1_234_567);
+        }
+    }
+
+    // ── Structured simulation errors (#532) ──────────────────────────
+
+    /// Legacy responses report the failure as one flattened string; nothing
+    /// is invented for the code or the payload.
+    #[test]
+    fn test_simulate_response_deserializes_legacy_string_error() {
+        let resp: SimulateTransactionResponse =
+            serde_json::from_str(r#"{ "error": "host invocation failed", "latestLedger": 7 }"#)
+                .expect("response should parse");
+
+        let error = resp.error.expect("legacy string error should be retained");
+        assert_eq!(error.code, None);
+        assert_eq!(error.message, "host invocation failed");
+        assert_eq!(error.data, None);
+        assert_eq!(error.to_string(), "host invocation failed");
+    }
+
+    /// The structured shape keeps the machine-readable code and the details
+    /// so callers can tell failure classes apart without parsing the message.
+    #[test]
+    fn test_simulate_response_deserializes_structured_error() {
+        let resp: SimulateTransactionResponse = serde_json::from_str(
+            r#"{
+                "error": {
+                    "code": -3,
+                    "message": "invocation failed",
+                    "data": { "type": "auth", "detail": "missing signature" }
+                },
+                "latestLedger": "42"
+            }"#,
+        )
+        .expect("response should parse");
+
+        let error = resp.error.expect("structured error should be retained");
+        assert_eq!(error.code, Some(-3));
+        assert_eq!(error.message, "invocation failed");
+        let data = error.data.as_ref().expect("details should be retained");
+        assert_eq!(data["type"], "auth");
+        assert_eq!(data["detail"], "missing signature");
+        // The human message stays concise: no payload dumped into it.
+        assert_eq!(error.to_string(), "invocation failed (error code -3)");
+        assert!(!error.to_string().contains("missing signature"));
+    }
+
+    /// A structured error that omits `message` still produces a usable one,
+    /// derived from the code, rather than an empty error line.
+    #[test]
+    fn test_simulate_response_structured_error_without_message() {
+        let resp: SimulateTransactionResponse =
+            serde_json::from_str(r#"{ "error": { "code": 9 } }"#).expect("response should parse");
+
+        let error = resp.error.expect("error should be retained");
+        assert_eq!(error.code, Some(9));
+        assert_eq!(error.message, "simulation failed with error code 9");
+        assert_eq!(error.data, None);
+    }
+
+    /// RPC versions disagree on whether the code is quoted; both forms are
+    /// accepted rather than failing the response over a quoting difference.
+    #[test]
+    fn test_simulate_response_structured_error_accepts_string_code() {
+        let resp: SimulateTransactionResponse =
+            serde_json::from_str(r#"{ "error": { "code": "12", "message": "quoted code" } }"#)
+                .expect("response should parse");
+
+        let error = resp.error.expect("error should be retained");
+        assert_eq!(error.code, Some(12));
+        assert_eq!(error.message, "quoted code");
+    }
+
+    /// A payload the tool does not recognise is kept as bounded details
+    /// instead of failing the whole response and hiding the failure.
+    #[test]
+    fn test_simulate_response_unrecognized_error_payload_is_kept() {
+        let resp: SimulateTransactionResponse =
+            serde_json::from_str(r#"{ "error": [1, 2, 3] }"#).expect("response should parse");
+
+        let error = resp.error.expect("error should be retained");
+        assert_eq!(error.code, None);
+        assert!(
+            error.message.contains("unrecognized"),
+            "got: {}",
+            error.message
+        );
+        assert_eq!(error.data, Some(serde_json::json!([1, 2, 3])));
+    }
+
+    /// No error at all is still `None` — both an explicit `null` and an
+    /// omitted field.
+    #[test]
+    fn test_simulate_response_absent_error_is_none() {
+        for json in [
+            r#"{ "error": null, "latestLedger": 1 }"#,
+            r#"{ "latestLedger": 1 }"#,
+        ] {
+            let resp: SimulateTransactionResponse =
+                serde_json::from_str(json).expect("response should parse");
+            assert!(resp.error.is_none(), "expected no error for {json}");
+        }
+    }
+
+    /// Error details come from an untrusted endpoint, so they are bounded:
+    /// deep nesting, long arrays, long strings and an oversized payload are
+    /// all normalised rather than retained in full.
+    #[test]
+    fn test_simulate_response_error_data_is_bounded() {
+        let long_string = "x".repeat(10_000);
+        let deep = serde_json::json!({ "a": { "b": { "c": { "d": { "e": "too deep" } } } } });
+        let many_items = serde_json::json!((0..100).collect::<Vec<u8>>());
+        let json = format!(
+            r#"{{ "error": {{ "code": 1, "message": "boom", "data": {{ "long": {long_string:?}, "deep": {deep}, "items": {many_items} }} }} }}"#
+        );
+
+        let resp: SimulateTransactionResponse =
+            serde_json::from_str(&json).expect("response should parse");
+        let error = resp.error.expect("error should be retained");
+        let data = error.data.expect("details should be retained");
+
+        let serialized = serde_json::to_string(&data).expect("bounded data serialises");
+        assert!(
+            serialized.len() <= MAX_SIMULATION_ERROR_DATA_BYTES + 64,
+            "payload must stay bounded, was {} bytes: {serialized}",
+            serialized.len()
+        );
+    }
+
+    /// A small payload is preserved exactly, so the common case loses no
+    /// information.
+    #[test]
+    fn test_simulate_response_small_error_data_is_preserved() {
+        let resp: SimulateTransactionResponse = serde_json::from_str(
+            r#"{ "error": { "message": "boom", "data": { "type": "invokeHostFunction" } } }"#,
+        )
+        .expect("response should parse");
+
+        let data = resp.error.and_then(|e| e.data).expect("details retained");
+        assert_eq!(data, serde_json::json!({ "type": "invokeHostFunction" }));
+    }
+
+    /// The JSON representation is stable for machine consumers: the same keys
+    /// for every structured error, and no keys the RPC did not supply.
+    #[test]
+    fn test_simulation_error_json_representation() {
+        let error = SimulationError {
+            code: Some(3),
+            message: "boom".to_string(),
+            data: Some(serde_json::json!({ "k": 1 })),
+        };
+        let json = error.to_json();
+        assert_eq!(json["code"], 3);
+        assert_eq!(json["message"], "boom");
+        assert_eq!(json["data"]["k"], 1);
+
+        let bare = SimulationError::new("no details");
+        let bare_json = bare.to_json();
+        assert_eq!(bare_json["message"], "no details");
+        assert!(bare_json.get("code").is_none(), "{bare_json}");
+        assert!(bare_json.get("data").is_none(), "{bare_json}");
+    }
+
+    /// The application error keeps the code and details, and renders the
+    /// concise human message.
+    #[test]
+    fn test_app_error_retains_simulation_details() {
+        let error = SimulationError {
+            code: Some(-3),
+            message: "invocation failed".to_string(),
+            data: Some(serde_json::json!({ "type": "auth" })),
+        };
+        let app_error = crate::error::AppError::SimulationFailed(Box::new(error.clone()));
+
+        assert_eq!(
+            app_error.to_string(),
+            "failed to simulate transaction: invocation failed (error code -3)"
+        );
+        match app_error {
+            crate::error::AppError::SimulationFailed(retained) => {
+                assert_eq!(retained.code, Some(-3));
+                assert_eq!(retained.data, error.data);
+            }
+            other => panic!("unexpected error variant: {other:?}"),
         }
     }
 
