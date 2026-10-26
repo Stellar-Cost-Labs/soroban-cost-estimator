@@ -529,6 +529,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
                 out,
                 json,
                 retain,
+                skip_unchanged,
             } => match action {
                 // A subcommand manages snapshots already on disk, so it cannot
                 // be combined with this command's fetching flags (enforced by
@@ -580,6 +581,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
                         out.as_deref(),
                         format,
                         retain,
+                        skip_unchanged,
                         rps,
                         timeout,
                         connect_timeout,
@@ -3935,11 +3937,130 @@ fn prune_output<'a>(
     })
 }
 
+/// Prints a newly saved snapshot in `format`.
+///
+/// Returns `true` when a machine format (JSON, CSV or Markdown) was printed,
+/// so the caller can skip the human retention footer and leave stdout as a
+/// single parseable document.
+fn print_saved_snapshot(
+    snapshot: &config_snapshot::model::ConfigSnapshot,
+    path: &Path,
+    format: cli::OutputFormat,
+    quiet: bool,
+) -> error::AppResult<bool> {
+    match format {
+        cli::OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(snapshot)?);
+            Ok(true)
+        }
+        cli::OutputFormat::Csv => {
+            println!("network,ledger,timestamp,path");
+            println!(
+                "{},{},{},{}",
+                snapshot.network,
+                snapshot.ledger,
+                snapshot.timestamp,
+                path.display()
+            );
+            Ok(true)
+        }
+        cli::OutputFormat::Markdown => {
+            println!(
+                "# Config Snapshot\n\n| Field | Value |\n| --- | --- |\n| Network | {} |\n| Ledger | {} |\n| Timestamp | {} |\n| Path | `{}` |",
+                snapshot.network,
+                snapshot.ledger,
+                snapshot.timestamp,
+                path.display()
+            );
+            Ok(true)
+        }
+        // `summary` describes one `CostReport`, so it has no snapshot form;
+        // like the aggregate commands it falls back to the table rendering.
+        cli::OutputFormat::Table | cli::OutputFormat::Summary => {
+            if !quiet {
+                println!("Config snapshot saved to: {}", path.display());
+                println!("Network: {}", snapshot.network);
+                println!("Ledger:  {}", snapshot.ledger);
+                println!("Time:    {}", snapshot.timestamp);
+            }
+            Ok(false)
+        }
+    }
+}
+
+/// Prints the result of a skipped `--skip-unchanged` capture in `format`.
+///
+/// Returns `true` when a machine format was printed, as
+/// [`print_saved_snapshot`] does. The exit status remains `0` in both cases:
+/// an unchanged configuration is a successful run, not a drift error.
+fn print_unchanged_snapshot(
+    snapshot: &config_snapshot::model::ConfigSnapshot,
+    latest: &Path,
+    format: cli::OutputFormat,
+    quiet: bool,
+) -> error::AppResult<bool> {
+    match format {
+        cli::OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "unchanged",
+                    "network": snapshot.network,
+                    "ledger": snapshot.ledger,
+                    "timestamp": snapshot.timestamp,
+                    "latest_snapshot": latest.display().to_string(),
+                }))?
+            );
+            Ok(true)
+        }
+        cli::OutputFormat::Csv => {
+            println!("status,network,ledger,timestamp,path");
+            println!(
+                "unchanged,{},{},{},{}",
+                snapshot.network,
+                snapshot.ledger,
+                snapshot.timestamp,
+                latest.display()
+            );
+            Ok(true)
+        }
+        cli::OutputFormat::Markdown => {
+            println!(
+                "# Config Snapshot\n\n| Field | Value |\n| --- | --- |\n| Status | unchanged |\n| Network | {} |\n| Ledger | {} |\n| Timestamp | {} |\n| Latest snapshot | `{}` |",
+                snapshot.network,
+                snapshot.ledger,
+                snapshot.timestamp,
+                latest.display()
+            );
+            Ok(true)
+        }
+        // See `print_saved_snapshot`: `summary` has no snapshot form and
+        // falls back to the table rendering.
+        cli::OutputFormat::Table | cli::OutputFormat::Summary => {
+            if !quiet {
+                println!("Configuration unchanged; no new snapshot written.");
+                println!("Latest:  {}", latest.display());
+                println!("Network: {}", snapshot.network);
+                println!("Ledger:  {}", snapshot.ledger);
+                println!("Time:    {}", snapshot.timestamp);
+            }
+            Ok(false)
+        }
+    }
+}
+
 /// `config snapshot` command: fetch config settings and save snapshot.
 ///
 /// With `--retain <N>`, a retention pass runs *after* the new snapshot is
 /// safely on disk, so a failed fetch or write never costs the user the older
 /// snapshots it would have pruned.
+///
+/// With `--skip-unchanged`, the fetched configuration is compared field by
+/// field with the latest snapshot and no file is written when nothing
+/// changed. The exit status is `0` in both cases: an unchanged network is a
+/// successful run, not a drift error. Machine formats report which happened
+/// via a `status` field (`saved` is implied by the snapshot document, while
+/// the unchanged document carries `"status": "unchanged"`).
 async fn cmd_config_snapshot(
     network: &str,
     rpc_url: Option<&str>,
@@ -3947,6 +4068,7 @@ async fn cmd_config_snapshot(
     out_path: Option<&str>,
     format: cli::OutputFormat,
     retain: Option<usize>,
+    skip_unchanged: bool,
     rps: Option<u64>,
     timeout: u64,
     connect_timeout: u64,
@@ -3974,41 +4096,43 @@ async fn cmd_config_snapshot(
         )
         .await?;
 
-        let path = config_snapshot::store::save_snapshot(&snapshot, out_path)?;
-        info!(path = %path.display(), ledger = snapshot.ledger, "snapshot saved");
+        let save_outcome = if skip_unchanged {
+            config_snapshot::store::save_snapshot_if_changed(&snapshot, out_path)?
+        } else {
+            config_snapshot::store::SnapshotSaveOutcome::Saved(
+                config_snapshot::store::save_snapshot(&snapshot, out_path)?,
+            )
+        };
 
         // Retention runs *after* the save, so a failed fetch or write never
         // costs the older snapshots it would have pruned. It manages the
         // snapshots directory, so a snapshot redirected with `--out` lives
-        // elsewhere and is neither counted nor deleted here.
+        // elsewhere and is neither counted nor deleted here. An unchanged
+        // capture still applies the policy: it is about the files already on
+        // disk, not about whether this run added one.
         let pruned = match retain {
             Some(count) => config_snapshot::store::prune_snapshots(network, Some(count), None)?,
             None => Vec::new(),
         };
 
-        if format == cli::OutputFormat::Json {
-            println!("{}", serde_json::to_string_pretty(&snapshot)?);
-            return Ok(());
+        match save_outcome {
+            config_snapshot::store::SnapshotSaveOutcome::Saved(path) => {
+                info!(path = %path.display(), ledger = snapshot.ledger, "snapshot saved");
+                if print_saved_snapshot(&snapshot, &path, format, quiet)? {
+                    return Ok(());
+                }
+            }
+            config_snapshot::store::SnapshotSaveOutcome::Unchanged { latest } => {
+                debug!(
+                    network,
+                    latest = %latest.display(),
+                    "configuration unchanged; no snapshot written"
+                );
+                if print_unchanged_snapshot(&snapshot, &latest, format, quiet)? {
+                    return Ok(());
+                }
+            }
         }
-        if !quiet {
-            println!("Config snapshot saved to: {}", path.display());
-            println!("Network: {}", snapshot.network);
-            println!("Ledger:  {}", snapshot.ledger);
-            println!("Time:    {}", snapshot.timestamp);
-        }
-        if format == cli::OutputFormat::Csv {
-            println!("network,ledger,timestamp,path");
-            println!("{},{},{},{}", snapshot.network, snapshot.ledger, snapshot.timestamp, path.display());
-            return Ok(());
-        }
-        if format == cli::OutputFormat::Markdown {
-            println!("# Config Snapshot\n\n| Field | Value |\n| --- | --- |\n| Network | {} |\n| Ledger | {} |\n| Timestamp | {} |\n| Path | `{}` |", snapshot.network, snapshot.ledger, snapshot.timestamp, path.display());
-            return Ok(());
-        }
-        println!("Config snapshot saved to: {}", path.display());
-        println!("Network: {}", snapshot.network);
-        println!("Ledger:  {}", snapshot.ledger);
-        println!("Time:    {}", snapshot.timestamp);
         if retain.is_some() {
             println!("{}", retention_summary(network, retain, None, &pruned));
             print_pruned_paths(&pruned);
@@ -6314,7 +6438,7 @@ mod tests {
     use super::watch_cost_delta;
     use soroban_cost_estimator::config_snapshot::diff;
     use soroban_cost_estimator::config_snapshot::model::{
-        ConfigSnapshot, ContractComputeV0, ContractLedgerCostV0,
+        ConfigSnapshot, ContractComputeV0, ContractLedgerCostV0, SNAPSHOT_SCHEMA_VERSION,
     };
     use soroban_cost_estimator::rpc::config::{
         ConfigSettingEntryRaw, ConfigSettingId, ConfigSettingsFetch,
@@ -6478,6 +6602,7 @@ mod tests {
 
     fn snapshot_with_compute_fee(fee: i64) -> ConfigSnapshot {
         ConfigSnapshot {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
             network: "testnet".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             ledger: 100,
@@ -6553,6 +6678,76 @@ mod tests {
         assert_eq!(parse_interval_secs("18446744073709551615m"), u64::MAX);
         assert_eq!(parse_interval_secs("9999999999999999999999"), 3600);
         assert_eq!(parse_interval_secs("007"), 7);
+    }
+
+    /// Issue #359: every duration suffix at every useful multiple, plus the
+    /// bare-number form (seconds).
+    #[test]
+    fn test_parse_interval_secs_suffix_matrix() {
+        for (input, expected) in [
+            ("10s", 10),
+            ("5m", 300),
+            ("2h", 7_200),
+            ("1d", 86_400),
+            ("60", 60),      // raw numbers are seconds
+            ("1s", 1),       // the smallest representable interval
+            ("60s", 60),     // a suffix that adds nothing
+            ("60m", 3_600),  // a minute count equal to one hour
+            ("24h", 86_400), // an hour count equal to one day
+            ("7d", 604_800), // a week
+            ("90m", 5_400),  // unit conversion really multiplies
+            ("+15s", 15),    // `u64::from_str` accepts an explicit plus
+        ] {
+            assert_eq!(
+                parse_interval_secs(input),
+                expected,
+                "input {input:?} should parse to {expected}s"
+            );
+        }
+    }
+
+    /// Zero is a valid interval: the parser has no error channel and reports
+    /// it faithfully, leaving any "must be positive" policy to the command
+    /// that consumes the value.
+    #[test]
+    fn test_parse_interval_secs_accepts_zero() {
+        for input in ["0", "0s", "0m", "0h", "0d", "00s"] {
+            assert_eq!(parse_interval_secs(input), 0, "input {input:?}");
+        }
+    }
+
+    /// Malformed intervals — including the issue's error cases — cannot be
+    /// reported as errors, because the function returns a bare `u64` with no
+    /// error channel. They fall back to the documented one-hour default,
+    /// *before* the unit multiplier is applied, so a bad value with a suffix
+    /// becomes 3600 × that unit.
+    #[test]
+    fn test_parse_interval_secs_malformed_input_falls_back_to_default() {
+        for (input, expected) in [
+            ("", 3_600),  // empty
+            (" ", 3_600), // blank            // A suffix with no number still selects the unit, so the
+            // fallback is scaled by it rather than returned as one hour.
+            ("s", 3_600),
+            ("m", 216_000),
+            ("h", 12_960_000),
+            ("d", 311_040_000),
+            ("5x", 3_600),     // unknown suffix, and no valid number
+            ("-10s", 3_600),   // negative intervals are not supported
+            ("-10m", 216_000), // ... the default still picks up the unit
+            ("-1d", 311_040_000),
+            ("abc", 3_600),
+            ("10 s", 3_600),                  // space before the suffix
+            ("1.5s", 3_600),                  // fractional numbers are not u64
+            ("10ss", 3_600),                  // two suffixes
+            ("1e2s", 3_600),                  // exponent notation
+            ("99999999999999999999s", 3_600), // does not fit u64
+        ] {
+            assert_eq!(
+                parse_interval_secs(input),
+                expected,
+                "malformed input {input:?} should fall back to {expected}s"
+            );
+        }
     }
 
     #[test]
