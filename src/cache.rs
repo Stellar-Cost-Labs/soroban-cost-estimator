@@ -17,14 +17,30 @@
 //!
 //! Every row records a `version` (serialized as `schema_version`). Rows
 //! written by older releases are migrated forward by
-//! [`migrate_to_latest`]; rows from a newer release are rejected with an
+//! [`crate::cache::migrate_to_latest`]; rows from a newer release are rejected with an
 //! upgrade hint rather than silently misread.
 //!
 //! # LRU eviction
 //!
-//! [`save_estimate`] keeps the cache bounded: once the configured byte or
+//! [`crate::cache::save_estimate`] keeps the cache bounded: once the configured byte or
 //! entry quota is exceeded, the least-recently-accessed rows are deleted
-//! until usage drops below 90% of the quota. See [`CacheLimits`].
+//! until usage drops below 90% of the quota. See [`crate::cache::CacheLimits`].
+//!
+//! # Permissions and security
+//!
+//! On Unix-like systems, the cache database (`cache.db`) and its containing directory
+//! (`~/.soroban-cost-estimator`) are created with user-only permissions (`0o600` for
+//! the database and sidecars, `0o700` for the directory) to prevent other local users
+//! from inspecting cost histories or contract metadata. Existing databases preserve
+//! their existing permissions and are not silently altered. On non-Unix platforms
+//! (e.g. Windows), operating system default Access Control Lists (ACLs) apply.
+//!
+//! # Corruption recovery
+//!
+//! If the SQLite database becomes corrupt (e.g. due to sudden power loss or filesystem
+//! damage), operations fail fast with [`crate::error::AppError::CacheCorrupt`]. The operator can
+//! run `cache recover` to atomically quarantine the damaged database to a timestamped
+//! backup (`cache.db.corrupt-<timestamp>.bak`) and initialize a fresh, empty cache.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -36,6 +52,7 @@ use rusqlite::TransactionBehavior;
 use serde::Deserialize;
 use serde::Serialize;
 use tracing::debug;
+use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
@@ -47,11 +64,58 @@ fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
     err.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
 }
 
+/// Check whether a rusqlite error indicates database corruption.
+///
+/// Distinguishes corruption from lock (`SQLITE_BUSY`, `SQLITE_LOCKED`),
+/// permission (`SQLITE_PERM`, `SQLITE_CANTOPEN`), and disk-full
+/// (`SQLITE_FULL`, `SQLITE_IOERR_FULL`) errors.
+pub fn is_database_corrupt_error(err: &rusqlite::Error) -> bool {
+    match err {
+        rusqlite::Error::SqliteFailure(ffi_err, msg) => {
+            // Lock, read-only, permission, and disk-full errors are not corruption.
+            if matches!(
+                ffi_err.code,
+                rusqlite::ErrorCode::DatabaseBusy
+                    | rusqlite::ErrorCode::DatabaseLocked
+                    | rusqlite::ErrorCode::ReadOnly
+                    | rusqlite::ErrorCode::PermissionDenied
+                    | rusqlite::ErrorCode::DiskFull
+            ) {
+                return false;
+            }
+
+            // Primary code SQLITE_CORRUPT (11)
+            if ffi_err.code == rusqlite::ErrorCode::DatabaseCorrupt {
+                return true;
+            }
+
+            // Extended code 26 is SQLITE_NOTADB ("file is not a database")
+            // Extended code 523 is SQLITE_IOERR_CORRUPTFS
+            if ffi_err.extended_code == 26 || ffi_err.extended_code == 523 {
+                return true;
+            }
+
+            if let Some(msg_text) = msg {
+                let lower = msg_text.to_lowercase();
+                if lower.contains("malformed")
+                    || lower.contains("file is not a database")
+                    || lower.contains("corrupt")
+                    || lower.contains("not a database")
+                {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 /// Current cache-entry schema version.
 ///
 /// Bump this whenever the on-disk `CachedEstimate` shape changes.
 /// Entries written by a version of the tool with an older schema are
-/// migrated forward through [`migrate_to_latest`]; entries written by a
+/// migrated forward through [`crate::cache::migrate_to_latest`]; entries written by a
 /// *newer* tool (version greater than this) are rejected rather than
 /// silently misread.
 ///
@@ -66,7 +130,7 @@ pub const CACHE_SCHEMA_VERSION: u32 = 3;
 /// field existed.
 ///
 /// Those legacy entries have no `version` key in their JSON, so serde's
-/// `default` fills in this value via [`default_schema_version`]. They are
+/// `default` fills in this value via `default_schema_version`. They are
 /// the first schema version and require no transformation to reach the
 /// current schema.
 pub const INITIAL_SCHEMA_VERSION: u32 = 1;
@@ -102,22 +166,21 @@ fn default_schema_version() -> u32 {
     INITIAL_SCHEMA_VERSION
 }
 
-/// Ledger I/O footprint of a simulated invocation.
-///
-/// Recorded alongside an estimate so a later run can diff I/O against it.
-/// Only runs that captured the footprint store this (older entries leave it
-/// absent), which is why it lives behind [`CachedEstimate::io`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct IoFootprint {
-    /// Ledger entries read.
-    pub read_entries: u32,
-    /// Ledger entries written.
-    pub write_entries: u32,
-    /// Bytes read from the ledger.
-    pub read_bytes: u32,
-    /// Bytes written to the ledger.
-    pub write_bytes: u32,
+/// Deserialize the legacy duration field when it is present as a number or
+/// null; old cache entries used `null` for an unknown duration.
+fn deserialize_duration_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<u64>::deserialize(deserializer)?;
+    Ok(value.unwrap_or_default())
 }
+
+// The ledger I/O footprint type lives with the report it describes (it is
+// what a cost report and an estimate-history entry record); the cache only
+// persists it. Re-exported so `cache::IoFootprint` keeps working as the name
+// existing callers use.
+pub use crate::report::cost_report::IoFootprint;
 
 /// A cached estimate result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,15 +215,36 @@ pub struct CachedEstimate {
     pub memory_bytes: u64,
     /// ISO-8601 timestamp of when the estimate was made.
     pub timestamp: String,
-    /// Simulation wall-clock duration in milliseconds (`None` if unknown).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub duration_ms: Option<u64>,
+    /// Simulation wall-clock duration in milliseconds (`0` if unknown).
+    #[serde(
+        default,
+        alias = "duration_ms",
+        deserialize_with = "deserialize_duration_ms"
+    )]
+    pub execution_duration_ms: u64,
     /// Whether the simulation succeeded.
     #[serde(default = "default_true")]
     pub success: bool,
+    /// Stellar network passphrase reported by the RPC endpoint.
+    #[serde(default)]
+    pub network_passphrase: Option<String>,
+    /// Stellar Core version reported by the RPC endpoint.
+    #[serde(default, alias = "stellar_core_version")]
+    pub core_version: Option<String>,
     /// Ledger I/O footprint recorded with this estimate, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub io: Option<IoFootprint>,
+}
+
+impl CachedEstimate {
+    /// Return the execution duration in milliseconds, or `None` if unknown (`0`).
+    pub fn duration_ms(&self) -> Option<u64> {
+        if self.execution_duration_ms == 0 {
+            None
+        } else {
+            Some(self.execution_duration_ms)
+        }
+    }
 }
 
 /// Filter criteria for querying cached simulation estimates.
@@ -333,6 +417,10 @@ impl From<QueryFilter> for CacheFilter {
 /// writes are serialized at the application level.
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
+/// Serialize cache initialization so concurrent first opens cannot race while
+/// creating or migrating the SQLite schema.
+static OPEN_LOCK: Mutex<()> = Mutex::new(());
+
 /// Default on-disk cache byte quota (50 MB).
 const DEFAULT_MAX_CACHE_BYTES: u64 = 50 * 1024 * 1024;
 
@@ -409,17 +497,66 @@ pub fn cache_limits() -> CacheLimits {
 }
 
 /// Returns the base data directory path: `~/.soroban-cost-estimator`,
-/// creating it if needed.
+/// creating it with user-only permissions if needed.
 fn data_dir() -> AppResult<PathBuf> {
-    let dir = crate::paths::data_dir()?;
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
+    crate::paths::ensure_data_dir()
 }
 
 /// Path to the SQLite cache database.
 fn db_path() -> AppResult<PathBuf> {
     Ok(data_dir()?.join("cache.db"))
 }
+
+/// Create a new database file with user-only permissions (`0o600` / `rw-------`)
+/// on Unix platforms if it does not already exist.
+///
+/// Returns `Ok(true)` if the file was newly created, or `Ok(false)` if it already existed.
+/// Preserves existing file permissions without modification.
+#[cfg(unix)]
+fn create_user_only_db_file(path: &Path) -> AppResult<bool> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(_) => {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            debug!(path = %path.display(), "created SQLite cache database with user-only permissions (0600)");
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            trace!(path = %path.display(), "SQLite cache database already exists; keeping existing permissions");
+            Ok(false)
+        }
+        Err(e) => Err(AppError::Io(e)),
+    }
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
+fn create_user_only_db_file(_path: &Path) -> AppResult<bool> {
+    Ok(false)
+}
+
+/// Ensure SQLite WAL/SHM/journal sidecar files have user-only permissions on Unix if present.
+#[cfg(unix)]
+fn ensure_sidecar_permissions(db_path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    for ext in ["-wal", "-shm", "-journal"] {
+        let sidecar_path = PathBuf::from(format!("{}{ext}", db_path.display()));
+        if sidecar_path.exists() {
+            let _ = std::fs::set_permissions(&sidecar_path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_sidecar_permissions(_db_path: &Path) {}
 
 /// Create the `estimates` table and its indexes (and tune journal mode) on an
 /// already-open connection if it does not exist yet.
@@ -456,6 +593,9 @@ pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
             memory_bytes     INTEGER NOT NULL,
             timestamp        TEXT NOT NULL,
             duration_ms      INTEGER,
+            execution_duration_ms INTEGER NOT NULL DEFAULT 0,
+            network_passphrase TEXT,
+            core_version     TEXT,
             success          INTEGER NOT NULL DEFAULT 1,
             last_accessed    TEXT NOT NULL DEFAULT '',
             io_json          TEXT,
@@ -476,16 +616,29 @@ pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
             total_stroops    INTEGER NOT NULL,
             cpu_instructions INTEGER NOT NULL,
             memory_bytes     INTEGER NOT NULL,
-            timestamp        TEXT NOT NULL
+            timestamp        TEXT NOT NULL,
+            io_json          TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_estimate_history_lookup
             ON estimate_history (wasm_hash, function, timestamp DESC);",
     )?;
+    // The history log records the ledger I/O footprint of each run too, so a
+    // later trend table can explain a fee change by the I/O it came from
+    // (#530). Nullable and additive: rows written before this column existed
+    // keep a NULL footprint, which reads back as "unavailable", never as zero.
+    ensure_table_column(conn, "estimate_history", "io_json", "TEXT")?;
     // Migrate a pre-v3 table (created before LRU access tracking) in place.
     ensure_column(conn, "last_accessed", "TEXT NOT NULL DEFAULT ''")?;
     // The ledger I/O footprint is additive and nullable, so adding it in
     // place keeps older databases readable without a schema-version bump.
     ensure_column(conn, "io_json", "TEXT")?;
+    ensure_column(conn, "execution_duration_ms", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "network_passphrase", "TEXT")?;
+    ensure_column(conn, "core_version", "TEXT")?;
+    let _ = conn.execute(
+        "UPDATE estimates SET execution_duration_ms = duration_ms WHERE execution_duration_ms = 0 AND duration_ms IS NOT NULL",
+        [],
+    );
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_estimates_lookup
              ON estimates (wasm_hash, function);
@@ -500,9 +653,9 @@ pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
-/// Whether `estimates` already has a column named `name`.
-fn column_exists(conn: &Connection, name: &str) -> AppResult<bool> {
-    let mut stmt = conn.prepare("PRAGMA table_info(estimates)")?;
+/// Whether `table` already has a column named `name`.
+fn column_exists(conn: &Connection, table: &str, name: &str) -> AppResult<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let column: String = row.get(1)?;
@@ -516,13 +669,26 @@ fn column_exists(conn: &Connection, name: &str) -> AppResult<bool> {
 /// Add `name` to the `estimates` table when a pre-migration database lacks
 /// it. A no-op on up-to-date databases.
 fn ensure_column(conn: &Connection, name: &str, definition: &str) -> AppResult<()> {
-    if column_exists(conn, name)? {
+    ensure_table_column(conn, "estimates", name, definition)
+}
+
+/// Add `name` to `table` when a pre-migration database lacks it.
+///
+/// A no-op on up-to-date databases. `table` and `name` are compile-time
+/// constants at every call site, never user input.
+fn ensure_table_column(
+    conn: &Connection,
+    table: &str,
+    name: &str,
+    definition: &str,
+) -> AppResult<()> {
+    if column_exists(conn, table, name)? {
         return Ok(());
     }
     conn.execute_batch(&format!(
-        "ALTER TABLE estimates ADD COLUMN {name} {definition};"
+        "ALTER TABLE {table} ADD COLUMN {name} {definition};"
     ))?;
-    debug!(column = name, "added missing cache column");
+    debug!(table, column = name, "added missing cache column");
     Ok(())
 }
 
@@ -596,6 +762,14 @@ pub fn classify_sqlite_error(err: &rusqlite::Error) -> CacheDbFailureKind {
 /// Summary of an explicit corrupt-cache recovery operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheRecoveryReport {
+    /// Path to the original database file.
+    pub original_path: PathBuf,
+    /// Path to the timestamped backup where the original file was quarantined.
+    pub backup_path: PathBuf,
+    /// Sidecar files (`-wal`, `-shm`, `-journal`) that were quarantined alongside the database.
+    pub sidecars_quarantined: Vec<PathBuf>,
+    /// Path to the newly initialized database.
+    pub new_path: PathBuf,
     /// Path of the active cache database that was re-initialized.
     pub database_path: PathBuf,
     /// Path where the corrupt database was quarantined (`<db>.corrupt.<timestamp>`).
@@ -633,6 +807,13 @@ pub fn last_cache_recovery_report() -> Option<CacheRecoveryReport> {
         .and_then(|guard| guard.clone())
 }
 
+fn make_corrupt_err(path: &Path, reason: impl std::fmt::Display) -> AppError {
+    AppError::CacheCorrupt(format!(
+        "{}: {reason} (run `soroban-cost-estimator cache recover` or pass `--recover-corrupt-cache` to quarantine and start fresh; cached estimates in the broken database will no longer be in active use)",
+        path.display()
+    ))
+}
+
 /// Run `PRAGMA quick_check(1)` to detect B-tree or page corruption even when
 /// the 100-byte SQLite header and schema table appear readable.
 fn verify_db_quick_check(conn: &Connection, path: &Path) -> AppResult<()> {
@@ -640,19 +821,16 @@ fn verify_db_quick_check(conn: &Connection, path: &Path) -> AppResult<()> {
         Ok(s) => s,
         Err(e) => {
             if classify_sqlite_error(&e) == CacheDbFailureKind::Corrupt {
-                return Err(AppError::CacheCorrupt {
-                    path: path.display().to_string(),
-                    reason: e.to_string(),
-                });
+                return Err(make_corrupt_err(path, e));
             }
             return Err(AppError::Sqlite(e));
         }
     };
     if !status.eq_ignore_ascii_case("ok") {
-        return Err(AppError::CacheCorrupt {
-            path: path.display().to_string(),
-            reason: format!("integrity check failed ({status})"),
-        });
+        return Err(make_corrupt_err(
+            path,
+            format!("integrity check failed ({status})"),
+        ));
     }
     Ok(())
 }
@@ -666,10 +844,7 @@ fn map_open_error(path: &Path, err: AppError) -> AppError {
         AppError::Sqlite(sql_err)
             if classify_sqlite_error(&sql_err) == CacheDbFailureKind::Corrupt =>
         {
-            AppError::CacheCorrupt {
-                path: path.display().to_string(),
-                reason: sql_err.to_string(),
-            }
+            make_corrupt_err(path, sql_err)
         }
         other => other,
     }
@@ -677,6 +852,25 @@ fn map_open_error(path: &Path, err: AppError) -> AppError {
 
 /// Open and validate `path` without performing recovery.
 fn open_and_validate_db(path: &Path) -> AppResult<Connection> {
+    if path.exists() {
+        if let Ok(metadata) = std::fs::metadata(path) {
+            if metadata.len() > 0 && metadata.len() < 100 {
+                return Err(make_corrupt_err(
+                    path,
+                    "file size is smaller than SQLite header",
+                ));
+            }
+            if metadata.len() >= 100 {
+                use std::io::Read;
+                let mut header = [0u8; 16];
+                if let Ok(mut f) = std::fs::File::open(path) {
+                    if f.read_exact(&mut header).is_err() || &header != b"SQLite format 3\0" {
+                        return Err(make_corrupt_err(path, "file is not a database"));
+                    }
+                }
+            }
+        }
+    }
     let conn = Connection::open(path).map_err(|e| map_open_error(path, AppError::Sqlite(e)))?;
     ensure_cache_schema(&conn).map_err(|e| map_open_error(path, e))?;
     verify_db_quick_check(&conn, path)?;
@@ -750,7 +944,7 @@ where
                 db_path.display()
             )));
         }
-        Err(AppError::CacheCorrupt { .. }) => {
+        Err(AppError::CacheCorrupt(_)) => {
             // Confirmed corrupt; proceed with atomic quarantine.
         }
         Err(other_err) => {
@@ -799,6 +993,10 @@ where
     );
 
     let report = CacheRecoveryReport {
+        original_path: db_path.to_path_buf(),
+        backup_path: quarantined_path.clone(),
+        sidecars_quarantined: quarantined_sidecars.clone(),
+        new_path: db_path.to_path_buf(),
         database_path: db_path.to_path_buf(),
         quarantined_path,
         quarantined_sidecars,
@@ -812,20 +1010,34 @@ where
 
 /// Open a connection to the cache database, ensure the schema exists, and
 /// import any pre-SQLite JSON cache files left behind by older releases.
+///
+/// On Unix, newly created databases are initialized with user-only permissions (`0600`),
+/// and WAL/SHM sidecars are restricted similarly. Existing databases retain their original
+/// permissions. Corruption errors are converted to [`AppError::CacheCorrupt`] with guidance
+/// on using the non-destructive recovery command.
 fn open_db() -> AppResult<Connection> {
+    let _open_guard = OPEN_LOCK
+        .lock()
+        .map_err(|e| AppError::General(format!("cache open lock poisoned: {e}")))?;
     let path = db_path()?;
+    let newly_created = create_user_only_db_file(&path)?;
+
     let conn = match open_and_validate_db(&path) {
         Ok(conn) => conn,
-        Err(AppError::CacheCorrupt { path: p, reason }) => {
+        Err(AppError::CacheCorrupt(msg)) => {
             if is_cache_recovery_enabled() {
                 recover_corrupt_cache_at(&path)?;
                 open_and_validate_db(&path)?
             } else {
-                return Err(AppError::CacheCorrupt { path: p, reason });
+                return Err(AppError::CacheCorrupt(msg));
             }
         }
         Err(other) => return Err(other),
     };
+
+    if newly_created {
+        ensure_sidecar_permissions(&path);
+    }
     // Transparent, one-time upgrade from the old per-entry JSON cache.
     // The directory is removed once every file is imported, so subsequent
     // opens short-circuit on `!dir.is_dir()`.
@@ -983,8 +1195,10 @@ fn import_legacy_json_file(conn: &Connection, path: &Path) -> AppResult<bool> {
         cpu_instructions: parsed.cpu_instructions,
         memory_bytes: parsed.memory_bytes,
         timestamp: parsed.timestamp.clone(),
-        duration_ms: parsed.duration_ms,
+        execution_duration_ms: parsed.duration_ms.unwrap_or(0),
         success: parsed.success,
+        network_passphrase: None,
+        core_version: None,
         // A legacy JSON entry predates the I/O footprint, so there is none
         // to carry over.
         io: None,
@@ -997,8 +1211,9 @@ fn import_legacy_json_file(conn: &Connection, path: &Path) -> AppResult<bool> {
     conn.execute(
         "INSERT OR IGNORE INTO estimates \
          (version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-          cpu_instructions, memory_bytes, timestamp, duration_ms, success, last_accessed) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+          cpu_instructions, memory_bytes, timestamp, duration_ms, execution_duration_ms, \
+          network_passphrase, core_version, success, last_accessed) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         rusqlite::params![
             CACHE_SCHEMA_VERSION as i64,
             migrated.wasm_hash,
@@ -1010,7 +1225,10 @@ fn import_legacy_json_file(conn: &Connection, path: &Path) -> AppResult<bool> {
             migrated.cpu_instructions as i64,
             migrated.memory_bytes as i64,
             migrated.timestamp,
-            migrated.duration_ms.map(|v| v as i64),
+            parsed.duration_ms.map(|v| v as i64),
+            migrated.execution_duration_ms as i64,
+            migrated.network_passphrase,
+            migrated.core_version,
             migrated.success as i64,
             migrated.timestamp,
         ],
@@ -1042,6 +1260,14 @@ where
                 );
                 std::thread::sleep(std::time::Duration::from_millis(delay));
                 delay *= 2;
+            }
+            Err(e) if is_database_corrupt_error(&e) => {
+                let path_display = db_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "cache.db".to_string());
+                return Err(AppError::CacheCorrupt(format!(
+                    "{path_display}: {e} (run `soroban-cost-estimator cache recover` to quarantine and start fresh)"
+                )));
             }
             Err(e) => return Err(e.into()),
         }
@@ -1140,6 +1366,11 @@ pub fn save_estimate_with_io(
 /// Identical to [`save_estimate`] except that the caller supplies the
 /// [`CacheLimits`] to enforce, which keeps eviction tests independent of the
 /// process-wide configuration. The insert and the eviction pass run in a
+/// Save an estimate result to the cache with an explicit eviction quota.
+///
+/// Identical to [`save_estimate`] except that the caller supplies the
+/// [`CacheLimits`] to enforce, which keeps eviction tests independent of the
+/// process-wide configuration. The insert and the eviction pass run in a
 /// single `BEGIN IMMEDIATE` transaction, so a crash can never leave the
 /// cache over quota, and concurrent writers serialize on SQLite's write
 /// lock (the in-process `WRITE_LOCK` additionally serializes threads).
@@ -1158,6 +1389,76 @@ pub fn save_estimate_with_limits(
     success: bool,
     limits: CacheLimits,
 ) -> AppResult<()> {
+    save_estimate_with_limits_and_metadata(
+        wasm_hash,
+        function,
+        args,
+        network,
+        ledger,
+        total_stroops,
+        cpu_instructions,
+        memory_bytes,
+        io,
+        duration_ms,
+        success,
+        None,
+        None,
+        limits,
+    )
+}
+
+/// Save an estimate result along with endpoint node metadata.
+#[allow(clippy::too_many_arguments)]
+pub fn save_estimate_with_metadata(
+    wasm_hash: &str,
+    function: &str,
+    args: &[String],
+    network: &str,
+    ledger: u32,
+    total_stroops: i64,
+    cpu_instructions: u64,
+    memory_bytes: u64,
+    duration_ms: Option<u64>,
+    success: bool,
+    network_passphrase: Option<&str>,
+    core_version: Option<&str>,
+) -> AppResult<()> {
+    save_estimate_with_limits_and_metadata(
+        wasm_hash,
+        function,
+        args,
+        network,
+        ledger,
+        total_stroops,
+        cpu_instructions,
+        memory_bytes,
+        None,
+        duration_ms,
+        success,
+        network_passphrase,
+        core_version,
+        cache_limits(),
+    )
+}
+
+/// Save an estimate result to the cache with optional metadata and eviction limits.
+#[allow(clippy::too_many_arguments)]
+pub fn save_estimate_with_limits_and_metadata(
+    wasm_hash: &str,
+    function: &str,
+    args: &[String],
+    network: &str,
+    ledger: u32,
+    total_stroops: i64,
+    cpu_instructions: u64,
+    memory_bytes: u64,
+    io: Option<IoFootprint>,
+    duration_ms: Option<u64>,
+    success: bool,
+    network_passphrase: Option<&str>,
+    core_version: Option<&str>,
+    limits: CacheLimits,
+) -> AppResult<()> {
     let args_hash = hash_args(args);
     let io_json = match io {
         Some(io) => Some(serde_json::to_string(&io)?),
@@ -1173,8 +1474,10 @@ pub fn save_estimate_with_limits(
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute(
         "INSERT INTO estimates \
-         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, duration_ms, success, last_accessed, io_json) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
+          cpu_instructions, memory_bytes, timestamp, duration_ms, execution_duration_ms, \
+          network_passphrase, core_version, success, last_accessed, io_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
          ON CONFLICT(wasm_hash, function, args_hash) DO UPDATE SET \
             version = excluded.version, \
             network = excluded.network, \
@@ -1184,6 +1487,9 @@ pub fn save_estimate_with_limits(
             memory_bytes = excluded.memory_bytes, \
             timestamp = excluded.timestamp, \
             duration_ms = excluded.duration_ms, \
+            execution_duration_ms = excluded.execution_duration_ms, \
+            network_passphrase = excluded.network_passphrase, \
+            core_version = excluded.core_version, \
             success = excluded.success, \
             last_accessed = excluded.last_accessed, \
             io_json = excluded.io_json",
@@ -1199,6 +1505,9 @@ pub fn save_estimate_with_limits(
             memory_bytes as i64,
             now,
             duration_ms.map(|v| v as i64),
+            duration_ms.unwrap_or_default() as i64,
+            network_passphrase,
+            core_version,
             success as i64,
             now,
             io_json,
@@ -1206,12 +1515,13 @@ pub fn save_estimate_with_limits(
     )?;
 
     // Append to the unbounded history log so `estimate --history` can show
-    // how this function's cost evolved across runs (#321). Unlike the
-    // `estimates` upsert above, every call adds a row here.
+    // how this function's cost evolved across runs (#321), including the
+    // ledger I/O each run consumed (#530). Unlike the `estimates` upsert
+    // above, every call adds a row here.
     tx.execute(
         "INSERT INTO estimate_history \
-         (wasm_hash, function, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         (wasm_hash, function, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, io_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         rusqlite::params![
             wasm_hash,
             function,
@@ -1221,6 +1531,7 @@ pub fn save_estimate_with_limits(
             cpu_instructions as i64,
             memory_bytes as i64,
             now,
+            io_json,
         ],
     )?;
 
@@ -1257,6 +1568,14 @@ pub struct EstimateHistoryEntry {
     pub memory_bytes: u64,
     /// ISO-8601 timestamp of when the estimate was made.
     pub timestamp: String,
+    /// Ledger I/O footprint recorded with the run, if it was captured.
+    ///
+    /// `None` for entries written before footprints were recorded (or by a
+    /// call that used [`save_estimate`], which has no footprint to store). A
+    /// missing footprint means "unknown", never "no ledger access", so
+    /// consumers must not render it as zero (#530).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io: Option<IoFootprint>,
 }
 
 /// Load up to `limit` previous estimates for the same `(wasm_hash,
@@ -1276,7 +1595,7 @@ pub fn load_estimate_history(
     let conn = open_db()?;
     let mut stmt = conn.prepare(
         "SELECT wasm_hash, function, network, ledger, total_stroops, \
-         cpu_instructions, memory_bytes, timestamp \
+         cpu_instructions, memory_bytes, timestamp, io_json \
          FROM estimate_history WHERE wasm_hash = ?1 AND function = ?2 \
          ORDER BY timestamp DESC, id DESC LIMIT ?3",
     )?;
@@ -1293,6 +1612,12 @@ pub fn load_estimate_history(
                 cpu_instructions: row.get::<_, i64>(5)? as u64,
                 memory_bytes: row.get::<_, i64>(6)? as u64,
                 timestamp: row.get(7)?,
+                // An undecodable footprint is treated as absent, matching
+                // `estimate_from_row`: better to omit I/O from a comparison
+                // than to fail the whole read.
+                io: row
+                    .get::<_, Option<String>>(8)?
+                    .and_then(|raw| serde_json::from_str(&raw).ok()),
             })
         },
     )?;
@@ -1494,20 +1819,22 @@ fn estimate_from_row(row: &rusqlite::Row<'_>) -> Result<CachedEstimate, rusqlite
         cpu_instructions: row.get::<_, i64>(7)? as u64,
         memory_bytes: row.get::<_, i64>(8)? as u64,
         timestamp: row.get(9)?,
-        duration_ms: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
+        execution_duration_ms: row.get::<_, Option<i64>>(10)?.unwrap_or(0) as u64,
         success: row.get::<_, i64>(11)? != 0,
         // A footprint that cannot be decoded is treated as absent: better to
         // omit I/O from a comparison than to fail the whole read.
         io: row
             .get::<_, Option<String>>(12)?
             .and_then(|raw| serde_json::from_str(&raw).ok()),
+        network_passphrase: row.get(13)?,
+        core_version: row.get(14)?,
     })
 }
 
 /// Carry a cached estimate forward to the current schema version.
 ///
 /// * `version < CACHE_SCHEMA_VERSION`: entries from older schemas are
-///   migrated forward one step at a time (see [`migrate_one_step`]) until
+///   migrated forward one step at a time (see `migrate_one_step`) until
 ///   they match the current schema.
 /// * `version == CACHE_SCHEMA_VERSION`: returned unchanged.
 /// * `version > CACHE_SCHEMA_VERSION`: an entry written by a *newer* tool.
@@ -1548,7 +1875,7 @@ fn migrate_one_step(migrated: CachedEstimate) -> CachedEstimate {
         // predate both, so they get conservative defaults (unknown duration,
         // and a successful simulation — the only outcome that was cached).
         v if v < DURATION_SCHEMA_VERSION => CachedEstimate {
-            duration_ms: None,
+            execution_duration_ms: 0,
             success: true,
             version: DURATION_SCHEMA_VERSION,
             ..migrated
@@ -1600,7 +1927,8 @@ pub fn load_estimate(
     let cached = {
         let mut stmt = conn.prepare(
             "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-             cpu_instructions, memory_bytes, timestamp, duration_ms, success, io_json \
+             cpu_instructions, memory_bytes, timestamp, execution_duration_ms, success, \
+             io_json, network_passphrase, core_version \
              FROM estimates WHERE wasm_hash = ?1 AND function = ?2 AND args_hash = ?3",
         )?;
         let mut rows = stmt.query(rusqlite::params![wasm_hash, function, args_hash.as_str()])?;
@@ -1676,7 +2004,8 @@ pub fn list_cached_estimates(network: &str) -> AppResult<Vec<CachedEstimate>> {
     let conn = open_db()?;
     let mut stmt = conn.prepare(
         "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-         cpu_instructions, memory_bytes, timestamp, duration_ms, success, io_json \
+         cpu_instructions, memory_bytes, timestamp, execution_duration_ms, success, \
+         io_json, network_passphrase, core_version \
          FROM estimates WHERE network = ?1 ORDER BY timestamp DESC",
     )?;
 
@@ -1762,7 +2091,8 @@ pub fn list_all_cached_estimates() -> AppResult<Vec<CachedEstimate>> {
     let conn = open_db()?;
     let mut stmt = conn.prepare(
         "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-         cpu_instructions, memory_bytes, timestamp, duration_ms, success, io_json \
+         cpu_instructions, memory_bytes, timestamp, execution_duration_ms, success, \
+         io_json, network_passphrase, core_version \
          FROM estimates ORDER BY timestamp DESC",
     )?;
 
@@ -1818,6 +2148,118 @@ pub fn query_estimates(network: &str, filter: &QueryFilter) -> AppResult<Vec<Cac
     query_cache(&cache_filter)
 }
 
+/// Default number of entries returned by a cache listing.
+pub const DEFAULT_LIST_LIMIT: usize = 50;
+
+/// Maximum number of entries a single cache listing may return.
+pub const MAX_LIST_LIMIT: usize = 1000;
+
+/// A page of cached estimates together with the total number of matches.
+///
+/// `total` counts every entry matching the filter, before pagination, so a
+/// caller can tell "3 of 120 shown" from "3 of 3 shown".
+#[derive(Debug, Clone)]
+pub struct CacheListing {
+    /// The entries on this page.
+    pub entries: Vec<CachedEstimate>,
+    /// Total number of entries matching the filter.
+    pub total: usize,
+    /// Number of entries skipped before this page.
+    pub offset: usize,
+    /// Maximum number of entries requested (after capping).
+    pub limit: usize,
+}
+
+/// Lists the cached estimates matching `filter`, one bounded page at a time.
+///
+/// The filter semantics are exactly those of [`query_cache`]; this only
+/// adds pagination on top. `limit` is capped at [`MAX_LIST_LIMIT`] so a
+/// listing can never dump an unbounded cache to the terminal.
+///
+/// # Network calls
+/// None — pure local SQLite I/O.
+pub fn list_cached_estimates_paginated(
+    filter: &CacheFilter,
+    limit: usize,
+    offset: usize,
+) -> AppResult<CacheListing> {
+    let limit = limit.min(MAX_LIST_LIMIT);
+    let matched = query_cache(filter)?;
+    let total = matched.len();
+    let entries = matched.into_iter().skip(offset).take(limit).collect();
+    Ok(CacheListing {
+        entries,
+        total,
+        offset,
+        limit,
+    })
+}
+
+/// Counts the cached estimates matching `filter`.
+///
+/// # Network calls
+/// None — pure local SQLite I/O.
+pub fn count_cached_estimates(filter: &CacheFilter) -> AppResult<usize> {
+    Ok(query_cache(filter)?.len())
+}
+
+/// Deletes the cached estimates matching `filter`.
+///
+/// Selection and deletion happen inside a single transaction, so the
+/// reported count always matches the number of removed rows and a failure
+/// leaves the cache untouched. The matching semantics are exactly those of
+/// [`query_cache`] — the filter is validated the same way and matched with
+/// the same [`CacheFilter::matches`] implementation.
+///
+/// # Network calls
+/// None — pure local SQLite I/O.
+pub fn delete_cached_estimates(filter: &CacheFilter) -> AppResult<usize> {
+    filter.validate()?;
+
+    let _guard = WRITE_LOCK
+        .lock()
+        .map_err(|e| AppError::General(format!("cache write lock poisoned: {e}")))?;
+
+    let mut conn = open_db()?;
+    let tx = conn.transaction()?;
+
+    let keys: Vec<(String, String, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
+             cpu_instructions, memory_bytes, timestamp, execution_duration_ms, success, io_json, \
+             network_passphrase, core_version \
+             FROM estimates",
+        )?;
+        let rows = stmt.query_map([], estimate_from_row)?;
+
+        let mut keys = Vec::new();
+        for row in rows {
+            let cached = row?;
+            // An entry written by a newer tool cannot be interpreted; it is
+            // left alone rather than deleted blindly.
+            let Ok(cached) = migrate_to_latest(cached) else {
+                continue;
+            };
+            if filter.matches(&cached) {
+                keys.push((cached.wasm_hash, cached.function, cached.args_hash));
+            }
+        }
+        keys
+    };
+
+    let mut removed = 0usize;
+    for (wasm_hash, function, args_hash) in &keys {
+        removed += tx.execute(
+            "DELETE FROM estimates WHERE wasm_hash = ?1 AND function = ?2 AND args_hash = ?3",
+            rusqlite::params![wasm_hash, function, args_hash],
+        )?;
+    }
+
+    tx.commit()?;
+    debug!(removed, "deleted cached estimates");
+    Ok(removed)
+}
+
 /// Export every cached estimate as a deterministic, JSON-serializable list.
 ///
 /// All rows are read from the SQLite cache, migrated to the current schema,
@@ -1831,7 +2273,8 @@ pub fn export_cached_estimates() -> AppResult<Vec<CachedEstimate>> {
     let conn = open_db()?;
     let mut stmt = conn.prepare(
         "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-         cpu_instructions, memory_bytes, timestamp, duration_ms, success, io_json \
+         cpu_instructions, memory_bytes, timestamp, execution_duration_ms, success, \
+         io_json, network_passphrase, core_version \
          FROM estimates ORDER BY wasm_hash, function, args_hash",
     )?;
 
@@ -1928,6 +2371,29 @@ pub struct CacheEntryStatus {
 /// None — pure SQLite I/O.
 pub fn verify_cache() -> AppResult<Vec<CacheEntryStatus>> {
     let conn = open_db()?;
+    let quick_check: String = conn
+        .query_row("PRAGMA quick_check(1);", [], |row| row.get(0))
+        .map_err(|e| {
+            if is_database_corrupt_error(&e) {
+                let path_display = db_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "cache.db".to_string());
+                AppError::CacheCorrupt(format!(
+                    "{path_display}: {e} (run `soroban-cost-estimator cache recover` to quarantine and start fresh)"
+                ))
+            } else {
+                AppError::Sqlite(e)
+            }
+        })?;
+    if !quick_check.eq_ignore_ascii_case("ok") {
+        let path_display = db_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "cache.db".to_string());
+        return Err(AppError::CacheCorrupt(format!(
+            "{path_display}: database integrity check failed: {quick_check} (run `soroban-cost-estimator cache recover` to quarantine and start fresh)"
+        )));
+    }
+
     let mut stmt = conn.prepare("SELECT version, wasm_hash, function, args_hash FROM estimates")?;
 
     let rows = stmt.query_map([], |row| {
@@ -1959,8 +2425,10 @@ pub fn verify_cache() -> AppResult<Vec<CacheEntryStatus>> {
             cpu_instructions: 0,
             memory_bytes: 0,
             timestamp: String::new(),
-            duration_ms: None,
+            execution_duration_ms: 0,
             success: true,
+            network_passphrase: None,
+            core_version: None,
             io: None,
         };
         let valid = migrate_to_latest(cached).is_ok();
@@ -2211,4 +2679,125 @@ fn wasm_file_mtime_nanos(wasm_path: &Path) -> AppResult<u64> {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     Ok(nanos)
+}
+
+/// Verify whether the on-disk SQLite cache database is healthy.
+///
+/// Returns `Ok(true)` if healthy or not present, `Ok(false)` if corruption is detected,
+/// or an error if permission/I/O issues prevent checking.
+pub fn check_cache_health() -> AppResult<bool> {
+    let path = db_path()?;
+    if !path.exists() {
+        return Ok(true);
+    }
+
+    if let Ok(metadata) = std::fs::metadata(&path) {
+        if metadata.len() < 100 {
+            return Ok(false);
+        }
+        use std::io::Read;
+        let mut header = [0u8; 16];
+        if let Ok(mut f) = std::fs::File::open(&path) {
+            if f.read_exact(&mut header).is_err() || &header != b"SQLite format 3\0" {
+                return Ok(false);
+            }
+        }
+    }
+
+    let conn = match Connection::open(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            if is_database_corrupt_error(&e) {
+                return Ok(false);
+            }
+            return Err(AppError::Sqlite(e));
+        }
+    };
+
+    let result = conn.query_row("PRAGMA quick_check(1);", [], |row| row.get::<_, String>(0));
+    match result {
+        Ok(msg) if msg.eq_ignore_ascii_case("ok") => Ok(true),
+        Ok(_) => Ok(false),
+        Err(e) if is_database_corrupt_error(&e) => Ok(false),
+        Err(e) => Err(AppError::Sqlite(e)),
+    }
+}
+
+/// Quarantine a corrupt SQLite cache database to a timestamped backup and
+/// initialize a clean database.
+pub fn recover_cache(force: bool) -> AppResult<CacheRecoveryReport> {
+    let _guard = WRITE_LOCK
+        .lock()
+        .map_err(|e| AppError::General(format!("cache write lock poisoned: {e}")))?;
+
+    let path = db_path()?;
+    let dir = crate::paths::ensure_data_dir()?;
+
+    if !path.exists() {
+        // No existing database to quarantine; initialize fresh database directly
+        let _ = open_db()?;
+        return Ok(CacheRecoveryReport {
+            original_path: path.clone(),
+            backup_path: path.clone(),
+            sidecars_quarantined: Vec::new(),
+            new_path: path.clone(),
+            database_path: path.clone(),
+            quarantined_path: path,
+            quarantined_sidecars: Vec::new(),
+            notice: "initialized fresh cache database".to_string(),
+        });
+    }
+
+    if !force {
+        let healthy = check_cache_health()?;
+        if healthy {
+            return Err(AppError::General(
+                "cache database is not corrupt (pass --force to reinitialize anyway)".to_string(),
+            ));
+        }
+    }
+
+    let timestamp = chrono::Utc::now().to_rfc3339().replace(':', "-");
+    let backup_path = dir.join(format!("cache.db.corrupt-{timestamp}.bak"));
+
+    // Atomically quarantine the main database file
+    std::fs::rename(&path, &backup_path)?;
+
+    // Quarantine sidecar files if present
+    let mut sidecars_quarantined = Vec::new();
+    for ext in ["-wal", "-shm", "-journal"] {
+        let sidecar_path = PathBuf::from(format!("{}{ext}", path.display()));
+        if sidecar_path.exists() {
+            let sidecar_backup = PathBuf::from(format!("{}{ext}", backup_path.display()));
+            if std::fs::rename(&sidecar_path, &sidecar_backup).is_ok() {
+                sidecars_quarantined.push(sidecar_backup);
+            }
+        }
+    }
+
+    // Initialize fresh empty cache database with user-only permissions
+    let _ = open_db()?;
+
+    info!(
+        backup = %backup_path.display(),
+        "quarantined corrupt cache database and initialized fresh cache"
+    );
+
+    let notice = format!(
+        "quarantined corrupt cache database to {} and initialized a new empty cache at {}; \
+         cached estimates from the broken database are no longer in active use",
+        backup_path.display(),
+        path.display()
+    );
+
+    Ok(CacheRecoveryReport {
+        original_path: path.clone(),
+        backup_path: backup_path.clone(),
+        sidecars_quarantined: sidecars_quarantined.clone(),
+        new_path: path.clone(),
+        database_path: path,
+        quarantined_path: backup_path,
+        quarantined_sidecars: sidecars_quarantined,
+        notice,
+    })
 }
