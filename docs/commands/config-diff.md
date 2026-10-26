@@ -28,6 +28,15 @@ Options:
   latest snapshot for the network (or the snapshot at `--against`).
 - `💰` marks a **pricing** change — a rate that feeds the fee math; `📋`
   marks a non-pricing change (a cap, limit, or window size).
+- Presence changes are reported separately from numeric changes: `🆕` marks a
+  setting that was **added**, `🗑️` one that was **removed**, and `❓` a
+  stored setting this build does **not recognize**. A missing setting is
+  *missing*, never a zero value, and the diff prints the state transition
+  (`State: missing → present`) instead of pretending the fee moved from 0.
+- Settings this build does not model (e.g. a config section introduced by a
+  newer protocol version) are surfaced instead of being ignored silently.
+  Their effect on pricing is unknown, so the diff stays conservative and
+  flags them as pricing-relevant.
 - Always cross-references the estimate cache and reports cached estimates
   recorded at an earlier ledger as potentially stale.
 - **Exit code 0** when no pricing changes; **exit code 1** when a pricing
