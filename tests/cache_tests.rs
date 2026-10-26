@@ -2847,6 +2847,7 @@ fn test_legacy_database_without_io_column_still_loads() {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn test_cache_decision_hit_miss_expired_network_mismatch_and_bypass() {
     with_temp_home(|tmp| {
         let secret_arg = "SECRET_CREDENTIAL_TOKEN_DO_NOT_LOG".to_string();
