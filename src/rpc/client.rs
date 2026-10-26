@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use governor::{Quota, RateLimiter};
@@ -423,6 +423,10 @@ pub struct RpcClient {
     pub headers: HeaderMap,
     /// Whether to print verbose RPC request/response diagnostics to stderr.
     pub verbose: bool,
+    /// Number of RPC attempts made (including retries and failover).
+    last_attempt_count: AtomicU8,
+    /// Whether a fallback RPC endpoint was used during the last call.
+    fallback_used: AtomicBool,
     /// Optional overall deadline spanning retries, backoff, and failover for a
     /// single RPC operation.
     total_timeout: Option<Duration>,
@@ -671,6 +675,8 @@ impl RpcClient {
             connect_timeout,
             headers,
             verbose,
+            last_attempt_count: AtomicU8::new(0),
+            fallback_used: AtomicBool::new(false),
             total_timeout: default_total_timeout(),
         }
     }
@@ -874,6 +880,8 @@ impl RpcClient {
         trace!(
             method,
             header_count = self.headers.len(),
+            attempt_count = self.last_attempt_count.load(Ordering::Relaxed),
+            fallback_used = self.fallback_used.load(Ordering::Relaxed),
             "sending RPC request"
         );
         match self
@@ -895,6 +903,7 @@ impl RpcClient {
                     // The operator-facing notice goes to stderr so it never
                     // contaminates machine-readable stdout (json/csv/markdown).
                     eprintln!("Primary RPC failed, failing over to fallback endpoint: {fallback}");
+                    self.fallback_used.store(true, Ordering::Relaxed);
                     debug!(
                         method,
                         primary = %self.url,
@@ -964,42 +973,50 @@ impl RpcClient {
             eprintln!("[RPC] -> {}", request_body_str);
         }
 
-        let response = with_retry_deadline(self.max_retries, deadline, self.total_timeout, || {
-            let client = client.clone();
-            let url = url.clone();
-            let request_body = request_body.clone();
-            let limiter = limiter.clone();
-            let headers = headers.clone();
+        let response = with_retry_deadline(
+            self.max_retries,
+            deadline,
+            self.total_timeout,
+            || {
+                let client = client.clone();
+                let url = url.clone();
+                let request_body = request_body.clone();
+                let limiter = limiter.clone();
+                let headers = headers.clone();
 
-            async move {
-                // Every outbound attempt (including retries) consumes a
-                // token, so the wire rate never exceeds the configured
-                // requests-per-second cap.
-                if let Some(limiter) = &limiter {
-                    limiter.until_ready().await;
-                }
-                let response = client
-                    .post(&url)
-                    .headers(headers)
-                    .json(&request_body)
-                    .send()
-                    .await
-                    .map_err(|e| connect_timeout_error(e, connect_timeout))?;
+                async move {
+                    // Every outbound attempt (including retries) consumes a
+                    // token, so the wire rate never exceeds the configured
+                    // requests-per-second cap.
+                    if let Some(limiter) = &limiter {
+                        limiter.until_ready().await;
+                    }
+                    let response = client
+                        .post(&url)
+                        .headers(headers)
+                        .json(&request_body)
+                        .send()
+                        .await
+                        .map_err(|e| connect_timeout_error(e, connect_timeout))?;
 
-                // Transient statuses (429/5xx) must be turned into errors so
-                // `with_retry` can back off and retry them. Non-transient
-                // statuses fall through and are parsed as JSON-RPC below.
-                let status = response.status();
-                if is_transient_status(status) {
-                    return Err(AppError::HttpStatus {
-                        status: status.as_u16(),
-                        retry_after: parse_retry_after(response.headers()),
-                        message: format!("RPC endpoint returned transient HTTP status {status}"),
-                    });
+                    // Transient statuses (429/5xx) must be turned into errors so
+                    // `with_retry` can back off and retry them. Non-transient
+                    // statuses fall through and are parsed as JSON-RPC below.
+                    let status = response.status();
+                    if is_transient_status(status) {
+                        return Err(AppError::HttpStatus {
+                            status: status.as_u16(),
+                            retry_after: parse_retry_after(response.headers()),
+                            message: format!(
+                                "RPC endpoint returned transient HTTP status {status}"
+                            ),
+                        });
+                    }
+                    Ok::<reqwest::Response, AppError>(response)
                 }
-                Ok::<reqwest::Response, AppError>(response)
-            }
-        })
+            },
+            Some(&self.last_attempt_count),
+        )
         .await?;
         let status = response.status();
 

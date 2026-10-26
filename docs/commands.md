@@ -356,6 +356,7 @@ soroban-cost-estimator config snapshot <COMMAND>
 | `--retain <N>` | | — | Automatically delete snapshots older than N days |
 | `--json` | | `false` | Print the snapshot as JSON (still saves it) |
 | `--retain <COUNT>` | | | Keep only the N most recent snapshots, pruning older ones after the save |
+| `--skip-unchanged` | | `false` | Do not write a new snapshot when the fetched configuration matches the latest one |
 | `--help` | `-h` | | Print help |
 
 **Subcommands**
@@ -375,8 +376,17 @@ soroban-cost-estimator config snapshot <COMMAND>
   timestamp makes every snapshot a versioned artifact.
 - `--json` also prints the full snapshot as JSON to stdout.
 - `--out` writes to an explicit path instead of the default directory.
+- New snapshots carry `"schema_version": 1`. Unversioned legacy files are
+  read as that same initial version and are never rewritten by a read. A file
+  declaring a newer version is rejected with its path and an upgrade hint.
+- `--skip-unchanged` compares the fetched network, protocol version and six
+  config settings against the latest snapshot and writes nothing when they
+  match. Capture metadata (timestamp, last-modified ledger, schema version)
+  never forces a new file. The command exits `0` whether it saved or skipped;
+  `--json` reports `"status": "unchanged"` when it skipped.
 - `--retain <COUNT>` runs a retention pass once the new snapshot is safely on
-  disk, and logs how many snapshots it pruned.
+  disk, and logs how many snapshots it pruned. It also runs after an unchanged
+  capture, so an existing directory is still trimmed.
 - `prune` deletes stale files by age. It is pure file I/O — no RPC call — so it
   is safe to schedule offline. It is also mutually exclusive with this
   command's fetching flags (`--out`, `--retain`), so `config snapshot --retain
@@ -788,14 +798,16 @@ Checked 5 cache entries.
 
 ---
 
-### `cache warm`
+### `config cache warm` / `cache warm`
 
-Pre-populate the cache by estimating every exported function (equivalent to
-running [`estimate-all`](#estimate-all)).
+Pre-populate the cache by estimating exported contract functions with
+deterministic default arguments. Both `config cache warm` and `cache warm` are
+accepted.
 
 **Usage**
 
 ```
+soroban-cost-estimator config cache warm [OPTIONS] --wasm <WASM>
 soroban-cost-estimator cache warm [OPTIONS] --wasm <WASM>
 ```
 
@@ -805,24 +817,34 @@ soroban-cost-estimator cache warm [OPTIONS] --wasm <WASM>
 |------|-------|----------|---------|-------------|
 | `--wasm <WASM>` | `-w` | ✅ | — | Path to the compiled Soroban contract `.wasm` file |
 | `--network <NETWORK>` | | | `testnet` | Network to simulate against |
+| `--rpc-url <RPC_URL>` | | | — | Explicit RPC URL (overrides network-based resolution) |
 | `--id <ID>` | | | — | Deployed contract ID (64 hex chars) to invoke each function against |
-| `--json` | | | `false` | Output as JSON instead of a human-readable list |
+| `--json` | | | `false` | Output the warm-up summary as JSON |
 | `--help` | `-h` | | | Print help |
 
 **Behavior**
 
-- Internally delegates to `estimate-all` — enumerates all exported functions
-  and simulates each zero-argument one against the network.
-- Each successful simulation is saved to the cache, keyed by
+- Simulates exported functions against the network, inferring deterministic
+  defaults from contract-spec types (e.g. `false` for bool, `0` for numbers,
+  `00` for bytes, `warm` for symbol/string).
+- Each successful simulation is saved to the local cache, keyed by
   `wasm_hash + function_name + args_hash`.
-- Useful for warming the cache before running `estimate` with `--cache-ttl`,
-  so the first call in a CI pipeline hits the cache instead of triggering a
-  fresh simulation.
+- Displays a progress bar on stderr during warm-up. On completion, stdout
+  reports `Warmed X functions into cache for <wasm_hash>` (or structured JSON with `--json`).
+- Exits with 0 on completion.
 
 **Examples**
 
 ```bash
-soroban-cost-estimator cache warm \
+soroban-cost-estimator config cache warm \
+  --wasm tests/fixtures/contract.wasm \
+  --network testnet
+```
+
+With deployed contract ID:
+
+```bash
+soroban-cost-estimator config cache warm \
   --wasm tests/fixtures/contract.wasm \
   --id CC4WIEYYSCFGDJXMLZ73FKUUJNDEOJRNOOBZHI55QR27NW4RCNTHAQ5T \
   --network testnet
