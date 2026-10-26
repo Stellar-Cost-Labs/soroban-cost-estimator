@@ -798,6 +798,144 @@ mod tests {
         assert_eq!(count_snapshots(&dir, "testnet"), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ── `list_snapshots_in`: filtering & chronological ordering ─────────
+
+    /// Fixed clock for the listing fixtures, so ordering assertions do not
+    /// depend on the wall clock.
+    fn timestamp(at: &str) -> DateTime<Utc> {
+        parse_snapshot_timestamp(at).expect("fixture timestamp")
+    }
+
+    /// Writes a file with an explicit name, so malformed names can be
+    /// exercised alongside well-formed ones.
+    fn write_named(dir: &Path, filename: &str, network: &str, at: &str) -> PathBuf {
+        let path = dir.join(filename);
+        std::fs::write(&path, snapshot_json(network, 1, at)).expect("write file");
+        path
+    }
+
+    #[test]
+    fn test_list_returns_only_the_requested_network() {
+        let dir = temp_dir("list-filter");
+        // Written newest-first on purpose: listing must not inherit disk order.
+        let newer = write_snapshot(&dir, "testnet", timestamp("2026-02-01T00:00:00+00:00"), 2);
+        let older = write_snapshot(&dir, "testnet", timestamp("2026-01-01T00:00:00+00:00"), 1);
+        write_snapshot(&dir, "mainnet", timestamp("2026-03-01T00:00:00+00:00"), 3);
+        write_snapshot(&dir, "futurenet", timestamp("2026-04-01T00:00:00+00:00"), 4);
+
+        assert_eq!(
+            list_snapshots_in(&dir, "testnet").expect("list"),
+            vec![older, newer],
+            "other networks' snapshots are filtered out, oldest first"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_list_does_not_match_networks_sharing_a_name_prefix() {
+        let dir = temp_dir("list-prefix");
+        let testnet = write_snapshot(&dir, "testnet", timestamp("2026-01-01T00:00:00+00:00"), 1);
+
+        // The prefix matched is `{network}-`, so a shorter network name that
+        // merely starts or ends the longer one must not match.
+        assert!(
+            list_snapshots_in(&dir, "test").expect("list").is_empty(),
+            "'test' must not match 'testnet-' files"
+        );
+        assert!(
+            list_snapshots_in(&dir, "net").expect("list").is_empty(),
+            "'net' must not match 'testnet-' files"
+        );
+        assert_eq!(
+            list_snapshots_in(&dir, "testnet").expect("list"),
+            vec![testnet]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_list_orders_chronologically_not_by_disk_or_name_order() {
+        let dir = temp_dir("list-sort");
+        let afternoon = write_snapshot(&dir, "testnet", timestamp("2026-01-01T15:00:00+00:00"), 3);
+        let morning = write_snapshot(&dir, "testnet", timestamp("2026-01-01T09:00:00+00:00"), 1);
+        let midday = write_snapshot(&dir, "testnet", timestamp("2026-01-01T12:00:00+00:00"), 2);
+
+        assert_eq!(
+            list_snapshots_in(&dir, "testnet").expect("list"),
+            vec![morning, midday, afternoon],
+            "oldest first; the newest snapshot is the last element"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_list_compares_instants_across_utc_offsets() {
+        let dir = temp_dir("list-offsets");
+        // 02:00+02:00 is 00:00 UTC — earlier than 00:30 UTC even though the
+        // name `…T00-30…` sorts before `…T02-00…` lexicographically.
+        let offset = write_named(
+            &dir,
+            "testnet-2026-01-01T02-00-00+02-00.json",
+            "testnet",
+            "2026-01-01T02:00:00+02:00",
+        );
+        let utc = write_named(
+            &dir,
+            "testnet-2026-01-01T00-30-00+00-00.json",
+            "testnet",
+            "2026-01-01T00:30:00+00:00",
+        );
+
+        assert_eq!(
+            list_snapshots_in(&dir, "testnet").expect("list"),
+            vec![offset, utc],
+            "timestamps are ordered as instants, not as text"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_list_ignores_foreign_and_non_json_files() {
+        let dir = temp_dir("list-foreign");
+        let snapshot = write_snapshot(&dir, "testnet", timestamp("2026-01-01T00:00:00+00:00"), 1);
+
+        // Wrong extension, other network, plain prose, or a directory that
+        // merely looks like a snapshot name — none belong in the listing.
+        std::fs::write(dir.join("README.md"), "notes").expect("write readme");
+        std::fs::write(dir.join("testnet-2026-01-02T00-00-00+00-00.txt"), "{}").expect("write txt");
+        write_snapshot(&dir, "mainnet", timestamp("2026-03-01T00:00:00+00:00"), 9);
+        std::fs::create_dir(dir.join("testnet-archive")).expect("create subdir");
+
+        assert_eq!(
+            list_snapshots_in(&dir, "testnet").expect("list"),
+            vec![snapshot]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_list_places_unparseable_timestamps_after_valid_ones() {
+        let dir = temp_dir("list-malformed");
+        let bad_first = write_named(&dir, "testnet-0000.json", "testnet", "not-a-timestamp");
+        let bad_second = write_named(&dir, "testnet-zzz.json", "testnet", "not-a-timestamp");
+        let valid = write_snapshot(&dir, "testnet", timestamp("2026-01-01T00:00:00+00:00"), 1);
+
+        assert_eq!(
+            list_snapshots_in(&dir, "testnet").expect("list"),
+            vec![valid, bad_first, bad_second],
+            "a name without a valid timestamp can never look like the newest snapshot"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_list_of_an_empty_directory_is_empty_not_an_error() {
+        let dir = temp_dir("list-empty");
+        let listed = list_snapshots_in(&dir, "testnet").expect("an empty listing is not an error");
+        assert!(listed.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// A bundle of config snapshots for export/import.
