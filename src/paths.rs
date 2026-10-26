@@ -19,7 +19,7 @@ use crate::error::{AppError, AppResult};
 /// so the environment check must come first there.
 ///
 /// This function only computes the path; callers that write into it are
-/// responsible for creating it if needed.
+/// responsible for creating it if needed (or call [`ensure_data_dir`]).
 pub fn data_dir() -> AppResult<PathBuf> {
     let home = env_home()
         .or_else(dirs::home_dir)
@@ -133,6 +133,25 @@ pub fn restrict_new_sidecar_permissions(sidecars: &[(PathBuf, bool)]) {
     {
         let _ = sidecars;
     }
+}
+
+/// Returns the base data directory: `~/.soroban-cost-estimator`, creating it
+/// if needed.
+///
+/// # Platform permissions
+///
+/// - **Unix-like systems** (Linux, macOS, BSD): If the directory does not exist,
+///   it is created with user-only permissions (`0o700` / `rwx------`) so that
+///   cache records and other local state are inaccessible to other local users.
+///   If the directory already exists, its permissions are left untouched so
+///   existing user preferences are preserved.
+/// - **Non-Unix platforms** (e.g. Windows): Filesystem permissions are governed
+///   by the operating system's default Access Control Lists (ACLs) within the
+///   user profile directory.
+pub fn ensure_data_dir() -> AppResult<PathBuf> {
+    let dir = data_dir()?;
+    ensure_private_dir(&dir)?;
+    Ok(dir)
 }
 
 /// The home directory as given by the platform's conventional environment
