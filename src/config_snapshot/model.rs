@@ -451,6 +451,7 @@ pub fn setting_unit(field_path: &str) -> Option<&'static str> {
     setting_unit_description(field_path)
 }
 
+/// Returns the human-readable unit description for a config setting field path, if known.
 #[must_use]
 pub fn setting_unit_description(field_path: &str) -> Option<&'static str> {
     match field_path {

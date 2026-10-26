@@ -1061,8 +1061,8 @@ mod tests {
 
     #[test]
     fn threshold_percent_accepts_finite_non_negative_values() {
-        assert_eq!(parse_threshold_percent("10").unwrap(), 10.0);
-        assert_eq!(parse_threshold_percent("500.5").unwrap(), 500.5);
+        assert!((parse_threshold_percent("10").unwrap() - 10.0).abs() < f64::EPSILON);
+        assert!((parse_threshold_percent("500.5").unwrap() - 500.5).abs() < f64::EPSILON);
         assert!(parse_threshold_percent("-1").is_err());
         assert!(parse_threshold_percent("NaN").is_err());
         assert!(parse_threshold_percent("inf").is_err());
