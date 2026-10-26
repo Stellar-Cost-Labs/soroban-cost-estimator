@@ -6655,6 +6655,76 @@ mod tests {
         assert_eq!(parse_interval_secs("007"), 7);
     }
 
+    /// Issue #359: every duration suffix at every useful multiple, plus the
+    /// bare-number form (seconds).
+    #[test]
+    fn test_parse_interval_secs_suffix_matrix() {
+        for (input, expected) in [
+            ("10s", 10),
+            ("5m", 300),
+            ("2h", 7_200),
+            ("1d", 86_400),
+            ("60", 60),      // raw numbers are seconds
+            ("1s", 1),       // the smallest representable interval
+            ("60s", 60),     // a suffix that adds nothing
+            ("60m", 3_600),  // a minute count equal to one hour
+            ("24h", 86_400), // an hour count equal to one day
+            ("7d", 604_800), // a week
+            ("90m", 5_400),  // unit conversion really multiplies
+            ("+15s", 15),    // `u64::from_str` accepts an explicit plus
+        ] {
+            assert_eq!(
+                parse_interval_secs(input),
+                expected,
+                "input {input:?} should parse to {expected}s"
+            );
+        }
+    }
+
+    /// Zero is a valid interval: the parser has no error channel and reports
+    /// it faithfully, leaving any "must be positive" policy to the command
+    /// that consumes the value.
+    #[test]
+    fn test_parse_interval_secs_accepts_zero() {
+        for input in ["0", "0s", "0m", "0h", "0d", "00s"] {
+            assert_eq!(parse_interval_secs(input), 0, "input {input:?}");
+        }
+    }
+
+    /// Malformed intervals — including the issue's error cases — cannot be
+    /// reported as errors, because the function returns a bare `u64` with no
+    /// error channel. They fall back to the documented one-hour default,
+    /// *before* the unit multiplier is applied, so a bad value with a suffix
+    /// becomes 3600 × that unit.
+    #[test]
+    fn test_parse_interval_secs_malformed_input_falls_back_to_default() {
+        for (input, expected) in [
+            ("", 3_600),  // empty
+            (" ", 3_600), // blank            // A suffix with no number still selects the unit, so the
+            // fallback is scaled by it rather than returned as one hour.
+            ("s", 3_600),
+            ("m", 216_000),
+            ("h", 12_960_000),
+            ("d", 311_040_000),
+            ("5x", 3_600),     // unknown suffix, and no valid number
+            ("-10s", 3_600),   // negative intervals are not supported
+            ("-10m", 216_000), // ... the default still picks up the unit
+            ("-1d", 311_040_000),
+            ("abc", 3_600),
+            ("10 s", 3_600),                  // space before the suffix
+            ("1.5s", 3_600),                  // fractional numbers are not u64
+            ("10ss", 3_600),                  // two suffixes
+            ("1e2s", 3_600),                  // exponent notation
+            ("99999999999999999999s", 3_600), // does not fit u64
+        ] {
+            assert_eq!(
+                parse_interval_secs(input),
+                expected,
+                "malformed input {input:?} should fall back to {expected}s"
+            );
+        }
+    }
+
     #[test]
     fn test_upgrade_detected_on_pricing_change() {
         let old = snapshot_with_compute_fee(100);
