@@ -201,11 +201,11 @@ fn test_unsupported_future_snapshot_schema_version_rejected_with_file_and_guidan
         "error should identify the file: {msg}"
     );
     assert!(
-        msg.contains("unsupported future snapshot schema_version 99"),
+        msg.contains("declares schema version 99"),
         "error should report unsupported schema version: {msg}"
     );
     assert!(
-        msg.contains("recommended action"),
+        msg.contains("upgrade soroban-cost-estimator"),
         "error should include recommended action: {msg}"
     );
     let _ = std::fs::remove_dir_all(&dir);

@@ -998,8 +998,6 @@ pub struct SnapshotMetadata {
 /// materialised; serde skips them.
 #[derive(serde::Deserialize)]
 struct SnapshotHeader {
-    #[serde(default = "crate::config_snapshot::model::default_snapshot_schema_version")]
-    schema_version: u32,
     network: String,
     timestamp: String,
     ledger: u32,
