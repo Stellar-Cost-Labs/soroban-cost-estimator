@@ -4,9 +4,14 @@ version = "0.1.0"
 edition = "2024"
 description = "CLI tool to estimate Soroban contract resource costs with network config-drift tracking."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/aigbagbobila/soroban-cost-estimator"
+repository = "https://github.com/Stellar-Cost-Labs/soroban-cost-estimator"
+readme = "README.md"
 rust-version = "1.85"
 default-run = "soroban-cost-estimator"
+
+# Release history is documented in CHANGELOG.md (Keep a Changelog 1.1.0).
+[package.metadata]
+changelog = "CHANGELOG.md"
 
 [workspace]
 members = ["."]
@@ -58,7 +63,7 @@ clap = { version = "4.6.4", features = ["derive", "string"] }
 clap_complete = "4.5"
 
 # Async runtime
-tokio = { version = "1.53.1", features = ["full"] }
+tokio = { version = "1.53.3", features = ["full"] }
 
 # HTTP client
 reqwest = { version = "0.13.4", features = ["json"] }
@@ -150,4 +155,3 @@ harness = false
 name = "wasm_benchmark"
 path = "benches/wasm_bench.rs"
 harness = false
-

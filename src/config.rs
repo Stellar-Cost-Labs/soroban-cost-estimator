@@ -8,7 +8,7 @@
 //! 3. explicit CLI arguments
 //!
 //! Network and timeout defaults are applied by rewriting clap's default
-//! values before parsing (see [`UserConfig::apply_cli_defaults`]), so an
+//! values before parsing (see [`crate::config::UserConfig::apply_cli_defaults`]), so an
 //! argument the user did not type picks up the config value while an explicit
 //! argument always wins. RPC URLs from `[rpc_urls]` replace the built-in
 //! endpoint for that network (see [`crate::rpc::client::set_endpoint_overrides`]);
@@ -25,7 +25,7 @@
 //! 3. `~/.soroban-cost-estimator/config.toml`
 //!
 //! No file at any default location is not an error. A file that exists but
-//! cannot be read or parsed is reported as [`AppError::Config`].
+//! cannot be read or parsed is reported as [`crate::error::AppError::Config`].
 //!
 //! # Example
 //!

@@ -303,7 +303,7 @@ fn test_config_diff_help() {
 fn test_watch_help() {
     let (stdout, stderr, code) = run_cli(&["watch", "--help"]);
     assert_eq!(code, 0, "watch --help should exit 0; stderr: {stderr}");
-    for flag in ["--network", "--interval"] {
+    for flag in ["--network", "--rpc-url", "--interval"] {
         assert!(
             stdout.contains(flag),
             "watch help should mention {flag}; got: {stdout}"
@@ -1810,6 +1810,41 @@ fn test_config_diff_loads_valid_snapshot_before_network() {
     assert!(
         !stderr.contains("Error: failed to parse snapshot"),
         "a valid snapshot must not be reported as malformed; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_diff_rpc_url_overrides_unknown_network() {
+    // `--rpc-url` must bypass network-name resolution for the live fetch: an
+    // otherwise unknown network name combined with --rpc-url fails on the RPC
+    // call itself (the dead endpoint), not on endpoint resolution.
+    let home = temp_home("diff-rpc-url-override");
+    let path = home.join("snapshot.json");
+    std::fs::write(&path, snapshot_json("not-a-network", 1000)).expect("write fixture");
+
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "--max-retries",
+            "0",
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against",
+            path.to_str().unwrap(),
+            "--rpc-url",
+            DEAD_RPC,
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "the dead endpoint should still fail");
+    assert!(
+        !stderr.contains("not configured for network"),
+        "--rpc-url should override network resolution; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("failed to send HTTP request"),
+        "the failure should come from the HTTP call; got: {stderr}"
     );
 }
 

@@ -299,6 +299,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
     let rps = args.rps;
     let timeout = args.timeout;
     let connect_timeout = args.connect_timeout;
+    rpc::client::set_default_total_timeout(args.total_timeout.map(std::time::Duration::from_secs));
     let max_retries = args.max_retries;
     let verbose = args.verbose;
     // `--precision` is a single global flag; read it once so every command
@@ -326,6 +327,11 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
         .default_network
         .unwrap_or_else(|| "testnet".to_string());
     let default_rpc_url = file.rpc_url;
+    // Validate an explicit `--rpc-url` before any command parses WASM or
+    // opens the cache, so a typo fails immediately with a clear message.
+    if let Some(url) = args.command.rpc_url() {
+        rpc::client::validate_rpc_url(url)?;
+    }
     match args.command {
         cli::Command::Estimate {
             wasm,
@@ -350,6 +356,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
             dry_run,
             project,
             repeat,
+            show_events,
         } => {
             if recover_cache {
                 if let Ok(false) = cache::check_cache_health() {
@@ -427,6 +434,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
                     wasm_new.as_deref(),
                     dry_run,
                     project.as_deref(),
+                    show_events,
                 )
                 .await
             }
@@ -517,6 +525,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
             cli::ConfigAction::Snapshot {
                 action,
                 network,
+                rpc_url,
                 out,
                 json,
                 retain,
@@ -566,6 +575,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
                     };
                     cmd_config_snapshot(
                         &env_string(network, &default_network, "SOROBAN_NETWORK"),
+                        rpc_url.as_deref(),
                         fallback,
                         out.as_deref(),
                         format,
@@ -584,6 +594,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
             cli::ConfigAction::List { network } => cmd_config_snapshot_list(&network, quiet),
             cli::ConfigAction::Diff {
                 network,
+                rpc_url,
                 against,
                 against_previous,
                 pricing_only,
@@ -615,6 +626,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
                 } else {
                     cmd_config_diff(
                         &env_string(network, &default_network, "SOROBAN_NETWORK"),
+                        rpc_url.as_deref(),
                         fallback,
                         against.as_deref(),
                         pricing_only,
@@ -975,6 +987,7 @@ struct SimulationRequest<'a> {
     extra_headers: &'a [String],
     quiet: bool,
     verbose: bool,
+    show_events: bool,
 }
 
 /// A `simulateTransaction` failure with no RPC-provided error code or details.
@@ -1001,6 +1014,7 @@ fn simulation_failed(message: impl Into<String>) -> error::AppError {
 /// All RPC traffic (simulation and fee-rate fetches) goes through one
 /// `RpcClient`, which deduplicates identical requests â€” the same method with
 /// the same params â€” so identical fee-rate fetches transmit at most once.
+#[allow(clippy::too_many_lines)]
 async fn simulate_report(
     req: &SimulationRequest<'_>,
 ) -> error::AppResult<report::cost_report::CostReport> {
@@ -1100,6 +1114,16 @@ async fn simulate_report(
         &network_config,
     );
 
+    // Simulation diagnostics (#525): counts of the response's events and
+    // state changes, with bounded per-entry summaries only under the
+    // `--show-events` opt-in. `None` when the response carried neither,
+    // keeping the default report shape unchanged.
+    let diagnostics = report::cost_report::build_simulation_diagnostics(
+        &response.events,
+        &response.state_changes,
+        req.show_events,
+    );
+
     Ok(report::cost_report::CostReport {
         function: req.fn_name.unwrap_or("(wasm upload)").to_string(),
         wasm_hash: req.wasm_hash.to_string(),
@@ -1121,6 +1145,7 @@ async fn simulate_report(
         history: None,
         projections: None,
         contract_meta: req.contract_meta.clone(),
+        diagnostics,
     })
 }
 
@@ -1164,6 +1189,7 @@ async fn cmd_estimate(
     wasm_new: Option<&str>,
     dry_run: bool,
     project: Option<&str>,
+    show_events: bool,
 ) -> error::AppResult<()> {
     // Parse the requested projection counts up front so an invalid list is
     // rejected before any RPC traffic, regardless of the output format.
@@ -1199,6 +1225,7 @@ async fn cmd_estimate(
             extra_headers,
             quiet,
             verbose,
+            show_events,
         )
         .await;
     }
@@ -1221,6 +1248,7 @@ async fn cmd_estimate(
             extra_headers,
             quiet,
             verbose,
+            show_events,
         )
         .await;
     }
@@ -1284,6 +1312,7 @@ async fn cmd_estimate(
         quiet,
         verbose,
         dry_run,
+        show_events,
     )
     .await?;
 
@@ -1698,6 +1727,7 @@ async fn cmd_estimate_repeat(
                     history: None,
                     projections: None,
                     contract_meta: wasm_info.contract_meta.clone(),
+                    diagnostics: None,
                 });
             }
         }
@@ -1791,6 +1821,7 @@ async fn estimate_once(
     quiet: bool,
     verbose: bool,
     dry_run: bool,
+    show_events: bool,
 ) -> error::AppResult<EstimateRun> {
     let json_flag = format == "json";
     // Formats whose stdout is consumed by a script (`json`, `summary`) keep
@@ -1982,6 +2013,7 @@ async fn estimate_once(
             extra_headers,
             quiet,
             verbose,
+            show_events,
         })
         .await?;
 
@@ -2262,6 +2294,7 @@ fn watch_build_header(
 /// # Network calls
 /// One full estimation (see [`estimate_once`]).
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::fn_params_excessive_bools)]
 async fn emit_watch_estimate(
     state: &mut EstimateWatchState,
     wasm_path: &str,
@@ -2281,6 +2314,7 @@ async fn emit_watch_estimate(
     human: bool,
     quiet: bool,
     verbose: bool,
+    show_events: bool,
 ) {
     match estimate_once(
         wasm_path,
@@ -2318,6 +2352,7 @@ async fn emit_watch_estimate(
         verbose,
         // `--watch` wins over `--dry-run`: watching exists to re-simulate.
         false,
+        show_events,
     )
     .await
     {
@@ -2361,6 +2396,7 @@ async fn emit_watch_estimate(
 /// None when nothing changed; otherwise one full estimation (see
 /// [`emit_watch_estimate`]).
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::fn_params_excessive_bools)]
 async fn estimate_watch_poll_once(
     state: &mut EstimateWatchState,
     wasm_path: &str,
@@ -2380,6 +2416,7 @@ async fn estimate_watch_poll_once(
     human: bool,
     quiet: bool,
     verbose: bool,
+    show_events: bool,
 ) -> error::AppResult<()> {
     let path = std::path::Path::new(wasm_path);
     let hash = match wasm_content_hash(path) {
@@ -2424,6 +2461,7 @@ async fn estimate_watch_poll_once(
         human,
         quiet,
         verbose,
+        show_events,
     )
     .await;
     Ok(())
@@ -2461,6 +2499,7 @@ async fn cmd_estimate_watch(
     extra_headers: &[String],
     quiet: bool,
     verbose: bool,
+    show_events: bool,
 ) -> error::AppResult<()> {
     use tracing::info;
 
@@ -2505,6 +2544,7 @@ async fn cmd_estimate_watch(
                 human,
                 quiet,
                 verbose,
+                show_events,
             )
             .await;
         }
@@ -2549,6 +2589,7 @@ async fn cmd_estimate_watch(
                     human,
                     quiet,
                     verbose,
+                    show_events,
                 ).await;
                 tokio::time::sleep(WATCH_POLL_DURATION).await;
             } => {}
@@ -2758,6 +2799,7 @@ pub fn format_estimate_all_markdown(results: &[EstimateAllResult]) -> String {
 /// ("new") build; everything else (`--fn`, `--arg`, `--id`, `--network`) is
 /// applied identically to both simulations so the numbers are comparable.
 /// The cache is neither read nor written in diff mode.
+#[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 async fn cmd_estimate_diff(
     old_path: &str,
@@ -2777,6 +2819,7 @@ async fn cmd_estimate_diff(
     extra_headers: &[String],
     quiet: bool,
     verbose: bool,
+    show_events: bool,
 ) -> error::AppResult<()> {
     use sha2::Digest;
 
@@ -2832,6 +2875,7 @@ async fn cmd_estimate_diff(
         extra_headers,
         quiet,
         verbose,
+        show_events,
     })
     .await?;
 
@@ -2856,6 +2900,7 @@ async fn cmd_estimate_diff(
         extra_headers,
         quiet,
         verbose,
+        show_events,
     })
     .await?;
 
@@ -3605,6 +3650,7 @@ fn wasm_info_json(
                 }).collect::<Vec<_>>(),
             })
         }).collect::<Vec<_>>(),
+        "function_signatures": wasm::parser::function_signatures_json(wasm_info),
         "spec_entries": wasm_info.spec_entries.iter()
             .map(wasm::parser::spec_entry_json)
             .collect::<Vec<_>>(),
@@ -3663,6 +3709,51 @@ fn wasm_info_json(
     })
 }
 
+/// Decides which ledger a config snapshot should be stamped with.
+///
+/// #267: this must be the network's **current** ledger, not the newest
+/// `last_modified_ledger` across the config settings. Those per-setting values
+/// only move on protocol-governance events, so they sit frozen between upgrades
+/// and made every snapshot report the same long-stale ledger.
+///
+/// Falls back to the newest per-setting value (the old behavior) when the node
+/// omits `latestLedger` or reports one beyond the model's `u32` range, so a
+/// snapshot never silently claims ledger 0.
+fn snapshot_ledger(fetched: &rpc::config::ConfigSettingsFetch) -> u32 {
+    use tracing::warn;
+
+    match fetched.latest_ledger {
+        Some(latest) => match u32::try_from(latest) {
+            Ok(ledger) => ledger,
+            Err(_) => {
+                warn!(
+                    latest,
+                    "node reported a ledger beyond the snapshot model's range — \
+                     falling back to per-setting last_modified values"
+                );
+                newest_last_modified(fetched)
+            }
+        },
+        None => {
+            warn!(
+                "node omitted latestLedger — falling back to the newest per-setting \
+                 last_modified ledger, which may be stale"
+            );
+            newest_last_modified(fetched)
+        }
+    }
+}
+
+/// The newest `last_modified_ledger` across the fetched settings, or 0.
+fn newest_last_modified(fetched: &rpc::config::ConfigSettingsFetch) -> u32 {
+    fetched
+        .entries
+        .iter()
+        .map(|e| e.last_modified_ledger)
+        .max()
+        .unwrap_or(0)
+}
+
 /// Fetches the current network config settings and builds a snapshot.
 ///
 /// Shared by `config snapshot`, `config diff`, and `watch`.
@@ -3700,17 +3791,31 @@ async fn fetch_config_snapshot(
             verbose,
         )?;
         debug!("fetching all config settings");
-        let raw_entries = rpc::config::fetch_all_config_settings(&client).await?;
-        debug!(entries = raw_entries.len(), "received config entries");
+        let fetched = rpc::config::fetch_all_config_settings(&client).await?;
+        debug!(
+            entries = fetched.entries.len(),
+            latest_ledger = ?fetched.latest_ledger,
+            "received config entries"
+        );
+
+        // Keep the per-setting provenance before decoding, so it survives even
+        // if a later step discards the raw entries.
+        let settings_last_modified: std::collections::BTreeMap<String, u32> = fetched
+            .entries
+            .iter()
+            .map(|raw| (raw.id.human_name().to_string(), raw.last_modified_ledger))
+            .collect();
+
+        // Stamp with the current ledger, not the frozen per-setting values.
+        let ledger = snapshot_ledger(&fetched);
 
         let mut snapshot = xdr_helper::begin_snapshot(network, 0);
-        for raw in &raw_entries {
+        for raw in &fetched.entries {
             let config_entry = xdr_helper::decode_config_entry_xdr(&raw.config_xdr, verbose)?;
             xdr_helper::apply_config_entry(&mut snapshot, config_entry);
         }
-        if let Some(latest) = raw_entries.iter().map(|e| e.last_modified_ledger).max() {
-            snapshot.ledger = latest;
-        }
+        snapshot.settings_last_modified = settings_last_modified;
+        snapshot.ledger = ledger;
         // The protocol version is informational (shown by `config snapshot
         // list`), so a failure here must not lose the snapshot itself.
         match rpc::config::fetch_protocol_version(&client).await {
@@ -3837,6 +3942,7 @@ fn prune_output<'a>(
 /// snapshots it would have pruned.
 async fn cmd_config_snapshot(
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     out_path: Option<&str>,
     format: cli::OutputFormat,
@@ -3857,7 +3963,7 @@ async fn cmd_config_snapshot(
         info!("taking config snapshot");
         let snapshot = fetch_config_snapshot(
             network,
-            None,
+            rpc_url,
             rpc_fallback_url,
             rps,
             timeout,
@@ -4160,6 +4266,20 @@ fn upgrade_detected(diff: &config_snapshot::diff::ConfigDiff) -> bool {
     diff.has_pricing_changes
 }
 
+/// Returns whether a diff contains a change that should be reported for the
+/// requested pricing threshold. Non-pricing changes are always reportable.
+fn has_reportable_config_changes(
+    diff: &config_snapshot::diff::ConfigDiff,
+    threshold_percent: Option<f64>,
+) -> bool {
+    let has_non_pricing_changes = diff.changes.iter().any(|change| !change.is_pricing_change);
+    let has_pricing_changes = match threshold_percent {
+        Some(threshold) => diff.has_significant_pricing_changes(threshold),
+        None => diff.has_pricing_changes(),
+    };
+    has_non_pricing_changes || has_pricing_changes
+}
+
 /// Cached estimates recorded before `ledger`, shaped for the
 /// `config diff --json` payload.
 ///
@@ -4211,6 +4331,7 @@ fn load_baseline_payload(
 #[allow(clippy::fn_params_excessive_bools)]
 async fn cmd_config_diff(
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     against_path: Option<&str>,
     pricing_only: bool,
@@ -4242,7 +4363,7 @@ async fn cmd_config_diff(
 
         let new_snapshot = fetch_config_snapshot(
             network,
-            None,
+            rpc_url,
             rpc_fallback_url,
             rps,
             timeout,
@@ -4262,11 +4383,15 @@ async fn cmd_config_diff(
         debug!(
             change_count = diff.changes.len(),
             has_pricing = diff.has_pricing_changes,
+            significant_pricing = ?threshold_percent
+                .map(|threshold| diff.has_significant_pricing_changes(threshold)),
             "diff computed"
         );
         if json_flag {
             let json_output = serde_json::json!({
                 "diff": diff,
+                "significant_pricing_changes": threshold_percent
+                    .map(|threshold| diff.has_significant_pricing_changes(threshold)),
                 "stale_estimates": stale_estimates_for(network, new_snapshot.ledger),
             });
             println!("{}", serde_json::to_string_pretty(&json_output)?);
@@ -4364,12 +4489,16 @@ fn cmd_config_diff_against_previous(
     debug!(
         change_count = diff.changes.len(),
         has_pricing = diff.has_pricing_changes,
+        significant_pricing = ?threshold_percent
+            .map(|threshold| diff.has_significant_pricing_changes(threshold)),
         "diff computed"
     );
 
     if json_flag {
         let json_output = serde_json::json!({
             "diff": diff,
+            "significant_pricing_changes": threshold_percent
+                .map(|threshold| diff.has_significant_pricing_changes(threshold)),
             "stale_estimates": stale_estimates_for(network, new_ledger),
         });
         println!("{}", serde_json::to_string_pretty(&json_output)?);
@@ -4732,7 +4861,9 @@ async fn watch_poll_once(
             if !*first {
                 if let Ok(old_snapshot) = config_snapshot::store::load_latest_snapshot(network) {
                     let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &snapshot);
-                    if !diff.changes.is_empty() {
+                    let reportable_changes =
+                        has_reportable_config_changes(&diff, threshold_percent);
+                    if reportable_changes {
                         debug!(change_count = diff.changes.len(), "config changes detected");
                         if !quiet {
                             println!(
@@ -4745,9 +4876,9 @@ async fn watch_poll_once(
                                 )
                             );
                         }
-                    }
 
-                    print_stale_estimates(network, snapshot.ledger, quiet);
+                        print_stale_estimates(network, snapshot.ledger, quiet);
+                    }
                 }
             }
 
@@ -6175,6 +6306,7 @@ mod tests {
     use super::EstimateAllStatus;
     use super::parse_interval_secs;
     use super::settled_new_build_detected;
+    use super::snapshot_ledger;
     use super::upgrade_detected;
     use super::wasm_content_hash;
     use super::wasm_info_json;
@@ -6184,15 +6316,172 @@ mod tests {
     use soroban_cost_estimator::config_snapshot::model::{
         ConfigSnapshot, ContractComputeV0, ContractLedgerCostV0,
     };
+    use soroban_cost_estimator::rpc::config::{
+        ConfigSettingEntryRaw, ConfigSettingId, ConfigSettingsFetch,
+    };
     use soroban_cost_estimator::wasm::parser::{
         ContractMeta, FunctionInfo, ParamInfo, SectionInfo, WasmInfo,
     };
+
+    // ── Snapshot ledger stamping (#267) ────────────────────────────────────
+    //
+    // The ledger a snapshot records must be the network's *current* ledger, not
+    // the newest `last_modified_ledger` across the config settings. Settings
+    // only change on governance events, so the latter stays frozen between
+    // upgrades and made every snapshot report the same long-stale ledger.
+
+    /// Realistic per-setting ledgers: all far behind the current chain, and
+    /// frozen across minutes, exactly as observed on testnet in #267.
+    const STALE_SETTING_LEDGERS: [(&ConfigSettingId, u32); 6] = [
+        (&ConfigSettingId::ContractComputeV0, 606_666),
+        (&ConfigSettingId::ContractLedgerCostV0, 3_470_630),
+        (&ConfigSettingId::ContractHistoricalDataV0, 606_666),
+        (&ConfigSettingId::ContractEventsV0, 606_666),
+        (&ConfigSettingId::ContractBandwidthV0, 606_666),
+        (&ConfigSettingId::StateArchival, 2_332),
+    ];
+
+    fn fetch_with(latest_ledger: Option<u64>) -> ConfigSettingsFetch {
+        ConfigSettingsFetch {
+            entries: STALE_SETTING_LEDGERS
+                .iter()
+                .map(|(id, ledger)| ConfigSettingEntryRaw {
+                    id: **id,
+                    config_xdr: "x".to_string(),
+                    last_modified_ledger: *ledger,
+                })
+                .collect(),
+            latest_ledger,
+        }
+    }
+
+    #[test]
+    fn test_snapshot_ledger_uses_current_ledger_not_last_modified() {
+        // The exact values from the #267 report: current 4_635_340 vs. the
+        // newest setting change at 3_470_630 — 1,164,710 ledgers stale.
+        let fetched = fetch_with(Some(4_635_340));
+
+        assert_eq!(
+            snapshot_ledger(&fetched),
+            4_635_340,
+            "snapshot must record the current ledger"
+        );
+        assert_eq!(
+            snapshot_ledger(&fetched),
+            4_635_340,
+            "and must not fall back to max(last_modified_ledger)=3470630"
+        );
+        assert_ne!(
+            snapshot_ledger(&fetched),
+            3_470_630,
+            "the frozen per-setting max must not win"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_ledger_advances_between_runs() {
+        // Two runs minutes apart must report different ledgers even though the
+        // settings have not changed.
+        let first = snapshot_ledger(&fetch_with(Some(4_635_340)));
+        let second = snapshot_ledger(&fetch_with(Some(4_635_412)));
+
+        assert_eq!(first, 4_635_340);
+        assert_eq!(second, 4_635_412);
+        assert_ne!(
+            first, second,
+            "two runs minutes apart must not report the same ledger"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_ledger_falls_back_when_latest_ledger_absent() {
+        // A node that omits latestLedger must not silently yield ledger 0.
+        let fetched = fetch_with(None);
+
+        assert_eq!(
+            snapshot_ledger(&fetched),
+            3_470_630,
+            "fallback should be the newest per-setting value, not 0"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_ledger_falls_back_when_ledger_exceeds_u32() {
+        // Beyond the model's range we cannot represent it, so fall back rather
+        // than truncating into a plausible-looking but wrong number.
+        let fetched = fetch_with(Some(u64::from(u32::MAX) + 1));
+
+        assert_eq!(snapshot_ledger(&fetched), 3_470_630);
+    }
+
+    #[test]
+    fn test_snapshot_ledger_falls_back_to_zero_without_entries() {
+        let fetched = ConfigSettingsFetch {
+            entries: Vec::new(),
+            latest_ledger: None,
+        };
+
+        assert_eq!(snapshot_ledger(&fetched), 0);
+    }
+
+    #[test]
+    fn test_snapshot_preserves_per_setting_provenance() {
+        // The per-setting last_modified values must survive the restamping, so
+        // "when did this price last move?" stays answerable.
+        let fetched = fetch_with(Some(4_635_340));
+        let provenance: std::collections::BTreeMap<String, u32> = fetched
+            .entries
+            .iter()
+            .map(|raw| (raw.id.human_name().to_string(), raw.last_modified_ledger))
+            .collect();
+
+        assert_eq!(provenance.len(), 6);
+        assert_eq!(
+            provenance.get("CONFIG_SETTING_CONTRACT_LEDGER_COST_V0"),
+            Some(&3_470_630),
+            "the stale per-setting value must be kept, not replaced"
+        );
+        assert_eq!(
+            provenance.get("CONFIG_SETTING_CONTRACT_COMPUTE_V0"),
+            Some(&606_666)
+        );
+        // The current ledger is distinct from, and larger than, all of them.
+        let current = snapshot_ledger(&fetched);
+        assert!(provenance.values().all(|lm| *lm < current));
+    }
+
+    #[test]
+    fn test_snapshots_without_provenance_field_still_deserialize() {
+        // Snapshots written before this field existed must keep loading, or
+        // every previously saved snapshot becomes unreadable.
+        let legacy = r#"{
+  "network": "testnet",
+  "timestamp": "2026-01-01T00:00:00Z",
+  "ledger": 3470630,
+  "contract_compute": null,
+  "contract_ledger_cost": null,
+  "contract_historical_data": null,
+  "contract_events": null,
+  "contract_bandwidth": null,
+  "state_archival": null
+}"#;
+
+        let snapshot: ConfigSnapshot =
+            serde_json::from_str(legacy).expect("legacy snapshot should still parse");
+
+        assert_eq!(snapshot.ledger, 3_470_630);
+        assert!(
+            snapshot.settings_last_modified.is_empty(),
+            "absent provenance must default to empty, not fail"
+        );
+    }
 
     fn snapshot_with_compute_fee(fee: i64) -> ConfigSnapshot {
         ConfigSnapshot {
             network: "testnet".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             ledger: 100,
+            settings_last_modified: std::collections::BTreeMap::new(),
             protocol_version: None,
             contract_compute: Some(ContractComputeV0 {
                 ledger_max_instructions: 1_000_000,
@@ -6668,6 +6957,7 @@ mod tests {
             history: None,
             projections: None,
             contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
+            diagnostics: None,
         }
     }
 
