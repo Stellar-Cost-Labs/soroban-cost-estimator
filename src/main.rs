@@ -3,6 +3,7 @@ use std::path::Path;
 use clap::{CommandFactory, FromArgMatches};
 use comfy_table::Cell;
 use comfy_table::Table;
+use serde::Deserialize;
 use soroban_cost_estimator::cache;
 use soroban_cost_estimator::cli;
 use soroban_cost_estimator::config;
@@ -298,6 +299,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
     let rps = args.rps;
     let timeout = args.timeout;
     let connect_timeout = args.connect_timeout;
+    rpc::client::set_default_total_timeout(args.total_timeout.map(std::time::Duration::from_secs));
     let max_retries = args.max_retries;
     let verbose = args.verbose;
     // `--precision` is a single global flag; read it once so every command
@@ -325,6 +327,11 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
         .default_network
         .unwrap_or_else(|| "testnet".to_string());
     let default_rpc_url = file.rpc_url;
+    // Validate an explicit `--rpc-url` before any command parses WASM or
+    // opens the cache, so a typo fails immediately with a clear message.
+    if let Some(url) = args.command.rpc_url() {
+        rpc::client::validate_rpc_url(url)?;
+    }
     match args.command {
         cli::Command::Estimate {
             wasm,
@@ -349,6 +356,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
             dry_run,
             project,
             repeat,
+            show_events,
         } => {
             if recover_cache {
                 if let Ok(false) = cache::check_cache_health() {
@@ -426,6 +434,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
                     wasm_new.as_deref(),
                     dry_run,
                     project.as_deref(),
+                    show_events,
                 )
                 .await
             }
@@ -980,6 +989,7 @@ struct SimulationRequest<'a> {
     extra_headers: &'a [String],
     quiet: bool,
     verbose: bool,
+    show_events: bool,
 }
 
 /// A `simulateTransaction` failure with no RPC-provided error code or details.
@@ -1006,6 +1016,7 @@ fn simulation_failed(message: impl Into<String>) -> error::AppError {
 /// All RPC traffic (simulation and fee-rate fetches) goes through one
 /// `RpcClient`, which deduplicates identical requests â€” the same method with
 /// the same params â€” so identical fee-rate fetches transmit at most once.
+#[allow(clippy::too_many_lines)]
 async fn simulate_report(
     req: &SimulationRequest<'_>,
 ) -> error::AppResult<report::cost_report::CostReport> {
@@ -1105,6 +1116,16 @@ async fn simulate_report(
         &network_config,
     );
 
+    // Simulation diagnostics (#525): counts of the response's events and
+    // state changes, with bounded per-entry summaries only under the
+    // `--show-events` opt-in. `None` when the response carried neither,
+    // keeping the default report shape unchanged.
+    let diagnostics = report::cost_report::build_simulation_diagnostics(
+        &response.events,
+        &response.state_changes,
+        req.show_events,
+    );
+
     Ok(report::cost_report::CostReport {
         function: req.fn_name.unwrap_or("(wasm upload)").to_string(),
         wasm_hash: req.wasm_hash.to_string(),
@@ -1126,6 +1147,7 @@ async fn simulate_report(
         history: None,
         projections: None,
         contract_meta: req.contract_meta.clone(),
+        diagnostics,
     })
 }
 
@@ -1169,6 +1191,7 @@ async fn cmd_estimate(
     wasm_new: Option<&str>,
     dry_run: bool,
     project: Option<&str>,
+    show_events: bool,
 ) -> error::AppResult<()> {
     // Parse the requested projection counts up front so an invalid list is
     // rejected before any RPC traffic, regardless of the output format.
@@ -1204,6 +1227,7 @@ async fn cmd_estimate(
             extra_headers,
             quiet,
             verbose,
+            show_events,
         )
         .await;
     }
@@ -1226,6 +1250,7 @@ async fn cmd_estimate(
             extra_headers,
             quiet,
             verbose,
+            show_events,
         )
         .await;
     }
@@ -1289,6 +1314,7 @@ async fn cmd_estimate(
         quiet,
         verbose,
         dry_run,
+        show_events,
     )
     .await?;
 
@@ -1703,6 +1729,7 @@ async fn cmd_estimate_repeat(
                     history: None,
                     projections: None,
                     contract_meta: wasm_info.contract_meta.clone(),
+                    diagnostics: None,
                 });
             }
         }
@@ -1796,6 +1823,7 @@ async fn estimate_once(
     quiet: bool,
     verbose: bool,
     dry_run: bool,
+    show_events: bool,
 ) -> error::AppResult<EstimateRun> {
     let json_flag = format == "json";
     // Formats whose stdout is consumed by a script (`json`, `summary`) keep
@@ -1987,6 +2015,7 @@ async fn estimate_once(
             extra_headers,
             quiet,
             verbose,
+            show_events,
         })
         .await?;
 
@@ -2267,6 +2296,7 @@ fn watch_build_header(
 /// # Network calls
 /// One full estimation (see [`estimate_once`]).
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::fn_params_excessive_bools)]
 async fn emit_watch_estimate(
     state: &mut EstimateWatchState,
     wasm_path: &str,
@@ -2286,6 +2316,7 @@ async fn emit_watch_estimate(
     human: bool,
     quiet: bool,
     verbose: bool,
+    show_events: bool,
 ) {
     match estimate_once(
         wasm_path,
@@ -2323,6 +2354,7 @@ async fn emit_watch_estimate(
         verbose,
         // `--watch` wins over `--dry-run`: watching exists to re-simulate.
         false,
+        show_events,
     )
     .await
     {
@@ -2366,6 +2398,7 @@ async fn emit_watch_estimate(
 /// None when nothing changed; otherwise one full estimation (see
 /// [`emit_watch_estimate`]).
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::fn_params_excessive_bools)]
 async fn estimate_watch_poll_once(
     state: &mut EstimateWatchState,
     wasm_path: &str,
@@ -2385,6 +2418,7 @@ async fn estimate_watch_poll_once(
     human: bool,
     quiet: bool,
     verbose: bool,
+    show_events: bool,
 ) -> error::AppResult<()> {
     let path = std::path::Path::new(wasm_path);
     let hash = match wasm_content_hash(path) {
@@ -2429,6 +2463,7 @@ async fn estimate_watch_poll_once(
         human,
         quiet,
         verbose,
+        show_events,
     )
     .await;
     Ok(())
@@ -2466,6 +2501,7 @@ async fn cmd_estimate_watch(
     extra_headers: &[String],
     quiet: bool,
     verbose: bool,
+    show_events: bool,
 ) -> error::AppResult<()> {
     use tracing::info;
 
@@ -2510,6 +2546,7 @@ async fn cmd_estimate_watch(
                 human,
                 quiet,
                 verbose,
+                show_events,
             )
             .await;
         }
@@ -2554,6 +2591,7 @@ async fn cmd_estimate_watch(
                     human,
                     quiet,
                     verbose,
+                    show_events,
                 ).await;
                 tokio::time::sleep(WATCH_POLL_DURATION).await;
             } => {}
@@ -2763,6 +2801,7 @@ pub fn format_estimate_all_markdown(results: &[EstimateAllResult]) -> String {
 /// ("new") build; everything else (`--fn`, `--arg`, `--id`, `--network`) is
 /// applied identically to both simulations so the numbers are comparable.
 /// The cache is neither read nor written in diff mode.
+#[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 async fn cmd_estimate_diff(
     old_path: &str,
@@ -2782,6 +2821,7 @@ async fn cmd_estimate_diff(
     extra_headers: &[String],
     quiet: bool,
     verbose: bool,
+    show_events: bool,
 ) -> error::AppResult<()> {
     use sha2::Digest;
 
@@ -2837,6 +2877,7 @@ async fn cmd_estimate_diff(
         extra_headers,
         quiet,
         verbose,
+        show_events,
     })
     .await?;
 
@@ -2861,6 +2902,7 @@ async fn cmd_estimate_diff(
         extra_headers,
         quiet,
         verbose,
+        show_events,
     })
     .await?;
 
@@ -3610,6 +3652,7 @@ fn wasm_info_json(
                 }).collect::<Vec<_>>(),
             })
         }).collect::<Vec<_>>(),
+        "function_signatures": wasm::parser::function_signatures_json(wasm_info),
         "spec_entries": wasm_info.spec_entries.iter()
             .map(wasm::parser::spec_entry_json)
             .collect::<Vec<_>>(),
@@ -4347,6 +4390,20 @@ fn upgrade_detected(diff: &config_snapshot::diff::ConfigDiff) -> bool {
     diff.has_pricing_changes
 }
 
+/// Returns whether a diff contains a change that should be reported for the
+/// requested pricing threshold. Non-pricing changes are always reportable.
+fn has_reportable_config_changes(
+    diff: &config_snapshot::diff::ConfigDiff,
+    threshold_percent: Option<f64>,
+) -> bool {
+    let has_non_pricing_changes = diff.changes.iter().any(|change| !change.is_pricing_change);
+    let has_pricing_changes = match threshold_percent {
+        Some(threshold) => diff.has_significant_pricing_changes(threshold),
+        None => diff.has_pricing_changes(),
+    };
+    has_non_pricing_changes || has_pricing_changes
+}
+
 /// Cached estimates recorded before `ledger`, shaped for the
 /// `config diff --json` payload.
 ///
@@ -4450,11 +4507,15 @@ async fn cmd_config_diff(
         debug!(
             change_count = diff.changes.len(),
             has_pricing = diff.has_pricing_changes,
+            significant_pricing = ?threshold_percent
+                .map(|threshold| diff.has_significant_pricing_changes(threshold)),
             "diff computed"
         );
         if json_flag {
             let json_output = serde_json::json!({
                 "diff": diff,
+                "significant_pricing_changes": threshold_percent
+                    .map(|threshold| diff.has_significant_pricing_changes(threshold)),
                 "stale_estimates": stale_estimates_for(network, new_snapshot.ledger),
             });
             println!("{}", serde_json::to_string_pretty(&json_output)?);
@@ -4552,12 +4613,16 @@ fn cmd_config_diff_against_previous(
     debug!(
         change_count = diff.changes.len(),
         has_pricing = diff.has_pricing_changes,
+        significant_pricing = ?threshold_percent
+            .map(|threshold| diff.has_significant_pricing_changes(threshold)),
         "diff computed"
     );
 
     if json_flag {
         let json_output = serde_json::json!({
             "diff": diff,
+            "significant_pricing_changes": threshold_percent
+                .map(|threshold| diff.has_significant_pricing_changes(threshold)),
             "stale_estimates": stale_estimates_for(network, new_ledger),
         });
         println!("{}", serde_json::to_string_pretty(&json_output)?);
@@ -4920,7 +4985,9 @@ async fn watch_poll_once(
             if !*first {
                 if let Ok(old_snapshot) = config_snapshot::store::load_latest_snapshot(network) {
                     let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &snapshot);
-                    if !diff.changes.is_empty() {
+                    let reportable_changes =
+                        has_reportable_config_changes(&diff, threshold_percent);
+                    if reportable_changes {
                         debug!(change_count = diff.changes.len(), "config changes detected");
                         if !quiet {
                             println!(
@@ -4933,9 +5000,9 @@ async fn watch_poll_once(
                                 )
                             );
                         }
-                    }
 
-                    print_stale_estimates(network, snapshot.ledger, quiet);
+                        print_stale_estimates(network, snapshot.ledger, quiet);
+                    }
                 }
             }
 
@@ -6613,6 +6680,76 @@ mod tests {
         assert_eq!(parse_interval_secs("007"), 7);
     }
 
+    /// Issue #359: every duration suffix at every useful multiple, plus the
+    /// bare-number form (seconds).
+    #[test]
+    fn test_parse_interval_secs_suffix_matrix() {
+        for (input, expected) in [
+            ("10s", 10),
+            ("5m", 300),
+            ("2h", 7_200),
+            ("1d", 86_400),
+            ("60", 60),      // raw numbers are seconds
+            ("1s", 1),       // the smallest representable interval
+            ("60s", 60),     // a suffix that adds nothing
+            ("60m", 3_600),  // a minute count equal to one hour
+            ("24h", 86_400), // an hour count equal to one day
+            ("7d", 604_800), // a week
+            ("90m", 5_400),  // unit conversion really multiplies
+            ("+15s", 15),    // `u64::from_str` accepts an explicit plus
+        ] {
+            assert_eq!(
+                parse_interval_secs(input),
+                expected,
+                "input {input:?} should parse to {expected}s"
+            );
+        }
+    }
+
+    /// Zero is a valid interval: the parser has no error channel and reports
+    /// it faithfully, leaving any "must be positive" policy to the command
+    /// that consumes the value.
+    #[test]
+    fn test_parse_interval_secs_accepts_zero() {
+        for input in ["0", "0s", "0m", "0h", "0d", "00s"] {
+            assert_eq!(parse_interval_secs(input), 0, "input {input:?}");
+        }
+    }
+
+    /// Malformed intervals — including the issue's error cases — cannot be
+    /// reported as errors, because the function returns a bare `u64` with no
+    /// error channel. They fall back to the documented one-hour default,
+    /// *before* the unit multiplier is applied, so a bad value with a suffix
+    /// becomes 3600 × that unit.
+    #[test]
+    fn test_parse_interval_secs_malformed_input_falls_back_to_default() {
+        for (input, expected) in [
+            ("", 3_600),  // empty
+            (" ", 3_600), // blank            // A suffix with no number still selects the unit, so the
+            // fallback is scaled by it rather than returned as one hour.
+            ("s", 3_600),
+            ("m", 216_000),
+            ("h", 12_960_000),
+            ("d", 311_040_000),
+            ("5x", 3_600),     // unknown suffix, and no valid number
+            ("-10s", 3_600),   // negative intervals are not supported
+            ("-10m", 216_000), // ... the default still picks up the unit
+            ("-1d", 311_040_000),
+            ("abc", 3_600),
+            ("10 s", 3_600),                  // space before the suffix
+            ("1.5s", 3_600),                  // fractional numbers are not u64
+            ("10ss", 3_600),                  // two suffixes
+            ("1e2s", 3_600),                  // exponent notation
+            ("99999999999999999999s", 3_600), // does not fit u64
+        ] {
+            assert_eq!(
+                parse_interval_secs(input),
+                expected,
+                "malformed input {input:?} should fall back to {expected}s"
+            );
+        }
+    }
+
     #[test]
     fn test_upgrade_detected_on_pricing_change() {
         let old = snapshot_with_compute_fee(100);
@@ -7015,6 +7152,7 @@ mod tests {
             history: None,
             projections: None,
             contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
+            diagnostics: None,
         }
     }
 
