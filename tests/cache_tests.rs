@@ -2847,6 +2847,7 @@ fn test_legacy_database_without_io_column_still_loads() {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn test_schema_migrations_across_all_supported_versions_preserve_estimates_and_indexes() {
     with_temp_home(|home| {
         let dir = home.join(".soroban-cost-estimator");
