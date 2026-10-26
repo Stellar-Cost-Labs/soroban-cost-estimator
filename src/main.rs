@@ -3931,7 +3931,9 @@ fn print_saved_snapshot(
             );
             Ok(true)
         }
-        cli::OutputFormat::Table => {
+        // `summary` describes one `CostReport`, so it has no snapshot form;
+        // like the aggregate commands it falls back to the table rendering.
+        cli::OutputFormat::Table | cli::OutputFormat::Summary => {
             if !quiet {
                 println!("Config snapshot saved to: {}", path.display());
                 println!("Network: {}", snapshot.network);
@@ -3989,7 +3991,9 @@ fn print_unchanged_snapshot(
             );
             Ok(true)
         }
-        cli::OutputFormat::Table => {
+        // See `print_saved_snapshot`: `summary` has no snapshot form and
+        // falls back to the table rendering.
+        cli::OutputFormat::Table | cli::OutputFormat::Summary => {
             if !quiet {
                 println!("Configuration unchanged; no new snapshot written.");
                 println!("Latest:  {}", latest.display());
