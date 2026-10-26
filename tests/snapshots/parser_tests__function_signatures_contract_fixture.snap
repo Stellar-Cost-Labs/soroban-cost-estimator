@@ -1,0 +1,36 @@
+---
+source: tests/parser_tests.rs
+expression: "serde_json::to_string_pretty(&json).expect(\"serialize signatures\")"
+---
+{
+  "functions": [
+    {
+      "name": "increment",
+      "params": [
+        {
+          "index": 0,
+          "name": "step",
+          "type": "i64",
+          "type_def": {
+            "type": "i64"
+          }
+        }
+      ],
+      "returns": [
+        {
+          "index": 0,
+          "type": "i64",
+          "type_def": {
+            "type": "i64"
+          }
+        }
+      ],
+      "spec_present": true,
+      "wasm": {
+        "param_count": 1,
+        "result_count": 1
+      }
+    }
+  ],
+  "schema_version": 1
+}
