@@ -37,9 +37,11 @@ management**.
 > or `estimate-all` evaluates every resolved contract in one run and prints an
 > aggregated multi-contract summary (function count, upload cost, and min/max
 > invocation fees per contract) instead of per-invocation output. `--json`
-> emits a structured batch report, and a contract that fails is reported in the
-> summary without aborting the rest of the run. In batch mode the `\*` above
-> marks the two WASM sources: supply at least one.
+> emits a structured batch report, while `--format ndjson` emits one JSON
+> object per contract (`estimate`) or function (`estimate-all`). Failed
+> contracts/functions are included as records and processing continues; progress
+> and diagnostics are written to stderr. In batch mode the `\*` above marks the
+> two WASM sources: supply at least one.
 
 ### `estimate`
 

@@ -273,11 +273,16 @@ async fn run_cli() -> i32 {
     } else {
         "info"
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level)),
-        )
-        .init();
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
+    if args.format == Some(cli::OutputFormat::Ndjson) {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    }
 
     if !args.quiet {
         info!(command = ?args.command, verbose = args.verbose, quiet = args.quiet, "starting soroban-cost-estimator");
@@ -398,6 +403,11 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
                 )
                 .await
             } else {
+                if format == cli::OutputFormat::Ndjson {
+                    return Err(error::AppError::General(
+                        "--format ndjson requires multiple WASM inputs for estimate".to_string(),
+                    ));
+                }
                 let single = paths
                     .first()
                     .ok_or_else(|| error::AppError::General("no WASM path".to_string()))?
@@ -3080,7 +3090,7 @@ async fn cmd_estimate_all(
     let span = info_span!("cmd_estimate_all", wasm_path, network);
     async {
         let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
-        let json_flag = format == "json";
+        let json_flag = format == "json" || format == "ndjson";
         emit_wasm_structure(&wasm_info, verbose, wasm_info_flag, json_flag);
 
         // Confirm the exact file being estimated up front â€” printed before any
@@ -3119,7 +3129,7 @@ async fn cmd_estimate_all(
                 .collect()
         };
 
-        let json_flag = format == "json";
+        let json_flag = format == "json" || format == "ndjson";
         let text_mode = format == "table" || format == "markdown";
         if text_mode && !quiet {
             println!("WASM SHA-256: {wasm_hash}");
@@ -3241,6 +3251,8 @@ async fn cmd_estimate_all(
                     }
                 }
                 println!();
+            } else if format == "ndjson" {
+                write_ndjson_line(&result)?;
             } else {
                 json_results.push(result);
             }
@@ -3278,7 +3290,7 @@ async fn cmd_estimate_all(
             .filter_map(|r| r.cpu_instructions)
             .collect();
         let fee_distribution = report::cost_report::FeeDistribution::from_samples(&fees, &cpu);
-        emit_fee_distribution_summary(&fee_distribution, format == "json", precision);
+        emit_fee_distribution_summary(&fee_distribution, json_flag, precision);
 
         if format == "json" {
             let report = EstimateAllJsonReport {
@@ -3286,6 +3298,8 @@ async fn cmd_estimate_all(
                 fee_distribution,
             };
             println!("{}", serde_json::to_string_pretty(&report)?);
+        } else if format == "ndjson" {
+            // Each completed function was written as an independent JSON record.
         } else if format == "csv" {
             println!("function,network,ledger,wasm_hash,cpu_instructions,memory_bytes,read_entries,write_entries,read_bytes,write_bytes,tx_size,non_refundable_stroops,refundable_stroops,total_stroops,total_xlm");
             for row in &csv_rows {
@@ -6244,8 +6258,8 @@ async fn cmd_batch(
 
         let text_mode = format == "table" || format == "markdown";
 
-        let mut contracts: Vec<report::cost_report::ContractCostSummary> =
-            Vec::with_capacity(total);
+        let mut contracts: Vec<report::cost_report::ContractCostSummary> = Vec::new();
+        let mut failed = 0usize;
         for (i, path) in wasm_paths.iter().enumerate() {
             if text_mode {
                 println!("[{}/{}] {}", i + 1, total, path.display());
@@ -6272,24 +6286,33 @@ async fn cmd_batch(
                     ),
                 }
             }
-            contracts.push(summary);
+            if !summary.is_ok() {
+                failed += 1;
+            }
+            if format == "ndjson" {
+                write_ndjson_line(&summary)?;
+            } else {
+                contracts.push(summary);
+            }
         }
 
-        let batch = report::cost_report::BatchCostReport::new(network.to_string(), contracts);
-
-        match format {
-            "json" => println!("{}", report::cost_report::format_batch_report_json(&batch)),
-            "csv" => print!("{}", report::cost_report::format_batch_report_csv(&batch)),
-            "markdown" => println!(
-                "{}",
-                report::cost_report::format_batch_report_markdown(&batch)
-            ),
-            _ => println!("{}", report::cost_report::format_batch_report_table(&batch)),
+        if format != "ndjson" {
+            let batch = report::cost_report::BatchCostReport::new(network.to_string(), contracts);
+            match format {
+                "json" => println!("{}", report::cost_report::format_batch_report_json(&batch)),
+                "csv" => print!("{}", report::cost_report::format_batch_report_csv(&batch)),
+                "markdown" => println!(
+                    "{}",
+                    report::cost_report::format_batch_report_markdown(&batch)
+                ),
+                _ => println!("{}", report::cost_report::format_batch_report_table(&batch)),
+            }
+            failed = batch.failed;
         }
 
         // Surface partial failures to scripts; the summary above is already
-        // printed, so callers still get the full report.
-        if batch.failed > 0 {
+        // emitted, so callers still get every completed record.
+        if failed > 0 {
             std::process::exit(1);
         }
 
@@ -6297,6 +6320,16 @@ async fn cmd_batch(
     }
     .instrument(span)
     .await
+}
+
+fn write_ndjson_line<T: serde::Serialize>(record: &T) -> error::AppResult<()> {
+    use std::io::Write;
+
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, record)?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
+    Ok(())
 }
 
 #[cfg(test)]

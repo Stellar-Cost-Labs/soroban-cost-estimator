@@ -3272,6 +3272,96 @@ fn start_mock_rpc_server_delayed(
 const LIVE_INCREMENT_TX_DATA: &str = "AAAAAAAAAAEAAAAH6hS8qZjpjw3bM46OXO9uGfBzeKO3HotPiGjO3IV+Ts0AAAABAAAABgAAAAEmU1Fc+h02S4iEBnpjdCESXpKHG/bOUxC3DeRWUy9+mQAAABQAAAABAAggFgAAAAAAAACIAAAAAAAAPEM=";
 
 #[test]
+fn test_estimate_batch_ndjson_emits_one_json_record_per_contract_and_keeps_going() {
+    let (rpc_url, _stop) = start_mock_rpc_server("", "1000", 100);
+    let home = temp_home("estimate-batch-ndjson");
+    let invalid_wasm = home.join("invalid.wasm");
+    std::fs::write(&invalid_wasm, b"not a wasm module").expect("write invalid wasm fixture");
+
+    let (stdout, _stderr, code) = run_cli_in_home(
+        &[
+            "estimate",
+            "--wasm",
+            invalid_wasm.to_str().expect("valid temp path"),
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--rpc-url",
+            &rpc_url,
+            "--format",
+            "ndjson",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 1, "a failed contract should make the batch fail");
+    let records = stdout
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|error| panic!("each output line must be valid JSON: {error}; {stdout}"));
+    assert_eq!(records.len(), 2, "one line should be emitted per contract");
+    assert_eq!(records[0]["path"], invalid_wasm.to_string_lossy().as_ref());
+    assert!(
+        records[0]["error"].is_string(),
+        "failed contracts need an error record"
+    );
+    assert_eq!(
+        records[1]["path"], "tests/fixtures/contract.wasm",
+        "the batch should continue and emit the next contract"
+    );
+    assert!(
+        stdout
+            .lines()
+            .all(|line| line.starts_with('{') && line.ends_with('}')),
+        "NDJSON output should contain only independent JSON objects: {stdout}"
+    );
+}
+
+#[test]
+fn test_estimate_all_ndjson_emits_one_json_record_per_function() {
+    let (rpc_url, _stop) = start_mock_rpc_server("", "1000", 100);
+    let home = temp_home("estimate-all-ndjson");
+    let wasm_path = "tests/fixtures/contract.wasm";
+    let expected_count = soroban_cost_estimator::wasm::parser::load_wasm(Path::new(wasm_path))
+        .expect("load fixture")
+        .functions
+        .len();
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "estimate-all",
+            "--wasm",
+            wasm_path,
+            "--rpc-url",
+            &rpc_url,
+            "--format",
+            "ndjson",
+            "--no-cache",
+            "--quiet",
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 0, "estimate-all should finish; stderr: {stderr}");
+    let records = stdout
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|error| panic!("each output line must be valid JSON: {error}; {stdout}"));
+    assert_eq!(
+        records.len(),
+        expected_count,
+        "one line should be emitted per exported function"
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record["function"].is_string() && record["status"].is_string()),
+        "each record should describe a function result: {stdout}"
+    );
+}
+
+#[test]
 fn test_estimate_fn_contract_fixture_populates_footprint_json() {
     let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
     let home = temp_home("estimate-footprint-json");
