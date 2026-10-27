@@ -1,7 +1,6 @@
-use std::path::PathBuf;
-
 use clap::builder::{PossibleValue, TypedValueParser};
 use clap::{Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
 
 /// Value parser for `--network` that advertises the supported network names to
 /// shell completion generators and `--help` output while still accepting any
@@ -97,6 +96,19 @@ impl ConfigAction {
     }
 }
 
+fn parse_threshold_percent(value: &str) -> Result<f64, String> {
+    let threshold = value
+        .parse::<f64>()
+        .map_err(|_| format!("invalid threshold percentage: {value}"))?;
+    if threshold.is_finite() && threshold >= 0.0 {
+        Ok(threshold)
+    } else {
+        Err(format!(
+            "threshold percentage must be a finite, non-negative number: {value}"
+        ))
+    }
+}
+
 /// Build version string with metadata from build.rs
 fn build_version() -> &'static str {
     concat!(
@@ -141,10 +153,15 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "N")]
     pub rps: Option<u64>,
 
-    /// HTTP request timeout for RPC calls, in seconds (applies to every
-    /// network call).
+    /// Per-attempt HTTP request timeout for RPC calls, in seconds (applies to
+    /// each individual network attempt).
     #[arg(long, global = true, value_name = "SECS", default_value_t = 30)]
     pub timeout: u64,
+
+    /// Optional overall RPC operation deadline, in seconds, spanning all retry
+    /// attempts, backoff delays, and fallback endpoint calls. 0 disables it.
+    #[arg(long, global = true, value_name = "SECS")]
+    pub total_timeout: Option<u64>,
 
     /// TCP connection establishment timeout for RPC calls, in seconds. Bounds
     /// only the initial connect — a dead or unreachable host fails within
@@ -344,6 +361,15 @@ pub enum Command {
         /// fee/CPU consistency across runs.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=100))]
         repeat: u32,
+
+        /// Include per-entry summaries of the simulation's events and state
+        /// changes (issue #525). Without this flag the report still shows
+        /// their counts when present, but never any payload bytes; with it,
+        /// bounded hex previews (32 bytes, 4 topics, 10 entries) are added.
+        /// Raw XDR/JSON payloads are never printed in full and are not
+        /// cached.
+        #[arg(long)]
+        show_events: bool,
     },
 
     /// Enumerate all public contract functions and estimate each one.
@@ -431,7 +457,7 @@ pub enum Command {
         #[arg(long, default_value = "1h")]
         interval: String,
         /// Percentage threshold for flagging significant changes (e.g. 10 for 10%).
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", value_parser = parse_threshold_percent)]
         threshold_percent: Option<f64>,
     },
 
@@ -793,6 +819,12 @@ pub enum ConfigAction {
         /// older ones once the new snapshot is safely on disk.
         #[arg(long, value_name = "COUNT")]
         retain: Option<usize>,
+
+        /// Do not write a new snapshot when the fetched configuration matches
+        /// the latest snapshot for the network. The command exits 0 whether a
+        /// snapshot was written or skipped.
+        #[arg(long)]
+        skip_unchanged: bool,
     },
     /// List all saved config snapshots with their timestamp and ledger.
     List {
@@ -824,7 +856,7 @@ pub enum ConfigAction {
         pricing_only: bool,
 
         /// Percentage threshold for flagging significant changes (e.g. 10 for 10%).
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", value_parser = parse_threshold_percent)]
         threshold_percent: Option<f64>,
 
         /// Print a single-line summary (counts of pricing/non-pricing changes)
@@ -1025,5 +1057,14 @@ mod tests {
                 "completion script for {shell:?} should reference {bin_name}"
             );
         }
+    }
+
+    #[test]
+    fn threshold_percent_accepts_finite_non_negative_values() {
+        assert_eq!(parse_threshold_percent("10").unwrap(), 10.0);
+        assert_eq!(parse_threshold_percent("500.5").unwrap(), 500.5);
+        assert!(parse_threshold_percent("-1").is_err());
+        assert!(parse_threshold_percent("NaN").is_err());
+        assert!(parse_threshold_percent("inf").is_err());
     }
 }

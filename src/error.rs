@@ -45,6 +45,8 @@ pub enum AppError {
         status: i64,
         /// Human-readable error message returned by the RPC server.
         message: String,
+        /// Optional structured data returned by the RPC server.
+        data: Option<serde_json::Value>,
     },
 
     /// The endpoint answered with a transient gateway status (502/503/504),
@@ -99,6 +101,14 @@ pub enum AppError {
         /// The underlying reqwest error that triggered the timeout.
         #[source]
         source: reqwest::Error,
+    },
+
+    /// An RPC operation exceeded its overall deadline across retries, backoff,
+    /// and fallback endpoints.
+    #[error("RPC operation timed out: exceeded overall deadline of {timeout_ms} ms")]
+    TotalTimeout {
+        /// The overall deadline, in milliseconds, that was exceeded.
+        timeout_ms: u64,
     },
 
     // ── WebSocket ────────────────────────────────────────────────
@@ -161,6 +171,24 @@ pub enum AppError {
     /// A snapshot file exists but is not valid snapshot JSON.
     #[error("failed to parse snapshot: {0}")]
     SnapshotParse(String),
+
+    /// A snapshot file is written in a schema this build does not understand.
+    ///
+    /// Newer releases may add or reshape fields, so the file is rejected (and
+    /// left untouched) instead of being misread. The message names the file
+    /// and the version to make the upgrade path obvious.
+    #[error(
+        "failed to load snapshot: {file} declares schema version {version}, but this build \
+         supports up to {supported} (upgrade soroban-cost-estimator to read it)"
+    )]
+    SnapshotSchemaUnsupported {
+        /// Path of the offending snapshot file.
+        file: String,
+        /// Schema version the file declares.
+        version: u32,
+        /// Newest schema version this build can read.
+        supported: u32,
+    },
 
     /// No snapshots have been captured for the given network.
     #[error("failed to load snapshots: none available for network {0}")]
@@ -275,17 +303,19 @@ mod tests {
         );
     }
 
-    /// Every variant's rendered message must follow the house style. Keeping
-    /// this exhaustive is what makes the guideline enforceable.
-    #[test]
-    fn every_variant_message_follows_house_style() {
-        let cases: Vec<AppError> = vec![
+    /// One constructible sample of every variant, so a test can assert a
+    /// property across the whole enum rather than the handful of variants a
+    /// CLI command happens to trigger.
+    fn all_variant_samples() -> Vec<AppError> {
+        vec![
             AppError::Io(std::io::Error::other("boom")),
             AppError::FileNotFound("a.wasm".to_string()),
             AppError::Rpc {
                 status: -32000,
                 message: "boom".to_string(),
+                data: None,
             },
+            AppError::TotalTimeout { timeout_ms: 1500 },
             AppError::InvalidHeader("missing '=' separator".to_string()),
             AppError::InvalidRpcUrl("`ftp://host` uses unsupported scheme `ftp`".to_string()),
             AppError::WsConnect("wss://host/ws: refused".to_string()),
@@ -304,6 +334,11 @@ mod tests {
             AppError::TypeValidation("arg 'abc' cannot be used as 'i64'".to_string()),
             AppError::SnapshotNotFound("/tmp/s.json".to_string()),
             AppError::SnapshotParse("invalid bundle".to_string()),
+            AppError::SnapshotSchemaUnsupported {
+                file: "/tmp/snapshot.json".to_string(),
+                version: 9,
+                supported: 1,
+            },
             AppError::NoSnapshots("testnet".to_string()),
             AppError::SimulationFailed(Box::new(crate::rpc::simulate::SimulationError::new(
                 "no cost data",
@@ -315,10 +350,48 @@ mod tests {
             AppError::Json(serde_json::from_str::<u8>("nope").unwrap_err()),
             AppError::CacheCorrupt("cache.db: malformed disk image".to_string()),
             AppError::General("could not determine home directory".to_string()),
-        ];
+        ]
+    }
 
-        for case in cases {
+    /// Every variant's rendered message must follow the house style. Keeping
+    /// this exhaustive is what makes the guideline enforceable.
+    #[test]
+    fn every_variant_message_follows_house_style() {
+        for case in all_variant_samples() {
             assert_house_style(&case.to_string());
+        }
+    }
+
+    /// A failure is reported as one line of user-facing text. A panic message,
+    /// a stack trace, or an internal `Debug` dump would all add more than
+    /// that, so none of them may appear (issue #360).
+    #[test]
+    fn every_variant_message_is_one_line_and_leaks_no_internals() {
+        for case in all_variant_samples() {
+            let message = case.to_string();
+            assert_eq!(
+                message.lines().count(),
+                1,
+                "a failure must be a single line: {message:?}"
+            );
+            for marker in [
+                "panicked at",
+                "stack backtrace",
+                "AppError::",
+                "RUST_BACKTRACE",
+            ] {
+                assert!(
+                    !message.contains(marker),
+                    "{marker:?} must never reach the user: {message:?}"
+                );
+            }
+            // A variant that forgot its `#[error(...)]` template would render
+            // its `Debug` form instead.
+            assert_ne!(
+                message,
+                format!("{case:?}"),
+                "variant rendered its Debug form instead of a message"
+            );
         }
     }
 

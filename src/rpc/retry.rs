@@ -34,25 +34,83 @@ const TRANSIENT_STATUSES: [u16; 5] = [429, 500, 502, 503, 504];
 ///
 /// Retry attempts are logged to stderr when debug logging is enabled (i.e.
 /// when the CLI is run with `--verbose`).
-pub async fn with_retry<F, Fut, T>(max_retries: usize, mut operation: F) -> AppResult<T>
+pub async fn with_retry<F, Fut, T>(max_retries: usize, operation: F) -> AppResult<T>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = AppResult<T>>,
 {
-    // `attempts` counts retries already performed. The initial attempt runs
-    // before any check, so the operation executes once plus up to
-    // `max_retries` extra times.
+    with_retry_deadline(max_retries, None, None, operation, None).await
+}
+
+/// Executes an async operation with retries, bounded by an optional overall
+/// monotonic `deadline` (`tokio::time::Instant`).
+///
+/// When `deadline` is `Some(d)`, every attempt is wrapped in
+/// [`tokio::time::timeout_at`] and any backoff sleep is capped at `d`. Once
+/// `d` expires, in-flight and subsequent retry work stops immediately and
+/// [`AppError::TotalTimeout`] is returned.
+pub async fn with_retry_deadline<F, Fut, T>(
+    max_retries: usize,
+    deadline: Option<tokio::time::Instant>,
+    total_timeout: Option<Duration>,
+    mut operation: F,
+    attempt_counter: Option<&std::sync::atomic::AtomicU8>,
+) -> AppResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = AppResult<T>>,
+{
+    let timeout_ms = total_timeout
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
     let mut attempts = 0;
 
     loop {
-        match operation().await {
+        if let Some(d) = deadline
+            && tokio::time::Instant::now() >= d
+        {
+            return Err(AppError::TotalTimeout { timeout_ms });
+        }
+
+        let attempt_result = if let Some(d) = deadline {
+            match tokio::time::timeout_at(d, operation()).await {
+                Ok(res) => res,
+                Err(_) => return Err(AppError::TotalTimeout { timeout_ms }),
+            }
+        } else {
+            operation().await
+        };
+
+        if let Some(counter) = attempt_counter {
+            counter.store(
+                (attempts + 1).min(u8::MAX as usize) as u8,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+
+        match attempt_result {
             Ok(value) => return Ok(value),
             Err(error) => {
-                if attempts >= max_retries || !is_retryable(&error) {
+                if matches!(error, AppError::TotalTimeout { .. })
+                    || attempts >= max_retries
+                    || !is_retryable(&error)
+                {
                     return Err(error);
                 }
 
                 let delay = retry_delay(&error, attempts);
+                if let Some(d) = deadline {
+                    let now = tokio::time::Instant::now();
+                    let Some(remaining) = d.checked_duration_since(now) else {
+                        return Err(AppError::TotalTimeout { timeout_ms });
+                    };
+                    if delay >= remaining {
+                        log_retry(&error, attempts + 1, max_retries, remaining);
+                        tokio::time::sleep_until(d).await;
+                        return Err(AppError::TotalTimeout { timeout_ms });
+                    }
+                }
+
                 log_retry(&error, attempts + 1, max_retries, delay);
                 tokio::time::sleep(delay).await;
                 attempts += 1;
@@ -74,8 +132,26 @@ fn is_retryable(error: &AppError) -> bool {
         AppError::Http(e) => e.is_connect() || e.is_timeout() || e.is_request(),
         AppError::HttpStatus { status, .. } => TRANSIENT_STATUSES.contains(status),
         AppError::RpcUnavailable { .. } | AppError::ConnectTimeout { .. } => true,
+        AppError::Rpc { status, data, .. } => is_retryable_rpc_error(*status, data.as_ref()),
         _ => false,
     }
+}
+
+/// Returns whether a JSON-RPC error represents a transient server failure.
+///
+/// An explicit boolean `data.retryable` field is authoritative when supplied
+/// by the server. Without it, only the standard internal error and reserved
+/// server-error range are retryable; unknown codes fail immediately.
+fn is_retryable_rpc_error(code: i64, data: Option<&serde_json::Value>) -> bool {
+    if let Some(retryable) = data
+        .and_then(serde_json::Value::as_object)
+        .and_then(|fields| fields.get("retryable"))
+        .and_then(serde_json::Value::as_bool)
+    {
+        return retryable;
+    }
+
+    code == -32603 || (-32099..=-32000).contains(&code)
 }
 
 /// Computes the delay before the retry following `attempt` (0-based).
@@ -224,9 +300,47 @@ mod tests {
         for status in [502u16, 503, 504] {
             assert!(is_retryable(&AppError::RpcUnavailable { status }));
         }
+    }
+
+    #[test]
+    fn classifies_json_rpc_codes_without_using_messages() {
+        for status in [-32603, -32099, -32000] {
+            assert!(
+                is_retryable(&AppError::Rpc {
+                    status,
+                    message: "anything".to_string(),
+                    data: None,
+                }),
+                "{status} should be retryable"
+            );
+        }
+
+        for status in [-32600, -32601, -32602, -32100, -1] {
+            assert!(
+                !is_retryable(&AppError::Rpc {
+                    status,
+                    message: "temporary server failure".to_string(),
+                    data: None,
+                }),
+                "{status} should not be retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_retryable_field_overrides_code_classification() {
+        let retryable = Some(serde_json::json!({"retryable": true}));
+        let permanent = Some(serde_json::json!({"retryable": false}));
+
+        assert!(is_retryable(&AppError::Rpc {
+            status: -32602,
+            message: "invalid params".to_string(),
+            data: retryable,
+        }));
         assert!(!is_retryable(&AppError::Rpc {
-            status: -32000,
-            message: "permanent".to_string(),
+            status: -32603,
+            message: "internal error".to_string(),
+            data: permanent,
         }));
     }
 
@@ -239,8 +353,9 @@ mod tests {
             async move {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 Err(AppError::Rpc {
-                    status: -32000,
+                    status: -32602,
                     message: "permanent".to_string(),
+                    data: None,
                 })
             }
         })
@@ -279,6 +394,7 @@ mod tests {
         assert!(!is_retryable(&AppError::Rpc {
             status: -1,
             message: "nope".to_string(),
+            data: None,
         }));
         assert!(!is_retryable(&AppError::XdrDecode("bad".to_string())));
     }
