@@ -1307,13 +1307,13 @@ fn test_custom_sections_serialized_with_names_and_sizes() {
         "sections should be captured"
     );
 
-    // Each section must have a name and size
-    for section in &wasm_info.sections {
-        assert!(!section.name.is_empty(), "section name must not be empty");
-        assert!(section.size > 0, "section {} has no size", section.name);
+    // Each custom section must have a name and size
+    for section in wasm_info.custom_sections() {
+        assert!(!section.name.is_empty(), "custom section name must not be empty");
+        assert!(section.size > 0, "custom section {} has no size", section.name);
         assert!(
             section.end > section.offset,
-            "section {} end must be after offset",
+            "custom section {} end must be after offset",
             section.name
         );
     }
