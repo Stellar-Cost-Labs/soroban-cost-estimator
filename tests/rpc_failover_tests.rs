@@ -408,7 +408,7 @@ async fn fallback_success_records_provenance_and_scrubs_credentials_in_cost_repo
             total_xlm: "0.0016700".to_string(),
             fee_percentages: std::collections::BTreeMap::new(),
         },
-        ledger: 123456,
+        ledger: 123_456,
         network: "testnet".to_string(),
         simulation_duration_ms: 45,
         rpc_endpoint: sanitized_host.clone(),
@@ -418,6 +418,7 @@ async fn fallback_success_records_provenance_and_scrubs_credentials_in_cost_repo
         history: None,
         projections: None,
         contract_meta: ContractMeta::default(),
+        diagnostics: None,
     };
 
     assert_eq!(report.rpc_role, "fallback");
@@ -515,7 +516,7 @@ async fn circuit_opens_after_threshold_and_fast_fails() {
 /// responding correctly, so there is no transport problem to protect against.
 #[tokio::test]
 async fn application_level_failures_do_not_open_circuit() {
-    let (url, served) = spawn_rpc_stub();
+    let (_url, served) = spawn_rpc_stub();
     // Replace the healthy stub reply with a JSON-RPC error body by standing
     // up a stub that always returns a JSON-RPC error.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
@@ -578,7 +579,7 @@ async fn application_level_failures_do_not_open_circuit() {
 /// a probe through. A successful probe closes the circuit.
 #[tokio::test]
 async fn circuit_recovers_after_cooldown_with_successful_probe() {
-    let dead_url = refused_port_url();
+    let _dead_url = refused_port_url();
     let (healthy_url, served) = spawn_rpc_stub();
     let clock = Arc::new(FakeClock::new());
     let cb = CircuitBreaker::with_clock(
