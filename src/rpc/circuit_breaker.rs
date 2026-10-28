@@ -253,7 +253,7 @@ impl CircuitBreaker {
                 } else {
                     debug!(
                         label = self.label,
-                        remaining_ms = (self.config.cooldown - elapsed).as_millis(),
+                        remaining_ms = self.config.cooldown.saturating_sub(elapsed).as_millis(),
                         "circuit open — rejecting call fast"
                     );
                     true
@@ -445,6 +445,7 @@ mod tests {
         AppError::Rpc {
             status: -32000,
             message: "simulation failed".to_string(),
+            data: None,
         }
     }
 
@@ -507,7 +508,9 @@ mod tests {
         // Pile up application-level errors way beyond the threshold.
         for _ in 0..10 {
             cb.record_failure(&make_rpc_error());
-            cb.record_failure(&AppError::SimulationFailed("no data".to_string()));
+            cb.record_failure(&AppError::SimulationFailed(Box::new(
+                crate::rpc::simulate::SimulationError::new("no data"),
+            )));
             cb.record_failure(&AppError::XdrDecode("invalid".to_string()));
         }
 
@@ -701,7 +704,9 @@ mod tests {
     fn application_errors_are_not_transport_failures() {
         let cases = [
             make_rpc_error(),
-            AppError::SimulationFailed("no cost data".to_string()),
+            AppError::SimulationFailed(Box::new(crate::rpc::simulate::SimulationError::new(
+                "no cost data",
+            ))),
             AppError::XdrDecode("bad base64".to_string()),
             AppError::WasmParse("invalid magic".to_string()),
             AppError::General("generic".to_string()),
