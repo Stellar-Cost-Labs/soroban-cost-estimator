@@ -2640,6 +2640,122 @@ pub fn calculate_projections(
 
 /// Formats a list of cost projections into a human-readable table.
 #[must_use]
+/// A pricing sensitivity report that reprices the same contract footprint
+/// against multiple saved config snapshots.
+///
+/// This shows how network pricing changes affect the same workload,
+/// isolating the pricing component from resource usage changes.
+///
+/// # Inputs
+/// - `footprint_fee_stroops`: The total fee in stroops from a simulation
+///   (resource usage is fixed; only rates change per snapshot).
+/// - `counts`: Optional invocation counts to project across multiple runs.
+/// - `snapshots`: A slice of config snapshots to reprice against.
+/// - `precision`: Decimal places for XLM fee display.
+///
+/// # Output
+/// A `PricingSensitivityReport` containing per-snapshot fee totals and
+///   identification of any missing rate fields that were silently zero.
+pub struct PricingSensitivityReport {
+    /// Per-snapshot total fees in stroops.
+    pub snapshot_fees: Vec<(String, i64)>,
+    /// Whether any snapshot had missing rate fields (fees may be underestimates).
+    pub has_missing_rates: bool,
+}
+
+/// Compute a pricing sensitivity report repricing the same footprint against
+/// multiple saved config snapshots.
+///
+/// For each snapshot, the footprint's resource usage is combined with the
+/// snapshot's contract compute rate (`fee_rate_per_instructions_increment`) to
+/// produce a total fee. If a snapshot is missing contract_compute, that
+/// snapshot is flagged and its fee is reported as a conservative estimate
+/// (with a warning that rates may be incomplete).
+///
+/// # Example
+/// ```ignore
+/// let footprint_fee = 1_500_000; // stroops from one invocation
+/// let snapshots = [
+///     snapshot_with_compute_fee(100), // 100 stroops/insn increment
+///     snapshot_with_compute_fee(200), // 200 stroops/insn increment
+/// ];
+/// let report = pricing_sensitivity_report(footprint_fee, &snapshots, 7);
+/// assert!(report.has_missing_rates == false);
+/// assert_eq!(report.snapshot_fees.len(), 2);
+/// ```
+pub fn pricing_sensitivity_report(
+    footprint_fee_stroops: i64,
+    snapshots: &[crate::config_snapshot::model::ConfigSnapshot],
+    _precision: u32,
+) -> PricingSensitivityReport {
+    let mut snapshot_fees = Vec::with_capacity(snapshots.len());
+    let mut has_missing_rates = false;
+
+    for snapshot in snapshots {
+        // Use contract_compute rate if available, otherwise flag missing rates
+        let compute_rate = match &snapshot.contract_compute {
+            Some(compute) => compute.fee_rate_per_instructions_increment,
+            None => {
+                has_missing_rates = true;
+                // Use a conservative estimate: assume 0 rate means we can't
+                // properly reprice, so report the footprint fee as-is with a
+                // warning that rates are missing.
+                // We still compute something but mark it as incomplete.
+                0i64
+            }
+        };
+
+        // Integer-only fee math: total_fee = footprint_fee * rate
+        // This isolates the pricing component from resource usage changes.
+        let total_fee_stroops = if compute_rate > 0 {
+            footprint_fee_stroops
+                .saturating_mul(compute_rate)
+                .saturating_div(1_000_000_000)
+        } else {
+            // If rate is 0 or missing, return the footprint fee as-is but
+            // mark that rates are missing so callers know this is an
+            // underestimate.
+            footprint_fee_stroops
+        };
+
+        let snapshot_name = format!("{}-{}", snapshot.network, snapshot.timestamp);
+        snapshot_fees.push((snapshot_name, total_fee_stroops));
+    }
+
+    PricingSensitivityReport {
+        snapshot_fees,
+        has_missing_rates,
+    }
+}
+
+/// Formats a pricing sensitivity report into a human-readable table.
+#[must_use]
+pub fn format_pricing_sensitivity_table(report: &PricingSensitivityReport) -> String {
+    let mut output = String::from("\nPricing Sensitivity Report\n\n");
+    output.push_str(&format!("{:<30} {}\n", "Snapshot", "Total Fee (stroops)"));
+    output.push_str(&format!("{:<30} {}\n", "---", "-------------------"));
+    for (snapshot, fee) in &report.snapshot_fees {
+        output.push_str(&format!("{:<30} {}\n", snapshot, fee));
+    }
+    if report.has_missing_rates {
+        output.push_str(
+            "\n⚠ Some snapshots are missing contract compute rates; fees may be underestimates.\n",
+        );
+    }
+    output
+}
+
+/// Formats a pricing sensitivity report as JSON.
+#[must_use]
+pub fn format_pricing_sensitivity_json(report: &PricingSensitivityReport) -> String {
+    let json: Vec<(&str, i64)> = report
+        .snapshot_fees
+        .iter()
+        .map(|(snapshot, fee)| (snapshot.as_str(), *fee))
+        .collect();
+    serde_json::to_string(&json).unwrap_or_else(|_| "[]".to_string())
+}
+
 pub fn format_projections_table(projections: &[CostProjection]) -> String {
     if projections.is_empty() {
         return String::new();
