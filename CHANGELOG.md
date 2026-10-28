@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `config snapshot --skip-unchanged` — compare the fetched configuration with
+  the latest stored snapshot and skip the write when nothing changed.
+  Timestamps, ledgers and schema versions are ignored for the comparison, the
+  command exits `0` either way, and `--json` reports
+  `"status": "unchanged"` when it skipped (#509).
+- Config snapshots now carry an explicit `schema_version` (the initial schema
+  is version `1`). Unversioned files from older releases are read as that
+  version and are never rewritten by a read; files written by a newer release
+  are rejected with the file name and an upgrade hint (#508).
+- `wasm info --json` now includes a `function_signatures` block with each exported
+  function's spec presence, raw WASM param/result counts, and parameter and
+  return types; names and types are explicit `null`s when the contract spec is
+  absent (#495).
 - `estimate --history` — compare the current run against up to 5 previous
   cached runs of the same contract function, rendered as a trend table
   (regressions in red, improvements in green) with a `history` array in
@@ -68,27 +81,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timestamp embedded in the file name, so snapshots taken with different UTC
   offsets are ordered chronologically.
 
-### Fixed
-
-- The CLI no longer overflows the stack on Windows. `clap`'s derive macros
-  build the whole command tree on the stack, which needs close to a megabyte
-  in an unoptimized build, while the main thread of a Windows process is
-  capped at 1 MiB by the linker. Every invocation — even `--help` — aborted
-  with a stack overflow. The CLI now runs on a dedicated thread with an 8 MiB
-  stack; output and exit codes are unchanged.
-- `cache delete --all` can no longer be combined with a filter. `--all` means
-  "every cached estimate on every network", and a stray `--network` used to
-  silently narrow it; the combination is now rejected and nothing is deleted.
-- Snapshot retention never deletes the newest snapshot for a network, however
-  old it is or however small `--retain` is, so a `config diff` always has a
-  pair left to compare.
-- `webpki-roots`, `webpki-root-certs` and `rustls-webpki` bumped to their
-  patched releases, which drop the distrusted `emSign ECC Root CA - G3`
-  certificate (RUSTSEC-2026-0381/0382/0383) and clear the `cargo deny`
-  advisory check.
-
-### Added
-
 - `--timeout` global flag — configurable HTTP request timeout for RPC calls
   in seconds (default 30).
 - `--max-retries` global flag — configurable maximum number of retry attempts
@@ -118,15 +110,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `estimate-all --json` now emits an object (`{ "functions": [...],
   "fee_distribution": { ... } }`) instead of a bare array; the per-function
   records moved under the `functions` key.
-
-### Changed
-
 - Renamed the report field `rpc_latency_ms` to `simulation_duration_ms`
   (JSON key, CSV column, and Markdown/table labels) to match the simulation
   round-trip semantics it measures.
 
+### Deprecated
+
+- No public APIs were deprecated in this release cycle.
+
+### Removed
+
+- No public APIs were removed in this release cycle.
+
 ### Fixed
 
+- `config snapshot` no longer prints its four summary lines twice in table
+  mode, and `--quiet` is now honoured for them. CSV and Markdown output no
+  longer has the human-readable summary mixed into it, so each format stays
+  parseable.
+- The CLI no longer overflows the stack on Windows. `clap`'s derive macros
+  build the whole command tree on the stack, which needs close to a megabyte
+  in an unoptimized build, while the main thread of a Windows process is
+  capped at 1 MiB by the linker. Every invocation — even `--help` — aborted
+  with a stack overflow. The CLI now runs on a dedicated thread with an 8 MiB
+  stack; output and exit codes are unchanged.
+- `cache delete --all` can no longer be combined with a filter. `--all` means
+  "every cached estimate on every network", and a stray `--network` used to
+  silently narrow it; the combination is now rejected and nothing is deleted.
+- Snapshot retention never deletes the newest snapshot for a network, however
+  old it is or however small `--retain` is, so a `config diff` always has a
+  pair left to compare.
+- `webpki-roots`, `webpki-root-certs` and `rustls-webpki` bumped to their
+  patched releases, which drop the distrusted `emSign ECC Root CA - G3`
+  certificate (RUSTSEC-2026-0381/0382/0383) and clear the `cargo deny`
+  advisory check.
 - Restore the `cache stats` subcommand wiring that a CLI refactor merge
   dropped, leaving `cmd_cache_stats` unreachable dead code.
 - WASM function signatures are now resolved against the *defined* function
@@ -139,6 +156,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Restore the WebSocket RPC client (`rpc::ws`) after the merge of `main`
   dropped its `AppError` variants and `resolve_ws_endpoint`, which broke
   compilation and red-flagged every CI job.
+
+### Security
+
+- Sensitive RPC headers supplied with `--header` / `-H` (`Authorization`,
+  `X-API-Key`, `Cookie`, and similar names) are redacted from verbose logs and
+  tracing output, so bearer tokens never leak into terminal or CI logs.
 
 ## [0.1.0] - 2026-08-13
 
