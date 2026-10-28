@@ -262,6 +262,54 @@ pub enum AppError {
     General(String),
 }
 
+/// Exit code for successful command completion.
+pub const EXIT_SUCCESS: i32 = 0;
+/// Exit code for operational, runtime, simulation, or validation failures.
+pub const EXIT_FAILURE: i32 = 1;
+/// Exit code for command-line syntax and usage errors (standard clap exit code).
+pub const EXIT_USAGE: i32 = 2;
+
+impl AppError {
+    /// Exit code associated with this error (stable for automation).
+    #[must_use]
+    pub fn exit_code(&self) -> i32 {
+        EXIT_FAILURE
+    }
+
+    /// High-level error category for automation and structured logging.
+    #[must_use]
+    pub fn error_category(&self) -> &'static str {
+        match self {
+            Self::Io(_) => "io",
+            Self::FileNotFound(_) => "file_not_found",
+            Self::Rpc { .. }
+            | Self::RpcUnavailable { .. }
+            | Self::Http(_)
+            | Self::InvalidHeader(_)
+            | Self::HttpStatus { .. }
+            | Self::ConnectTimeout { .. }
+            | Self::TotalTimeout { .. }
+            | Self::InvalidRpcUrl(_)
+            | Self::UnknownNetwork(_) => "rpc",
+            Self::WsConnect(_) | Self::WsProtocol(_) | Self::WsClosed => "websocket",
+            Self::XdrDecode(_) | Self::XdrEncode(_) => "xdr",
+            Self::WasmParse(_) | Self::WasmValidation(_) | Self::WasmFileTooLarge { .. } => "wasm",
+            Self::TypeValidation(_) => "invalid_arguments",
+            Self::SnapshotNotFound(_)
+            | Self::SnapshotParse(_)
+            | Self::NoSnapshots(_)
+            | Self::NotEnoughSnapshots { .. } => "snapshot",
+            Self::SimulationFailed(_) => "simulation",
+            Self::TxConstruction(_) => "transaction",
+            Self::FeeCalc(_) => "fee_calc",
+            Self::Config(_) | Self::ConfigFetch(_) | Self::ConfigSettingNotFound(_) => "config",
+            Self::Json(_) => "serialization",
+            Self::Sqlite(_) | Self::CacheCorrupt(_) => "cache",
+            Self::General(_) => "general",
+        }
+    }
+}
+
 /// Convenience alias for `Result<T, AppError>`.
 pub type AppResult<T> = Result<T, AppError>;
 
@@ -412,5 +460,40 @@ mod tests {
                 "error message must separate cause with a colon: {rendered:?}"
             );
         }
+    }
+
+    #[test]
+    fn stable_exit_codes_and_categories() {
+        use super::{EXIT_FAILURE, EXIT_SUCCESS, EXIT_USAGE};
+
+        assert_eq!(EXIT_SUCCESS, 0);
+        assert_eq!(EXIT_FAILURE, 1);
+        assert_eq!(EXIT_USAGE, 2);
+
+        let rpc_err = AppError::UnknownNetwork("nope".to_string());
+        assert_eq!(rpc_err.exit_code(), EXIT_FAILURE);
+        assert_eq!(rpc_err.error_category(), "rpc");
+
+        let sim_err = AppError::SimulationFailed(Box::new(
+            crate::rpc::simulate::SimulationError::new("trap"),
+        ));
+        assert_eq!(sim_err.exit_code(), EXIT_FAILURE);
+        assert_eq!(sim_err.error_category(), "simulation");
+
+        let arg_err = AppError::TypeValidation("bad arg".to_string());
+        assert_eq!(arg_err.exit_code(), EXIT_FAILURE);
+        assert_eq!(arg_err.error_category(), "invalid_arguments");
+
+        let io_err = AppError::FileNotFound("missing.wasm".to_string());
+        assert_eq!(io_err.exit_code(), EXIT_FAILURE);
+        assert_eq!(io_err.error_category(), "file_not_found");
+
+        let wasm_err = AppError::WasmFileTooLarge {
+            path: "too_large.wasm".to_string(),
+            size: 20_000_000,
+            max_size: 16_777_216,
+        };
+        assert_eq!(wasm_err.exit_code(), EXIT_FAILURE);
+        assert_eq!(wasm_err.error_category(), "wasm");
     }
 }

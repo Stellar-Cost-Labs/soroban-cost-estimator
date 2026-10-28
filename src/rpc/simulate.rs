@@ -551,14 +551,26 @@ pub fn parse_transaction_data_resources(
 pub fn parse_resource_fee(min_resource_fee: &Option<String>) -> AppResult<Option<i64>> {
     match min_resource_fee {
         Some(fee_str) => {
+            let trimmed = fee_str.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+
             // Modern form: plain decimal stroops.
-            if let Ok(stroops) = fee_str.trim().parse::<i64>() {
+            if let Ok(stroops) = trimmed.parse::<i64>() {
                 return Ok(Some(stroops));
             }
 
             // Legacy form: base64-encoded XDR int64 (big-endian, 8 bytes).
-            let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, fee_str)
+            let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, trimmed)
                 .map_err(|e| AppError::General(format!("resource fee: invalid base64: {e}")))?;
+
+            if bytes.len() < 8 {
+                return Err(AppError::General(format!(
+                    "resource fee: invalid XDR length: {} bytes",
+                    bytes.len()
+                )));
+            }
 
             let fee_bytes: [u8; 8] = bytes[..8].try_into().map_err(|_| {
                 AppError::General(format!(
