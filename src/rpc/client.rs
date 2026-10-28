@@ -154,7 +154,7 @@ pub fn resolve_ws_endpoint(network: &str, custom_url: Option<&str>) -> AppResult
 fn sanitize_host(url: &str) -> String {
     let without_scheme = url.split("://").nth(1).unwrap_or(url);
     let host_part = without_scheme.split('/').next().unwrap_or(without_scheme);
-    let host = host_part.split('@').last().unwrap_or(host_part);
+    let host = host_part.split('@').next_back().unwrap_or(host_part);
     host.split('?').next().unwrap_or(host).to_string()
 }
 
@@ -928,6 +928,8 @@ impl RpcClient {
         }
     }
 
+    /// Returns whether the primary or fallback RPC endpoint served the last response.
+    #[must_use]
     pub fn served_role(&self) -> &'static str {
         if self.fallback_used.load(Ordering::Relaxed) {
             "fallback"
@@ -936,6 +938,8 @@ impl RpcClient {
         }
     }
 
+    /// Returns the sanitized host identifier of the RPC endpoint that served the last response.
+    #[must_use]
     pub fn sanitized_host(&self) -> String {
         sanitize_host(if self.fallback_used.load(Ordering::Relaxed) {
             self.fallback_url.as_deref().unwrap_or(&self.url)

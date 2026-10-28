@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use serde_json::Value;
 use soroban_cost_estimator::error::AppResult;
-use soroban_cost_estimator::report::cost_report::{CostReport, FeeBreakdown};
+use soroban_cost_estimator::report::cost_report::CostReport;
+use soroban_cost_estimator::report::fee_calc::FeeBreakdown;
 use soroban_cost_estimator::report::formatter::{JsonFormatter, ReportFormatter, TableFormatter};
 use soroban_cost_estimator::rpc::client::RpcClient;
 use soroban_cost_estimator::wasm::parser::ContractMeta;

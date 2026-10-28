@@ -2762,6 +2762,7 @@ pub fn format_pricing_sensitivity_json(report: &PricingSensitivityReport) -> Str
     serde_json::to_string(&json).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// Formats a list of cost projections into a human-readable table.
 pub fn format_projections_table(projections: &[CostProjection]) -> String {
     if projections.is_empty() {
         return String::new();
