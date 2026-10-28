@@ -1,3 +1,5 @@
+/// Circuit breaker for persistently unhealthy RPC endpoints (issue #505).
+pub mod circuit_breaker;
 /// Thin JSON-RPC client for Stellar Soroban RPC endpoints.
 pub mod client;
 /// Typed accessors for the network configuration (`getLedgerEntries`).
