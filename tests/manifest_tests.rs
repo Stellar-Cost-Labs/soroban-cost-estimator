@@ -22,15 +22,17 @@ async fn manifest_preflight_prevents_all_rpc_and_execution_uses_each_override() 
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let dir = std::env::temp_dir().join(format!("sce-manifest-rpc-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    // Serialize the path as a TOML string so Windows backslashes cannot be
+    // interpreted as escape sequences in the generated manifest.
+    let wasm_path = toml::Value::String(
+        root.join("tests/fixtures/zeroarg.wasm")
+            .display()
+            .to_string(),
+    )
+    .to_string();
     let fixture = std::fs::read_to_string(root.join("tests/fixtures/manifests/valid.toml"))
         .unwrap()
-        .replace(
-            "../zeroarg.wasm",
-            &root
-                .join("tests/fixtures/zeroarg.wasm")
-                .display()
-                .to_string(),
-        )
+        .replace("\"../zeroarg.wasm\"", &wasm_path)
         .replace(
             "network = \"testnet\"",
             &format!("network = \"testnet\"\nrpc_url = \"{}\"", first.uri()),
@@ -57,7 +59,11 @@ async fn manifest_preflight_prevents_all_rpc_and_execution_uses_each_override() 
     };
     let invalid = run(path.clone(), dir.clone()).await.unwrap();
     assert!(!invalid.status.success());
-    assert!(String::from_utf8_lossy(&invalid.stderr).contains("contracts[2]"));
+    assert!(
+        String::from_utf8_lossy(&invalid.stderr).contains("contracts[2]"),
+        "expected validation to reach contracts[2], got: {}",
+        String::from_utf8_lossy(&invalid.stderr)
+    );
     assert!(first.received_requests().await.unwrap().is_empty());
     assert!(second.received_requests().await.unwrap().is_empty());
 
