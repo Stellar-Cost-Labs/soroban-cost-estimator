@@ -1144,10 +1144,10 @@ pub struct CostReport {
     /// slow or overloaded RPC endpoints.
     pub simulation_duration_ms: u64,
     /// Sanitized host identifier of the RPC endpoint that served the estimate.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub rpc_endpoint: String,
     /// Whether the primary or fallback endpoint served the successful response.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub rpc_role: String,
     /// Fee rates used to compute the breakdown (carried so optimization
     /// suggestions can quantify per-resource savings). Excluded from

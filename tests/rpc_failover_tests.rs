@@ -330,6 +330,7 @@ async fn overall_deadline_spans_primary_and_fallback_attempts() {
 /// query tokens, and Authorization headers in the underlying URLs are
 /// properly sanitized and never rendered in human or structured reports (#501).
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn fallback_success_records_provenance_and_scrubs_credentials_in_cost_report() {
     let (fallback_url, served) = spawn_rpc_stub();
     // Embed sensitive userinfo and query string tokens in both endpoints,
