@@ -631,7 +631,7 @@ fn contract_meta_section(section_name: &str) -> Vec<u8> {
 
 /// Encodes a single `ScSpecFunctionV0` entry using stellar-xdr.
 fn xdr_spec_function(name: &str, inputs: &[(&str, &str)], outputs: &[&str]) -> Vec<u8> {
-    use stellar_xdr::{ScSpecEntry, ScSpecFunctionV0, ScSpecInput, ScSpecTypeDef, WriteXdr};
+    use stellar_xdr::{ScSpecEntry, ScSpecFunctionV0, ScSpecTypeDef, WriteXdr, ReadXdr};
 
     let mut spec_inputs = Vec::new();
     for (input_name, input_type) in inputs {
@@ -642,8 +642,8 @@ fn xdr_spec_function(name: &str, inputs: &[(&str, &str)], outputs: &[&str]) -> V
             "void" => ScSpecTypeDef::Void,
             _ => ScSpecTypeDef::Val,
         };
-        spec_inputs.push(ScSpecInput {
-            name: stellar_xdr::Scname(name.as_bytes().to_vec().try_into().unwrap()),
+        spec_inputs.push(stellar_xdr::ScSpecFunctionInputV0 {
+            name: stellar_xdr::ScSymbol::try_from(input_name.as_bytes().to_vec()).unwrap(),
             doc: stellar_xdr::StringM::default(),
             type_,
         });
@@ -661,7 +661,7 @@ fn xdr_spec_function(name: &str, inputs: &[(&str, &str)], outputs: &[&str]) -> V
         .collect();
 
     let function = ScSpecFunctionV0 {
-        name: stellar_xdr::Scname(name.as_bytes().to_vec().try_into().unwrap()),
+        name: stellar_xdr::ScSymbol::try_from(name.as_bytes().to_vec()).unwrap(),
         doc: stellar_xdr::StringM::default(),
         inputs: spec_inputs.try_into().unwrap(),
         outputs: spec_outputs.try_into().unwrap(),
@@ -669,7 +669,8 @@ fn xdr_spec_function(name: &str, inputs: &[(&str, &str)], outputs: &[&str]) -> V
 
     let entry = ScSpecEntry::FunctionV0(function);
     let mut out = Vec::new();
-    entry.write_xdr(&mut out).expect("write XDR");
+    let mut limited = stellar_xdr::Limited::new(&mut out, stellar_xdr::Limits::none());
+    entry.write_xdr(&mut limited).expect("write XDR");
     out
 }
 
