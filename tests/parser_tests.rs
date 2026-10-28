@@ -1334,12 +1334,13 @@ fn test_custom_sections_serialized_with_names_and_sizes() {
     // JSON serialization must include section names and sizes deterministically
     let breakdown = wasm_info.section_breakdown();
     let section_sizes_map = breakdown.size_map();
-    // size_map should have an entry for every section (repeated names are suffixed)
-    assert!(
-        section_sizes_map.len() == wasm_info.sections.len(),
-        "size_map entry count {} must match sections count {}",
+    // size_map should have an entry for every section in the breakdown (including module header)
+    assert_eq!(
         section_sizes_map.len(),
-        wasm_info.sections.len()
+        breakdown.sections.len(),
+        "size_map entry count {} must match breakdown sections count {}",
+        section_sizes_map.len(),
+        breakdown.sections.len()
     );
 
     // Human-readable output must retain current format
