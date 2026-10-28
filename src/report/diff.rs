@@ -553,6 +553,8 @@ mod tests {
             ledger: 100,
             network: "testnet".to_string(),
             simulation_duration_ms: 42,
+            rpc_endpoint: String::new(),
+            rpc_role: String::new(),
             rates: None,
             warnings: Vec::new(),
             history: None,
