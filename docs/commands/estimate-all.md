@@ -114,3 +114,11 @@ Skipped and successful functions are reported as JSON records under the
   }
 }
 ```
+
+## JSON output compatibility
+
+`functions` and `fee_distribution` are the two stable top-level keys of this
+document; entries keep a uniform shape across `ok`, `skipped`, and `error`
+statuses. See [`estimate` — JSON output compatibility](estimate.md#json-output-compatibility)
+for the full policy (additive keys are non-breaking; renames, removals, and
+type changes are breaking).

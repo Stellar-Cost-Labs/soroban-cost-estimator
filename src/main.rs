@@ -7282,4 +7282,334 @@ mod tests {
         assert!(header.contains("â”€â”€ Build #2 â€” 2026-09-24 14:05:00 UTC â”€â”€"));
         assert!(header.contains("+1427 stroops (+0.0001427 XLM)"));
     }
+
+    // -- JSON schema contracts (#531): estimate-all and wasm info --------
+    //
+    // The `estimate-all --json` document and the `wasm info --json`
+    // inspection document are produced by private items in this file, so
+    // their structural contracts are validated here. The lib-side report
+    // families live in `tests/json_schema_tests.rs`.
+
+    fn schema_fee(total: i64) -> soroban_cost_estimator::report::fee_calc::FeeBreakdown {
+        soroban_cost_estimator::report::fee_calc::FeeBreakdown {
+            non_refundable_stroops: 1,
+            refundable_stroops: total - 1,
+            cpu_fee_stroops: 1,
+            storage_fee_stroops: 0,
+            bandwidth_fee_stroops: 0,
+            base_fee_stroops: 0,
+            total_stroops: total,
+            total_xlm: "0.0000003".to_string(),
+            fee_percentages: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_estimate_all_json_document_full_schema() {
+        let ok = EstimateAllResult {
+            function: "inc".to_string(),
+            status: EstimateAllStatus::Ok,
+            reason: None,
+            error: None,
+            wasm_hash: Some("deadbeef".to_string()),
+            network: Some("testnet".to_string()),
+            ledger: Some(10),
+            cpu_instructions: Some(100),
+            memory_bytes: Some(0),
+            read_entries: Some(1),
+            write_entries: Some(1),
+            read_bytes: Some(0),
+            write_bytes: Some(10),
+            tx_size: Some(50),
+            fee: Some(schema_fee(3)),
+            warnings: Vec::new(),
+            contract_meta: ContractMeta::default(),
+        };
+        let report = EstimateAllJsonReport {
+            functions: vec![
+                ok,
+                EstimateAllResult::skipped("needs_args", "needs --fn/--arg (1 param(s))"),
+                EstimateAllResult::errored("bad", "boom"),
+            ],
+            fee_distribution:
+                soroban_cost_estimator::report::cost_report::FeeDistribution::from_samples(
+                    &[3],
+                    &[100],
+                ),
+        };
+        let value: serde_json::Value = serde_json::to_value(&report).unwrap();
+        let root = value.as_object().expect("document is an object");
+
+        // Both top-level aggregate keys are part of the contract.
+        for key in ["functions", "fee_distribution"] {
+            assert!(
+                root.contains_key(key),
+                "`estimate-all --json` must always emit `{key}`"
+            );
+        }
+
+        // `fee_distribution` carries the complete integer statistics set.
+        let dist = root["fee_distribution"]
+            .as_object()
+            .expect("fee_distribution is an object");
+        for key in [
+            "function_count",
+            "min_fee_stroops",
+            "max_fee_stroops",
+            "mean_fee_stroops",
+            "median_fee_stroops",
+            "std_dev_fee_stroops",
+            "min_cpu_instructions",
+            "max_cpu_instructions",
+            "mean_cpu_instructions",
+        ] {
+            let entry = dist
+                .get(key)
+                .unwrap_or_else(|| panic!("fee_distribution.{key} is a required key"));
+            assert!(
+                entry.is_u64() || entry.is_i64(),
+                "fee_distribution.{key} must be an integer (fee math is never floating point), got {entry}"
+            );
+        }
+
+        let functions = root["functions"].as_array().expect("functions is an array");
+        assert_eq!(functions.len(), 3, "one entry per function, in order");
+        let mut statuses: Vec<&str> = Vec::new();
+        for entry in functions {
+            let entry = entry
+                .as_object()
+                .expect("every function entry is an object");
+            // Uniform per-entry keys regardless of outcome.
+            assert!(
+                entry["function"].is_string(),
+                "`function` must always be present as a string"
+            );
+            assert!(
+                entry["status"].is_string(),
+                "`status` must always be present as a string"
+            );
+            assert!(
+                entry["warnings"].is_array(),
+                "`warnings` must always be present as an array"
+            );
+            statuses.push(entry["status"].as_str().expect("status"));
+        }
+        assert_eq!(statuses, vec!["ok", "skipped", "error"]);
+
+        let resources = [
+            "wasm_hash",
+            "network",
+            "ledger",
+            "cpu_instructions",
+            "memory_bytes",
+            "read_entries",
+            "write_entries",
+            "read_bytes",
+            "write_bytes",
+            "tx_size",
+            "fee",
+        ];
+
+        // `ok` entry: resources and fee present; failure-only fields absent.
+        let ok = functions[0].as_object().expect("ok entry");
+        for key in resources {
+            assert!(ok.contains_key(key), "ok entry must carry `{key}`");
+        }
+        assert!(ok.get("reason").is_none() && ok.get("error").is_none());
+        // An empty contract-meta block is omitted on batch entries, matching
+        // the documented per-entry skip predicate.
+        assert!(ok.get("contract_meta").is_none());
+        let fee = ok["fee"].as_object().expect("fee object");
+        for key in [
+            "non_refundable_stroops",
+            "refundable_stroops",
+            "cpu_fee_stroops",
+            "storage_fee_stroops",
+            "bandwidth_fee_stroops",
+            "base_fee_stroops",
+            "total_stroops",
+            "total_xlm",
+            "fee_percentages",
+        ] {
+            assert!(
+                fee.contains_key(key),
+                "fee object must carry the documented key `{key}`"
+            );
+        }
+
+        // `skipped` entry: only `reason` besides the uniform keys.
+        let skipped = functions[1].as_object().expect("skipped entry");
+        assert!(skipped["reason"].is_string());
+        assert!(skipped.get("error").is_none());
+        for key in resources {
+            assert!(
+                skipped.get(key).is_none(),
+                "skipped entry must omit `{key}`, got {:?}",
+                skipped.get(key)
+            );
+        }
+
+        // `error` entry: only `error` besides the uniform keys.
+        let errored = functions[2].as_object().expect("error entry");
+        assert!(errored["error"].is_string());
+        assert!(errored.get("reason").is_none());
+        for key in resources {
+            assert!(
+                errored.get(key).is_none(),
+                "error entry must omit `{key}`, got {:?}",
+                errored.get(key)
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_wasm_info_json_top_level_schema() {
+        // The real fixture is inspected so every derived block (sections,
+        // functions, spec entries) is exercised with live data.
+        let wasm_path = "tests/fixtures/contract.wasm";
+        let info = soroban_cost_estimator::wasm::parser::load_wasm_with_limit(
+            std::path::Path::new(wasm_path),
+            soroban_cost_estimator::wasm::parser::DEFAULT_MAX_WASM_FILE_SIZE_BYTES,
+        )
+        .expect("fixture loads");
+        let hash = info.wasm_hash.clone();
+        let value = wasm_info_json(wasm_path, &info, &hash);
+        let root = value
+            .as_object()
+            .expect("wasm info JSON is a top-level object");
+
+        let need = |key: &str| {
+            root.get(key)
+                .unwrap_or_else(|| panic!("`wasm info --json` must always emit `{key}`"))
+        };
+
+        assert!(need("path").is_string() && need("sha256").is_string());
+        assert!(need("size").is_u64() && need("debug_symbol_bytes").is_u64());
+        assert!(
+            need("has_spec").is_boolean() && need("has_debug_symbols").is_boolean(),
+            "spec and debug presence flags must be booleans"
+        );
+        assert!(need("estimated_size_reduction_percent").is_number());
+        // The top-level SDK shortcut mirrors the metadata block: a string
+        // when known, an explicit null when the binary carries no SDK tag.
+        assert!(
+            need("sdk_version").is_string() || need("sdk_version").is_null(),
+            "top-level sdk_version is a string or null"
+        );
+
+        let meta = need("contract_meta")
+            .as_object()
+            .expect("contract_meta object");
+        for key in ["name", "version", "description", "author", "sdk_version"] {
+            assert!(
+                meta.contains_key(key),
+                "contract_meta must always emit `{key}` (null when unset)"
+            );
+        }
+        assert!(meta["entries"].is_array());
+
+        let functions = need("functions").as_array().expect("functions array");
+        assert!(!functions.is_empty(), "fixture exports functions");
+        for entry in functions {
+            let entry = entry.as_object().expect("function entry object");
+            for key in ["name", "signature"] {
+                assert!(entry[key].is_string(), "function.{key} must be a string");
+            }
+            for key in ["param_count", "result_count"] {
+                assert!(entry[key].is_u64(), "function.{key} must be an integer");
+            }
+            for key in ["params", "returns"] {
+                assert!(entry[key].is_array(), "function.{key} must be an array");
+            }
+            for param in entry["params"].as_array().expect("params") {
+                let param = param.as_object().expect("param object");
+                assert!(param["name"].is_string() && param["type"].is_string());
+                assert!(param.contains_key("type_def"));
+            }
+            for ret in entry["returns"].as_array().expect("returns") {
+                let ret = ret.as_object().expect("return object");
+                assert!(ret["type"].is_string());
+                assert!(ret.contains_key("type_def"));
+            }
+        }
+
+        assert!(need("spec_entries").is_array());
+
+        let sizes = need("section_sizes")
+            .as_object()
+            .expect("section_sizes map");
+        for (name, size) in sizes {
+            assert!(
+                size.is_u64(),
+                "section_sizes.{name} must be an integer byte count"
+            );
+        }
+        let sections = need("sections").as_array().expect("sections array");
+        assert!(!sections.is_empty());
+        for entry in sections {
+            let entry = entry.as_object().expect("section entry");
+            for key in [
+                "name",
+                "id",
+                "offset",
+                "end",
+                "size",
+                "header_size",
+                "total_size",
+                "percent",
+                "custom",
+            ] {
+                assert!(
+                    entry.contains_key(key),
+                    "sections[] must always emit `{key}`"
+                );
+            }
+            assert!(entry["name"].is_string());
+            assert!(
+                entry["id"].is_null() || entry["id"].is_u64(),
+                "section id is a number or null"
+            );
+            assert!(
+                entry["offset"].is_null() || entry["offset"].is_u64(),
+                "section offset is a number or null"
+            );
+            assert!(entry["size"].is_u64());
+            assert!(entry["percent"].is_number());
+            assert!(entry["custom"].is_boolean());
+        }
+
+        for key in ["imports", "host_imports"] {
+            let imports = need(key).as_array().expect("imports array");
+            for entry in imports {
+                let entry = entry.as_object().expect("import entry");
+                assert!(entry["module"].is_string());
+                assert!(entry["name"].is_string());
+                assert!(entry["kind"].is_string());
+            }
+        }
+
+        let module = need("module").as_object().expect("module object");
+        assert!(
+            module.contains_key("start_function"),
+            "module.start_function must be present (a number or null)"
+        );
+        let memories = module["memories"].as_array().expect("memories array");
+        for memory in memories {
+            let memory = memory.as_object().expect("memory entry");
+            assert!(memory["initial_pages"].is_u64());
+            assert!(
+                memory["maximum_pages"].is_null() || memory["maximum_pages"].is_u64(),
+                "maximum_pages is a number or null"
+            );
+            assert!(memory["memory64"].is_boolean());
+        }
+        let exports = module["exports"].as_array().expect("exports array");
+        for export in exports {
+            let export = export.as_object().expect("export entry");
+            assert!(export["name"].is_string() && export["kind"].is_string());
+            assert!(export["index"].is_u64());
+        }
+    }
 }
