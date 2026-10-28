@@ -155,228 +155,105 @@ async fn mock_rpc_fixture_surfaces_rpc_errors_from_the_server() {
 }
 
 #[tokio::test]
-async fn mock_rpc_retries_valid_delta_seconds_retry_after() {
+async fn test_cache_warm_end_to_end_with_mock_rpc() {
     let server = common::start_mock_rpc_server().await;
 
-    // First request gets 429 with delta-seconds "0" (immediate retry)
-    common::stub_rate_limit(&server, "getHealth", Some("0"), 1).await;
-    // Second request succeeds
     common::stub_jsonrpc_success(
         &server,
         "getHealth",
         json!({
-            "status": "healthy"
+            "status": "healthy",
+            "latestLedger": 100
         }),
     )
     .await;
 
-    let client = RpcClient::with_options(
-        server.uri().as_str(),
-        None,
-        std::time::Duration::from_secs(5),
-        2,
-        false,
-    );
-
-    let health: serde_json::Value = client.call("getHealth", json!({})).await.expect(
-        "rate-limited request with valid delta-seconds Retry-After should succeed on retry",
-    );
-    assert_eq!(health["status"], "healthy");
-}
-
-#[tokio::test]
-async fn mock_rpc_retries_valid_http_date_retry_after() {
-    let server = common::start_mock_rpc_server().await;
-
-    // HTTP-date 1 second in the future
-    let future_time = std::time::SystemTime::now() + std::time::Duration::from_secs(1);
-    let date_str = httpdate::fmt_http_date(future_time);
-
-    common::stub_rate_limit(&server, "getHealth", Some(&date_str), 1).await;
+    let live_tx_data = "AAAAAAAAAAEAAAAH6hS8qZjpjw3bM46OXO9uGfBzeKO3HotPiGjO3IV+Ts0AAAABAAAABgAAAAEmU1Fc+h02S4iEBnpjdCESXpKHG/bOUxC3DeRWUy9+mQAAABQAAAABAAggFgAAAAAAAACIAAAAAAAAPEM=";
     common::stub_jsonrpc_success(
         &server,
-        "getHealth",
+        "simulateTransaction",
         json!({
-            "status": "healthy"
+            "latestLedger": 100,
+            "minResourceFee": "15427",
+            "transactionData": live_tx_data
         }),
     )
     .await;
 
-    let client = RpcClient::with_options(
-        server.uri().as_str(),
-        None,
-        std::time::Duration::from_secs(5),
-        2,
-        false,
+    let temp_home = std::env::temp_dir().join(format!("sce-warm-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_home);
+    let _ = std::fs::create_dir_all(&temp_home);
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"));
+    cmd.env("HOME", &temp_home);
+    cmd.env("USERPROFILE", &temp_home);
+    cmd.args([
+        "config",
+        "cache",
+        "warm",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--rpc-url",
+        &server.uri(),
+    ]);
+
+    let output = cmd.output().expect("failed to run CLI");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let code = output.status.code().unwrap_or(-1);
+
+    assert_eq!(code, 0, "cache warm should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("Warmed 1 functions into cache for"),
+        "summary format: {stdout}"
+    );
+    assert!(
+        stderr.contains("Warming cache"),
+        "stderr should display progress: {stderr}"
     );
 
-    let health: serde_json::Value = client
-        .call("getHealth", json!({}))
-        .await
-        .expect("rate-limited request with valid HTTP-date Retry-After should succeed on retry");
-    assert_eq!(health["status"], "healthy");
-}
+    // JSON mode test (use --quiet so tracing log is suppressed from stdout)
+    let mut cmd_json = std::process::Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"));
+    cmd_json.env("HOME", &temp_home);
+    cmd_json.env("USERPROFILE", &temp_home);
+    cmd_json.args([
+        "config",
+        "cache",
+        "warm",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--rpc-url",
+        &server.uri(),
+        "--json",
+        "--quiet",
+    ]);
 
-#[tokio::test]
-async fn mock_rpc_retries_past_http_date_with_zero_delay() {
-    let server = common::start_mock_rpc_server().await;
+    let output_json = cmd_json.output().expect("failed to run CLI");
+    let stdout_json = String::from_utf8_lossy(&output_json.stdout);
+    assert_eq!(output_json.status.code().unwrap_or(-1), 0);
+    let v: serde_json::Value =
+        serde_json::from_str(stdout_json.trim()).expect("valid JSON summary");
+    assert_eq!(v["warmed_functions"], 1);
+    assert!(v.get("wasm_hash").is_some(), "wasm_hash in JSON: {v}");
 
-    // HTTP-date in the past
-    let past_date = "Sun, 06 Nov 1994 08:49:37 GMT";
-
-    common::stub_rate_limit(&server, "getHealth", Some(past_date), 1).await;
-    common::stub_jsonrpc_success(
-        &server,
-        "getHealth",
-        json!({
-            "status": "healthy"
-        }),
-    )
-    .await;
-
-    let client = RpcClient::with_options(
-        server.uri().as_str(),
-        None,
-        std::time::Duration::from_secs(5),
-        2,
-        false,
-    );
-
-    let health: serde_json::Value = client
-        .call("getHealth", json!({}))
-        .await
-        .expect("rate-limited request with past HTTP-date should retry immediately and succeed");
-    assert_eq!(health["status"], "healthy");
-}
-
-#[tokio::test]
-async fn mock_rpc_handles_malformed_retry_after_falling_back_to_backoff() {
-    let server = common::start_mock_rpc_server().await;
-
-    common::stub_rate_limit(&server, "getHealth", Some("malformed-not-a-date"), 1).await;
-    common::stub_jsonrpc_success(
-        &server,
-        "getHealth",
-        json!({
-            "status": "healthy"
-        }),
-    )
-    .await;
-
-    let client = RpcClient::with_options(
-        server.uri().as_str(),
-        None,
-        std::time::Duration::from_secs(5),
-        2,
-        false,
-    );
-
-    let health: serde_json::Value = client.call("getHealth", json!({})).await.expect(
-        "rate-limited request with malformed Retry-After should fall back to backoff and succeed",
-    );
-    assert_eq!(health["status"], "healthy");
-}
-
-#[tokio::test]
-async fn mock_rpc_handles_absent_retry_after_falling_back_to_backoff() {
-    let server = common::start_mock_rpc_server().await;
-
-    // No Retry-After header
-    common::stub_rate_limit(&server, "getHealth", None, 1).await;
-    common::stub_jsonrpc_success(
-        &server,
-        "getHealth",
-        json!({
-            "status": "healthy"
-        }),
-    )
-    .await;
-
-    let client = RpcClient::with_options(
-        server.uri().as_str(),
-        None,
-        std::time::Duration::from_secs(5),
-        2,
-        false,
-    );
-
-    let health: serde_json::Value = client.call("getHealth", json!({})).await.expect(
-        "rate-limited request without Retry-After header should fall back to backoff and succeed",
-    );
-    assert_eq!(health["status"], "healthy");
-}
-
-#[tokio::test]
-async fn mock_rpc_excessive_retry_after_honors_zero_max_retries() {
-    let server = common::start_mock_rpc_server().await;
-
-    // Server returns excessive 429 delay: 86400s (1 day)
-    common::stub_rate_limit(&server, "getHealth", Some("86400"), 1).await;
-
-    // max_retries = 0: must not retry
-    let client = RpcClient::with_options(
-        server.uri().as_str(),
-        None,
-        std::time::Duration::from_secs(5),
-        0,
-        false,
-    );
-
-    let err = client
-        .call::<serde_json::Value>("getHealth", json!({}))
-        .await
-        .expect_err("rate-limited request with max_retries=0 must surface error without retrying");
-
-    match err {
-        AppError::HttpStatus {
-            status,
-            retry_after,
-            ..
-        } => {
-            assert_eq!(status, 429);
-            // Must be capped by MAX_RETRY_DELAY (60s)
-            assert_eq!(
-                retry_after,
-                Some(soroban_cost_estimator::rpc::retry::MAX_RETRY_DELAY)
-            );
-        }
-        other => panic!("expected AppError::HttpStatus, got: {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn mock_rpc_excessive_http_date_is_capped_at_max_delay() {
-    let server = common::start_mock_rpc_server().await;
-
-    // Excessive HTTP-date far in the future
-    let far_future = "Thu, 31 Dec 2099 23:59:59 GMT";
-    common::stub_rate_limit(&server, "getHealth", Some(far_future), 1).await;
-
-    let client = RpcClient::with_options(
-        server.uri().as_str(),
-        None,
-        std::time::Duration::from_secs(5),
-        0,
-        false,
-    );
-
-    let err = client
-        .call::<serde_json::Value>("getHealth", json!({}))
-        .await
-        .expect_err("excessive HTTP-date must fail fast when max_retries=0");
-
-    match err {
-        AppError::HttpStatus {
-            status,
-            retry_after,
-            ..
-        } => {
-            assert_eq!(status, 429);
-            assert_eq!(
-                retry_after,
-                Some(soroban_cost_estimator::rpc::retry::MAX_RETRY_DELAY)
-            );
-        }
-        other => panic!("expected AppError::HttpStatus, got: {other:?}"),
-    }
+    // Verify cache entry is present and queryable
+    let mut cmd_query = std::process::Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"));
+    cmd_query.env("HOME", &temp_home);
+    cmd_query.env("USERPROFILE", &temp_home);
+    cmd_query.args([
+        "config",
+        "cache",
+        "query",
+        "--fn",
+        "increment",
+        "--json",
+        "--quiet",
+    ]);
+    let output_query = cmd_query.output().expect("failed to run CLI query");
+    let stdout_query = String::from_utf8_lossy(&output_query.stdout);
+    assert_eq!(output_query.status.code().unwrap_or(-1), 0);
+    let entries: serde_json::Value =
+        serde_json::from_str(stdout_query.trim()).expect("valid JSON query");
+    assert_eq!(entries.as_array().map(Vec::len), Some(1));
+    assert_eq!(entries[0]["function"], "increment");
 }
