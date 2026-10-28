@@ -3,7 +3,6 @@ use std::path::Path;
 use clap::{CommandFactory, FromArgMatches};
 use comfy_table::Cell;
 use comfy_table::Table;
-use serde::Deserialize;
 use soroban_cost_estimator::cache;
 use soroban_cost_estimator::cli;
 use soroban_cost_estimator::config;
@@ -1144,6 +1143,8 @@ async fn simulate_report(
         ledger: latest_ledger,
         network: req.network.to_string(),
         simulation_duration_ms,
+        rpc_endpoint: client.sanitized_host(),
+        rpc_role: client.served_role().to_string(),
         rates: Some(fee_rates),
         warnings,
         history: None,
@@ -1726,6 +1727,8 @@ async fn cmd_estimate_repeat(
                     ledger: latest_ledger,
                     network: network.to_string(),
                     simulation_duration_ms,
+                    rpc_endpoint: client.sanitized_host(),
+                    rpc_role: client.served_role().to_string(),
                     rates: Some(fee_rates),
                     warnings: Vec::new(),
                     history: None,
@@ -7247,6 +7250,8 @@ mod tests {
             ledger: 3_894_195,
             network: "testnet".to_string(),
             simulation_duration_ms: 87,
+            rpc_endpoint: String::new(),
+            rpc_role: String::new(),
             rates: None,
             warnings: Vec::new(),
             history: None,

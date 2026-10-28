@@ -191,6 +191,12 @@ impl TableFormatter {
             "RPC round-trip: {} ms\n",
             report.simulation_duration_ms
         ));
+        if !report.rpc_endpoint.is_empty() {
+            output.push_str(&format!(
+                "RPC endpoint: {} ({})\n",
+                report.rpc_endpoint, report.rpc_role
+            ));
+        }
         output.push_str(&format!("WASM hash: {}\n", report.wasm_hash));
         output.push_str(&format!("WASM size: {} bytes\n", report.wasm_size));
         output.push('\n');
@@ -447,6 +453,12 @@ impl ReportFormatter for MarkdownFormatter {
             "- **Simulation latency:** {} ms\n\n",
             report.simulation_duration_ms
         ));
+        if !report.rpc_endpoint.is_empty() {
+            output.push_str(&format!(
+                "- **RPC endpoint:** `{}` ({})\n\n",
+                report.rpc_endpoint, report.rpc_role
+            ));
+        }
 
         // Resource table
         output.push_str("### Resources\n\n");
@@ -768,6 +780,8 @@ mod tests {
             ledger: 3_894_195,
             network: "testnet".to_string(),
             simulation_duration_ms: 87,
+            rpc_endpoint: String::new(),
+            rpc_role: String::new(),
             rates: None,
             warnings: Vec::new(),
             history: None,
@@ -804,6 +818,8 @@ mod tests {
             ledger: 0,
             network: "mainnet".to_string(),
             simulation_duration_ms: 0,
+            rpc_endpoint: String::new(),
+            rpc_role: String::new(),
             rates: None,
             warnings: Vec::new(),
             history: None,
