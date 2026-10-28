@@ -157,6 +157,11 @@ pub struct ConfigSnapshot {
     /// `ConfigSettingStateArchival`: entry TTLs, rent rates, and eviction scan
     /// settings.
     pub state_archival: Option<StateArchivalV0>,
+    /// Annotations recorded when the snapshot was captured automatically —
+    /// e.g. `protocol_upgrade_v22` on a snapshot marking a protocol
+    /// transition.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 impl ConfigSnapshot {

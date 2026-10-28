@@ -931,8 +931,8 @@ fn test_estimate_nonexistent_wasm_file() {
         "a missing WASM file should exit 1; stderr: {stderr}"
     );
     assert!(
-        stderr.starts_with("Error:"),
-        "runtime failures are reported on stderr as `Error: …`; got: {stderr}"
+        stderr.contains("Error: file not found"),
+        "runtime failures are reported on stderr as `Error: …` (after any tracing logs, which also go to stderr); got: {stderr}"
     );
     assert!(
         stderr.contains("file not found"),

@@ -1060,6 +1060,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)] // exact equality is the point: the parser must not round.
     fn threshold_percent_accepts_finite_non_negative_values() {
         assert_eq!(parse_threshold_percent("10").unwrap(), 10.0);
         assert_eq!(parse_threshold_percent("500.5").unwrap(), 500.5);

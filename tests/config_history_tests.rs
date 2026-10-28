@@ -31,6 +31,7 @@ fn make_snapshot(
             fee_tx_size1_kb: bandwidth_fee,
         }),
         state_archival: None,
+        tags: Vec::new(),
     }
 }
 

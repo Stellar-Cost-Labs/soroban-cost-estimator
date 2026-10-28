@@ -17,6 +17,7 @@ fn empty_snapshot() -> ConfigSnapshot {
         contract_events: None,
         contract_bandwidth: None,
         state_archival: None,
+        tags: Vec::new(),
     }
 }
 
@@ -75,6 +76,7 @@ fn full_snapshot() -> ConfigSnapshot {
             eviction_scan_size: 1000,
             starting_eviction_scan_level: 16,
         }),
+        tags: Vec::new(),
     }
 }
 
@@ -165,6 +167,7 @@ fn snapshot_with(
         } else {
             None
         },
+        tags: Vec::new(),
     }
 }
 
@@ -193,6 +196,7 @@ fn make_snapshot(compute_fee: i64, bandwidth_fee: i64) -> ConfigSnapshot {
             fee_tx_size1_kb: bandwidth_fee,
         }),
         state_archival: None,
+        tags: Vec::new(),
     }
 }
 
