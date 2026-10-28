@@ -284,8 +284,8 @@ pub enum Command {
         #[arg(long, short = 'i')]
         interactive: bool,
 
-        /// Skip re-simulation when a cached estimate is still fresh
-        /// (e.g. "30m", "1h", "7d"; bare value = seconds).
+        /// Override the cache freshness TTL from config.toml (default: 7d).
+        /// Accepts "30m", "1h", "7d", or bare seconds.
         #[arg(long, value_name = "DURATION")]
         cache_ttl: Option<String>,
 
@@ -1061,8 +1061,8 @@ mod tests {
 
     #[test]
     fn threshold_percent_accepts_finite_non_negative_values() {
-        assert_eq!(parse_threshold_percent("10").unwrap(), 10.0);
-        assert_eq!(parse_threshold_percent("500.5").unwrap(), 500.5);
+        assert!((parse_threshold_percent("10").unwrap() - 10.0).abs() < f64::EPSILON);
+        assert!((parse_threshold_percent("500.5").unwrap() - 500.5).abs() < f64::EPSILON);
         assert!(parse_threshold_percent("-1").is_err());
         assert!(parse_threshold_percent("NaN").is_err());
         assert!(parse_threshold_percent("inf").is_err());
