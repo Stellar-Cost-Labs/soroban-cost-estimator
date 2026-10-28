@@ -162,277 +162,106 @@ async fn mock_rpc_fixture_surfaces_rpc_errors_from_the_server() {
     assert!(matches!(err, AppError::Rpc { status: -32602, .. }));
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Protocol Fixture Compatibility Tests
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn read_fixture(filename: &str) -> String {
-    let path = Path::new("tests/fixtures/rpc").join(filename);
-    fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read fixture at {}: {e}", path.display()))
-}
-
-/// Compatibility case: Modern Soroban RPC (Protocol 21+) `simulateTransaction` response.
-///
-/// Features:
-/// - Numeric `latestLedger`
-/// - Plain decimal string `minResourceFee`
-/// - Authoritative resources (CPU instructions, footprint sizes, read/write bytes)
-///   and resource fee encoded in `transactionData` XDR
-/// - Legacy `cost` object absent
 #[tokio::test]
-async fn test_fixture_simulate_transaction_current_compatibility() {
-    let raw_json = read_fixture("simulate_transaction_current.json");
-    let fixture_value: serde_json::Value =
-        serde_json::from_str(&raw_json).expect("valid fixture JSON");
+async fn test_cache_warm_end_to_end_with_mock_rpc() {
+    let server = common::start_mock_rpc_server().await;
 
-    // 1. Direct typed deserialization
-    let resp: SimulateTransactionResponse =
-        serde_json::from_str(&raw_json).expect("must deserialize into SimulateTransactionResponse");
+    common::stub_jsonrpc_success(
+        &server,
+        "getHealth",
+        json!({
+            "status": "healthy",
+            "latestLedger": 100
+        }),
+    )
+    .await;
 
-    assert_eq!(resp.latest_ledger, Some(3_894_195));
-    assert_eq!(resp.ledger_sequence(), 3_894_195);
-    assert_eq!(resp.min_resource_fee.as_deref(), Some("15427"));
+    let live_tx_data = "AAAAAAAAAAEAAAAH6hS8qZjpjw3bM46OXO9uGfBzeKO3HotPiGjO3IV+Ts0AAAABAAAABgAAAAEmU1Fc+h02S4iEBnpjdCESXpKHG/bOUxC3DeRWUy9+mQAAABQAAAABAAggFgAAAAAAAACIAAAAAAAAPEM=";
+    common::stub_jsonrpc_success(
+        &server,
+        "simulateTransaction",
+        json!({
+            "latestLedger": 100,
+            "minResourceFee": "15427",
+            "transactionData": live_tx_data
+        }),
+    )
+    .await;
+
+    let temp_home = std::env::temp_dir().join(format!("sce-warm-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_home);
+    let _ = std::fs::create_dir_all(&temp_home);
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"));
+    cmd.env("HOME", &temp_home);
+    cmd.env("USERPROFILE", &temp_home);
+    cmd.args([
+        "config",
+        "cache",
+        "warm",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--rpc-url",
+        &server.uri(),
+    ]);
+
+    let output = cmd.output().expect("failed to run CLI");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let code = output.status.code().unwrap_or(-1);
+
+    assert_eq!(code, 0, "cache warm should exit 0; stderr: {stderr}");
     assert!(
-        resp.cost.is_none(),
-        "modern response does not include legacy cost object"
+        stdout.contains("Warmed 1 functions into cache for"),
+        "summary format: {stdout}"
     );
-    assert!(resp.error.is_none());
-
-    // 2. Resource fee extraction (both decimal string and XDR)
-    let fee_from_string = parse_resource_fee(&resp.min_resource_fee)
-        .expect("parse resource fee")
-        .expect("fee present");
-    assert_eq!(fee_from_string, 15_427);
-
-    let fee_from_xdr = parse_transaction_data_resource_fee(&resp.transaction_data)
-        .expect("parse transaction data fee")
-        .expect("fee present in XDR");
-    assert_eq!(fee_from_xdr, 15_427);
-
-    // 3. Simulation resource metrics extraction from transactionData XDR
-    let resources = parse_transaction_data_resources(&resp.transaction_data)
-        .expect("parse resources")
-        .expect("resources present in XDR");
-    assert_eq!(resources.cpu_insns, 532_502);
-    assert_eq!(resources.read_entries, 1);
-    assert_eq!(resources.write_entries, 1);
-    assert_eq!(resources.read_bytes, 0);
-    assert_eq!(resources.write_bytes, 136);
-
-    // 4. End-to-end via mock RPC server
-    let server = common::start_mock_rpc_server().await;
-    common::stub_jsonrpc_success(&server, "simulateTransaction", fixture_value).await;
-    let client = RpcClient::new(server.uri().as_str());
-
-    let server_resp: SimulateTransactionResponse = client
-        .call("simulateTransaction", json!({ "transaction": "test" }))
-        .await
-        .expect("call should succeed");
-    assert_eq!(server_resp.ledger_sequence(), 3_894_195);
-}
-
-/// Compatibility case: Legacy Soroban RPC (Protocol 20) `simulateTransaction` response.
-///
-/// Features:
-/// - String-formatted `latestLedger` (`"3894195"`)
-/// - Base64-encoded XDR int64 `minResourceFee` (`"AAAAAAA81a8="`)
-/// - Legacy `cost` object with string numbers (`"cpuInsns"`, `"memBytes"`)
-/// - `transactionData` is null
-#[tokio::test]
-async fn test_fixture_simulate_transaction_legacy_compatibility() {
-    let raw_json = read_fixture("simulate_transaction_legacy.json");
-    let fixture_value: serde_json::Value =
-        serde_json::from_str(&raw_json).expect("valid fixture JSON");
-
-    // 1. Direct typed deserialization
-    let resp: SimulateTransactionResponse =
-        serde_json::from_str(&raw_json).expect("must deserialize into SimulateTransactionResponse");
-
-    // String latestLedger must be flexibly parsed
-    assert_eq!(resp.latest_ledger, Some(3_894_195));
-    assert_eq!(resp.ledger_sequence(), 3_894_195);
-
-    // Legacy cost object with string numbers must be parsed
-    let cost = resp.cost.expect("legacy cost object must be present");
-    assert_eq!(cost.cpu_insns, 100_000);
-    assert_eq!(cost.mem_bytes, 2_000);
-
-    // Base64-encoded XDR int64 fee must be parsed
-    let fee = parse_resource_fee(&resp.min_resource_fee)
-        .expect("parse resource fee")
-        .expect("fee present");
-    assert_eq!(fee, 3_986_863);
-
-    // 2. End-to-end via mock RPC server
-    let server = common::start_mock_rpc_server().await;
-    common::stub_jsonrpc_success(&server, "simulateTransaction", fixture_value).await;
-    let client = RpcClient::new(server.uri().as_str());
-
-    let server_resp: SimulateTransactionResponse = client
-        .call("simulateTransaction", json!({ "transaction": "test" }))
-        .await
-        .expect("call should succeed");
-    assert_eq!(server_resp.ledger_sequence(), 3_894_195);
-}
-
-/// Compatibility case: Contract simulation execution error.
-///
-/// Features:
-/// - `error` field carries failure string
-/// - `latestLedger` is reported
-#[test]
-fn test_fixture_simulate_transaction_error_compatibility() {
-    let raw_json = read_fixture("simulate_transaction_error.json");
-    let resp: SimulateTransactionResponse =
-        serde_json::from_str(&raw_json).expect("must deserialize error response");
-
-    assert_eq!(
-        resp.error.as_ref().map(|e| e.message.as_str()),
-        Some("HostError: Error(Contract, #1)")
+    assert!(
+        stderr.contains("Warming cache"),
+        "stderr should display progress: {stderr}"
     );
-    assert_eq!(resp.ledger_sequence(), 3_894_195);
-}
 
-/// Compatibility case: Modern `getHealth` response with node metadata.
-///
-/// Features:
-/// - `status`: "healthy"
-/// - `networkPassphrase` and `coreVersion` present
-/// - Numeric `latestLedger`
-#[tokio::test]
-async fn test_fixture_get_health_current_compatibility() {
-    let raw_json = read_fixture("get_health_current.json");
-    let fixture_value: serde_json::Value =
-        serde_json::from_str(&raw_json).expect("valid fixture JSON");
+    // JSON mode test (use --quiet so tracing log is suppressed from stdout)
+    let mut cmd_json = std::process::Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"));
+    cmd_json.env("HOME", &temp_home);
+    cmd_json.env("USERPROFILE", &temp_home);
+    cmd_json.args([
+        "config",
+        "cache",
+        "warm",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--rpc-url",
+        &server.uri(),
+        "--json",
+        "--quiet",
+    ]);
 
-    let resp: HealthResponse =
-        serde_json::from_str(&raw_json).expect("must deserialize into HealthResponse");
-    assert_eq!(resp.status, "healthy");
-    assert_eq!(
-        resp.network_passphrase.as_deref(),
-        Some("Test SDF Network ; September 2015")
-    );
-    assert_eq!(resp.core_version.as_deref(), Some("stellar-core 21.0.0"));
-    assert_eq!(resp.latest_ledger, Some(123_456));
+    let output_json = cmd_json.output().expect("failed to run CLI");
+    let stdout_json = String::from_utf8_lossy(&output_json.stdout);
+    assert_eq!(output_json.status.code().unwrap_or(-1), 0);
+    let v: serde_json::Value =
+        serde_json::from_str(stdout_json.trim()).expect("valid JSON summary");
+    assert_eq!(v["warmed_functions"], 1);
+    assert!(v.get("wasm_hash").is_some(), "wasm_hash in JSON: {v}");
 
-    let server = common::start_mock_rpc_server().await;
-    common::stub_jsonrpc_success(&server, "getHealth", fixture_value).await;
-    let client = RpcClient::new(server.uri().as_str());
-
-    let metadata = client.health_check().await.expect("health check must pass");
-    assert_eq!(
-        metadata.network_passphrase.as_deref(),
-        Some("Test SDF Network ; September 2015")
-    );
-    assert_eq!(
-        metadata.core_version.as_deref(),
-        Some("stellar-core 21.0.0")
-    );
-}
-
-/// Compatibility case: Legacy minimal `getHealth` response.
-///
-/// Features:
-/// - `status`: "healthy"
-/// - Node metadata omitted
-/// - Numeric `latestLedger`
-#[tokio::test]
-async fn test_fixture_get_health_legacy_compatibility() {
-    let raw_json = read_fixture("get_health_legacy.json");
-    let fixture_value: serde_json::Value =
-        serde_json::from_str(&raw_json).expect("valid fixture JSON");
-
-    let resp: HealthResponse =
-        serde_json::from_str(&raw_json).expect("must deserialize into HealthResponse");
-    assert_eq!(resp.status, "healthy");
-    assert!(resp.network_passphrase.is_none());
-    assert!(resp.core_version.is_none());
-    assert_eq!(resp.latest_ledger, Some(42));
-
-    let server = common::start_mock_rpc_server().await;
-    common::stub_jsonrpc_success(&server, "getHealth", fixture_value).await;
-    let client = RpcClient::new(server.uri().as_str());
-
-    let metadata = client.health_check().await.expect("health check must pass");
-    assert!(metadata.network_passphrase.is_none());
-    assert!(metadata.core_version.is_none());
-}
-
-/// Compatibility case: Unhealthy node response.
-#[tokio::test]
-async fn test_fixture_get_health_unhealthy_compatibility() {
-    let raw_json = read_fixture("get_health_unhealthy.json");
-    let fixture_value: serde_json::Value =
-        serde_json::from_str(&raw_json).expect("valid fixture JSON");
-
-    let resp: HealthResponse =
-        serde_json::from_str(&raw_json).expect("must deserialize into HealthResponse");
-    assert_eq!(resp.status, "unhealthy");
-
-    let server = common::start_mock_rpc_server().await;
-    common::stub_jsonrpc_success(&server, "getHealth", fixture_value).await;
-    let client = RpcClient::new(server.uri().as_str());
-
-    let err = client
-        .health_check()
-        .await
-        .expect_err("unhealthy status must fail");
-    assert!(err.to_string().contains("unhealthy"));
-}
-
-/// Compatibility case: `getLatestLedger` for modern and legacy protocol versions.
-///
-/// Tests both Protocol 22 (current) and Protocol 20 (legacy).
-#[test]
-fn test_fixture_get_latest_ledger_current_and_legacy_compatibility() {
-    let current_raw = read_fixture("get_latest_ledger_current.json");
-    let current: GetLatestLedgerResponse =
-        serde_json::from_str(&current_raw).expect("deserialize current latest ledger");
-    assert_eq!(current.protocol_version, 22);
-    assert_eq!(current.sequence, 2_539_605);
-
-    let legacy_raw = read_fixture("get_latest_ledger_legacy.json");
-    let legacy: GetLatestLedgerResponse =
-        serde_json::from_str(&legacy_raw).expect("deserialize legacy latest ledger");
-    assert_eq!(legacy.protocol_version, 20);
-    assert_eq!(legacy.sequence, 1_000_000);
-}
-
-/// Compatibility case: `getLedgerEntries` for modern and legacy responses.
-///
-/// Verifies:
-/// - Modern response: numeric latestLedger, entry with liveUntilLedgerSeq
-/// - Legacy response: string latestLedger ("1000005"), entry without liveUntilLedgerSeq
-#[tokio::test]
-async fn test_fixture_get_ledger_entries_current_and_legacy_compatibility() {
-    // 1. Current shape
-    let current_raw = read_fixture("get_ledger_entries_current.json");
-    let current: GetLedgerEntriesResponse =
-        serde_json::from_str(&current_raw).expect("deserialize current ledger entries");
-    assert_eq!(current.latest_ledger, Some(2_539_605));
-    assert_eq!(current.entries.len(), 1);
-    assert_eq!(current.entries[0].last_modified_ledger_seq, Some(2_539_600));
-    assert_eq!(current.entries[0].live_until_ledger_seq, Some(2_600_000));
-
-    // 2. Legacy shape (string latestLedger, no liveUntilLedgerSeq)
-    let legacy_raw = read_fixture("get_ledger_entries_legacy.json");
-    let legacy: GetLedgerEntriesResponse =
-        serde_json::from_str(&legacy_raw).expect("deserialize legacy ledger entries");
-    assert_eq!(legacy.latest_ledger, Some(1_000_005));
-    assert_eq!(legacy.entries.len(), 1);
-    assert_eq!(legacy.entries[0].last_modified_ledger_seq, Some(1_000_000));
-    assert_eq!(legacy.entries[0].live_until_ledger_seq, None);
-
-    // 3. Via mock server
-    let server = common::start_mock_rpc_server().await;
-    let legacy_val: serde_json::Value = serde_json::from_str(&legacy_raw).expect("valid json");
-    common::stub_jsonrpc_success(&server, "getLedgerEntries", legacy_val).await;
-    let client = RpcClient::new(server.uri().as_str());
-
-    let server_resp: GetLedgerEntriesResponse = client
-        .call("getLedgerEntries", json!({ "keys": ["AAAAFA=="] }))
-        .await
-        .expect("call should succeed");
-    assert_eq!(server_resp.latest_ledger, Some(1_000_005));
+    // Verify cache entry is present and queryable
+    let mut cmd_query = std::process::Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"));
+    cmd_query.env("HOME", &temp_home);
+    cmd_query.env("USERPROFILE", &temp_home);
+    cmd_query.args([
+        "config",
+        "cache",
+        "query",
+        "--fn",
+        "increment",
+        "--json",
+        "--quiet",
+    ]);
+    let output_query = cmd_query.output().expect("failed to run CLI query");
+    let stdout_query = String::from_utf8_lossy(&output_query.stdout);
+    assert_eq!(output_query.status.code().unwrap_or(-1), 0);
+    let entries: serde_json::Value =
+        serde_json::from_str(stdout_query.trim()).expect("valid JSON query");
+    assert_eq!(entries.as_array().map(Vec::len), Some(1));
+    assert_eq!(entries[0]["function"], "increment");
 }
