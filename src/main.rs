@@ -147,6 +147,9 @@ struct EstimateAllJsonReport {
     fee_distribution: report::cost_report::FeeDistribution,
 }
 
+/// Default period for reusing an estimate before it is re-simulated.
+const DEFAULT_CACHE_TTL: &str = "7d";
+
 /// Parses the command line with `config.toml` values installed as clap
 /// defaults, so explicit arguments always beat the config file.
 ///
@@ -326,6 +329,11 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
         .default_network
         .unwrap_or_else(|| "testnet".to_string());
     let default_rpc_url = file.rpc_url;
+    let default_cache_ttl = file
+        .cache_ttl
+        .as_deref()
+        .unwrap_or(DEFAULT_CACHE_TTL)
+        .to_string();
     // Validate an explicit `--rpc-url` before any command parses WASM or
     // opens the cache, so a typo fails immediately with a clear message.
     if let Some(url) = args.command.rpc_url() {
@@ -407,6 +415,9 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
                 .await;
             }
             let paths = resolve_wasm_paths(&wasm, wasm_dir.as_deref())?;
+            // A command-line TTL wins over config.toml. In the absence of
+            // both, estimates are reusable for seven days.
+            let cache_ttl = cache_ttl.as_deref().unwrap_or(&default_cache_ttl);
             if wasm.len() > 1 || wasm_dir.is_some() {
                 // Multi-contract run: aggregate every contract into a single
                 // batch summary instead of printing per-invocation reports.
@@ -443,7 +454,7 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
                     r#fn.as_deref(),
                     &contract_args,
                     interactive_flag,
-                    cache_ttl.as_deref(),
+                    Some(cache_ttl),
                     compare,
                     clear_cache,
                     no_cache,
