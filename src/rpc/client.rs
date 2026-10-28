@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use governor::{Quota, RateLimiter};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -13,7 +13,7 @@ use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
 use crate::rpc::circuit_breaker::CircuitBreaker;
-use crate::rpc::retry::{DEFAULT_MAX_RETRIES, with_retry_deadline};
+use crate::rpc::retry::{DEFAULT_MAX_RETRIES, MAX_RETRY_DELAY, with_retry_deadline};
 
 /// Default per-request HTTP timeout applied to every RPC call. Matches the
 /// CLI's `--timeout` default (30 seconds).
