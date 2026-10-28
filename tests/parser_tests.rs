@@ -1322,3 +1322,46 @@ fn test_fuzz_seed_corpus_fixtures_succeed() {
         );
     }
 }
+
+/// Golden test: the `function_signatures` block for the fixture contract is
+/// stable JSON that keeps Soroban spec types apart from raw WASM counts.
+#[test]
+fn test_function_signatures_json_golden_contract_fixture() {
+    let info =
+        soroban_cost_estimator::wasm::parser::load_wasm(Path::new("tests/fixtures/contract.wasm"))
+            .expect("failed to load contract fixture");
+    let json = soroban_cost_estimator::wasm::parser::function_signatures_json(&info);
+    insta::assert_snapshot!(
+        "function_signatures_contract_fixture",
+        serde_json::to_string_pretty(&json).expect("serialize signatures")
+    );
+}
+
+/// A bare WASM module has no contract spec, so names and types must be
+/// explicit nulls while the raw WASM counts are preserved.
+#[test]
+fn test_function_signatures_json_marks_absent_spec_names() {
+    let info =
+        soroban_cost_estimator::wasm::parser::load_wasm(Path::new("tests/fixtures/minimal.wasm"))
+            .expect("failed to load minimal fixture");
+    let json = soroban_cost_estimator::wasm::parser::function_signatures_json(&info);
+    let add_one = json["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .find(|f| f["name"] == "add_one")
+        .expect("add_one function");
+    assert_eq!(add_one["spec_present"], false);
+    let param_count = add_one["wasm"]["param_count"].as_u64().expect("count");
+    assert_eq!(
+        add_one["params"].as_array().expect("params").len() as u64,
+        param_count
+    );
+    assert!(
+        add_one["params"]
+            .as_array()
+            .expect("params")
+            .iter()
+            .all(|p| p["name"].is_null() && p["type"].is_null())
+    );
+}

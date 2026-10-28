@@ -97,11 +97,13 @@ issue boards.
 ```markdown
 # <short imperative title>
 
-## Summary
+## Summary 
+
 
 <one-sentence description of what this issue asks for.>
 
 ## Background
+
 
 <why this matters. what problem does it solve? what is the current behaviour
 and why is it insufficient? reference relevant files, docs, or user workflows.>

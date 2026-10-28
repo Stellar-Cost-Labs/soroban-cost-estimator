@@ -22,7 +22,7 @@
 
 # Soroban Cost Estimator
 
-[📚 Documentation](https://soroban-cost-estimator.gitbook.io/soroban-cost_estimator-docs) · [📖 CLI Reference](docs/commands/reference.md) · [🔄 Migration Guide](docs/migration.md) · [🩺 Troubleshooting](docs/troubleshooting.md)
+[📚 Documentation](https://soroban-cost-estimator.gitbook.io/soroban-cost_estimator-docs) · [📖 CLI Reference](docs/commands/reference.md) · [🔄 Migration Guide](docs/migration-guide.md) · [🩺 Troubleshooting](docs/troubleshooting.md)
 
 **Estimate Soroban contract resource costs & track network pricing changes over time.**
 
@@ -273,13 +273,21 @@ Fetch all 6 `ConfigSetting` ledger entries, decode them via XDR, timestamp,
 and save to disk.
 
 ```bash
-soroban-cost-estimator config snapshot --network testnet [--out /custom/path.json] [--json] [--retain <N>]
-soroban-cost-estimator config snapshot --network testnet [--out /custom/path.json] [--json] [--retain N]
+soroban-cost-estimator config snapshot --network testnet [--out /custom/path.json] [--json] [--retain <N>] [--skip-unchanged]
 ```
 
 Saved to `~/.soroban-cost-estimator/snapshots/<network>-<timestamp>.json`.
 `--json` also prints the snapshot as JSON (and still saves it). Each snapshot
-also records the network protocol version from `getLatestLedger`.
+also records the network protocol version from `getLatestLedger`, and starts
+with `"schema_version": 1`. Unversioned files from older releases are read as
+that initial version and are never rewritten just by reading them; a file
+written by a *newer* release is rejected with its path and an upgrade hint.
+
+`--skip-unchanged` is for scheduled collection: after fetching, the network,
+protocol version and all six settings are compared with the latest snapshot,
+and no file is written when they match. Timestamps and ledgers never count as
+changes. The command exits `0` either way, and `--json` reports
+`"status": "unchanged"` when it skipped.
 `--retain N` is a retention policy: snapshots for the network whose files are
 older than N days are deleted after saving, so the snapshots directory doesn't
 grow without bound.
@@ -345,6 +353,15 @@ instead of the full diff, handy for CI status lines:
 ```bash
 soroban-cost-estimator config diff --network testnet --summary
 ```
+
+- Use `--threshold-percent N` with `config diff` or `watch` to treat only
+  pricing changes whose absolute relative change is at least `N` percent as
+  significant. For example, `--threshold-percent 10` flags changes of 10% or
+  more. The threshold accepts finite, non-negative values; values above 100
+  are useful when only unusually large repricing events should be reported.
+  In `watch`, pricing changes below the threshold are not printed, while
+  non-pricing changes continue to be reported. JSON config diffs include a
+  `significant_pricing_changes` field when a threshold is supplied.
 
 - Exits **0** if no pricing changes, **1** with a detailed field-by-field
   diff if pricing changed (default behavior)
@@ -703,6 +720,9 @@ now stale after a network pricing change. Run `cache verify` to check the
 cache has not been corrupted.
 
 ## ✅ Verified against live testnet
+
+For side-by-side Stellar CLI and estimator commands, with representative output
+comparisons and the batch workflow, see the [migration guide](docs/migration-guide.md).
 
 The invocation path is proven end-to-end against a **real deployed contract**
 on Stellar testnet, cross-checked against the native Stellar CLI:
