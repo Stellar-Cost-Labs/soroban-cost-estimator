@@ -480,15 +480,9 @@ pub fn parse_args_file(path: &std::path::Path) -> AppResult<Vec<TypedArg>> {
 pub fn typed_cache_args(args: &[TypedArg]) -> AppResult<Vec<String>> {
     args.iter()
         .map(|arg| {
-            let bytes = arg
-                .value
-                .to_xdr(stellar_xdr::Limits::none())
-                .map_err(|e| {
-                    AppError::XdrEncode(format!(
-                        "cache key for '{}' argument: {e}",
-                        arg.type_name
-                    ))
-                })?;
+            let bytes = arg.value.to_xdr(stellar_xdr::Limits::none()).map_err(|e| {
+                AppError::XdrEncode(format!("cache key for '{}' argument: {e}", arg.type_name))
+            })?;
             Ok(format!("{}:{}", arg.type_name, hex::encode(bytes)))
         })
         .collect()
@@ -523,11 +517,7 @@ fn wrong_shape(at: &str, type_name: &str, found: &serde_json::Value, wanted: &st
 /// asking for the integer view rejects `5.0`, `1e3`, and any token that
 /// overflowed 64 bits (which serde_json keeps as a lossy float) with a clear
 /// message instead of silently truncating.
-fn json_integer_u64(
-    value: &serde_json::Value,
-    at: &str,
-    type_name: &str,
-) -> AppResult<u64> {
+fn json_integer_u64(value: &serde_json::Value, at: &str, type_name: &str) -> AppResult<u64> {
     value.as_u64().ok_or_else(|| {
         wrong_shape(
             at,
@@ -614,7 +604,7 @@ fn json_to_scval(
         "u128" => {
             let n = decimal_string_integer::<u128>(value, at, type_name)?;
             Ok(stellar_xdr::ScVal::U128(stellar_xdr::UInt128Parts {
-                hi: n >> 64,
+                hi: (n >> 64) as u64,
                 lo: n as u64,
             }))
         }
@@ -664,9 +654,8 @@ fn json_to_scval(
                 .strip_prefix("0x")
                 .or_else(|| s.strip_prefix("0X"))
                 .unwrap_or(s);
-            let raw = hex::decode(hex_str).map_err(|e| {
-                AppError::ArgsFile(format!("{at}: '{s}' is not valid hex: {e}"))
-            })?;
+            let raw = hex::decode(hex_str)
+                .map_err(|e| AppError::ArgsFile(format!("{at}: '{s}' is not valid hex: {e}")))?;
             stellar_xdr::BytesM::try_from(raw)
                 .map(stellar_xdr::ScBytes::from)
                 .map(stellar_xdr::ScVal::Bytes)
@@ -697,25 +686,24 @@ fn json_to_scval(
                 .map_err(|e| AppError::ArgsFile(format!("{at}: vec is too large: {e}")))
         }
         "map" => {
-            let items = value
-                .as_array()
-                .ok_or_else(|| {
-                    wrong_shape(
-                        at,
-                        type_name,
-                        value,
-                        "a JSON array of {\"key\": …, \"value\": …} entries",
-                    )
-                })?;
+            let items = value.as_array().ok_or_else(|| {
+                wrong_shape(
+                    at,
+                    type_name,
+                    value,
+                    "a JSON array of {\"key\": …, \"value\": …} entries",
+                )
+            })?;
             let mut entries = Vec::with_capacity(items.len());
             for (i, item) in items.iter().enumerate() {
-                let entry: ArgsFileMapEntry = serde_json::from_value(item.clone()).map_err(|e| {
-                    AppError::ArgsFile(format!(
-                        "{at}[{i}]: map entries must be objects of the form \
+                let entry: ArgsFileMapEntry =
+                    serde_json::from_value(item.clone()).map_err(|e| {
+                        AppError::ArgsFile(format!(
+                            "{at}[{i}]: map entries must be objects of the form \
                          {{\"key\": {{\"type\": …, \"value\": …}}, \
                           \"value\": {{\"type\": …, \"value\": …}}}}: {e}"
-                    ))
-                })?;
+                        ))
+                    })?;
                 let key = json_to_scval(
                     &entry.key.type_name,
                     &entry.key.value,

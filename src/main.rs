@@ -936,12 +936,12 @@ async fn simulate_report(
         // against the contract spec first; the validator returns the values
         // in the function's declaration order.
         Some(typed) => {
-            let ordered = xdr_helper::validate_typed_args_against_spec(
-                req.fn_name,
-                typed,
-                req.functions,
-            )?;
-            debug!(arg_count = ordered.len(), "validated typed arguments against contract spec");
+            let ordered =
+                xdr_helper::validate_typed_args_against_spec(req.fn_name, typed, req.functions)?;
+            debug!(
+                arg_count = ordered.len(),
+                "validated typed arguments against contract spec"
+            );
             ordered
         }
         None => {
@@ -1412,6 +1412,16 @@ async fn cmd_estimate_repeat(
             } else {
                 (contract_id, fn_name, args)
             };
+        if fn_name.is_some() {
+            if contract_id.is_none() {
+                return Err(error::AppError::TxConstruction(
+                    "contract id required for function invocation (pass --id <64-hex>)".to_string(),
+                ));
+            }
+            if let Some(id) = contract_id {
+                xdr_helper::parse_contract_id(id)?;
+            }
+        }
 
         wasm_info.validate_wasm_limits(65536, 2048)?;
 
@@ -1444,19 +1454,36 @@ async fn cmd_estimate_repeat(
         }
 
         if dry_run {
-            let sc_vals: Vec<stellar_xdr::ScVal> = match typed_args {
-                Some(typed) => xdr_helper::validate_typed_args_against_spec(
-                    fn_name,
-                    typed,
-                    &wasm_info.functions,
-                )?,
-                None => {
-                    xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
-                    args.iter()
-                        .map(|a| xdr_helper::parse_arg_scval(a))
-                        .collect()
-                }
-            };
+            let (sc_vals, arg_labels): (Vec<stellar_xdr::ScVal>, Vec<String>) =
+                match typed_args {
+                    Some(typed) => {
+                        let ordered = xdr_helper::validate_typed_args_against_spec(
+                            fn_name,
+                            typed,
+                            &wasm_info.functions,
+                        )?;
+                        let labels = typed
+                            .iter()
+                            .map(|a| match &a.name {
+                                Some(name) => format!("{name}: {}", a.type_name),
+                                None => a.type_name.clone(),
+                            })
+                            .collect();
+                        (ordered, labels)
+                    }
+                    None => {
+                        xdr_helper::validate_args_against_spec(
+                            fn_name,
+                            args,
+                            &wasm_info.functions,
+                        )?;
+                        let vals = args
+                            .iter()
+                            .map(|a| xdr_helper::parse_arg_scval(a))
+                            .collect();
+                        (vals, args.to_vec())
+                    }
+                };
             let tx_xdr = xdr_helper::build_simulation_tx_envelope(
                 &wasm_info.bytes,
                 contract_id,
@@ -1811,6 +1838,17 @@ async fn estimate_once(
                 (contract_id, fn_name, args)
             };
 
+        if fn_name.is_some() {
+            if contract_id.is_none() {
+                return Err(error::AppError::TxConstruction(
+                    "contract id required for function invocation (pass --id <64-hex>)".to_string(),
+                ));
+            }
+            if let Some(id) = contract_id {
+                xdr_helper::parse_contract_id(id)?;
+            }
+        }
+
         // Validate WASM memory and table constraints against network limits (defaults: 64KB max size, 2048 pages)
         wasm_info.validate_wasm_limits(65536, 2048)?;
 
@@ -1870,21 +1908,14 @@ async fn estimate_once(
             // declaration order) first; `--arg` strings keep positional
             // validation. Either way an invalid argument fails here, before
             // any network access.
-            let (sc_vals, arg_labels): (Vec<stellar_xdr::ScVal>, Vec<String>) = match typed_args {
+            let sc_vals: Vec<stellar_xdr::ScVal> = match typed_args {
                 Some(typed) => {
                     let ordered = xdr_helper::validate_typed_args_against_spec(
                         fn_name,
                         typed,
                         &wasm_info.functions,
                     )?;
-                    let labels = typed
-                        .iter()
-                        .map(|a| match &a.name {
-                            Some(name) => format!("{name}: {}", a.type_name),
-                            None => a.type_name.clone(),
-                        })
-                        .collect();
-                    (ordered, labels)
+                    ordered
                 }
                 None => {
                     xdr_helper::validate_args_against_spec(fn_name, args, &wasm_info.functions)?;
@@ -1892,7 +1923,7 @@ async fn estimate_once(
                         .iter()
                         .map(|a| xdr_helper::parse_arg_scval(a))
                         .collect();
-                    (vals, args.to_vec())
+                    vals
                 }
             };
             debug!(arg_count = sc_vals.len(), "parsed arguments");
@@ -5372,11 +5403,8 @@ async fn batch_contract_summary(
     };
     let sc_vals: Vec<stellar_xdr::ScVal> = match typed_args {
         Some(typed) => {
-            match xdr_helper::validate_typed_args_against_spec(
-                fn_name,
-                typed,
-                &wasm_info.functions,
-            ) {
+            match xdr_helper::validate_typed_args_against_spec(fn_name, typed, &wasm_info.functions)
+            {
                 Ok(ordered) => ordered,
                 Err(e) => return validation_failure(e.to_string()),
             }
@@ -5387,7 +5415,9 @@ async fn batch_contract_summary(
             {
                 return validation_failure(e.to_string());
             }
-            args.iter().map(|a| xdr_helper::parse_arg_scval(a)).collect()
+            args.iter()
+                .map(|a| xdr_helper::parse_arg_scval(a))
+                .collect()
         }
     };
 
@@ -5429,7 +5459,7 @@ async fn batch_contract_summary(
             &wasm_info.bytes,
             Some(fn_info.name.as_str()),
             contract_id,
-            sc_vals,
+            &sc_vals,
         )
         .await;
         match outcome {
