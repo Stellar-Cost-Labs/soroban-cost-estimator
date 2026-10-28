@@ -306,4 +306,3 @@ async fn mock_rpc_fixture_bounds_dedup_cache_and_evicts_lru() {
     // k1 and k3 are retained in cache; k2 was evicted
     assert_eq!(client.dedup_cache_len().await, 2);
 }
-
