@@ -266,34 +266,76 @@ pub fn stroops_to_xlm(stroops: i64, precision: u32) -> String {
 }
 
 /// Parse an XLM string to stroops (i64).
+///
+/// The value is signed and the sign applies to the whole amount: `"-1.5"` is
+/// `-15_000_000` stroops. The sign is split off before the fraction is read,
+/// so the fraction always adds to the magnitude rather than to a negative
+/// whole part.
+///
+/// Only the first 7 fractional digits — stroop precision — are significant.
+/// Further digits are truncated rather than rounded, matching the 7 decimal
+/// places [`stroops_to_xlm`] emits at [`DEFAULT_PRECISION`]; the exact value a
+/// caller round-trips is the value it gets back. A non-digit anywhere in the
+/// fraction (even past the 7th place) is rejected.
+///
+/// # Errors
+///
+/// [`AppError::FeeCalc`] for input that is not a plain decimal number, and for
+/// values outside the representable stroop range (`i64::MIN..=i64::MAX`).
 pub fn xlm_to_stroops(xlm: &str) -> AppResult<i64> {
-    let parts: Vec<&str> = xlm.split('.').collect();
-    match parts.len() {
-        1 => {
-            let whole: i64 = parts[0]
-                .parse()
-                .map_err(|_| AppError::FeeCalc(format!("invalid XLM value: {xlm}")))?;
-            whole.checked_mul(10_000_000).ok_or_else(|| {
-                AppError::FeeCalc("XLM value is out of range for stroops".to_string())
-            })
-        }
-        2 => {
-            let whole: i64 = parts[0]
-                .parse()
-                .map_err(|_| AppError::FeeCalc(format!("invalid XLM value: {xlm}")))?;
-            let fraction_str = format!("{:0<7}", parts[1]);
-            let fraction: i64 = fraction_str[..7.min(fraction_str.len())]
-                .parse()
-                .map_err(|_| AppError::FeeCalc(format!("invalid XLM value: {xlm}")))?;
-            whole
-                .checked_mul(10_000_000)
-                .and_then(|w| w.checked_add(fraction))
-                .ok_or_else(|| {
-                    AppError::FeeCalc("XLM value is out of range for stroops".to_string())
-                })
-        }
-        _ => Err(AppError::FeeCalc(format!("invalid XLM value: {xlm}"))),
+    let invalid = || AppError::FeeCalc(format!("invalid XLM value: {xlm}"));
+    let out_of_range = || AppError::FeeCalc("XLM value is out of range for stroops".to_string());
+
+    // Strip the sign first so it scales the whole amount. Applying it after
+    // adding the fraction would under-count every negative fraction: with the
+    // fraction added to a negative whole part, `-1.5` would parse as `-0.5`.
+    let (negative, magnitude) = match xlm.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, xlm),
+    };
+
+    let parts: Vec<&str> = magnitude.split('.').collect();
+    let (whole_text, fraction_text) = match parts.as_slice() {
+        [whole] => (*whole, ""),
+        [whole, fraction] => (*whole, *fraction),
+        _ => return Err(invalid()),
+    };
+
+    // Digits only: this rejects whitespace, a second sign, and any other
+    // decoration instead of letting `i64::from_str` interpret it.
+    if whole_text.is_empty() || !whole_text.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
     }
+    // Whole-part digits beyond `i64` are reported as invalid input (the
+    // `i64::try_from` at the end owns the range error for representable
+    // digits).
+    let whole: i64 = whole_text.parse().map_err(|_| invalid())?;
+
+    // Walk the fraction a character at a time so a multi-byte UTF-8 input
+    // cannot split a character and panic, and keep at most 7 digits.
+    let mut fraction: i64 = 0;
+    let mut digits = 0u32;
+    for ch in fraction_text.chars() {
+        let Some(digit) = ch.to_digit(10) else {
+            return Err(invalid());
+        };
+        if digits < 7 {
+            fraction = fraction * 10 + i64::from(digit);
+            digits += 1;
+        }
+    }
+    // Right-pad to stroop precision: `"5"` means 0.5 XLM, not 0.0000005.
+    for _ in digits..7 {
+        fraction *= 10;
+    }
+
+    // Accumulate in `i128` because the magnitude of `i64::MIN`,
+    // 9_223_372_036_854_775_808, does not fit in an `i64` until the sign is
+    // applied.
+    let magnitude = i128::from(whole) * 10_000_000 + i128::from(fraction);
+    let signed = if negative { -magnitude } else { magnitude };
+
+    i64::try_from(signed).map_err(|_| out_of_range())
 }
 
 /// Min/max/average fee summary across a set of estimates.
@@ -508,6 +550,98 @@ mod tests {
         assert_eq!(stroops_to_xlm(1_265_000, 4), "0.1265");
         // Default precision preserves full stroop fidelity.
         assert_eq!(stroops_to_xlm(1, DEFAULT_PRECISION), "0.0000001");
+    }
+
+    /// Issue #358: the string matrix from the acceptance criteria, covering
+    /// every decimal boundary the parser has to handle.
+    #[test]
+    fn test_xlm_to_stroops_string_matrix() {
+        for (input, expected) in [
+            ("0", 0),
+            ("0.1", 1_000_000),
+            ("0.0000001", 1), // smallest representable amount: 1 stroop
+            ("1.0000000", 10_000_000),
+            ("100.500", 1_005_000_000),
+            ("100.5", 1_005_000_000), // trailing zeros are optional
+            ("1", 10_000_000),        // no decimal point at all
+        ] {
+            assert_eq!(
+                xlm_to_stroops(input).expect("valid XLM value"),
+                expected,
+                "input {input:?}"
+            );
+        }
+    }
+
+    /// The sign belongs to the whole value, so it scales the fraction too:
+    /// `-1.5` must be -15_000_000 stroops, not -5_000_000 (the pre-fix
+    /// behaviour, which added the fraction to the negative whole part).
+    #[test]
+    fn test_xlm_to_stroops_applies_sign_to_the_fraction() {
+        for (input, expected) in [
+            ("-5", -50_000_000),
+            ("-0.1", -1_000_000),
+            ("-1.5", -15_000_000),
+            ("-100.500", -1_005_000_000),
+            ("-0.0000001", -1),
+            ("-0", 0),
+        ] {
+            assert_eq!(
+                xlm_to_stroops(input).expect("valid XLM value"),
+                expected,
+                "input {input:?}"
+            );
+        }
+    }
+
+    /// Malformed input is reported as an error, never as a panic. The
+    /// multi-byte UTF-8 cases matter: the fraction used to be sliced by byte
+    /// index, which panicked on `é`-dense input instead of rejecting it.
+    #[test]
+    fn test_xlm_to_stroops_rejects_malformed_input() {
+        for input in ["", " 1.0 ", "abc", "1..0", "1.2.3", ".5", "1.ééééé", "-é"] {
+            let err = xlm_to_stroops(input).expect_err("malformed input must be rejected");
+            assert!(
+                err.to_string().contains("invalid XLM value"),
+                "input {input:?} produced an unexpected error: {err}"
+            );
+        }
+    }
+
+    /// Digits beyond stroop precision are truncated, and a non-digit in that
+    /// trailing run is still rejected.
+    #[test]
+    fn test_xlm_to_stroops_truncates_past_seven_digits() {
+        assert_eq!(xlm_to_stroops("1.1234567").unwrap(), 11_234_567);
+        assert_eq!(xlm_to_stroops("1.12345678").unwrap(), 11_234_567);
+        assert_eq!(xlm_to_stroops("1.1234567000").unwrap(), 11_234_567);
+        assert!(xlm_to_stroops("1.1234567x").is_err());
+    }
+
+    /// The integer parser and formatter are inverses across the whole stroop
+    /// range, including the signed extremes of `i64`.
+    #[test]
+    fn test_xlm_to_stroops_round_trips_stroops_to_xlm() {
+        for stroops in [
+            0,
+            1,
+            -1,
+            1_234_567,
+            -1_234_567,
+            10_000_000,
+            -10_000_000,
+            999_999_999_999_999,
+            -999_999_999_999_999,
+            i64::MAX,
+            i64::MIN,
+        ] {
+            let xlm = stroops_to_xlm(stroops, DEFAULT_PRECISION);
+            assert_eq!(
+                xlm_to_stroops(&xlm).expect("formatted stroops must parse"),
+                stroops,
+                "round trip failed for {stroops} (formatted as {xlm:?})"
+            );
+        }
     }
 
     #[test]
