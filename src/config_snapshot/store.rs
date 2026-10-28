@@ -26,6 +26,63 @@ fn snapshots_dir() -> AppResult<PathBuf> {
     Ok(dir)
 }
 
+static ATOMIC_TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Writes `contents` to `dest` atomically via a sibling temporary file.
+///
+/// The temporary file is created in the same parent directory as `dest` with a
+/// `.tmp` suffix (so snapshot directory listings looking for `.json` files
+/// ignore in-flight writes), flushed and synced to disk, and then renamed over
+/// `dest`. If any step fails, the temporary file is removed and any pre-existing
+/// file at `dest` remains untouched.
+pub fn write_snapshot_atomically(dest: &Path, contents: &[u8]) -> AppResult<()> {
+    write_snapshot_atomically_with(dest, contents, |file| {
+        use std::io::Write;
+        file.write_all(contents)?;
+        file.sync_all()
+    })
+}
+
+/// Like [`write_snapshot_atomically`], allowing callers/tests to inject the
+/// write/flush step to simulate mid-write or pre-rename I/O failures.
+pub fn write_snapshot_atomically_with<F>(dest: &Path, _contents: &[u8], writer: F) -> AppResult<()>
+where
+    F: FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+{
+    let parent = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+
+    let file_name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "snapshot.json".to_string());
+    let seq = ATOMIC_TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp_path = parent.join(format!(".{file_name}.{}.{seq}.tmp", std::process::id()));
+
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        writer(&mut file)
+    })();
+
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(AppError::Io(err));
+    }
+
+    if let Err(err) = std::fs::rename(&temp_path, dest) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(AppError::Io(err));
+    }
+
+    Ok(())
+}
+
 /// Extracts the timestamp encoded in a snapshot file name.
 ///
 /// Snapshot files are named `{network}-{timestamp}.json`, where the
@@ -118,7 +175,7 @@ pub fn save_snapshot(snapshot: &ConfigSnapshot, out_path: Option<&str>) -> AppRe
     };
 
     let json = serde_json::to_string_pretty(&snapshot)?;
-    std::fs::write(&path, json)?;
+    write_snapshot_atomically(&path, json.as_bytes())?;
     debug!(
         path = %path.display(),
         network = snapshot.network,
