@@ -1,0 +1,13 @@
+{
+  "transactionData": "AAAAAAAAAAEAAAAH6hS8qZjpjw3bM46OXO9uGfBzeKO3HotPiGjO3IV+Ts0AAAABAAAABgAAAAEmU1Fc+h02S4iEBnpjdCESXpKHG/bOUxC3DeRWUy9+mQAAABQAAAABAAggFgAAAAAAAACIAAAAAAAAPEM=",
+  "cost": {
+    "cpuInsns": "100000",
+    "memBytes": "2000"
+  },
+  "error": null,
+  "latestLedger": "1842910",
+  "events": [],
+  "minResourceFee": "AAAAAAAApBA=",
+  "restoreFee": null,
+  "stateChanges": []
+}

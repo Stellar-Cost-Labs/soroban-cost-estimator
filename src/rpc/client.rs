@@ -378,18 +378,37 @@ struct DedupState {
 
 /// Response envelope for the `getHealth` JSON-RPC method.
 ///
-/// Stellar RPC returns node status and optional node identity metadata.
-#[derive(Debug, Deserialize)]
+/// Stellar RPC returns node status, optional node identity metadata,
+/// plus optional ledger-window information.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct HealthResponse {
+pub struct HealthResponse {
     /// Node health status: `healthy`, `degraded`, or `unhealthy`.
-    status: String,
+    pub status: String,
     /// Stellar network passphrase served by the node.
     #[serde(default)]
-    network_passphrase: Option<String>,
+    pub network_passphrase: Option<String>,
     /// Stellar Core version served by the node.
     #[serde(default)]
-    core_version: Option<String>,
+    pub core_version: Option<String>,
+    /// Latest ledger sequence known to the node, if reported.
+    #[serde(
+        default,
+        deserialize_with = "crate::rpc::simulate::deserialize_u64_flexible_opt"
+    )]
+    pub latest_ledger: Option<u64>,
+    /// Oldest ledger sequence retained by the node, if reported.
+    #[serde(
+        default,
+        deserialize_with = "crate::rpc::simulate::deserialize_u64_flexible_opt"
+    )]
+    pub oldest_ledger: Option<u64>,
+    /// Ledger retention window size, if reported.
+    #[serde(
+        default,
+        deserialize_with = "crate::rpc::simulate::deserialize_u64_flexible_opt"
+    )]
+    pub ledger_retention_window: Option<u64>,
 }
 
 /// Node identity metadata returned by `getHealth`.

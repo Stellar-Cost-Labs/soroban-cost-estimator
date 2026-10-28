@@ -1,0 +1,6 @@
+{
+  "status": "healthy",
+  "latestLedger": "1842910",
+  "oldestLedger": "1825630",
+  "ledgerRetentionWindow": "17280"
+}
