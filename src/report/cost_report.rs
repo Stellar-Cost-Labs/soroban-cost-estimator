@@ -1143,6 +1143,12 @@ pub struct CostReport {
     /// `Simulation latency: X ms` in the table footer. Also helps identify
     /// slow or overloaded RPC endpoints.
     pub simulation_duration_ms: u64,
+    /// Sanitized host identifier of the RPC endpoint that served the estimate.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rpc_endpoint: String,
+    /// Whether the primary or fallback endpoint served the successful response.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rpc_role: String,
     /// Fee rates used to compute the breakdown (carried so optimization
     /// suggestions can quantify per-resource savings). Excluded from
     /// serialized output; `None` when the rates were unavailable.
@@ -2756,6 +2762,7 @@ pub fn format_pricing_sensitivity_json(report: &PricingSensitivityReport) -> Str
     serde_json::to_string(&json).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// Formats a list of cost projections into a human-readable table.
 pub fn format_projections_table(projections: &[CostProjection]) -> String {
     if projections.is_empty() {
         return String::new();
@@ -2880,6 +2887,8 @@ mod tests {
             ledger: 3_894_195,
             network: "testnet".to_string(),
             simulation_duration_ms: 87,
+            rpc_endpoint: String::new(),
+            rpc_role: String::new(),
             rates: Some(rates),
             warnings: Vec::new(),
             history: None,
@@ -3002,6 +3011,8 @@ mod tests {
             ledger: 0,
             network: "testnet".to_string(),
             simulation_duration_ms: 0,
+            rpc_endpoint: String::new(),
+            rpc_role: String::new(),
             rates: None,
             warnings: Vec::new(),
             history: None,
