@@ -1309,8 +1309,15 @@ fn test_custom_sections_serialized_with_names_and_sizes() {
 
     // Each custom section must have a name and size
     for section in wasm_info.custom_sections() {
-        assert!(!section.name.is_empty(), "custom section name must not be empty");
-        assert!(section.size > 0, "custom section {} has no size", section.name);
+        assert!(
+            !section.name.is_empty(),
+            "custom section name must not be empty"
+        );
+        assert!(
+            section.size > 0,
+            "custom section {} has no size",
+            section.name
+        );
         assert!(
             section.end > section.offset,
             "custom section {} end must be after offset",
@@ -1428,6 +1435,7 @@ fn test_unknown_custom_sections_handled_gracefully() {
     let _ = std::fs::remove_file(&temp);
 }
 
+#[test]
 fn test_fuzz_seed_corpus_fixtures_succeed() {
     use soroban_cost_estimator::wasm::parser::{
         enumerate_module_metadata, parse_contract_spec_entries, validate_wasm,
