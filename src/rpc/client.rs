@@ -12,6 +12,7 @@ use tokio::sync::{Mutex, Notify};
 use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
+use crate::rpc::circuit_breaker::CircuitBreaker;
 use crate::rpc::retry::{DEFAULT_MAX_RETRIES, with_retry_deadline};
 
 /// Default per-request HTTP timeout applied to every RPC call. Matches the
@@ -149,6 +150,13 @@ pub fn resolve_ws_endpoint(network: &str, custom_url: Option<&str>) -> AppResult
     let ws_endpoint = to_websocket_url(&http_endpoint)?;
     debug!(network, ws_endpoint, "resolved WebSocket RPC endpoint");
     Ok(ws_endpoint)
+}
+
+fn sanitize_host(url: &str) -> String {
+    let without_scheme = url.split("://").nth(1).unwrap_or(url);
+    let host_part = without_scheme.split('/').next().unwrap_or(without_scheme);
+    let host = host_part.split('@').next_back().unwrap_or(host_part);
+    host.split('?').next().unwrap_or(host).to_string()
 }
 
 /// Rewrites an RPC URL into its WebSocket form.
@@ -430,6 +438,10 @@ pub struct RpcClient {
     /// Optional overall deadline spanning retries, backoff, and failover for a
     /// single RPC operation.
     total_timeout: Option<Duration>,
+    /// Optional circuit breaker for the primary endpoint.
+    circuit_primary: Option<CircuitBreaker>,
+    /// Optional circuit breaker for the fallback endpoint (independent health state).
+    circuit_fallback: Option<CircuitBreaker>,
 }
 
 impl RpcClient {
@@ -678,6 +690,8 @@ impl RpcClient {
             last_attempt_count: AtomicU8::new(0),
             fallback_used: AtomicBool::new(false),
             total_timeout: default_total_timeout(),
+            circuit_primary: None,
+            circuit_fallback: None,
         }
     }
 
@@ -687,6 +701,22 @@ impl RpcClient {
     #[must_use]
     pub fn with_total_timeout(mut self, total_timeout: Option<Duration>) -> Self {
         self.total_timeout = total_timeout.filter(|d| !d.is_zero());
+        self
+    }
+
+    /// Attach circuit breakers for the primary and optional fallback endpoints.
+    ///
+    /// Pass `None` for either argument to leave that endpoint's breaker
+    /// disabled. New clients start without any circuit breakers, preserving
+    /// the existing retry/failover behavior until the operator opts in.
+    #[must_use]
+    pub fn with_circuit_breaker(
+        mut self,
+        primary: Option<CircuitBreaker>,
+        fallback: Option<CircuitBreaker>,
+    ) -> Self {
+        self.circuit_primary = primary;
+        self.circuit_fallback = fallback;
         self
     }
 
@@ -884,10 +914,39 @@ impl RpcClient {
             fallback_used = self.fallback_used.load(Ordering::Relaxed),
             "sending RPC request"
         );
-        match self
+
+        // ── Primary endpoint ─────────────────────────────────────────────────
+        // Fast-fail without network contact when the primary circuit is open.
+        if let Some(ref cb) = self.circuit_primary {
+            if cb.should_reject() {
+                debug!(
+                    method,
+                    primary = %self.url,
+                    "circuit open for primary endpoint — fast-failing without network contact"
+                );
+                return Err(cb.open_error());
+            }
+        }
+
+        let primary_result = self
             .post_and_parse(method, &body, &self.url, self.connect_timeout, deadline)
-            .await
-        {
+            .await;
+
+        // Record the outcome in the primary circuit breaker (when enabled).
+        match &primary_result {
+            Ok(_) => {
+                if let Some(ref cb) = self.circuit_primary {
+                    cb.record_success();
+                }
+            }
+            Err(e) => {
+                if let Some(ref cb) = self.circuit_primary {
+                    cb.record_failure(e);
+                }
+            }
+        }
+
+        match primary_result {
             Ok(result) => Ok(result),
             Err(e) if Self::is_failover_trigger(&e) => {
                 if let Some(d) = deadline
@@ -900,6 +959,23 @@ impl RpcClient {
                     return Err(AppError::TotalTimeout { timeout_ms });
                 }
                 if let Some(ref fallback) = self.fallback_url {
+                    // ── Fallback endpoint ─────────────────────────────────────────────────
+                    // Fast-fail without network contact when the fallback
+                    // circuit is also open.
+                    if let Some(ref cb) = self.circuit_fallback {
+                        if cb.should_reject() {
+                            debug!(
+                                method,
+                                fallback = %fallback,
+                                "circuit open for fallback endpoint — fast-failing without network contact"
+                            );
+                            // Return the original primary error so the caller
+                            // sees a transport error rather than a confusing
+                            // "circuit open" message for the fallback.
+                            return Err(e);
+                        }
+                    }
+
                     // The operator-facing notice goes to stderr so it never
                     // contaminates machine-readable stdout (json/csv/markdown).
                     eprintln!("Primary RPC failed, failing over to fallback endpoint: {fallback}");
@@ -911,14 +987,51 @@ impl RpcClient {
                         error = %e,
                         "primary RPC endpoint failed — failing over to fallback"
                     );
-                    self.post_and_parse(method, &body, fallback, self.connect_timeout, deadline)
-                        .await
+                    let fallback_result = self
+                        .post_and_parse(method, &body, fallback, self.connect_timeout, deadline)
+                        .await;
+
+                    // Record the fallback outcome in the fallback circuit breaker (when enabled).
+                    match &fallback_result {
+                        Ok(_) => {
+                            if let Some(ref cb) = self.circuit_fallback {
+                                cb.record_success();
+                            }
+                        }
+                        Err(fe) => {
+                            if let Some(ref cb) = self.circuit_fallback {
+                                cb.record_failure(fe);
+                            }
+                        }
+                    }
+
+                    fallback_result
                 } else {
                     Err(e)
                 }
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Returns whether the primary or fallback RPC endpoint served the last response.
+    #[must_use]
+    pub fn served_role(&self) -> &'static str {
+        if self.fallback_used.load(Ordering::Relaxed) {
+            "fallback"
+        } else {
+            "primary"
+        }
+    }
+
+    /// Returns the sanitized host identifier of the RPC endpoint that served the last response.
+    #[must_use]
+    pub fn sanitized_host(&self) -> String {
+        sanitize_host(if self.fallback_used.load(Ordering::Relaxed) {
+            self.fallback_url.as_deref().unwrap_or(&self.url)
+        } else {
+            &self.url
+        })
     }
 
     /// True when `error` should trigger a failover attempt against the
