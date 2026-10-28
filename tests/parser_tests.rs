@@ -631,7 +631,7 @@ fn contract_meta_section(section_name: &str) -> Vec<u8> {
 
 /// Encodes a single `ScSpecFunctionV0` entry using stellar-xdr.
 fn xdr_spec_function(name: &str, inputs: &[(&str, &str)], outputs: &[&str]) -> Vec<u8> {
-    use stellar_xdr::{ScSpecEntry, ScSpecFunctionV0, ScSpecTypeDef, WriteXdr, ReadXdr};
+    use stellar_xdr::{ScSpecEntry, ScSpecFunctionV0, ScSpecTypeDef, WriteXdr};
 
     let mut spec_inputs = Vec::new();
     for (input_name, input_type) in inputs {
