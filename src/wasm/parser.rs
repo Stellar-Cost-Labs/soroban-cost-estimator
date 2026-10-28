@@ -1049,8 +1049,10 @@ pub struct FunctionInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpecExportDiagnostic {
     /// A function declared in the spec is not exported by the WASM module.
+    /// The `name` field contains the function name that is in the spec but missing from exports.
     SpecFunctionNotExported { name: String },
     /// A function exported by the WASM module has no corresponding spec entry.
+    /// The `name` field contains the exported function name that is missing from the spec.
     ExportMissingSpec { name: String },
 }
 
