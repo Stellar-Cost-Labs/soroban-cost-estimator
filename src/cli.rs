@@ -289,8 +289,8 @@ pub enum Command {
         #[arg(long, short = 'i')]
         interactive: bool,
 
-        /// Skip re-simulation when a cached estimate is still fresh
-        /// (e.g. "30m", "1h", "7d"; bare value = seconds).
+        /// Override the cache freshness TTL from config.toml (default: 7d).
+        /// Accepts "30m", "1h", "7d", or bare seconds.
         #[arg(long, value_name = "DURATION")]
         cache_ttl: Option<String>,
 
