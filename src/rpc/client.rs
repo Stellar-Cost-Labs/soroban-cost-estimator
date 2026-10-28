@@ -788,6 +788,25 @@ impl RpcClient {
         self
     }
 
+    /// Sets the maximum capacity of the request deduplication completed-result cache.
+    ///
+    /// When new entries exceed this bound, older completed requests are deterministically
+    /// evicted using a Least-Recently-Used (LRU) policy. In-flight single-flight requests
+    /// remain unaffected. A capacity of `0` disables completed-request caching while
+    /// preserving single-flight deduplication for concurrent in-flight requests.
+    #[must_use]
+    pub fn with_dedup_capacity(mut self, capacity: usize) -> Self {
+        self.dedup = Arc::new(Mutex::new(DedupState::with_capacity(capacity)));
+        self
+    }
+
+    /// Returns the number of completed entries currently retained in the deduplication cache.
+    #[must_use]
+    pub async fn dedup_cache_len(&self) -> usize {
+        let state = self.dedup.lock().await;
+        state.completed.len()
+    }
+
     /// Returns the custom HTTP headers configured for this client.
     ///
     /// These are the headers parsed from the `--header` values and attached to
