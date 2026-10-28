@@ -152,6 +152,13 @@ pub fn resolve_ws_endpoint(network: &str, custom_url: Option<&str>) -> AppResult
     Ok(ws_endpoint)
 }
 
+fn sanitize_host(url: &str) -> String {
+    let without_scheme = url.split("://").nth(1).unwrap_or(url);
+    let host_part = without_scheme.split('/').next().unwrap_or(without_scheme);
+    let host = host_part.split('@').next_back().unwrap_or(host_part);
+    host.split('?').next().unwrap_or(host).to_string()
+}
+
 /// Rewrites an RPC URL into its WebSocket form.
 ///
 /// * `ws://` / `wss://` URLs are kept as-is.
@@ -1005,6 +1012,26 @@ impl RpcClient {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Returns whether the primary or fallback RPC endpoint served the last response.
+    #[must_use]
+    pub fn served_role(&self) -> &'static str {
+        if self.fallback_used.load(Ordering::Relaxed) {
+            "fallback"
+        } else {
+            "primary"
+        }
+    }
+
+    /// Returns the sanitized host identifier of the RPC endpoint that served the last response.
+    #[must_use]
+    pub fn sanitized_host(&self) -> String {
+        sanitize_host(if self.fallback_used.load(Ordering::Relaxed) {
+            self.fallback_url.as_deref().unwrap_or(&self.url)
+        } else {
+            &self.url
+        })
     }
 
     /// True when `error` should trigger a failover attempt against the

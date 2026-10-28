@@ -1,4 +1,5 @@
-//! Integration tests for RPC endpoint failover (`--rpc-fallback-url`, #306)
+//! Integration tests for RPC endpoint failover (`--rpc-fallback-url`, #306),
+//! endpoint provenance metadata (`rpc_endpoint`, `rpc_role`, #501),
 //! and circuit breaking for persistently unhealthy endpoints (#505).
 //!
 //! These drive the crate's public [`RpcClient`] and the built CLI binary
@@ -16,10 +17,14 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use soroban_cost_estimator::error::AppResult;
+use soroban_cost_estimator::report::cost_report::CostReport;
+use soroban_cost_estimator::report::fee_calc::FeeBreakdown;
+use soroban_cost_estimator::report::formatter::{JsonFormatter, ReportFormatter, TableFormatter};
 use soroban_cost_estimator::rpc::circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitState, Clock,
 };
 use soroban_cost_estimator::rpc::client::RpcClient;
+use soroban_cost_estimator::wasm::parser::ContractMeta;
 
 /// A hostname that is guaranteed never to resolve (RFC 6761 reserves the
 /// `.invalid` TLD), standing in for a misconfigured/unreachable primary
@@ -72,7 +77,7 @@ fn refused_port_url() -> String {
     format!("http://{addr}")
 }
 
-// ── Fake clock ───────────────────────────────────────────────────────────────
+// â”€â”€ Fake clock â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// A fake monotonic clock for deterministic circuit-breaker tests.
 /// Advances time without sleeping via [`FakeClock::advance`].
@@ -103,7 +108,7 @@ impl Clock for FakeClock {
     }
 }
 
-// ── Existing failover tests (#306) ───────────────────────────────────────────
+// â”€â”€ Existing failover tests (#306) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// When the primary endpoint points at an invalid host (DNS never resolves)
 /// and a fallback URL is configured, a request must transparently fail over
@@ -320,7 +325,139 @@ async fn overall_deadline_spans_primary_and_fallback_attempts() {
     assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
 }
 
-// ── Circuit breaker integration tests (#505) ─────────────────────────────────
+/// Integration test verifying that fallback success records the correct
+/// `rpc_endpoint` and `rpc_role` in the CostReport, and that any credentials,
+/// query tokens, and Authorization headers in the underlying URLs are
+/// properly sanitized and never rendered in human or structured reports (#501).
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn fallback_success_records_provenance_and_scrubs_credentials_in_cost_report() {
+    let (fallback_url, served) = spawn_rpc_stub();
+    // Embed sensitive userinfo and query string tokens in both endpoints,
+    // and provide an Authorization header with a secret token.
+    let primary_with_creds =
+        "http://primary_user:primary_secret@primary.invalid:8080/rpc?token=prim_secret_tok";
+    let fallback_with_creds = format!(
+        "{}/rpc?key=fallback_secret_token",
+        fallback_url.replace("http://", "http://fallback_user:fallback_pass@")
+    );
+    let secret_auth = "Authorization=Bearer ultra-secret-jwt-token";
+
+    let client = RpcClient::with_fallback_headers(
+        primary_with_creds,
+        Some(&fallback_with_creds),
+        None,
+        Duration::from_secs(10),
+        0,
+        &[secret_auth.to_string()],
+        false,
+    )
+    .expect("valid client config");
+
+    let result: AppResult<Value> = client.call("getHealth", serde_json::json!({})).await;
+    assert!(
+        result.is_ok(),
+        "fallback should successfully serve the request: {result:?}"
+    );
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        1,
+        "fallback server must have served 1 request"
+    );
+
+    // Endpoint provenance asserts
+    assert_eq!(client.served_role(), "fallback");
+    let sanitized_host = client.sanitized_host();
+
+    assert!(
+        sanitized_host.starts_with("127.0.0.1:"),
+        "sanitized host should be fallback loopback host:port; got: {sanitized_host}"
+    );
+    // Ensure all secrets are absent from sanitized host
+    assert!(!sanitized_host.contains("primary_secret"));
+    assert!(!sanitized_host.contains("primary_user"));
+    assert!(!sanitized_host.contains("fallback_secret"));
+    assert!(!sanitized_host.contains("fallback_user"));
+    assert!(!sanitized_host.contains("fallback_pass"));
+    assert!(!sanitized_host.contains("fallback_secret_token"));
+    assert!(!sanitized_host.contains("prim_secret_tok"));
+    assert!(!sanitized_host.contains("ultra-secret-jwt-token"));
+    assert!(!sanitized_host.contains('@'));
+    assert!(!sanitized_host.contains('?'));
+
+    // Construct CostReport using client's provenance
+    let report = CostReport {
+        function: "transfer".to_string(),
+        wasm_hash: "0123456789abcdef".to_string(),
+        wasm_size: 2048,
+        wasm_sections: Vec::new(),
+        cpu_instructions: 250_000,
+        memory_bytes: 4096,
+        tx_size: 512,
+        read_entries: 2,
+        write_entries: 2,
+        read_bytes: 128,
+        write_bytes: 128,
+        fee: FeeBreakdown {
+            non_refundable_stroops: 5000,
+            refundable_stroops: 10000,
+            cpu_fee_stroops: 500,
+            storage_fee_stroops: 1000,
+            bandwidth_fee_stroops: 100,
+            base_fee_stroops: 100,
+            total_stroops: 16700,
+            total_xlm: "0.0016700".to_string(),
+            fee_percentages: std::collections::BTreeMap::new(),
+        },
+        ledger: 123_456,
+        network: "testnet".to_string(),
+        simulation_duration_ms: 45,
+        rpc_endpoint: sanitized_host.clone(),
+        rpc_role: client.served_role().to_string(),
+        rates: None,
+        warnings: Vec::new(),
+        history: None,
+        projections: None,
+        contract_meta: ContractMeta::default(),
+        diagnostics: None,
+    };
+
+    assert_eq!(report.rpc_role, "fallback");
+    assert_eq!(report.rpc_endpoint, sanitized_host);
+
+    // Verify human-readable table report
+    let table_output = TableFormatter.format(&report);
+    assert!(
+        table_output.contains(&format!("RPC endpoint: {sanitized_host} (fallback)")),
+        "table must display sanitized endpoint and role; got:\n{table_output}"
+    );
+    assert!(!table_output.contains("primary_secret"));
+    assert!(!table_output.contains("primary_user"));
+    assert!(!table_output.contains("fallback_secret"));
+    assert!(!table_output.contains("fallback_user"));
+    assert!(!table_output.contains("fallback_pass"));
+    assert!(!table_output.contains("fallback_secret_token"));
+    assert!(!table_output.contains("prim_secret_tok"));
+    assert!(!table_output.contains("ultra-secret-jwt-token"));
+    assert!(!table_output.contains("Bearer"));
+
+    // Verify structured JSON report
+    let json_output = JsonFormatter.format(&report);
+    assert!(
+        json_output.contains(&format!(r#""rpc_endpoint": "{sanitized_host}""#)),
+        "JSON output must include sanitized rpc_endpoint; got:\n{json_output}"
+    );
+    assert!(
+        json_output.contains(r#""rpc_role": "fallback""#),
+        "JSON output must include rpc_role: fallback; got:\n{json_output}"
+    );
+    assert!(!json_output.contains("primary_secret"));
+    assert!(!json_output.contains("fallback_pass"));
+    assert!(!json_output.contains("fallback_secret_token"));
+    assert!(!json_output.contains("ultra-secret-jwt-token"));
+}
+
+// â”€â”€ Circuit breaker integration tests (#505) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// A circuit breaker that is disabled (threshold = 0) must never reject calls
 /// and must not change the behavior of a healthy endpoint.
@@ -355,7 +492,7 @@ async fn circuit_opens_after_threshold_and_fast_fails() {
     let client = RpcClient::with_fallback(&dead_url, None, None, Duration::from_secs(5), 0, false)
         .with_circuit_breaker(Some(cb.clone()), None);
 
-    // First two calls fail with transport errors — circuit stays closed.
+    // First two calls fail with transport errors â€” circuit stays closed.
     let _ = client.call::<Value>("test", serde_json::json!({})).await;
     assert_eq!(
         cb.state(),
@@ -369,18 +506,18 @@ async fn circuit_opens_after_threshold_and_fast_fails() {
         "two failures: circuit must be open"
     );
 
-    // Third call — circuit is open, must fail immediately without a
+    // Third call â€” circuit is open, must fail immediately without a
     // network attempt.
     let result = client.call::<Value>("test", serde_json::json!({})).await;
     assert!(result.is_err(), "open circuit must return an error");
 }
 
 /// Application-level simulation failures (JSON-RPC errors inside a 200
-/// response) must never open the circuit — the endpoint is reachable and
+/// response) must never open the circuit â€” the endpoint is reachable and
 /// responding correctly, so there is no transport problem to protect against.
 #[tokio::test]
 async fn application_level_failures_do_not_open_circuit() {
-    let (url, served) = spawn_rpc_stub();
+    let (_url, served) = spawn_rpc_stub();
     // Replace the healthy stub reply with a JSON-RPC error body by standing
     // up a stub that always returns a JSON-RPC error.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
@@ -395,7 +532,7 @@ async fn application_level_failures_do_not_open_circuit() {
                 let mut buf = [0u8; 2048];
                 let _ = stream.read(&mut buf);
                 ctr.fetch_add(1, Ordering::SeqCst);
-                // JSON-RPC error body inside HTTP 200 — application error,
+                // JSON-RPC error body inside HTTP 200 â€” application error,
                 // not a transport failure.
                 let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"simulation failed"}}"#;
                 let response = format!(
@@ -420,7 +557,7 @@ async fn application_level_failures_do_not_open_circuit() {
         RpcClient::with_fallback(&rpc_error_url, None, None, Duration::from_secs(5), 0, false)
             .with_circuit_breaker(Some(cb.clone()), None);
 
-    // Many application-level errors — circuit must stay closed.
+    // Many application-level errors â€” circuit must stay closed.
     for _ in 0..10 {
         let _ = client.call::<Value>("test", serde_json::json!({})).await;
     }
@@ -443,7 +580,7 @@ async fn application_level_failures_do_not_open_circuit() {
 /// a probe through. A successful probe closes the circuit.
 #[tokio::test]
 async fn circuit_recovers_after_cooldown_with_successful_probe() {
-    let dead_url = refused_port_url();
+    let _dead_url = refused_port_url();
     let (healthy_url, served) = spawn_rpc_stub();
     let clock = Arc::new(FakeClock::new());
     let cb = CircuitBreaker::with_clock(
@@ -459,7 +596,7 @@ async fn circuit_recovers_after_cooldown_with_successful_probe() {
     // Advance the fake clock past the cooldown.
     clock.advance(Duration::from_millis(201));
 
-    // Now use a healthy endpoint — the probe should succeed and close the
+    // Now use a healthy endpoint â€” the probe should succeed and close the
     // circuit. We create a new client with the same shared circuit breaker
     // pointing at the now-healthy URL.
     let client =
