@@ -1064,6 +1064,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn threshold_percent_accepts_finite_non_negative_values() {
         assert!((parse_threshold_percent("10").unwrap() - 10.0).abs() < f64::EPSILON);
         assert!((parse_threshold_percent("500.5").unwrap() - 500.5).abs() < f64::EPSILON);
