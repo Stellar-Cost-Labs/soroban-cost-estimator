@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Duration;
 
 use governor::{Quota, RateLimiter};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -414,7 +414,9 @@ pub struct HealthMetadata {
 pub struct RpcClient {
     url: String,
     fallback_url: Option<String>,
-    client: reqwest::Client,
+    // Legacy infallible constructors retain configuration failures and report
+    // them before sending any request. Never fall back to a direct connection.
+    client: Result<reqwest::Client, String>,
     dedup: Arc<Mutex<DedupState>>,
     /// Fixed-rate limiter shared by every network call, when enabled.
     limiter: Option<Arc<governor::DefaultDirectRateLimiter>>,
@@ -444,11 +446,61 @@ pub struct RpcClient {
     circuit_fallback: Option<CircuitBreaker>,
 }
 
+/// Explicit process-local proxy used by CLI-created RPC clients. This is not
+/// written to the environment, so one invocation cannot alter other tools.
+static EXPLICIT_PROXY: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+
+/// Configure the explicit HTTP(S) proxy for subsequently created clients.
+///
+/// An explicit proxy takes precedence over `HTTP_PROXY`/`HTTPS_PROXY` because
+/// reqwest evaluates configured proxies before environment-derived settings.
+/// Credentials are intentionally never retained in diagnostics or logs.
+pub fn set_explicit_proxy(proxy_url: Option<&str>) -> AppResult<()> {
+    if let Some(proxy_url) = proxy_url {
+        reqwest::Proxy::all(proxy_url)
+            .map_err(|_| AppError::InvalidProxy("invalid proxy URL".to_string()))?;
+    }
+    let proxy = EXPLICIT_PROXY.get_or_init(|| RwLock::new(None));
+    let mut configured = proxy
+        .write()
+        .map_err(|_| AppError::InvalidProxy("proxy configuration lock poisoned".to_string()))?;
+    *configured = proxy_url.map(str::to_owned);
+    Ok(())
+}
+
+fn explicit_proxy() -> Option<String> {
+    EXPLICIT_PROXY
+        .get()
+        .and_then(|proxy| proxy.read().ok().and_then(|configured| configured.clone()))
+}
+
 impl RpcClient {
     /// Create a new RPC client pointing at the given URL, without rate
     /// limiting and with the default request timeout.
     pub fn new(url: &str) -> Self {
         Self::with_rate_limit(url, None, false)
+    }
+
+    /// Create a client that routes its RPC traffic through `proxy_url`.
+    ///
+    /// This per-client constructor is primarily useful for embedders and
+    /// tests; the CLI configures the same behavior through `--rpc-proxy`.
+    pub fn with_proxy(url: &str, proxy_url: &str) -> AppResult<Self> {
+        reqwest::Proxy::all(proxy_url)
+            .map_err(|_| AppError::InvalidProxy("invalid proxy URL".to_string()))?;
+        let client = Self::from_parts_with_proxy(
+            url,
+            None,
+            None,
+            DEFAULT_TIMEOUT,
+            DEFAULT_CONNECT_TIMEOUT,
+            DEFAULT_MAX_RETRIES,
+            HeaderMap::new(),
+            false,
+            Some(proxy_url),
+        );
+        client.check_client_configuration()?;
+        Ok(client)
     }
 
     /// Create a new RPC client pointing at the given URL, optionally capping
@@ -641,7 +693,7 @@ impl RpcClient {
             "creating RPC client"
         );
         let headers = parse_headers(headers)?;
-        Ok(Self::from_parts(
+        let client = Self::from_parts(
             url,
             fallback_url,
             rps,
@@ -650,7 +702,9 @@ impl RpcClient {
             max_retries,
             headers,
             verbose,
-        ))
+        );
+        client.check_client_configuration()?;
+        Ok(client)
     }
 
     /// Shared, infallible construction path for every public constructor.
@@ -667,20 +721,36 @@ impl RpcClient {
         headers: HeaderMap,
         verbose: bool,
     ) -> Self {
+        Self::from_parts_with_proxy(
+            url,
+            fallback_url,
+            rps,
+            timeout,
+            connect_timeout,
+            max_retries,
+            headers,
+            verbose,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_parts_with_proxy(
+        url: &str,
+        fallback_url: Option<&str>,
+        rps: Option<u64>,
+        timeout: Duration,
+        connect_timeout: Duration,
+        max_retries: usize,
+        headers: HeaderMap,
+        verbose: bool,
+        proxy_url: Option<&str>,
+    ) -> Self {
         Self {
             url: url.to_string(),
             fallback_url: fallback_url.map(String::from),
-            // `ClientBuilder::build` only fails on invalid configuration (a
-            // default builder cannot), so fall back to a plain client to keep
-            // construction infallible.
-            client: reqwest::Client::builder()
-                .timeout(timeout)
-                .connect_timeout(connect_timeout)
-                .tcp_keepalive(Duration::from_secs(30))
-                .pool_idle_timeout(Duration::from_secs(90))
-                .default_headers(headers.clone())
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            client: build_http_client(timeout, connect_timeout, headers.clone(), proxy_url)
+                .map_err(|error| error.to_string()),
             dedup: Arc::new(Mutex::new(DedupState::default())),
             limiter: rps.and_then(build_rate_limiter),
             max_retries,
@@ -693,6 +763,13 @@ impl RpcClient {
             circuit_primary: None,
             circuit_fallback: None,
         }
+    }
+
+    fn check_client_configuration(&self) -> AppResult<()> {
+        self.client
+            .as_ref()
+            .map(|_| ())
+            .map_err(|message| AppError::Config(message.clone()))
     }
 
     /// Sets an overall per-operation deadline spanning all retry attempts,
@@ -1070,7 +1147,11 @@ impl RpcClient {
         connect_timeout: Duration,
         deadline: Option<tokio::time::Instant>,
     ) -> AppResult<Value> {
-        let client = self.client.clone();
+        let client = self
+            .client
+            .as_ref()
+            .map_err(|message| AppError::Config(message.clone()))?
+            .clone();
         let url = url.to_string();
         let request_body = body.clone();
         let limiter = self.limiter.clone();
@@ -1199,6 +1280,44 @@ impl RpcClient {
         );
         trace!(method, "RPC call succeeded");
         Ok(result.clone())
+    }
+}
+
+fn build_http_client(
+    timeout: Duration,
+    connect_timeout: Duration,
+    headers: HeaderMap,
+    proxy_url: Option<&str>,
+) -> AppResult<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(connect_timeout)
+        .tcp_keepalive(Duration::from_secs(30))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .default_headers(headers);
+    if let Some(proxy_url) = proxy_url.map(str::to_owned).or_else(explicit_proxy) {
+        let proxy = reqwest::Proxy::all(proxy_url)
+            .map_err(|_| AppError::InvalidProxy("invalid proxy URL".to_string()))?;
+        builder = builder.proxy(proxy);
+    }
+    builder
+        .build()
+        .map_err(|_| AppError::Config("failed to build RPC HTTP client".to_string()))
+}
+
+#[cfg(test)]
+mod proxy_builder_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_proxy_is_an_error_instead_of_a_direct_client() {
+        let result = build_http_client(
+            DEFAULT_TIMEOUT,
+            DEFAULT_CONNECT_TIMEOUT,
+            HeaderMap::new(),
+            Some("http://[invalid"),
+        );
+        assert!(matches!(result, Err(AppError::InvalidProxy(_))));
     }
 }
 
