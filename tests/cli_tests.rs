@@ -2181,6 +2181,69 @@ fn test_watch_unknown_network_is_non_fatal() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+/// `watch` handles Ctrl-C as a clean shutdown and leaves no partial snapshot.
+#[cfg(unix)]
+#[test]
+fn test_watch_sigint_exits_cleanly_without_partial_snapshot() {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::process::ExitStatusExt;
+    use std::time::{Duration, Instant};
+
+    let home = temp_home("watch-sigint");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args(["watch", "--network", "testnet"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn watch");
+
+    let stdout = child.stdout.take().expect("watch stdout should be piped");
+    let (line_tx, line_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let result = reader.read_line(&mut line).map(|_| line);
+        let _ = line_tx.send(result);
+    });
+
+    let startup_line = line_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("watch did not print its startup line")
+        .expect("failed to read watch startup line");
+    assert!(
+        startup_line.contains("Watching testnet for config changes"),
+        "unexpected watch startup output: {startup_line}"
+    );
+
+    let signal_status = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .expect("failed to run kill");
+    assert!(signal_status.success(), "failed to send SIGINT to watch");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to check watch status") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("watch did not exit within 2 seconds after SIGINT");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    assert!(status.success(), "watch exited unsuccessfully: {status}");
+    assert_eq!(status.signal(), None, "watch was terminated by a signal");
+    assert!(
+        snapshot_files(&home, "testnet").is_empty(),
+        "watch left a snapshot file behind after SIGINT"
+    );
+}
+
 // `wasm-info` — contractmeta display
 // ─────────────────────────────────────────────────────────────────────────
 
