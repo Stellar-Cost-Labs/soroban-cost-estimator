@@ -12,6 +12,15 @@ pub const DEFAULT_MAX_RETRIES: usize = 3;
 /// plus a random jitter offset drawn from the same range.
 const BASE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+/// Maximum delay allowed for any single retry attempt, capping both exponential
+/// backoff and server-provided `Retry-After` values.
+///
+/// Upstream servers or gateways under heavy load may occasionally return
+/// excessively long `Retry-After` headers (e.g., hours or days). Capping the
+/// delay prevents requests from hanging indefinitely while still respecting
+/// the server's rate-limiting cooldown window up to a reasonable threshold.
+pub const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
+
 /// HTTP statuses that indicate a transient failure worth retrying: rate
 /// limiting (429) and server-side errors (500/502/503/504). Deterministic
 /// client errors such as 400 are never retried.
@@ -34,25 +43,83 @@ const TRANSIENT_STATUSES: [u16; 5] = [429, 500, 502, 503, 504];
 ///
 /// Retry attempts are logged to stderr when debug logging is enabled (i.e.
 /// when the CLI is run with `--verbose`).
-pub async fn with_retry<F, Fut, T>(max_retries: usize, mut operation: F) -> AppResult<T>
+pub async fn with_retry<F, Fut, T>(max_retries: usize, operation: F) -> AppResult<T>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = AppResult<T>>,
 {
-    // `attempts` counts retries already performed. The initial attempt runs
-    // before any check, so the operation executes once plus up to
-    // `max_retries` extra times.
+    with_retry_deadline(max_retries, None, None, operation, None).await
+}
+
+/// Executes an async operation with retries, bounded by an optional overall
+/// monotonic `deadline` (`tokio::time::Instant`).
+///
+/// When `deadline` is `Some(d)`, every attempt is wrapped in
+/// [`tokio::time::timeout_at`] and any backoff sleep is capped at `d`. Once
+/// `d` expires, in-flight and subsequent retry work stops immediately and
+/// [`AppError::TotalTimeout`] is returned.
+pub async fn with_retry_deadline<F, Fut, T>(
+    max_retries: usize,
+    deadline: Option<tokio::time::Instant>,
+    total_timeout: Option<Duration>,
+    mut operation: F,
+    attempt_counter: Option<&std::sync::atomic::AtomicU8>,
+) -> AppResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = AppResult<T>>,
+{
+    let timeout_ms = total_timeout
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
     let mut attempts = 0;
 
     loop {
-        match operation().await {
+        if let Some(d) = deadline
+            && tokio::time::Instant::now() >= d
+        {
+            return Err(AppError::TotalTimeout { timeout_ms });
+        }
+
+        let attempt_result = if let Some(d) = deadline {
+            match tokio::time::timeout_at(d, operation()).await {
+                Ok(res) => res,
+                Err(_) => return Err(AppError::TotalTimeout { timeout_ms }),
+            }
+        } else {
+            operation().await
+        };
+
+        if let Some(counter) = attempt_counter {
+            counter.store(
+                (attempts + 1).min(u8::MAX as usize) as u8,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+
+        match attempt_result {
             Ok(value) => return Ok(value),
             Err(error) => {
-                if attempts >= max_retries || !is_retryable(&error) {
+                if matches!(error, AppError::TotalTimeout { .. })
+                    || attempts >= max_retries
+                    || !is_retryable(&error)
+                {
                     return Err(error);
                 }
 
                 let delay = retry_delay(&error, attempts);
+                if let Some(d) = deadline {
+                    let now = tokio::time::Instant::now();
+                    let Some(remaining) = d.checked_duration_since(now) else {
+                        return Err(AppError::TotalTimeout { timeout_ms });
+                    };
+                    if delay >= remaining {
+                        log_retry(&error, attempts + 1, max_retries, remaining);
+                        tokio::time::sleep_until(d).await;
+                        return Err(AppError::TotalTimeout { timeout_ms });
+                    }
+                }
+
                 log_retry(&error, attempts + 1, max_retries, delay);
                 tokio::time::sleep(delay).await;
                 attempts += 1;
@@ -74,26 +141,45 @@ fn is_retryable(error: &AppError) -> bool {
         AppError::Http(e) => e.is_connect() || e.is_timeout() || e.is_request(),
         AppError::HttpStatus { status, .. } => TRANSIENT_STATUSES.contains(status),
         AppError::RpcUnavailable { .. } | AppError::ConnectTimeout { .. } => true,
+        AppError::Rpc { status, data, .. } => is_retryable_rpc_error(*status, data.as_ref()),
         _ => false,
     }
 }
 
+/// Returns whether a JSON-RPC error represents a transient server failure.
+///
+/// An explicit boolean `data.retryable` field is authoritative when supplied
+/// by the server. Without it, only the standard internal error and reserved
+/// server-error range are retryable; unknown codes fail immediately.
+fn is_retryable_rpc_error(code: i64, data: Option<&serde_json::Value>) -> bool {
+    if let Some(retryable) = data
+        .and_then(serde_json::Value::as_object)
+        .and_then(|fields| fields.get("retryable"))
+        .and_then(serde_json::Value::as_bool)
+    {
+        return retryable;
+    }
+
+    code == -32603 || (-32099..=-32000).contains(&code)
+}
+
 /// Computes the delay before the retry following `attempt` (0-based).
 ///
-/// A `Retry-After` hint, when present, is authoritative. Otherwise the delay
-/// is the exponential backoff `500ms * 2^attempt` plus a random jitter offset
-/// of up to the same magnitude.
-fn retry_delay(error: &AppError, attempt: usize) -> Duration {
+/// A `Retry-After` hint, when present, is authoritative, capped at [`MAX_RETRY_DELAY`].
+/// Otherwise the delay is the exponential backoff `500ms * 2^attempt` plus a random
+/// jitter offset of up to the same magnitude, also capped at [`MAX_RETRY_DELAY`].
+pub fn retry_delay(error: &AppError, attempt: usize) -> Duration {
     if let AppError::HttpStatus {
         retry_after: Some(delay),
         ..
     } = error
     {
-        return *delay;
+        return (*delay).min(MAX_RETRY_DELAY);
     }
 
     let exponential = BASE_RETRY_DELAY.saturating_mul(1u32 << attempt.min(16));
-    exponential.saturating_add(random_below(exponential))
+    let delay = exponential.saturating_add(random_below(exponential));
+    delay.min(MAX_RETRY_DELAY)
 }
 
 /// Returns a pseudo-random `Duration` in `[0, max)`.
@@ -133,7 +219,9 @@ mod tests {
     use std::time::Duration;
 
     use crate::error::{AppError, AppResult};
-    use crate::rpc::retry::{BASE_RETRY_DELAY, is_retryable, retry_delay, with_retry};
+    use crate::rpc::retry::{
+        BASE_RETRY_DELAY, MAX_RETRY_DELAY, is_retryable, retry_delay, with_retry,
+    };
 
     /// Returns the URL of an ephemeral `127.0.0.1` port that is guaranteed
     /// closed: a listener is bound to it, its address captured, then the
@@ -224,9 +312,47 @@ mod tests {
         for status in [502u16, 503, 504] {
             assert!(is_retryable(&AppError::RpcUnavailable { status }));
         }
+    }
+
+    #[test]
+    fn classifies_json_rpc_codes_without_using_messages() {
+        for status in [-32603, -32099, -32000] {
+            assert!(
+                is_retryable(&AppError::Rpc {
+                    status,
+                    message: "anything".to_string(),
+                    data: None,
+                }),
+                "{status} should be retryable"
+            );
+        }
+
+        for status in [-32600, -32601, -32602, -32100, -1] {
+            assert!(
+                !is_retryable(&AppError::Rpc {
+                    status,
+                    message: "temporary server failure".to_string(),
+                    data: None,
+                }),
+                "{status} should not be retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_retryable_field_overrides_code_classification() {
+        let retryable = Some(serde_json::json!({"retryable": true}));
+        let permanent = Some(serde_json::json!({"retryable": false}));
+
+        assert!(is_retryable(&AppError::Rpc {
+            status: -32602,
+            message: "invalid params".to_string(),
+            data: retryable,
+        }));
         assert!(!is_retryable(&AppError::Rpc {
-            status: -32000,
-            message: "permanent".to_string(),
+            status: -32603,
+            message: "internal error".to_string(),
+            data: permanent,
         }));
     }
 
@@ -239,8 +365,9 @@ mod tests {
             async move {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 Err(AppError::Rpc {
-                    status: -32000,
+                    status: -32602,
                     message: "permanent".to_string(),
+                    data: None,
                 })
             }
         })
@@ -279,6 +406,7 @@ mod tests {
         assert!(!is_retryable(&AppError::Rpc {
             status: -1,
             message: "nope".to_string(),
+            data: None,
         }));
         assert!(!is_retryable(&AppError::XdrDecode("bad".to_string())));
     }
@@ -315,5 +443,68 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Excessive `Retry-After` values must be capped at [`MAX_RETRY_DELAY`].
+    #[test]
+    fn retry_after_excessive_delay_is_capped_at_max() {
+        let error = AppError::HttpStatus {
+            status: 429,
+            retry_after: Some(Duration::from_secs(3600)),
+            message: String::new(),
+        };
+        assert_eq!(retry_delay(&error, 0), MAX_RETRY_DELAY);
+    }
+
+    /// Zero delay specified by `Retry-After` is honored without backoff.
+    #[test]
+    fn retry_after_zero_delay_is_honored() {
+        let error = AppError::HttpStatus {
+            status: 429,
+            retry_after: Some(Duration::ZERO),
+            message: String::new(),
+        };
+        assert_eq!(retry_delay(&error, 3), Duration::ZERO);
+    }
+
+    /// High attempt count backoff is also capped at [`MAX_RETRY_DELAY`].
+    #[test]
+    fn exponential_backoff_is_capped_at_max_retry_delay() {
+        let error = AppError::HttpStatus {
+            status: 503,
+            retry_after: None,
+            message: String::new(),
+        };
+        let delay = retry_delay(&error, 16);
+        assert!(delay <= MAX_RETRY_DELAY);
+    }
+
+    /// When `max_retries` is 0, a rate-limited failure surfaces immediately
+    /// without retrying or delaying.
+    #[tokio::test]
+    async fn zero_max_retries_surfaces_rate_limit_immediately() {
+        let attempts = AtomicUsize::new(0);
+        let result: AppResult<()> = with_retry(0, || {
+            let attempts = &attempts;
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(AppError::HttpStatus {
+                    status: 429,
+                    retry_after: Some(Duration::from_secs(10)),
+                    message: "rate limited".to_string(),
+                })
+            }
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(AppError::HttpStatus {
+                status: 429,
+                retry_after: Some(_),
+                ..
+            })
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 }

@@ -3,6 +3,8 @@ use comfy_table::{Cell, CellAlignment, Color, Table};
 use crate::report::fee_calc::{FeeBreakdown, FeeRates};
 use crate::wasm::parser::{ContractMeta, SectionSize, format_contract_meta};
 
+use stellar_xdr::ReadXdr;
+
 // fee_percentage removed since we now use the precalculated exact percentages
 
 /// Minimum terminal width (in columns) required before the fee bar chart is
@@ -348,6 +350,470 @@ pub fn format_resource_warnings(warnings: &[ResourceWarning]) -> String {
     out
 }
 
+/// Maximum number of event / state-change entries summarized individually
+/// (issue #525). Counts always reflect the full response, so rendered
+/// output stays bounded no matter how many entries a simulation produced.
+pub const MAX_SUMMARIZED_ENTRIES: usize = 10;
+
+/// Maximum number of payload bytes hex-encoded per preview (#525).
+pub const MAX_PREVIEW_BYTES: usize = 32;
+
+/// Maximum number of topics previewed per event (#525).
+pub const MAX_PREVIEW_TOPICS: usize = 4;
+
+/// A bounded, redaction-safe summary of one simulation event (issue #525).
+///
+/// Payload bytes are never carried by default: without the explicit
+/// `--show-events` opt-in, only counts and decoded sizes are recorded, so no
+/// raw XDR leaves the RPC layer into reports, logs, or JSON output. Previews
+/// are bounded hex prefixes ([`MAX_PREVIEW_BYTES`]), never full payloads.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EventSummary {
+    /// Event kind: `"contract"`, `"diagnostic"`, `"legacy-xdr"` for the
+    /// pre-object base64-string form, or a bounded raw value / `"unknown"`
+    /// for version-drifted or malformed items.
+    pub kind: String,
+    /// Number of topics the event carried (0 for unrecognized items).
+    pub topic_count: usize,
+    /// Decoded size of the data payload in bytes. `None` when the payload
+    /// is missing or not valid base64 (malformed payloads never fail the
+    /// estimate, issue #525).
+    pub data_bytes: Option<usize>,
+    /// Bounded hex previews of the first topics — details mode only
+    /// (`--show-events`); empty by default (redaction).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topic_previews: Vec<String>,
+    /// Bounded hex preview of the data payload — details mode only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_preview: Option<String>,
+}
+
+/// A bounded, redaction-safe summary of one simulated state change
+/// (issue #525). Same redaction rules as [`EventSummary`]: sizes by
+/// default, bounded hex previews only on explicit request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StateChangeSummary {
+    /// Ledger-entry kind decoded from the change key XDR (e.g.
+    /// `"ContractData"`, `"ContractCode"`), or `"unrecognized"` for
+    /// malformed or undecodable keys.
+    pub key_type: String,
+    /// The change verb: `"created"`, `"updated"`, `"deleted"`, `"unknown"`
+    /// (object without any change payload), or `"unrecognized"` for
+    /// malformed items.
+    pub change: String,
+    /// Decoded size of the created/updated payload in bytes. `None` for
+    /// deletions, missing payloads, and undecodable base64.
+    pub payload_bytes: Option<usize>,
+    /// Bounded hex preview of the change payload — details mode only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_preview: Option<String>,
+}
+
+/// Diagnostic counts — and, only on explicit request, bounded per-entry
+/// summaries — of a simulation's events and state changes (issue #525).
+///
+/// `simulateTransaction` can return events and `stateChanges` that explain
+/// *why* resource usage looks the way it does. Counts are always shown when
+/// present; the `events` / `state_changes` summary arrays are populated only
+/// when the user passes `--show-events`, keeping the default output (text
+/// and JSON) unchanged for reports without diagnostics.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SimulationDiagnostics {
+    /// Total number of events in the response (may exceed the summarized
+    /// number of entries).
+    pub event_count: usize,
+    /// Total number of state changes in the response (may exceed the
+    /// summarized number of entries).
+    pub state_change_count: usize,
+    /// Bounded per-event summaries — empty unless `--show-events` was given.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<EventSummary>,
+    /// Bounded per-state-change summaries — empty unless `--show-events`
+    /// was given.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state_changes: Vec<StateChangeSummary>,
+}
+
+/// Hex-encode a payload preview, bounded to [`MAX_PREVIEW_BYTES`] bytes with
+/// a truncation marker when more bytes followed (#525).
+fn hex_preview(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let shown = &bytes[..bytes.len().min(MAX_PREVIEW_BYTES)];
+    let mut out = String::with_capacity(shown.len() * 2 + 16);
+    for byte in shown {
+        // Writing into a String cannot fail.
+        let _ = write!(out, "{byte:02x}");
+    }
+    if bytes.len() > shown.len() {
+        let _ = write!(out, "…(+{} bytes)", bytes.len() - shown.len());
+    }
+    out
+}
+
+/// Base64-decode a payload for size/preview purposes (#525). Returns `None`
+/// for missing or malformed base64 — diagnostics must never fail the
+/// estimate.
+fn decode_payload(b64: &str) -> Option<Vec<u8>> {
+    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok()
+}
+
+/// Summarize one raw simulation event (#525). Lenient by design: raw JSON
+/// objects (`{ type, topic, data }`), legacy base64-XDR strings, and
+/// malformed items all produce a summary instead of an error.
+fn summarize_event(item: &serde_json::Value, include_previews: bool) -> EventSummary {
+    use serde_json::Value;
+
+    // Legacy RPC form: the whole event is one base64 XDR string.
+    if let Value::String(raw) = item {
+        let decoded = decode_payload(raw);
+        return EventSummary {
+            kind: "legacy-xdr".to_string(),
+            topic_count: 0,
+            data_bytes: decoded.as_ref().map(Vec::len),
+            topic_previews: Vec::new(),
+            data_preview: if include_previews {
+                decoded.as_deref().map(hex_preview)
+            } else {
+                None
+            },
+        };
+    }
+
+    let Value::Object(obj) = item else {
+        // Numbers, booleans, arrays, null — nothing recognizable.
+        return EventSummary {
+            kind: "unrecognized".to_string(),
+            ..EventSummary::default()
+        };
+    };
+
+    let kind = match obj.get("type").and_then(Value::as_str) {
+        Some(kind) if kind == "contract" || kind == "diagnostic" => kind.to_string(),
+        // Preserve unknown kinds but bound them: the value is remote input.
+        Some(other) => other.chars().take(24).collect(),
+        None => "unknown".to_string(),
+    };
+    let topics: Vec<&str> = obj
+        .get("topic")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let topic_count = obj
+        .get("topic")
+        .and_then(Value::as_array)
+        .map_or(topics.len(), Vec::len);
+
+    let data = obj
+        .get("data")
+        .and_then(Value::as_str)
+        .and_then(decode_payload);
+
+    let mut topic_previews = Vec::new();
+    let mut data_preview = None;
+    if include_previews {
+        for topic in topics.iter().take(MAX_PREVIEW_TOPICS) {
+            topic_previews.push(
+                decode_payload(topic)
+                    .map_or_else(|| "(undecodable)".to_string(), |b| hex_preview(&b)),
+            );
+        }
+        if topics.len() > MAX_PREVIEW_TOPICS {
+            topic_previews.push(format!("…(+{} topics)", topics.len() - MAX_PREVIEW_TOPICS));
+        }
+        data_preview = data.as_deref().map(hex_preview);
+    }
+
+    EventSummary {
+        kind,
+        topic_count,
+        data_bytes: data.as_ref().map(Vec::len),
+        topic_previews,
+        data_preview,
+    }
+}
+
+/// Summarize one raw simulated state change (#525) — a `LedgerEntryChange`
+/// object (`{ key, created?, updated?, deleted? }`). Malformed items
+/// summarize as `unrecognized` rather than failing.
+fn summarize_state_change(item: &serde_json::Value, include_previews: bool) -> StateChangeSummary {
+    use serde_json::Value;
+
+    let Value::Object(obj) = item else {
+        return StateChangeSummary {
+            key_type: "unrecognized".to_string(),
+            change: "unrecognized".to_string(),
+            ..StateChangeSummary::default()
+        };
+    };
+
+    // The change key decodes to a `LedgerKey`; its variant name (e.g.
+    // `ContractData`) is a safe, useful label. Undecodable keys are marked.
+    let key_type = obj
+        .get("key")
+        .and_then(Value::as_str)
+        .and_then(decode_payload)
+        .and_then(|bytes| {
+            stellar_xdr::LedgerKey::from_xdr(&bytes, stellar_xdr::Limits::none()).ok()
+        })
+        .map_or_else(|| "unrecognized".to_string(), |key| key.name().to_string());
+
+    let deleted = obj.get("deleted").and_then(Value::as_bool).unwrap_or(false);
+    let payload = obj
+        .get("created")
+        .or_else(|| obj.get("updated"))
+        .and_then(Value::as_str)
+        .and_then(decode_payload);
+
+    // Exactly one of created / updated / deleted identifies the change; a
+    // bare key (or an undecodable payload) leaves the verb `unknown`, and a
+    // non-object item is `unrecognized` (handled above).
+    let change = if deleted {
+        "deleted"
+    } else if obj.get("created").is_some() {
+        "created"
+    } else if obj.get("updated").is_some() {
+        "updated"
+    } else if obj.contains_key("key") {
+        "unknown"
+    } else {
+        "unrecognized"
+    };
+
+    StateChangeSummary {
+        key_type,
+        change: change.to_string(),
+        payload_bytes: payload.as_ref().map(Vec::len),
+        payload_preview: if include_previews {
+            payload.as_deref().map(hex_preview)
+        } else {
+            None
+        },
+    }
+}
+
+/// Summarize the raw simulation events (#525), bounded to
+/// [`MAX_SUMMARIZED_ENTRIES`] entries. `include_previews` adds bounded hex
+/// previews of decoded payloads; without it the summaries carry only kinds,
+/// counts, and sizes — payload bytes never leave the RPC layer by default.
+#[must_use]
+pub fn summarize_events(events: &[serde_json::Value], include_previews: bool) -> Vec<EventSummary> {
+    events
+        .iter()
+        .take(MAX_SUMMARIZED_ENTRIES)
+        .map(|item| summarize_event(item, include_previews))
+        .collect()
+}
+
+/// Summarize the raw simulated state changes (#525), bounded to
+/// [`MAX_SUMMARIZED_ENTRIES`] entries (same rules as [`summarize_events`]).
+#[must_use]
+pub fn summarize_state_changes(
+    changes: &[serde_json::Value],
+    include_previews: bool,
+) -> Vec<StateChangeSummary> {
+    changes
+        .iter()
+        .take(MAX_SUMMARIZED_ENTRIES)
+        .map(|item| summarize_state_change(item, include_previews))
+        .collect()
+}
+
+/// Build the simulation diagnostics section (#525), or `None` when the
+/// response carried neither events nor state changes — such reports keep
+/// their exact previous shape in text and JSON output.
+///
+/// `include_details` corresponds to the `--show-events` opt-in: only then
+/// are the bounded per-entry summaries attached; counts are always present.
+#[must_use]
+pub fn build_simulation_diagnostics(
+    events: &Option<Vec<serde_json::Value>>,
+    state_changes: &Option<Vec<serde_json::Value>>,
+    include_details: bool,
+) -> Option<SimulationDiagnostics> {
+    let events = events.as_deref().unwrap_or(&[]);
+    let state_changes = state_changes.as_deref().unwrap_or(&[]);
+    if events.is_empty() && state_changes.is_empty() {
+        return None;
+    }
+    Some(SimulationDiagnostics {
+        event_count: events.len(),
+        state_change_count: state_changes.len(),
+        events: if include_details {
+            summarize_events(events, true)
+        } else {
+            Vec::new()
+        },
+        state_changes: if include_details {
+            summarize_state_changes(state_changes, true)
+        } else {
+            Vec::new()
+        },
+    })
+}
+
+/// Render simulation diagnostics (#525) as a human-readable block: the
+/// counts always, per-entry summaries only when `--show-events` attached
+/// them. Returns an empty string when there is nothing to report, so callers
+/// can append the result unconditionally.
+#[must_use]
+pub fn format_simulation_diagnostics(diagnostics: Option<&SimulationDiagnostics>) -> String {
+    let Some(diagnostics) = diagnostics else {
+        return String::new();
+    };
+
+    let mut out = format!(
+        "\nSimulation diagnostics: {} {}, {} {}",
+        diagnostics.event_count,
+        if diagnostics.event_count == 1 {
+            "event"
+        } else {
+            "events"
+        },
+        diagnostics.state_change_count,
+        if diagnostics.state_change_count == 1 {
+            "state change"
+        } else {
+            "state changes"
+        },
+    );
+    if diagnostics.events.is_empty() && diagnostics.state_changes.is_empty() {
+        out.push_str(" (re-run with --show-events for per-entry summaries)");
+    }
+    out.push('\n');
+
+    if !diagnostics.events.is_empty() {
+        out.push_str(&entry_count_header(
+            "Events",
+            diagnostics.events.len(),
+            diagnostics.event_count,
+        ));
+        for (index, event) in diagnostics.events.iter().enumerate() {
+            out.push_str(&format!(
+                "  - event[{index}]: {}, {} topic{}",
+                event.kind,
+                event.topic_count,
+                if event.topic_count == 1 { "" } else { "s" }
+            ));
+            match event.data_bytes {
+                Some(bytes) => out.push_str(&format!(", data {bytes} bytes")),
+                None => out.push_str(", data unavailable"),
+            }
+            out.push('\n');
+            for (topic_index, topic) in event.topic_previews.iter().enumerate() {
+                out.push_str(&format!("      topic[{topic_index}]: {topic}\n"));
+            }
+            if let Some(preview) = &event.data_preview {
+                out.push_str(&format!("      data: {preview}\n"));
+            }
+        }
+    }
+
+    if !diagnostics.state_changes.is_empty() {
+        out.push_str(&entry_count_header(
+            "State changes",
+            diagnostics.state_changes.len(),
+            diagnostics.state_change_count,
+        ));
+        for (index, change) in diagnostics.state_changes.iter().enumerate() {
+            out.push_str(&format!(
+                "  - state change[{index}]: {}, {}",
+                change.key_type, change.change
+            ));
+            match change.payload_bytes {
+                Some(bytes) => out.push_str(&format!(", payload {bytes} bytes")),
+                None => {
+                    if change.change != "deleted" {
+                        out.push_str(", payload unavailable");
+                    }
+                }
+            }
+            out.push('\n');
+            if let Some(preview) = &change.payload_preview {
+                out.push_str(&format!("      payload: {preview}\n"));
+            }
+        }
+    }
+
+    out
+}
+
+/// Section header naming how many entries of a diagnostics list were
+/// summarized, when the cap truncated the list (#525).
+fn entry_count_header(title: &str, shown: usize, total: usize) -> String {
+    if shown < total {
+        format!("{title} (showing {shown} of {total}):\n")
+    } else {
+        format!("{title}:\n")
+    }
+}
+
+/// Render simulation diagnostics (#525) as a Markdown section with the same
+/// bounded, redaction-safe content as [`format_simulation_diagnostics`].
+/// Returns an empty string when there is nothing to report.
+#[must_use]
+pub fn format_simulation_diagnostics_markdown(
+    diagnostics: Option<&SimulationDiagnostics>,
+) -> String {
+    let Some(diagnostics) = diagnostics else {
+        return String::new();
+    };
+
+    let mut out = String::from("\n### Simulation Diagnostics\n\n");
+    out.push_str(&format!(
+        "- **Counts:** {} {}, {} {}\n",
+        diagnostics.event_count,
+        if diagnostics.event_count == 1 {
+            "event"
+        } else {
+            "events"
+        },
+        diagnostics.state_change_count,
+        if diagnostics.state_change_count == 1 {
+            "state change"
+        } else {
+            "state changes"
+        },
+    ));
+    if diagnostics.events.is_empty() && diagnostics.state_changes.is_empty() {
+        out.push_str("\n*Re-run with `--show-events` for per-entry summaries.*\n");
+        return out;
+    }
+    for (index, event) in diagnostics.events.iter().enumerate() {
+        let data = match event.data_bytes {
+            Some(bytes) => format!("data {bytes} bytes"),
+            None => "data unavailable".to_string(),
+        };
+        out.push_str(&format!(
+            "- `event[{index}]`: {}, {} topic{s}, {data}\n",
+            event.kind,
+            event.topic_count,
+            s = if event.topic_count == 1 { "" } else { "s" },
+        ));
+        for (topic_index, topic) in event.topic_previews.iter().enumerate() {
+            out.push_str(&format!("  - `topic[{topic_index}]`: `{topic}`\n"));
+        }
+        if let Some(preview) = &event.data_preview {
+            out.push_str(&format!("  - `data`: `{preview}`\n"));
+        }
+    }
+    for (index, change) in diagnostics.state_changes.iter().enumerate() {
+        let payload = match change.payload_bytes {
+            Some(bytes) => format!(", payload {bytes} bytes"),
+            None if change.change == "deleted" => String::new(),
+            None => ", payload unavailable".to_string(),
+        };
+        out.push_str(&format!(
+            "- `state change[{index}]`: {}, {}{payload}\n",
+            change.key_type, change.change,
+        ));
+        if let Some(preview) = &change.payload_preview {
+            out.push_str(&format!("  - `payload`: `{preview}`\n"));
+        }
+    }
+    out
+}
+
 /// Direction of a historical fee change relative to the current run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -677,6 +1143,12 @@ pub struct CostReport {
     /// `Simulation latency: X ms` in the table footer. Also helps identify
     /// slow or overloaded RPC endpoints.
     pub simulation_duration_ms: u64,
+    /// Sanitized host identifier of the RPC endpoint that served the estimate.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rpc_endpoint: String,
+    /// Whether the primary or fallback endpoint served the successful response.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rpc_role: String,
     /// Fee rates used to compute the breakdown (carried so optimization
     /// suggestions can quantify per-resource savings). Excluded from
     /// serialized output; `None` when the rates were unavailable.
@@ -700,6 +1172,13 @@ pub struct CostReport {
     /// decodable section; deserialized as empty from older payloads.
     #[serde(default)]
     pub contract_meta: ContractMeta,
+    /// Simulation event / state-change diagnostics (#525). `None` when the
+    /// response carried neither events nor state changes, so the default
+    /// text and JSON output stay unchanged. Counts are always present when
+    /// the section is; bounded per-entry summaries appear only under the
+    /// `--show-events` opt-in. Never persisted in the estimate cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<SimulationDiagnostics>,
 }
 
 /// A cost projection for a specific batch invocation count.
@@ -2167,6 +2646,123 @@ pub fn calculate_projections(
 
 /// Formats a list of cost projections into a human-readable table.
 #[must_use]
+/// A pricing sensitivity report that reprices the same contract footprint
+/// against multiple saved config snapshots.
+///
+/// This shows how network pricing changes affect the same workload,
+/// isolating the pricing component from resource usage changes.
+///
+/// # Inputs
+/// - `footprint_fee_stroops`: The total fee in stroops from a simulation
+///   (resource usage is fixed; only rates change per snapshot).
+/// - `counts`: Optional invocation counts to project across multiple runs.
+/// - `snapshots`: A slice of config snapshots to reprice against.
+/// - `precision`: Decimal places for XLM fee display.
+///
+/// # Output
+/// A `PricingSensitivityReport` containing per-snapshot fee totals and
+///   identification of any missing rate fields that were silently zero.
+pub struct PricingSensitivityReport {
+    /// Per-snapshot total fees in stroops.
+    pub snapshot_fees: Vec<(String, i64)>,
+    /// Whether any snapshot had missing rate fields (fees may be underestimates).
+    pub has_missing_rates: bool,
+}
+
+/// Compute a pricing sensitivity report repricing the same footprint against
+/// multiple saved config snapshots.
+///
+/// For each snapshot, the footprint's resource usage is combined with the
+/// snapshot's contract compute rate (`fee_rate_per_instructions_increment`) to
+/// produce a total fee. If a snapshot is missing contract_compute, that
+/// snapshot is flagged and its fee is reported as a conservative estimate
+/// (with a warning that rates may be incomplete).
+///
+/// # Example
+/// ```ignore
+/// let footprint_fee = 1_500_000; // stroops from one invocation
+/// let snapshots = [
+///     snapshot_with_compute_fee(100), // 100 stroops/insn increment
+///     snapshot_with_compute_fee(200), // 200 stroops/insn increment
+/// ];
+/// let report = pricing_sensitivity_report(footprint_fee, &snapshots, 7);
+/// assert!(report.has_missing_rates == false);
+/// assert_eq!(report.snapshot_fees.len(), 2);
+/// ```
+pub fn pricing_sensitivity_report(
+    footprint_fee_stroops: i64,
+    snapshots: &[crate::config_snapshot::model::ConfigSnapshot],
+    _precision: u32,
+) -> PricingSensitivityReport {
+    let mut snapshot_fees = Vec::with_capacity(snapshots.len());
+    let mut has_missing_rates = false;
+
+    for snapshot in snapshots {
+        // Use contract_compute rate if available, otherwise flag missing rates
+        let compute_rate = match &snapshot.contract_compute {
+            Some(compute) => compute.fee_rate_per_instructions_increment,
+            None => {
+                has_missing_rates = true;
+                // Use a conservative estimate: assume 0 rate means we can't
+                // properly reprice, so report the footprint fee as-is with a
+                // warning that rates are missing.
+                // We still compute something but mark it as incomplete.
+                0i64
+            }
+        };
+
+        // Integer-only fee math: total_fee = footprint_fee * rate
+        // This isolates the pricing component from resource usage changes.
+        let total_fee_stroops = if compute_rate > 0 {
+            footprint_fee_stroops
+                .saturating_mul(compute_rate)
+                .saturating_div(1_000_000_000)
+        } else {
+            // If rate is 0 or missing, return the footprint fee as-is but
+            // mark that rates are missing so callers know this is an
+            // underestimate.
+            footprint_fee_stroops
+        };
+
+        let snapshot_name = format!("{}-{}", snapshot.network, snapshot.timestamp);
+        snapshot_fees.push((snapshot_name, total_fee_stroops));
+    }
+
+    PricingSensitivityReport {
+        snapshot_fees,
+        has_missing_rates,
+    }
+}
+
+/// Formats a pricing sensitivity report into a human-readable table.
+#[must_use]
+pub fn format_pricing_sensitivity_table(report: &PricingSensitivityReport) -> String {
+    let mut output = String::from("\nPricing Sensitivity Report\n\n");
+    output.push_str(&format!("{:<30} {}\n", "Snapshot", "Total Fee (stroops)"));
+    output.push_str(&format!("{:<30} {}\n", "---", "-------------------"));
+    for (snapshot, fee) in &report.snapshot_fees {
+        output.push_str(&format!("{:<30} {}\n", snapshot, fee));
+    }
+    if report.has_missing_rates {
+        output.push_str(
+            "\n⚠ Some snapshots are missing contract compute rates; fees may be underestimates.\n",
+        );
+    }
+    output
+}
+
+/// Formats a pricing sensitivity report as JSON.
+#[must_use]
+pub fn format_pricing_sensitivity_json(report: &PricingSensitivityReport) -> String {
+    let json: Vec<(&str, i64)> = report
+        .snapshot_fees
+        .iter()
+        .map(|(snapshot, fee)| (snapshot.as_str(), *fee))
+        .collect();
+    serde_json::to_string(&json).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Formats a list of cost projections into a human-readable table.
 pub fn format_projections_table(projections: &[CostProjection]) -> String {
     if projections.is_empty() {
         return String::new();
@@ -2291,11 +2887,14 @@ mod tests {
             ledger: 3_894_195,
             network: "testnet".to_string(),
             simulation_duration_ms: 87,
+            rpc_endpoint: String::new(),
+            rpc_role: String::new(),
             rates: Some(rates),
             warnings: Vec::new(),
             history: None,
             projections: None,
             contract_meta: ContractMeta::default(),
+            diagnostics: None,
         }
     }
 
@@ -2412,11 +3011,14 @@ mod tests {
             ledger: 0,
             network: "testnet".to_string(),
             simulation_duration_ms: 0,
+            rpc_endpoint: String::new(),
+            rpc_role: String::new(),
             rates: None,
             warnings: Vec::new(),
             history: None,
             projections: None,
             contract_meta: ContractMeta::default(),
+            diagnostics: None,
         };
 
         let table_out = format_report_table(&report);
@@ -2965,6 +3567,272 @@ mod tests {
         assert!(
             cpu_row.ends_with(','),
             "percent column should be empty; got: {cpu_row}"
+        );
+    }
+
+    // ── Simulation diagnostics (#525) ─────────────────────────────────
+
+    use serde_json::json;
+
+    /// Base64 of a real `LedgerKey::Account` XDR, for state-change keys that
+    /// decode to a named variant.
+    fn account_key_b64(seed: u8) -> String {
+        use stellar_xdr::WriteXdr;
+        let key = stellar_xdr::LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
+            account_id: stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::Uint256([seed; 32]),
+            )),
+        });
+        let xdr = key.to_xdr(stellar_xdr::Limits::none()).expect("encode key");
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &xdr)
+    }
+
+    /// One well-formed contract event object as the RPC returns it.
+    fn contract_event(topics: usize, data: &str) -> serde_json::Value {
+        let topic: Vec<serde_json::Value> = (0..topics)
+            .map(|_| {
+                json!(base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    b"\0\0\0\0"
+                ))
+            })
+            .collect();
+        json!({ "type": "contract", "topic": topic, "data": data })
+    }
+
+    /// Empty / absent payloads must produce no diagnostics section at all, so
+    /// the default report shape is unchanged (AC: empty payloads).
+    #[test]
+    fn test_diagnostics_empty_payloads_render_nothing() {
+        assert!(build_simulation_diagnostics(&None, &None, false).is_none());
+        assert!(build_simulation_diagnostics(&None, &None, true).is_none());
+        assert!(
+            build_simulation_diagnostics(&Some(vec![]), &Some(vec![]), true).is_none(),
+            "empty arrays are not diagnostics"
+        );
+
+        assert_eq!(format_simulation_diagnostics(None), "");
+        assert_eq!(format_simulation_diagnostics_markdown(None), "");
+
+        // JSON: a report without diagnostics keeps its previous shape.
+        let report = report_with_rates(sample_rates());
+        let parsed: serde_json::Value =
+            serde_json::from_str(&format_report_json(&report)).expect("valid json");
+        assert!(
+            parsed.get("diagnostics").is_none(),
+            "default JSON output must not grow a diagnostics key"
+        );
+    }
+
+    /// Populated payloads: counts always present; per-entry summaries (and
+    /// previews) only under the `--show-events` opt-in (AC: populated).
+    #[test]
+    fn test_diagnostics_populated_counts_always_details_on_request() {
+        let events = vec![
+            contract_event(
+                2,
+                &base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"hello"),
+            ),
+            json!({ "type": "diagnostic", "topic": [], "data": null }),
+        ];
+        let changes = vec![json!({
+            "key": account_key_b64(9),
+            "created": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"entry")
+        })];
+
+        // Counts without details (default mode).
+        let counts =
+            build_simulation_diagnostics(&Some(events.clone()), &Some(changes.clone()), false)
+                .expect("diagnostics present");
+        assert_eq!(counts.event_count, 2);
+        assert_eq!(counts.state_change_count, 1);
+        assert!(counts.events.is_empty(), "details are opt-in");
+        assert!(counts.state_changes.is_empty(), "details are opt-in");
+
+        // Text mode: counts line plus the re-run hint.
+        let text = format_simulation_diagnostics(Some(&counts));
+        assert!(
+            text.contains("Simulation diagnostics: 2 events, 1 state change"),
+            "{text}"
+        );
+        assert!(text.contains("re-run with --show-events"), "{text}");
+
+        // Details mode: bounded per-entry summaries with previews.
+        let detailed =
+            build_simulation_diagnostics(&Some(events), &Some(changes), true).expect("present");
+        assert_eq!(detailed.events.len(), 2);
+        assert_eq!(detailed.state_changes.len(), 1);
+        assert_eq!(detailed.events[0].kind, "contract");
+        assert_eq!(detailed.events[0].topic_count, 2);
+        assert_eq!(detailed.events[0].data_bytes, Some(5));
+        assert_eq!(detailed.events[0].topic_previews.len(), 2);
+        assert!(detailed.events[0].data_preview.is_some());
+        assert_eq!(detailed.state_changes[0].key_type, "Account");
+        assert_eq!(detailed.state_changes[0].change, "created");
+        assert_eq!(detailed.state_changes[0].payload_bytes, Some(5));
+
+        let text = format_simulation_diagnostics(Some(&detailed));
+        assert!(text.contains("Events:"), "{text}");
+        assert!(!text.contains("re-run with --show-events"), "{text}");
+
+        // JSON mode: details serialize; counts mode keeps summaries absent
+        // (redaction), and the counts are always present.
+        let mut report = report_with_rates(sample_rates());
+        report.diagnostics = Some(counts);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&format_report_json(&report)).expect("valid json");
+        assert_eq!(parsed["diagnostics"]["event_count"], 2);
+        assert_eq!(parsed["diagnostics"]["state_change_count"], 1);
+        assert!(
+            parsed["diagnostics"].get("events").is_none(),
+            "summaries must be absent without --show-events"
+        );
+
+        report.diagnostics = Some(detailed);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&format_report_json(&report)).expect("valid json");
+        assert_eq!(parsed["diagnostics"]["events"][0]["kind"], "contract");
+        assert_eq!(
+            parsed["diagnostics"]["state_changes"][0]["key_type"],
+            "Account"
+        );
+    }
+
+    /// Malformed payloads must never fail the estimate: they summarize
+    /// leniently in both text and JSON modes (AC: malformed).
+    #[test]
+    fn test_diagnostics_malformed_payloads_are_lenient() {
+        let events = vec![
+            json!(42),                                         // number
+            json!(null),                                       // null
+            json!(["array"]),                                  // array
+            json!("not-valid-base64!!!"),                      // legacy string, bad b64
+            json!({ "type": 7, "topic": "nope", "data": 12 }), // wrong types
+            json!({ "type": "x".repeat(64) }),                 // oversized kind label
+        ];
+        let changes = vec![
+            json!("just a string"),
+            json!({ "key": "!!!not-xdr!!!", "created": "@@@" }),
+            json!({ "updated": "@@@" }),          // no key at all
+            json!({ "key": account_key_b64(3) }), // bare key, verb unknown
+            json!({ "key": account_key_b64(4), "deleted": true }),
+        ];
+
+        let diagnostics =
+            build_simulation_diagnostics(&Some(events), &Some(changes), true).expect("present");
+        assert_eq!(diagnostics.event_count, 6);
+        assert_eq!(diagnostics.state_change_count, 5);
+
+        // Events: every item summarized, none decoded as data.
+        assert_eq!(diagnostics.events[0].kind, "unrecognized");
+        assert_eq!(diagnostics.events[3].kind, "legacy-xdr");
+        assert_eq!(diagnostics.events[3].data_bytes, None);
+        assert_eq!(diagnostics.events[4].kind, "unknown");
+        assert_eq!(
+            diagnostics.events[5].kind.chars().count(),
+            24,
+            "unknown kind labels stay bounded"
+        );
+
+        // State changes: undecodable keys/payloads are marked, not fatal.
+        assert_eq!(diagnostics.state_changes[0].key_type, "unrecognized");
+        assert_eq!(diagnostics.state_changes[1].key_type, "unrecognized");
+        assert_eq!(diagnostics.state_changes[1].change, "created");
+        assert_eq!(diagnostics.state_changes[2].change, "updated");
+        assert_eq!(diagnostics.state_changes[3].change, "unknown");
+        assert_eq!(diagnostics.state_changes[4].change, "deleted");
+        assert_eq!(diagnostics.state_changes[4].payload_bytes, None);
+
+        // Text rendering does not panic and still reports counts.
+        let text = format_simulation_diagnostics(Some(&diagnostics));
+        assert!(text.contains("6 events, 5 state changes"), "{text}");
+
+        // JSON rendering round-trips.
+        let mut report = report_with_rates(sample_rates());
+        report.diagnostics = Some(diagnostics);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&format_report_json(&report)).expect("valid json");
+        assert_eq!(parsed["diagnostics"]["event_count"], 6);
+    }
+
+    /// Output stays bounded no matter how large the response is (AC: bound
+    /// output size).
+    #[test]
+    fn test_diagnostics_output_is_bounded() {
+        let big_payload = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            vec![0xAAu8; MAX_PREVIEW_BYTES * 4],
+        );
+        let events: Vec<serde_json::Value> = (0..MAX_SUMMARIZED_ENTRIES + 5)
+            .map(|_| contract_event(MAX_PREVIEW_TOPICS + 3, &big_payload))
+            .collect();
+
+        let diagnostics =
+            build_simulation_diagnostics(&Some(events), &None, true).expect("present");
+        assert_eq!(
+            diagnostics.event_count,
+            MAX_SUMMARIZED_ENTRIES + 5,
+            "counts reflect the full response"
+        );
+        assert_eq!(
+            diagnostics.events.len(),
+            MAX_SUMMARIZED_ENTRIES,
+            "per-entry summaries stay capped"
+        );
+
+        // Payload previews are truncated with an explicit marker.
+        let preview = diagnostics.events[0]
+            .data_preview
+            .as_deref()
+            .expect("preview present");
+        assert!(
+            preview.contains("(+"),
+            "truncation marker expected: {preview}"
+        );
+
+        // Topic previews are capped too.
+        assert_eq!(
+            diagnostics.events[0].topic_previews.len(),
+            MAX_PREVIEW_TOPICS + 1,
+            "capped topics plus the overflow marker"
+        );
+
+        // Text rendering names the cap instead of listing everything.
+        let text = format_simulation_diagnostics(Some(&diagnostics));
+        assert!(
+            text.contains(&format!(
+                "Events (showing {MAX_SUMMARIZED_ENTRIES} of {}):",
+                MAX_SUMMARIZED_ENTRIES + 5
+            )),
+            "{text}"
+        );
+    }
+
+    /// Redaction by default: without the opt-in no payload bytes appear
+    /// anywhere, not even bounded previews (AC: redact unsafe payloads).
+    #[test]
+    fn test_diagnostics_default_mode_carries_no_payload_bytes() {
+        let secret = b"super-secret-contract-data".to_vec();
+        let events = vec![contract_event(
+            1,
+            &base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &secret),
+        )];
+
+        let diagnostics =
+            build_simulation_diagnostics(&Some(events), &None, false).expect("present");
+        let text = format_simulation_diagnostics(Some(&diagnostics));
+        let json = serde_json::to_string(&diagnostics).expect("serialize");
+
+        let secret_hex = hex_preview(&secret);
+        for output in [&text, &json] {
+            assert!(
+                !output.contains(&secret_hex),
+                "raw payload bytes must never appear by default"
+            );
+        }
+        assert!(
+            diagnostics.events.is_empty() && diagnostics.state_changes.is_empty(),
+            "summaries (and their previews) are opt-in"
         );
     }
 }

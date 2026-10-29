@@ -34,11 +34,14 @@ fn sample_report() -> CostReport {
         ledger: 3_894_195,
         network: "testnet".to_string(),
         simulation_duration_ms: 87,
+        rpc_endpoint: String::new(),
+        rpc_role: String::new(),
         rates: None,
         warnings: Vec::new(),
         history: None,
         projections: None,
         contract_meta: ContractMeta::default(),
+        diagnostics: None,
     }
 }
 
@@ -69,11 +72,14 @@ fn empty_report() -> CostReport {
         ledger: 0,
         network: "mainnet".to_string(),
         simulation_duration_ms: 0,
+        rpc_endpoint: String::new(),
+        rpc_role: String::new(),
         rates: None,
         warnings: Vec::new(),
         history: None,
         projections: None,
         contract_meta: ContractMeta::default(),
+        diagnostics: None,
     }
 }
 
@@ -179,11 +185,14 @@ fn batch_report(function: &str, cpu: u64, fee_stroops: i64, writes: u32) -> Cost
         ledger: 3_894_195,
         network: "testnet".to_string(),
         simulation_duration_ms: 87,
+        rpc_endpoint: String::new(),
+        rpc_role: String::new(),
         rates: None,
         warnings: Vec::new(),
         history: None,
         projections: None,
         contract_meta: ContractMeta::default(),
+        diagnostics: None,
     }
 }
 

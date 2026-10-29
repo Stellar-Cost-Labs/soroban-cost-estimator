@@ -191,6 +191,12 @@ impl TableFormatter {
             "RPC round-trip: {} ms\n",
             report.simulation_duration_ms
         ));
+        if !report.rpc_endpoint.is_empty() {
+            output.push_str(&format!(
+                "RPC endpoint: {} ({})\n",
+                report.rpc_endpoint, report.rpc_role
+            ));
+        }
         output.push_str(&format!("WASM hash: {}\n", report.wasm_hash));
         output.push_str(&format!("WASM size: {} bytes\n", report.wasm_size));
         output.push('\n');
@@ -231,6 +237,13 @@ impl TableFormatter {
         // Resource-limit warnings (#322) — only when something nears a ceiling.
         output.push_str(&crate::report::cost_report::format_resource_warnings(
             &report.warnings,
+        ));
+
+        // Simulation diagnostics (#525) — counts always when the response
+        // carried events/state changes; per-entry summaries only under the
+        // `--show-events` opt-in. Empty string when absent.
+        output.push_str(&crate::report::cost_report::format_simulation_diagnostics(
+            report.diagnostics.as_ref(),
         ));
 
         // Historical trend table (#321) — only populated with `--history`.
@@ -440,6 +453,12 @@ impl ReportFormatter for MarkdownFormatter {
             "- **Simulation latency:** {} ms\n\n",
             report.simulation_duration_ms
         ));
+        if !report.rpc_endpoint.is_empty() {
+            output.push_str(&format!(
+                "- **RPC endpoint:** `{}` ({})\n\n",
+                report.rpc_endpoint, report.rpc_role
+            ));
+        }
 
         // Resource table
         output.push_str("### Resources\n\n");
@@ -463,6 +482,14 @@ impl ReportFormatter for MarkdownFormatter {
                 output.push_str(&format!("> **Warning:** {}\n\n", warning.message));
             }
         }
+
+        // Simulation diagnostics (#525) — counts always when present,
+        // per-entry summaries only under the `--show-events` opt-in.
+        output.push_str(
+            &crate::report::cost_report::format_simulation_diagnostics_markdown(
+                report.diagnostics.as_ref(),
+            ),
+        );
 
         // Fee breakdown, nested in a collapsible section so long reports stay
         // compact when posted as a GitHub PR comment (#325).
@@ -753,11 +780,14 @@ mod tests {
             ledger: 3_894_195,
             network: "testnet".to_string(),
             simulation_duration_ms: 87,
+            rpc_endpoint: String::new(),
+            rpc_role: String::new(),
             rates: None,
             warnings: Vec::new(),
             history: None,
             projections: None,
             contract_meta: crate::wasm::parser::ContractMeta::default(),
+            diagnostics: None,
         }
     }
 
@@ -788,11 +818,14 @@ mod tests {
             ledger: 0,
             network: "mainnet".to_string(),
             simulation_duration_ms: 0,
+            rpc_endpoint: String::new(),
+            rpc_role: String::new(),
             rates: None,
             warnings: Vec::new(),
             history: None,
             projections: None,
             contract_meta: crate::wasm::parser::ContractMeta::default(),
+            diagnostics: None,
         }
     }
 
@@ -1685,5 +1718,75 @@ mod tests {
         let md_out = MarkdownFormatter.format(&report);
         assert!(md_out.contains("### Cost Projections"));
         assert!(md_out.contains("| 100 | 1,552,700 | 0.1552700 | $0.18 |"));
+    }
+
+    // ── Simulation diagnostics (#525) ───────────────────────────────
+
+    /// A report carrying diagnostics with counts only (no `--show-events`).
+    fn counted_diagnostics_report() -> CostReport {
+        use crate::report::cost_report::{EventSummary, SimulationDiagnostics};
+        let mut report = sample_report();
+        report.diagnostics = Some(SimulationDiagnostics {
+            event_count: 3,
+            state_change_count: 1,
+            events: Vec::<EventSummary>::new(),
+            state_changes: Vec::new(),
+        });
+        report
+    }
+
+    /// Counts render in table mode and name the opt-in; JSON keeps summaries
+    /// absent until `--show-events` attached them.
+    #[test]
+    fn test_formatters_render_diagnostics_counts_by_default() {
+        let report = counted_diagnostics_report();
+
+        let table_out = TableFormatter.format(&report);
+        assert!(
+            table_out.contains("Simulation diagnostics: 3 events, 1 state change"),
+            "{table_out}"
+        );
+        assert!(
+            table_out.contains("re-run with --show-events"),
+            "{table_out}"
+        );
+
+        let json_out = JsonFormatter.format(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json_out).expect("valid json");
+        assert_eq!(parsed["diagnostics"]["event_count"], 3);
+        assert_eq!(parsed["diagnostics"]["state_change_count"], 1);
+        assert!(parsed["diagnostics"].get("events").is_none());
+
+        // A report without diagnostics keeps its exact previous output.
+        let clean = TableFormatter.format(&sample_report());
+        assert!(!clean.contains("Simulation diagnostics"), "{clean}");
+    }
+
+    /// `--show-events` details render as entries in both text formats.
+    #[test]
+    fn test_formatters_render_diagnostics_details_when_requested() {
+        use crate::report::cost_report::{EventSummary, SimulationDiagnostics};
+        let mut report = sample_report();
+        report.diagnostics = Some(SimulationDiagnostics {
+            event_count: 1,
+            state_change_count: 0,
+            events: vec![EventSummary {
+                kind: "contract".to_string(),
+                topic_count: 1,
+                data_bytes: Some(5),
+                topic_previews: vec!["00000000".to_string()],
+                data_preview: Some("68656c6c6f".to_string()),
+            }],
+            state_changes: Vec::new(),
+        });
+
+        let table_out = TableFormatter.format(&report);
+        assert!(table_out.contains("Events:"), "{table_out}");
+        assert!(table_out.contains("event[0]: contract"), "{table_out}");
+        assert!(table_out.contains("data: 68656c6c6f"), "{table_out}");
+
+        let md_out = MarkdownFormatter.format(&report);
+        assert!(md_out.contains("### Simulation Diagnostics"), "{md_out}");
+        assert!(md_out.contains("`event[0]`: contract"), "{md_out}");
     }
 }
