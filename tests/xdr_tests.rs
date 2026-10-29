@@ -87,10 +87,10 @@ fn test_scval_vec_roundtrip() {
     ]
     .try_into()
     .unwrap();
-    test_roundtrip(stellar_xdr::ScVal::Vec(vec));
+    test_roundtrip(stellar_xdr::ScVal::Vec(Some(stellar_xdr::ScVec(vec))));
 
     let vec: VecM<stellar_xdr::ScVal> = vec![].try_into().unwrap();
-    test_roundtrip(stellar_xdr::ScVal::Vec(vec));
+    test_roundtrip(stellar_xdr::ScVal::Vec(Some(stellar_xdr::ScVec(vec))));
 }
 
 #[test]
@@ -107,10 +107,10 @@ fn test_scval_map_roundtrip() {
     ]
     .try_into()
     .unwrap();
-    test_roundtrip(stellar_xdr::ScVal::Map(map));
+    test_roundtrip(stellar_xdr::ScVal::Map(Some(stellar_xdr::ScMap(map))));
 
     let map: VecM<stellar_xdr::ScMapEntry> = vec![].try_into().unwrap();
-    test_roundtrip(stellar_xdr::ScVal::Map(map));
+    test_roundtrip(stellar_xdr::ScVal::Map(Some(stellar_xdr::ScMap(map))));
 }
 
 #[test]

@@ -677,9 +677,9 @@ fn xdr_spec_function(name: &str, inputs: &[(&str, &str)], outputs: &[&str]) -> V
             _ => ScSpecTypeDef::Val,
         };
         spec_inputs.push(stellar_xdr::ScSpecFunctionInputV0 {
-            name: stellar_xdr::ScSymbol::try_from(input_name.as_bytes().to_vec()).unwrap(),
+            name: stellar_xdr::StringM::try_from(input_name.as_bytes().to_vec()).unwrap(),
             doc: stellar_xdr::StringM::default(),
-            type_,
+            type_: type_def,
         });
     }
 
