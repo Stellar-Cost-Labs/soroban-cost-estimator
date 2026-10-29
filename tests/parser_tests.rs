@@ -660,6 +660,93 @@ fn contract_meta_section(section_name: &str) -> Vec<u8> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// contractspecv0 custom-section parsing helpers
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Encodes a single `ScSpecFunctionV0` entry using stellar-xdr.
+fn xdr_spec_function(name: &str, inputs: &[(&str, &str)], outputs: &[&str]) -> Vec<u8> {
+    use stellar_xdr::{ScSpecEntry, ScSpecFunctionV0, ScSpecTypeDef, WriteXdr};
+
+    let mut spec_inputs = Vec::new();
+    for (input_name, input_type) in inputs {
+        let type_def = match *input_type {
+            "i64" => ScSpecTypeDef::I64,
+            "u64" => ScSpecTypeDef::U64,
+            "bool" => ScSpecTypeDef::Bool,
+            "void" => ScSpecTypeDef::Void,
+            _ => ScSpecTypeDef::Val,
+        };
+        spec_inputs.push(stellar_xdr::ScSpecFunctionInputV0 {
+            name: stellar_xdr::StringM::try_from(input_name.as_bytes().to_vec()).unwrap(),
+            doc: stellar_xdr::StringM::default(),
+            type_: type_def,
+        });
+    }
+
+    let spec_outputs: Vec<ScSpecTypeDef> = outputs
+        .iter()
+        .map(|output_type| match *output_type {
+            "i64" => ScSpecTypeDef::I64,
+            "u64" => ScSpecTypeDef::U64,
+            "bool" => ScSpecTypeDef::Bool,
+            "void" => ScSpecTypeDef::Void,
+            _ => ScSpecTypeDef::Val,
+        })
+        .collect();
+
+    let function = ScSpecFunctionV0 {
+        name: stellar_xdr::ScSymbol::try_from(name.as_bytes().to_vec()).unwrap(),
+        doc: stellar_xdr::StringM::default(),
+        inputs: spec_inputs.try_into().unwrap(),
+        outputs: spec_outputs.try_into().unwrap(),
+    };
+
+    let entry = ScSpecEntry::FunctionV0(function);
+    let mut out = Vec::new();
+    let mut limited = stellar_xdr::Limited::new(&mut out, stellar_xdr::Limits::none());
+    entry.write_xdr(&mut limited).expect("write XDR");
+    out
+}
+
+/// Creates a contractspecv0 section with the given functions.
+fn contract_spec_section(functions: &[Vec<u8>]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    for func in functions {
+        payload.extend_from_slice(func);
+    }
+    custom_section("contractspecv0", &payload)
+}
+
+/// WASM with a valid spec matching its exports.
+fn wasm_with_valid_spec() -> Vec<u8> {
+    let mut bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
+    // The minimal.wasm exports "add_one" function
+    let spec_func = xdr_spec_function("add_one", &[("value", "i64")], &["i64"]);
+    bytes.extend_from_slice(&contract_spec_section(&[spec_func]));
+    bytes
+}
+
+/// WASM with a stale spec entry (spec declares function not exported).
+fn wasm_with_stale_spec_entry() -> Vec<u8> {
+    let mut bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
+    // Spec declares "add_one" (exported) and "old_function" (not exported)
+    let spec_func1 = xdr_spec_function("add_one", &[("value", "i64")], &["i64"]);
+    let spec_func2 = xdr_spec_function("old_function", &[], &["void"]);
+    bytes.extend_from_slice(&contract_spec_section(&[spec_func1, spec_func2]));
+    bytes
+}
+
+/// WASM with an export missing spec metadata.
+fn wasm_with_export_missing_spec() -> Vec<u8> {
+    let mut bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
+    // Spec declares "other_function" but WASM exports "add_one"
+    // This will cause "add_one" to be flagged as missing spec metadata
+    let spec_func = xdr_spec_function("other_function", &[], &["void"]);
+    bytes.extend_from_slice(&contract_spec_section(&[spec_func]));
+    bytes
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // contractmeta custom-section parsing
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -786,8 +873,8 @@ fn test_validate_wasm_limits_valid() {
         functions: vec![],
         has_spec: false,
         spec_entries: vec![],
-        sections: vec![],
         contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
+        spec_diagnostics: vec![],
         start_function: None,
         memories: vec![soroban_cost_estimator::wasm::parser::MemoryInfo {
             initial_pages: 50,
@@ -796,6 +883,7 @@ fn test_validate_wasm_limits_valid() {
         }],
         imports: vec![],
         exports: vec![],
+        sections: vec![],
         summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
             initial_pages: 0,
             max_pages: None,
@@ -818,12 +906,13 @@ fn test_validate_wasm_limits_size_exceeded() {
         functions: vec![],
         has_spec: false,
         spec_entries: vec![],
-        sections: vec![],
         contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
+        spec_diagnostics: vec![],
         start_function: None,
         memories: vec![],
         imports: vec![],
         exports: vec![],
+        sections: vec![],
         summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
             initial_pages: 0,
             max_pages: None,
@@ -852,8 +941,8 @@ fn test_validate_wasm_limits_initial_memory_exceeded() {
         functions: vec![],
         has_spec: false,
         spec_entries: vec![],
-        sections: vec![],
         contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
+        spec_diagnostics: vec![],
         start_function: None,
         memories: vec![soroban_cost_estimator::wasm::parser::MemoryInfo {
             initial_pages: 200,
@@ -862,6 +951,7 @@ fn test_validate_wasm_limits_initial_memory_exceeded() {
         }],
         imports: vec![],
         exports: vec![],
+        sections: vec![],
         summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
             initial_pages: 0,
             max_pages: None,
@@ -890,8 +980,8 @@ fn test_validate_wasm_limits_max_memory_exceeded() {
         functions: vec![],
         has_spec: false,
         spec_entries: vec![],
-        sections: vec![],
         contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
+        spec_diagnostics: vec![],
         start_function: None,
         memories: vec![soroban_cost_estimator::wasm::parser::MemoryInfo {
             initial_pages: 50,
@@ -900,6 +990,7 @@ fn test_validate_wasm_limits_max_memory_exceeded() {
         }],
         imports: vec![],
         exports: vec![],
+        sections: vec![],
         summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
             initial_pages: 0,
             max_pages: None,
@@ -928,8 +1019,8 @@ fn test_validate_wasm_limits_unbounded_memory_allowed() {
         functions: vec![],
         has_spec: false,
         spec_entries: vec![],
-        sections: vec![],
         contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
+        spec_diagnostics: vec![],
         start_function: None,
         memories: vec![soroban_cost_estimator::wasm::parser::MemoryInfo {
             initial_pages: 50,
@@ -938,6 +1029,7 @@ fn test_validate_wasm_limits_unbounded_memory_allowed() {
         }],
         imports: vec![],
         exports: vec![],
+        sections: vec![],
         summary: soroban_cost_estimator::wasm::parser::WasmStructureSummary {
             initial_pages: 0,
             max_pages: None,
@@ -1498,6 +1590,207 @@ fn test_fuzz_seed_corpus_fixtures_succeed() {
             "spec entries: {path_str}"
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// spec export validation
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_validate_spec_exports_valid_spec() {
+    use soroban_cost_estimator::wasm::parser::{
+        FunctionInfo, ParamInfo, SpecFunctionInfo, TypeInfo, validate_spec_exports,
+    };
+
+    let spec_functions = vec![SpecFunctionInfo {
+        name: "add_one".to_string(),
+        doc: String::new(),
+        inputs: vec![ParamInfo {
+            name: "value".to_string(),
+            type_name: "i64".to_string(),
+            type_def: stellar_xdr::ScSpecTypeDef::I64,
+        }],
+        outputs: vec![TypeInfo {
+            type_name: "i64".to_string(),
+            type_def: stellar_xdr::ScSpecTypeDef::I64,
+        }],
+    }];
+
+    let exported_functions = vec![FunctionInfo {
+        name: "add_one".to_string(),
+        param_count: 1,
+        result_count: 1,
+        params: vec![],
+        returns: vec![],
+    }];
+
+    let diagnostics = validate_spec_exports(&spec_functions, &exported_functions);
+    assert!(
+        diagnostics.is_empty(),
+        "valid spec should produce no diagnostics, got: {diagnostics:?}"
+    );
+}
+
+#[test]
+fn test_validate_spec_exports_stale_entry() {
+    use soroban_cost_estimator::wasm::parser::{
+        FunctionInfo, SpecFunctionInfo, validate_spec_exports,
+    };
+
+    let spec_functions = vec![
+        SpecFunctionInfo {
+            name: "add_one".to_string(),
+            doc: String::new(),
+            inputs: vec![],
+            outputs: vec![],
+        },
+        SpecFunctionInfo {
+            name: "old_function".to_string(),
+            doc: String::new(),
+            inputs: vec![],
+            outputs: vec![],
+        },
+    ];
+
+    let exported_functions = vec![FunctionInfo {
+        name: "add_one".to_string(),
+        param_count: 0,
+        result_count: 0,
+        params: vec![],
+        returns: vec![],
+    }];
+
+    let diagnostics = validate_spec_exports(&spec_functions, &exported_functions);
+    assert_eq!(diagnostics.len(), 1);
+    match &diagnostics[0] {
+        soroban_cost_estimator::wasm::parser::SpecExportDiagnostic::SpecFunctionNotExported {
+            name,
+        } => assert_eq!(name, "old_function"),
+        _ => panic!("expected SpecFunctionNotExported diagnostic"),
+    }
+}
+
+#[test]
+fn test_validate_spec_exports_export_missing_spec() {
+    use soroban_cost_estimator::wasm::parser::{
+        FunctionInfo, SpecFunctionInfo, validate_spec_exports,
+    };
+
+    let spec_functions = vec![SpecFunctionInfo {
+        name: "other_function".to_string(),
+        doc: String::new(),
+        inputs: vec![],
+        outputs: vec![],
+    }];
+
+    let exported_functions = vec![FunctionInfo {
+        name: "add_one".to_string(),
+        param_count: 0,
+        result_count: 0,
+        params: vec![],
+        returns: vec![],
+    }];
+
+    let diagnostics = validate_spec_exports(&spec_functions, &exported_functions);
+    assert_eq!(diagnostics.len(), 1);
+    match &diagnostics[0] {
+        soroban_cost_estimator::wasm::parser::SpecExportDiagnostic::ExportMissingSpec { name } => {
+            assert_eq!(name, "add_one")
+        }
+        _ => panic!("expected ExportMissingSpec diagnostic"),
+    }
+}
+
+#[test]
+fn test_validate_spec_exports_no_spec() {
+    use soroban_cost_estimator::wasm::parser::{FunctionInfo, validate_spec_exports};
+
+    let spec_functions: Vec<soroban_cost_estimator::wasm::parser::SpecFunctionInfo> = vec![];
+    let exported_functions = vec![FunctionInfo {
+        name: "add_one".to_string(),
+        param_count: 0,
+        result_count: 0,
+        params: vec![],
+        returns: vec![],
+    }];
+
+    let diagnostics = validate_spec_exports(&spec_functions, &exported_functions);
+    assert!(
+        diagnostics.is_empty(),
+        "no spec should produce no diagnostics, got: {diagnostics:?}"
+    );
+}
+
+#[test]
+fn test_load_wasm_with_valid_spec_no_diagnostics() {
+    let bytes = wasm_with_valid_spec();
+    let temp = std::env::temp_dir().join(format!("sce-valid-spec-{}.wasm", std::process::id()));
+    std::fs::write(&temp, &bytes).expect("write fixture");
+
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(&temp)
+        .expect("wasm with valid spec should load");
+    assert!(wasm_info.has_spec);
+    assert!(
+        wasm_info.spec_diagnostics.is_empty(),
+        "valid spec should have no diagnostics, got: {:?}",
+        wasm_info.spec_diagnostics
+    );
+
+    let _ = std::fs::remove_file(&temp);
+}
+
+#[test]
+fn test_load_wasm_with_stale_spec_entry_diagnostic() {
+    let bytes = wasm_with_stale_spec_entry();
+    let temp = std::env::temp_dir().join(format!("sce-stale-spec-{}.wasm", std::process::id()));
+    std::fs::write(&temp, &bytes).expect("write fixture");
+
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(&temp)
+        .expect("wasm with stale spec entry should load");
+    assert!(wasm_info.has_spec);
+    assert_eq!(wasm_info.spec_diagnostics.len(), 1);
+    match &wasm_info.spec_diagnostics[0] {
+        soroban_cost_estimator::wasm::parser::SpecExportDiagnostic::SpecFunctionNotExported {
+            name,
+        } => assert_eq!(name, "old_function"),
+        _ => panic!("expected SpecFunctionNotExported diagnostic"),
+    }
+
+    let _ = std::fs::remove_file(&temp);
+}
+
+#[test]
+fn test_load_wasm_with_export_missing_spec_diagnostic() {
+    let bytes = wasm_with_export_missing_spec();
+    let temp = std::env::temp_dir().join(format!("sce-missing-spec-{}.wasm", std::process::id()));
+    std::fs::write(&temp, &bytes).expect("write fixture");
+
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(&temp)
+        .expect("wasm with export missing spec should load");
+    assert!(wasm_info.has_spec);
+    assert_eq!(wasm_info.spec_diagnostics.len(), 1);
+    match &wasm_info.spec_diagnostics[0] {
+        soroban_cost_estimator::wasm::parser::SpecExportDiagnostic::ExportMissingSpec { name } => {
+            assert_eq!(name, "add_one")
+        }
+        _ => panic!("expected ExportMissingSpec diagnostic"),
+    }
+
+    let _ = std::fs::remove_file(&temp);
+}
+
+#[test]
+fn test_load_wasm_without_spec_no_diagnostics() {
+    let path = Path::new("tests/fixtures/minimal.wasm");
+    let wasm_info =
+        soroban_cost_estimator::wasm::parser::load_wasm(path).expect("failed to load test WASM");
+
+    assert!(!wasm_info.has_spec);
+    assert!(
+        wasm_info.spec_diagnostics.is_empty(),
+        "no spec should have no diagnostics, got: {:?}",
+        wasm_info.spec_diagnostics
+    );
 }
 
 /// Golden test: the `function_signatures` block for the fixture contract is
