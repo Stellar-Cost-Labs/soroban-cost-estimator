@@ -1458,6 +1458,58 @@ fn test_presence_change_keeps_a_conservative_pricing_status() {
 }
 
 #[test]
+fn test_decreased_pricing_fields_are_detected_for_every_setting_id() {
+    let old = full_snapshot();
+    let mut new = old.clone();
+
+    new.contract_compute
+        .as_mut()
+        .unwrap()
+        .fee_rate_per_instructions_increment = 5;
+    new.contract_ledger_cost
+        .as_mut()
+        .unwrap()
+        .fee_disk_read_ledger_entry = 50;
+    new.contract_historical_data
+        .as_mut()
+        .unwrap()
+        .fee_historical1_kb = 50;
+    new.contract_events
+        .as_mut()
+        .unwrap()
+        .fee_contract_events1_kb = 25;
+    new.contract_bandwidth.as_mut().unwrap().fee_tx_size1_kb = 5;
+    new.state_archival
+        .as_mut()
+        .unwrap()
+        .persistent_rent_rate_denominator = 50_000;
+
+    let diff = diff::diff_snapshots(&old, &new);
+    assert_eq!(diff.changes.len(), 6);
+    assert!(diff.has_pricing_changes());
+    assert!(diff.changes.iter().all(|change| change.is_pricing_change));
+    assert!(diff.has_significant_pricing_changes(50.0));
+    assert!(diff.changes.iter().all(|change| {
+        change.old_value.parse::<i64>().unwrap() > change.new_value.parse::<i64>().unwrap()
+    }));
+}
+
+#[test]
+fn test_zero_pricing_baseline_and_identical_zero_values() {
+    let unchanged = make_snapshot(0, 0);
+    let identical_diff = diff::diff_snapshots(&unchanged, &unchanged);
+    assert!(identical_diff.changes.is_empty());
+    assert!(!identical_diff.has_pricing_changes());
+    assert!(!identical_diff.has_significant_pricing_changes(0.0));
+
+    let changed = make_snapshot(10, 0);
+    let zero_baseline_diff = diff::diff_snapshots(&unchanged, &changed);
+    assert_eq!(zero_baseline_diff.changes.len(), 1);
+    assert!(zero_baseline_diff.has_pricing_changes());
+    assert!(zero_baseline_diff.has_significant_pricing_changes(0.0));
+}
+
+#[test]
 fn test_snapshot_payload_keeps_known_fields_and_captures_unknown_ones() {
     let json = snapshot_json_with_extras(",\n  \"contract_compute_v1\": {\"fee\": 7}");
     let payload = SnapshotPayload::parse(&json).expect("parse payload");
