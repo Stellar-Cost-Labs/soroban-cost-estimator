@@ -50,3 +50,23 @@ pub async fn stub_jsonrpc_error(server: &MockServer, method_name: &str, code: i6
         .mount(server)
         .await;
 }
+
+pub async fn stub_rate_limit(
+    server: &MockServer,
+    method_name: &str,
+    retry_after: Option<&str>,
+    up_to_times: u64,
+) {
+    let mut template = ResponseTemplate::new(429);
+    if let Some(header_val) = retry_after {
+        template = template.append_header("Retry-After", header_val);
+    }
+    Mock::given(method("POST"))
+        .and(body_string_contains(format!(
+            "\"method\":\"{method_name}\""
+        )))
+        .respond_with(template)
+        .up_to_n_times(up_to_times)
+        .mount(server)
+        .await;
+}
