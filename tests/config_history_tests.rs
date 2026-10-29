@@ -448,6 +448,71 @@ fn test_missing_snapshots_reports_an_error() {
     });
 }
 
+// ── Snapshot permissions and safe writing (#512) ───────────────────────────
+
+#[cfg(unix)]
+#[test]
+fn test_snapshot_permissions_restricted_on_unix() {
+    use std::os::unix::fs::PermissionsExt;
+
+    with_temp_home(|_home| {
+        let snap = make_snapshot("2026-01-01T00:00:00Z", 100, 10, 5);
+        let path = store::save_snapshot(&snap, None).expect("save snapshot");
+        let meta = std::fs::metadata(&path).expect("read metadata");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "newly created snapshot file must have mode 0o600, found: {mode:o}"
+        );
+
+        // Ensure normal reads remain functional
+        let loaded =
+            store::load_snapshot_from_path(&path.to_string_lossy()).expect("load snapshot");
+        assert_eq!(loaded.network, "testnet");
+        assert_eq!(loaded.ledger, 100);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn test_snapshot_permissions_preserves_existing_caller_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    with_temp_home(|home| {
+        let caller_file = home.join("custom_snapshot.json");
+        std::fs::write(&caller_file, "{}").expect("create existing file");
+        std::fs::set_permissions(&caller_file, std::fs::Permissions::from_mode(0o644))
+            .expect("set mode 0o644");
+
+        let snap = make_snapshot("2026-01-01T00:00:00Z", 200, 10, 5);
+        let path = store::save_snapshot(&snap, Some(caller_file.to_str().expect("path str")))
+            .expect("save snapshot to existing file");
+
+        let meta = std::fs::metadata(&path).expect("read metadata");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o644,
+            "existing file permissions must be preserved, found: {mode:o}"
+        );
+
+        let loaded =
+            store::load_snapshot_from_path(&path.to_string_lossy()).expect("load snapshot");
+        assert_eq!(loaded.ledger, 200);
+    });
+}
+
+#[test]
+fn test_snapshot_normal_write_and_read_roundtrip() {
+    with_temp_home(|_home| {
+        let snap = make_snapshot("2026-01-01T00:00:00Z", 150, 10, 5);
+        let path = store::save_snapshot(&snap, None).expect("save snapshot");
+        let loaded =
+            store::load_snapshot_from_path(&path.to_string_lossy()).expect("load snapshot");
+        assert_eq!(loaded.ledger, 150);
+        assert_eq!(loaded.timestamp, "2026-01-01T00:00:00Z");
+    });
+}
+
 // ── Snapshot schema versioning (#508) ─────────────────────────────────────
 
 use soroban_cost_estimator::error::AppError;

@@ -2325,6 +2325,7 @@ dependencies = [
  "futures-util",
  "governor",
  "hex",
+ "httpdate",
  "insta",
  "proptest",
  "reqwest",
