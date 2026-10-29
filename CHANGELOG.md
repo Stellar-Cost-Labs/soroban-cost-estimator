@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `--verbose` now dumps every JSON-RPC exchange: the request (endpoint, method,
+  JSON-RPC ID, params, headers and exact body) and the response (HTTP status,
+  headers and raw body) are written to standard error, so a failed simulation
+  can be debugged without a packet capture. Responses to retried transient
+  failures and gateway errors are included, payloads are logged before they are
+  parsed even when they are not valid JSON, credential headers stay
+  `<redacted>`, and the dump goes to standard error so the data written to
+  standard output is unaffected. `RUST_LOG=debug` enables the same diagnostics
+  without `--verbose` (#298).
 - `config snapshot --skip-unchanged` — compare the fetched configuration with
   the latest stored snapshot and skip the write when nothing changed.
   Timestamps, ledgers and schema versions are ignored for the comparison, the

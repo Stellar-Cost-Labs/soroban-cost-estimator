@@ -170,8 +170,8 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "SECS", default_value_t = 5)]
     pub connect_timeout: u64,
 
-    /// Enable debug-level logging, including full RPC request payloads and
-    /// response summaries.
+    /// Enable debug-level logging, including the JSON-RPC requests and
+    /// responses sent to the RPC endpoint (credential headers redacted).
     #[arg(long, short, global = true)]
     pub verbose: bool,
 

@@ -208,7 +208,31 @@ soroban-cost-estimator estimate \
   rather than being silently dropped and leaving the request unauthenticated.
 - Credential headers (`Authorization`, `Proxy-Authorization`, `X-API-Key`,
   `API-Key`, `Cookie`) are replaced with `<redacted>` in verbose logs, so a
-  token never reaches a terminal, log file, or CI transcript.
+  token never reaches a terminal, log file, or CI transcript. Bodies are
+  logged verbatim, so a `simulateTransaction` envelope (contract arguments
+  included) does appear in the dump.
+
+### Inspecting RPC traffic
+
+`--verbose` (`-v`) prints every JSON-RPC exchange to standard error, which is
+what you want when a simulation fails and the CLI error alone does not say why:
+
+```text
+[RPC REQ] POST https://soroban-testnet.stellar.org (412 bytes)
+[RPC REQ] method=simulateTransaction id=1
+[RPC REQ] params={"transaction":"AAAA…"}
+[RPC REQ] body: {"id":1,"jsonrpc":"2.0","method":"simulateTransaction",…}
+[RPC RES] HTTP 200 OK (184 ms)
+[RPC RES] body: {"jsonrpc":"2.0","id":1,"error":{"code":-32602,…}}
+```
+
+The response body is logged exactly as received — an HTML gateway page
+included — and before it is parsed, so a payload that failed to deserialize is
+still visible. Responses to retried transient failures (`429`/`5xx`) are logged
+too. The dump goes to standard error, never into the data written to standard
+output, so the table or `--json` document on stdout is not affected by it.
+Credential headers are shown as `<redacted>`. `RUST_LOG=debug` produces the
+same diagnostics without `--verbose`; nothing is printed otherwise.
 
 ### `estimate-all`
 
