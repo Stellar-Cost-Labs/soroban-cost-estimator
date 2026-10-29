@@ -539,11 +539,76 @@ straight into another tool.
 
 ## Exit codes
 
-| Code | Meaning |
-|---|---|
-| `0` | Success; for `config diff`, no qualifying change |
-| `1` | A command failed with an `AppError` (printed to stderr), or `config diff` / `cache verify` found what they check for |
-| `101` | The CLI worker thread panicked — always a bug |
+`build_change_log_from_snapshots` takes a set of snapshots, sorts them by
+timestamp, and diffs each consecutive pair. Each changed field produces a
+`FieldHistoryEntry` stamped with the newer snapshot's timestamp and ledger.
+
+`last_changed_from_log` reduces the log to the single most recent entry per
+field — useful for "when did X last change?" queries. Both functions power
+the `config history` and `config last-changed` commands.
+
+### `cache.rs` — Estimate Caching
+
+Cached estimates are stored in `~/.soroban-cost-estimator/cache/`. The
+filename key is `{wasm_hash}-{function_name}-{args_hash}.json`. Each entry
+stores:
+
+- `wasm_hash` — SHA-256 hex of the WASM bytes
+- `function` — function name
+- `args_hash` — SHA-256 hex of the concatenated arg strings
+- `network`, `ledger`, `total_stroops`, `cpu_instructions`, `memory_bytes`
+- `timestamp` — ISO-8601 of when the estimate was made
+
+`find_stale_estimates` filters cached entries by ledger — any entry simulated
+at an earlier ledger than the current config snapshot is considered stale.
+`config diff` cross-references the cache to report which past estimates are
+now unreliable.
+
+`verify_cache` reads every `.json` file in the cache directory and checks
+that it parses as a valid `CachedEstimate`. Corrupt entries are reported by
+filename, and the command exits with code 1 if any fail.
+
+## Data Flow: `estimate` Command
+
+```
+User invokes: soroban-cost-estimator estimate --wasm contract.wasm --fn increment --arg step=5
+
+1. Load & validate WASM          (wasm::parser::load_wasm)
+   ├─ wasmparser::validate
+   ├─ enumerate exported functions
+   └─ decode contractspecv0 (if present)
+
+2. Resolve RPC endpoint          (rpc::client::resolve_endpoint)
+   "testnet" → "https://soroban-testnet.stellar.org"
+
+3. Parse arguments               (xdr_helper::parse_arg_scval)
+   "step=5" → ScVal::I64(5)
+
+4. Build simulation tx envelope  (xdr_helper::build_simulation_tx_envelope)
+   └─ TransactionEnvelope → InvokeHostFunctionOp → InvokeContract
+
+5. Simulate against network      (rpc::simulate::simulate_transaction)
+   └─ POST / {"method": "simulateTransaction", "params": {...}}
+
+6. Extract resources from response
+   ├─ CPU insns from transactionData XDR (modern) or cost object (legacy)
+   ├─ Read/write entries from footprint
+   └─ Total fee from minResourceFee or transactionData.resource_fee
+
+7. Fetch fee rates               (main::fetch_config_cache + main::fee_rates_from_config)
+   ├─ One batched GET with all six ConfigSetting* keys (rpc::config::ConfigCache,
+   │  memoized for the run — `estimate-all` prices N functions for 1 fetch, not N)
+   ├─ ConfigSettingContractComputeV0     → fee_per_10k_insns
+   ├─ ConfigSettingContractLedgerCostV0  → fee_per_read_entry, fee_per_write_entry, fee_per_read_1kb
+   └─ ConfigSettingContractBandwidthV0   → fee_per_1kb
+
+8. Compute fee breakdown         (report::fee_calc::compute_fee_breakdown)
+   ├─ Non-refundable = CPU + storage I/O + bandwidth (integer math)
+   └─ Refundable = max(0, total - non_refundable)
+
+9. Build CostReport              (report::cost_report::CostReport)
+
+10. Save to cache                (cache::save_estimate)
 
 `config diff` decides between 0 and 1 in
 `config_snapshot::diff::resolve_exit_code`; see the
