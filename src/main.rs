@@ -3806,6 +3806,7 @@ fn wasm_info_json(
                 "custom": s.id == Some(0),
             })
         }).collect::<Vec<_>>(),
+        "custom_sections": wasm::parser::custom_sections_json(wasm_info),
         "imports": wasm_info.imports.iter().map(|i| {
             serde_json::json!({
                 "module": i.module,
@@ -7095,6 +7096,7 @@ mod tests {
         assert_eq!(code["header_size"], 2);
         assert_eq!(code["total_size"], 22);
         assert!((code["percent"].as_f64().expect("percent") - 50.0).abs() < 0.01);
+        assert_eq!(value["custom_sections"], serde_json::json!([]));
     }
 
     #[test]
