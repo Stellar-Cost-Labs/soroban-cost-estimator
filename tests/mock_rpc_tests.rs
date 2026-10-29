@@ -328,3 +328,52 @@ async fn test_cache_warm_end_to_end_with_mock_rpc() {
     assert_eq!(entries.as_array().map(Vec::len), Some(1));
     assert_eq!(entries[0]["function"], "increment");
 }
+
+#[tokio::test]
+async fn mock_rpc_fixture_bounds_dedup_cache_and_evicts_lru() {
+    let server = common::start_mock_rpc_server().await;
+
+    common::stub_jsonrpc_success(
+        &server,
+        "getLedgerEntries",
+        json!({
+            "latestLedger": 100,
+            "entries": []
+        }),
+    )
+    .await;
+
+    // Client with capacity bound of 2
+    let client = RpcClient::new(server.uri().as_str()).with_dedup_capacity(2);
+
+    let k1 = json!({ "keys": ["key1"] });
+    let k2 = json!({ "keys": ["key2"] });
+    let k3 = json!({ "keys": ["key3"] });
+
+    let _: serde_json::Value = client
+        .call("getLedgerEntries", k1.clone())
+        .await
+        .expect("call k1");
+    let _: serde_json::Value = client
+        .call("getLedgerEntries", k2.clone())
+        .await
+        .expect("call k2");
+    assert_eq!(client.dedup_cache_len().await, 2);
+
+    // Re-access k1 to promote it as most recently used
+    let _: serde_json::Value = client
+        .call("getLedgerEntries", k1.clone())
+        .await
+        .expect("repeat k1");
+    assert_eq!(client.dedup_cache_len().await, 2);
+
+    // Call k3: exceeds bound of 2, evicts least-recently used (k2)
+    let _: serde_json::Value = client
+        .call("getLedgerEntries", k3.clone())
+        .await
+        .expect("call k3");
+    assert_eq!(client.dedup_cache_len().await, 2);
+
+    // k1 and k3 are retained in cache; k2 was evicted
+    assert_eq!(client.dedup_cache_len().await, 2);
+}
