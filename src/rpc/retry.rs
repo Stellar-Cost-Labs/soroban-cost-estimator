@@ -133,14 +133,17 @@ where
 /// Retryable transport failures are connection/timeout/request errors; an
 /// HTTP status error is retryable only for the statuses in
 /// [`TRANSIENT_STATUSES`]; transient gateway statuses
-/// ([`AppError::RpcUnavailable`]) and connect timeouts are also retryable.
+/// ([`AppError::RpcUnavailable`]), connect timeouts and whole-request timeouts
+/// are also retryable.
 /// Everything else — RPC-level errors, XDR decode failures, deterministic
 /// 4xx client errors — is deterministic and returned as-is.
 fn is_retryable(error: &AppError) -> bool {
     match error {
         AppError::Http(e) => e.is_connect() || e.is_timeout() || e.is_request(),
         AppError::HttpStatus { status, .. } => TRANSIENT_STATUSES.contains(status),
-        AppError::RpcUnavailable { .. } | AppError::ConnectTimeout { .. } => true,
+        AppError::RpcUnavailable { .. }
+        | AppError::ConnectTimeout { .. }
+        | AppError::RequestTimeout { .. } => true,
         AppError::Rpc { status, data, .. } => is_retryable_rpc_error(*status, data.as_ref()),
         _ => false,
     }

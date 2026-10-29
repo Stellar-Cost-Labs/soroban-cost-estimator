@@ -124,6 +124,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- RPC requests that exceed the configured `--timeout` now fail with the
+  descriptive `RPC request timed out after X seconds` error instead of the
+  generic `failed to send HTTP request` transport error. Request timeouts are
+  retried and trigger `--rpc-fallback-url` failover, while connect-phase
+  timeouts keep their distinct `--connect-timeout` handling (#294).
 - `config snapshot` no longer prints its four summary lines twice in table
   mode, and `--quiet` is now honoured for them. CSV and Markdown output no
   longer has the human-readable summary mixed into it, so each format stays

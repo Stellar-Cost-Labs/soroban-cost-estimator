@@ -107,6 +107,19 @@ pub enum AppError {
         source: reqwest::Error,
     },
 
+    /// The RPC endpoint did not complete the request within the configured
+    /// `--timeout`. Distinct from [`AppError::ConnectTimeout`], which bounds
+    /// only the initial TCP/TLS connect. Wraps the underlying reqwest error so
+    /// the original context is preserved.
+    #[error("RPC request timed out after {seconds} seconds")]
+    RequestTimeout {
+        /// The configured request timeout, in seconds.
+        seconds: u64,
+        /// The underlying reqwest error that triggered the timeout.
+        #[source]
+        source: reqwest::Error,
+    },
+
     /// An RPC operation exceeded its overall deadline across retries, backoff,
     /// and fallback endpoints.
     #[error("RPC operation timed out: exceeded overall deadline of {timeout_ms} ms")]

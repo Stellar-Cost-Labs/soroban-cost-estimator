@@ -374,6 +374,8 @@ impl CircuitBreaker {
 /// - [`AppError::Http`] with a connect/timeout/request flag (DNS failure,
 ///   connection refused, request-level transport error)
 /// - [`AppError::ConnectTimeout`] (TCP connect timed out)
+/// - [`AppError::RequestTimeout`] (the endpoint accepted the request but did
+///   not complete it within the configured `--timeout` budget)
 /// - [`AppError::RpcUnavailable`] (HTTP 502/503/504 gateway error)
 /// - [`AppError::HttpStatus`] with a gateway status (502/503/504)
 ///
@@ -383,7 +385,9 @@ impl CircuitBreaker {
 pub fn is_transport_failure(error: &AppError) -> bool {
     match error {
         AppError::Http(e) => e.is_connect() || e.is_timeout() || e.is_request(),
-        AppError::ConnectTimeout { .. } | AppError::RpcUnavailable { .. } => true,
+        AppError::ConnectTimeout { .. }
+        | AppError::RequestTimeout { .. }
+        | AppError::RpcUnavailable { .. } => true,
         AppError::HttpStatus { status, .. } => matches!(status, 502..=504),
         // Everything else — RPC-level, XDR, WASM, simulation, config errors —
         // is a deterministic application-level failure that the endpoint
@@ -698,6 +702,33 @@ mod tests {
         // function which explicitly matches ConnectTimeout { .. }.
         // The integration tests in rpc_failover_tests.rs exercise the real
         // path with a network-level connection refused error.
+    }
+
+    /// A whole-request timeout means the endpoint accepted the request but
+    /// never completed it within the `--timeout` budget, so it must count
+    /// toward the breaker threshold just like a TCP connect timeout does.
+    #[tokio::test]
+    async fn request_timeout_is_a_transport_failure() {
+        // `is_transport_failure` classifies the `AppError` variant, not the
+        // wrapped `reqwest::Error`, so any transport error will do. Bind an
+        // ephemeral port, then drop the listener: connecting to the captured
+        // address is refused immediately, so no real timeout has to elapse.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local address");
+        drop(listener);
+        let source = reqwest::get(format!("http://{addr}"))
+            .await
+            .expect_err("connection must refuse");
+        let error = AppError::RequestTimeout {
+            seconds: 30,
+            source,
+        };
+        assert!(
+            is_transport_failure(&error),
+            "a whole-request timeout must be a transport failure: {error}"
+        );
     }
 
     #[test]

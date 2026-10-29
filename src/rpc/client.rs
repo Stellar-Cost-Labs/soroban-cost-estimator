@@ -497,6 +497,10 @@ pub struct RpcClient {
     /// Maximum number of retries on transient (HTTP) failures, with
     /// exponential backoff.
     max_retries: usize,
+    /// Total per-request HTTP timeout (connect through response body), as
+    /// configured by the CLI's `--timeout` flag. Stored so the configured
+    /// value can be asserted directly and reported in timeout errors.
+    timeout: Duration,
     /// TCP connection establishment timeout. Distinct from the total request
     /// timeout: it bounds only the initial connect (TCP/TLS handshake), so a
     /// dead or unreachable host fails fast instead of hanging for the full
@@ -828,6 +832,7 @@ impl RpcClient {
             dedup: Arc::new(Mutex::new(DedupState::default())),
             limiter: rps.and_then(build_rate_limiter),
             max_retries,
+            timeout,
             connect_timeout,
             headers,
             verbose,
@@ -853,6 +858,17 @@ impl RpcClient {
     pub fn with_total_timeout(mut self, total_timeout: Option<Duration>) -> Self {
         self.total_timeout = total_timeout.filter(|d| !d.is_zero());
         self
+    }
+
+    /// Returns the total per-request HTTP timeout configured for this client.
+    ///
+    /// This is the value passed to `reqwest::ClientBuilder::timeout`, i.e. the
+    /// `--timeout` flag (or the matching `timeout_secs` config-file value).
+    /// Exposed for diagnostics and for tests that pin down the wiring between
+    /// the CLI flag and the HTTP client.
+    #[must_use]
+    pub const fn request_timeout(&self) -> Duration {
+        self.timeout
     }
 
     /// Attach circuit breakers for the primary and optional fallback endpoints.
@@ -1219,7 +1235,9 @@ impl RpcClient {
                 // are the cases where a fallback endpoint might succeed.
                 e.is_connect() || e.is_timeout() || e.is_request()
             }
-            AppError::ConnectTimeout { .. } | AppError::RpcUnavailable { .. } => true,
+            AppError::ConnectTimeout { .. }
+            | AppError::RequestTimeout { .. }
+            | AppError::RpcUnavailable { .. } => true,
             // Transient gateway statuses surfaced as HttpStatus (502/503/504)
             // are also failover triggers; other HttpStatus values (429/500 or
             // deterministic 4xx) are not — 429/500 are retried but not failed
@@ -1248,6 +1266,7 @@ impl RpcClient {
         let url = url.to_string();
         let request_body = body.clone();
         let limiter = self.limiter.clone();
+        let timeout = self.timeout;
         // Custom headers are attached per request (rather than as client
         // defaults) so the stored configuration stays authoritative.
         let headers = self.headers.clone();
@@ -1284,7 +1303,7 @@ impl RpcClient {
                         .json(&request_body)
                         .send()
                         .await
-                        .map_err(|e| connect_timeout_error(e, connect_timeout))?;
+                        .map_err(|e| map_request_error(e, timeout, connect_timeout))?;
 
                     // Transient statuses (429/5xx) must be turned into errors so
                     // `with_retry` can back off and retry them. Non-transient
@@ -1323,17 +1342,25 @@ impl RpcClient {
             });
         }
 
+        // Reading the body can itself time out: reqwest's `timeout` bounds the
+        // whole request, body included. Both the `send()` and the body read are
+        // therefore routed through [`map_request_error`] so a stalled body still
+        // surfaces the descriptive [`AppError::RequestTimeout`] (or the
+        // connect-phase [`AppError::ConnectTimeout`]).
         let response_body: Value = if let Some(d) = deadline {
             let timeout_ms = self
                 .total_timeout
                 .map(|t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX))
                 .unwrap_or(0);
-            match tokio::time::timeout_at(d, response.json()).await {
-                Ok(res) => res?,
-                Err(_) => return Err(AppError::TotalTimeout { timeout_ms }),
-            }
+            let Ok(body) = tokio::time::timeout_at(d, response.json()).await else {
+                return Err(AppError::TotalTimeout { timeout_ms });
+            };
+            body.map_err(|e| map_request_error(e, timeout, connect_timeout))?
         } else {
-            response.json().await?
+            response
+                .json()
+                .await
+                .map_err(|e| map_request_error(e, timeout, connect_timeout))?
         };
 
         if let Some(error) = response_body.get("error") {
@@ -1414,24 +1441,43 @@ mod proxy_builder_tests {
     }
 }
 
-/// Rewrap a reqwest error whose connect phase timed out into an
-/// [`AppError::ConnectTimeout`], so an unreachable host produces a distinct,
-/// actionable message instead of a generic request timeout.
+/// Maps a transport-level `reqwest` error onto the most specific
+/// [`AppError`] variant, so callers get an actionable message.
+///
+/// * A connect-phase timeout (timeout-flagged **and** connect-flagged) becomes
+///   [`AppError::ConnectTimeout`], naming the `--connect-timeout` budget.
+/// * Any other timeout-flagged error — a whole-request timeout, i.e. connect
+///   through response body — becomes [`AppError::RequestTimeout`], naming the
+///   `--timeout` budget and rendering as `RPC request timed out after X
+///   seconds`.
+/// * Every other error maps to [`AppError::Http`] as before.
 ///
 /// In reqwest, an expired `connect_timeout` surfaces as a timeout-flagged
 /// error whose source chain also carries a connect error (a `TimedOut` marker
 /// inside a hyper connect error), so `is_timeout() && is_connect()` separates
 /// it from a whole-request timeout (`is_timeout()` without `is_connect()`).
-/// Every other error maps to [`AppError::Http`] as before.
-fn connect_timeout_error(error: reqwest::Error, connect_timeout: Duration) -> AppError {
-    if !connect_timeout.is_zero() && error.is_timeout() && error.is_connect() {
-        AppError::ConnectTimeout {
-            seconds: connect_timeout.as_secs(),
-            source: error,
+/// A zero duration is the documented "disabled" sentinel for each budget, so a
+/// disabled budget never claims the error.
+fn map_request_error(
+    error: reqwest::Error,
+    timeout: Duration,
+    connect_timeout: Duration,
+) -> AppError {
+    if error.is_timeout() {
+        if !connect_timeout.is_zero() && error.is_connect() {
+            return AppError::ConnectTimeout {
+                seconds: connect_timeout.as_secs(),
+                source: error,
+            };
         }
-    } else {
-        AppError::from(error)
+        if !timeout.is_zero() {
+            return AppError::RequestTimeout {
+                seconds: timeout.as_secs(),
+                source: error,
+            };
+        }
     }
+    AppError::from(error)
 }
 
 /// Builds an optional fixed-rate limiter for `rps` requests per second.
@@ -2289,22 +2335,96 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// Spawns an HTTP server that sends the response *headers* — announcing a
+    /// body — and then never writes that body, so the client's whole-request
+    /// timeout fires while the body is being read rather than in `send()`.
+    async fn spawn_stalled_body_stub() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind stub server");
+        let addr = listener.local_addr().expect("no local address");
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    // Promise 64 bytes and then send nothing: the client sees
+                    // the status line and headers, then blocks on the body.
+                    let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                   Content-Length: 64\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(headers.as_bytes()).await;
+                    let _ = stream.flush().await;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
     /// A per-request timeout configured via `with_options` must actually
-    /// bound the request: against a server that accepts but never answers,
-    /// the retry loop gives up and surfaces an HTTP error rather than
-    /// waiting forever.
+    /// bound the request — against a server that accepts but never answers —
+    /// and surface the acceptance criterion's descriptive message rather than
+    /// a generic transport error.
     #[tokio::test]
     async fn test_request_timeout_applies() {
         let url = spawn_hanging_stub().await;
-        let client = RpcClient::with_options(&url, None, Duration::from_millis(100), 0, false);
+        let client = RpcClient::with_options(&url, None, Duration::from_secs(1), 0, false);
 
-        let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
+        let error = client
+            .call::<Value>("test.method", serde_json::json!({}))
+            .await
+            .expect_err("a hanging server must eventually produce a timeout error");
+
+        assert_eq!(error.to_string(), "RPC request timed out after 1 seconds");
+    }
+
+    /// A timeout that fires while the response *body* is being read must go
+    /// through the same mapping as one that fires in `send()`, so it surfaces
+    /// the descriptive [`AppError::RequestTimeout`] instead of a generic
+    /// transport error.
+    #[tokio::test]
+    async fn test_body_read_timeout_maps_to_descriptive_error() {
+        let url = spawn_stalled_body_stub().await;
+        let client = RpcClient::with_options(&url, None, Duration::from_secs(1), 0, false);
+
+        let error = client
+            .call::<Value>("test.method", serde_json::json!({}))
+            .await
+            .expect_err("a stalled response body must eventually time out");
 
         assert!(
-            result.is_err(),
-            "a hanging server must eventually produce a timeout error"
+            matches!(error, AppError::RequestTimeout { seconds: 1, .. }),
+            "a body-read timeout must map to RequestTimeout: {error}"
         );
+        assert_eq!(error.to_string(), "RPC request timed out after 1 seconds");
     }
+
+    /// The `timeout` supplied to `with_options` must be stored verbatim on the
+    /// client, i.e. the `--timeout` value is exactly what configures
+    /// `reqwest::ClientBuilder::timeout` (acceptance criterion).
+    #[test]
+    fn test_request_timeout_config_is_stored() {
+        let client =
+            RpcClient::with_options("http://localhost", None, Duration::from_secs(7), 3, false);
+        assert_eq!(client.request_timeout(), Duration::from_secs(7));
+    }
+
+    /// Constructors without an explicit timeout must fall back to
+    /// [`super::DEFAULT_TIMEOUT`], which matches the CLI's `--timeout`
+    /// default of 30 seconds.
+    #[test]
+    fn test_default_request_timeout_is_thirty_seconds() {
+        assert_eq!(
+            RpcClient::new("http://localhost").request_timeout(),
+            Duration::from_secs(30)
+        );
+        let client =
+            RpcClient::with_headers("http://localhost", &[], false).expect("valid empty headers");
+        assert_eq!(client.request_timeout(), Duration::from_secs(30));
+    }
+
     /// The `connect_timeout` supplied to `with_connect_timeout` must be
     /// stored verbatim on the client (asserts the configuration is actually
     /// wired through, per the issue's acceptance criteria).
@@ -2382,22 +2502,48 @@ mod tests {
             .await
             .expect_err("port 1 must refuse");
 
-        let mapped = super::connect_timeout_error(refused, Duration::from_secs(5));
+        let mapped =
+            super::map_request_error(refused, Duration::from_secs(30), Duration::from_secs(5));
         assert!(
             matches!(mapped, AppError::Http(_)),
             "connection refused must not be rewrapped as a connect timeout: {mapped}"
         );
     }
 
-    /// With the connect timeout disabled (zero), even a timeout-flagged,
-    /// connect-flagged error must stay a plain [`AppError::Http`].
+    /// A whole-request timeout (timeout-flagged but not connect-flagged) must
+    /// map to the descriptive [`AppError::RequestTimeout`] variant, never to
+    /// the connect-timeout variant.
+    #[tokio::test]
+    async fn test_request_timeout_maps_to_descriptive_error() {
+        let url = spawn_hanging_stub().await;
+        let source = reqwest::Client::builder()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .expect("build client")
+            .get(&url)
+            .send()
+            .await
+            .expect_err("hanging server must time out");
+
+        let mapped = super::map_request_error(source, Duration::from_secs(30), Duration::ZERO);
+
+        assert!(
+            matches!(mapped, AppError::RequestTimeout { seconds: 30, .. }),
+            "request timeout must map to RequestTimeout: {mapped}"
+        );
+        assert_eq!(mapped.to_string(), "RPC request timed out after 30 seconds");
+    }
+
+    /// A connection-refused error is neither timeout- nor connect-timeout
+    /// flagged, so it must stay a plain [`AppError::Http`] even when the
+    /// connect budget is disabled.
     #[tokio::test]
     async fn test_disabled_connect_timeout_skips_rewrapping() {
         let refused = reqwest::get("http://127.0.0.1:1")
             .await
             .expect_err("port 1 must refuse");
 
-        let mapped = super::connect_timeout_error(refused, Duration::ZERO);
+        let mapped = super::map_request_error(refused, Duration::from_secs(30), Duration::ZERO);
         assert!(matches!(mapped, AppError::Http(_)));
     }
 
@@ -2433,6 +2579,34 @@ mod tests {
         assert!(
             result.is_ok(),
             "request should fail over to the fallback endpoint"
+        );
+        assert_eq!(
+            fallback_counter.load(Ordering::SeqCst),
+            1,
+            "fallback endpoint should have served exactly one request"
+        );
+    }
+
+    /// A whole-request timeout is a transport failure, so a configured
+    /// fallback endpoint must be tried before the timeout error surfaces.
+    #[tokio::test]
+    async fn test_failover_on_request_timeout() {
+        let hanging_url = spawn_hanging_stub().await;
+        let (fallback_url, fallback_counter) = spawn_json_rpc_stub(0).await;
+        let client = RpcClient::with_fallback(
+            &hanging_url,
+            Some(&fallback_url),
+            None,
+            Duration::from_millis(300),
+            0,
+            false,
+        );
+
+        let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
+
+        assert!(
+            result.is_ok(),
+            "a request timeout should fail over to the fallback endpoint: {result:?}"
         );
         assert_eq!(
             fallback_counter.load(Ordering::SeqCst),
