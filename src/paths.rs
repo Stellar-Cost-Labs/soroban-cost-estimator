@@ -19,7 +19,14 @@ use crate::error::{AppError, AppResult};
 /// so the environment check must come first there.
 ///
 /// This function only computes the path; callers that write into it are
-/// responsible for creating it if needed (or call [`ensure_data_dir`]).
+/// responsible for creating it if needed.
+///
+/// # Permission policy
+/// Snapshot files and sensitive cache data stored under this directory are
+/// created with restricted user-only permissions (`0o600` on Unix systems)
+/// to avoid exposure on shared or multi-user machines. On non-Unix platforms
+/// (such as Windows), files rely on default platform access control lists (ACLs)
+/// inherited from the user's home profile directory.
 pub fn data_dir() -> AppResult<PathBuf> {
     let home = env_home()
         .or_else(dirs::home_dir)

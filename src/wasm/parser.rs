@@ -192,8 +192,9 @@ pub fn validate_wasm(bytes: &[u8]) -> AppResult<()> {
 
 /// Validates WASM memory limits against Soroban network constraints.
 ///
-/// Returns a warning message if the WASM memory section exceeds Soroban limits,
-/// or `Ok(None)` if the memory is within limits.
+/// Returns a warning message if a defined or imported WASM memory exceeds
+/// Soroban limits, or `None` if memory is within limits or the module is
+/// invalid.
 ///
 /// Soroban enforces a per-transaction memory limit of 40 MB (approximately 610 WASM pages).
 /// If the WASM declares a memory that exceeds this limit, the contract will likely
@@ -201,16 +202,53 @@ pub fn validate_wasm(bytes: &[u8]) -> AppResult<()> {
 #[must_use]
 pub fn validate_wasm_memory_limits(bytes: &[u8]) -> Option<String> {
     let mut memories = Vec::new();
+    let mut validator = wasmparser::Validator::new();
 
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
-        if let Ok(wasmparser::Payload::MemorySection(section)) = payload {
-            for memory in section.into_iter().flatten() {
-                memories.push(MemoryInfo {
-                    initial_pages: memory.initial,
-                    maximum_pages: memory.maximum,
-                    memory64: memory.memory64,
-                });
+        let payload = payload.ok()?;
+
+        // This diagnostic is deliberately warning-only. Only inspect section
+        // contents after wasmparser has validated the payload; invalid input is
+        // reported by the normal module validation path instead.
+        validator.payload(&payload).ok()?;
+
+        match payload {
+            wasmparser::Payload::ImportSection(section) => {
+                for group in section {
+                    let group = group.ok()?;
+                    match group {
+                        wasmparser::Imports::Single(_, imported) => {
+                            add_imported_memory(&imported.ty, &mut memories);
+                        }
+                        wasmparser::Imports::Compact1 { items, .. } => {
+                            for item in items {
+                                let item = item.ok()?;
+                                add_imported_memory(&item.ty, &mut memories);
+                            }
+                        }
+                        wasmparser::Imports::Compact2 { ty, names, .. } => {
+                            for name in names {
+                                name.ok()?;
+                                add_imported_memory(&ty, &mut memories);
+                            }
+                        }
+                    }
+                }
             }
+            wasmparser::Payload::MemorySection(section) => {
+                for memory in section {
+                    let memory = memory.ok()?;
+                    memories.push(MemoryDeclaration {
+                        info: MemoryInfo {
+                            initial_pages: memory.initial,
+                            maximum_pages: memory.maximum,
+                            memory64: memory.memory64,
+                        },
+                        imported: false,
+                    });
+                }
+            }
+            _ => {}
         }
     }
 
@@ -221,19 +259,24 @@ pub fn validate_wasm_memory_limits(bytes: &[u8]) -> Option<String> {
     let mut warnings = Vec::new();
 
     for (idx, memory) in memories.iter().enumerate() {
-        let memory_label = if memories.len() == 1 {
+        let memory_label = if memory.imported {
+            format!("Imported memory[{idx}]")
+        } else if memories.len() == 1 {
             "Memory".to_string()
         } else {
-            format!("Memory[{}]", idx)
+            format!("Memory[{idx}]")
         };
 
         // Check initial pages
-        if memory.initial_pages > SOROBAN_MAX_WASM_PAGES {
-            let initial_bytes = memory.initial_pages * WASM_PAGE_SIZE_BYTES;
+        if memory.info.initial_pages > SOROBAN_MAX_WASM_PAGES {
+            let initial_bytes = memory
+                .info
+                .initial_pages
+                .saturating_mul(WASM_PAGE_SIZE_BYTES);
             warnings.push(format!(
                 "{}: initial size {} pages ({} bytes) exceeds Soroban limit of {} pages ({} bytes)",
                 memory_label,
-                memory.initial_pages,
+                memory.info.initial_pages,
                 initial_bytes,
                 SOROBAN_MAX_WASM_PAGES,
                 SOROBAN_TX_MEMORY_LIMIT_BYTES
@@ -241,9 +284,9 @@ pub fn validate_wasm_memory_limits(bytes: &[u8]) -> Option<String> {
         }
 
         // Check maximum pages if specified
-        if let Some(max_pages) = memory.maximum_pages {
+        if let Some(max_pages) = memory.info.maximum_pages {
             if max_pages > SOROBAN_MAX_WASM_PAGES {
-                let max_bytes = max_pages * WASM_PAGE_SIZE_BYTES;
+                let max_bytes = max_pages.saturating_mul(WASM_PAGE_SIZE_BYTES);
                 warnings.push(format!(
                     "{}: maximum size {} pages ({} bytes) exceeds Soroban limit of {} pages ({} bytes)",
                     memory_label,
@@ -260,6 +303,26 @@ pub fn validate_wasm_memory_limits(bytes: &[u8]) -> Option<String> {
         None
     } else {
         Some(warnings.join("; "))
+    }
+}
+
+/// A memory declaration with its source in the WebAssembly index space.
+struct MemoryDeclaration {
+    info: MemoryInfo,
+    imported: bool,
+}
+
+/// Adds an imported memory declaration, ignoring non-memory imports.
+fn add_imported_memory(ty: &wasmparser::TypeRef, memories: &mut Vec<MemoryDeclaration>) {
+    if let wasmparser::TypeRef::Memory(memory) = ty {
+        memories.push(MemoryDeclaration {
+            info: MemoryInfo {
+                initial_pages: memory.initial,
+                maximum_pages: memory.maximum,
+                memory64: memory.memory64,
+            },
+            imported: true,
+        });
     }
 }
 
@@ -1046,6 +1109,28 @@ pub struct FunctionInfo {
 /// Schema version of the `function_signatures` JSON block.
 pub const FUNCTION_SIGNATURES_SCHEMA_VERSION: u32 = 1;
 
+/// Renders every custom section's name and byte size as JSON.
+///
+/// Preserves repeated custom sections as separate entries and preserves
+/// deterministic ordering matching the WASM binary sequence.
+#[must_use]
+pub fn custom_sections_json(info: &WasmInfo) -> serde_json::Value {
+    let entries: Vec<serde_json::Value> = info
+        .sections
+        .iter()
+        .filter(|s| s.custom)
+        .map(|s| {
+            json!({
+                "name": s.name,
+                "size": s.size,
+                "offset": s.offset,
+                "end": s.end,
+            })
+        })
+        .collect();
+    json!(entries)
+}
+
 /// Renders every exported function's signature as stable JSON.
 ///
 /// Soroban spec types (`type`/`type_def`) are kept separate from the raw WASM
@@ -1364,6 +1449,11 @@ impl WasmInfo {
         self.imports
             .iter()
             .filter(|imp| imp.module == HOST_IMPORT_MODULE)
+    }
+
+    /// Returns an iterator over custom sections (`id == 0`), in binary order.
+    pub fn custom_sections(&self) -> impl Iterator<Item = &SectionInfo> {
+        self.sections.iter().filter(|s| s.custom)
     }
 
     /// Size accounting for the whole file: the module header plus one entry

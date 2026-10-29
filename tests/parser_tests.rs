@@ -1,6 +1,40 @@
 use std::path::Path;
 
 #[test]
+fn test_validate_imported_memory_limits() {
+    let bytes = include_bytes!("fixtures/imported_memory.wasm");
+
+    let warning = soroban_cost_estimator::wasm::parser::validate_wasm_memory_limits(bytes)
+        .expect("imported memory above the Soroban limit should warn");
+
+    assert!(warning.contains("Imported memory[0]"), "got: {warning}");
+    assert!(warning.contains("maximum size 611 pages"), "got: {warning}");
+}
+
+#[test]
+fn test_validate_absent_memory_has_no_warning() {
+    let bytes = include_bytes!("fixtures/minimal.wasm");
+
+    assert!(soroban_cost_estimator::wasm::parser::validate_wasm_memory_limits(bytes).is_none());
+}
+
+#[test]
+fn test_validate_defined_memory_limits() {
+    // Header + a memory section declaring a 611-page maximum.
+    let bytes = [
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x05, 0x05, 0x01, 0x01, 0x01, 0xe3, 0x04,
+    ];
+
+    let warning = soroban_cost_estimator::wasm::parser::validate_wasm_memory_limits(&bytes)
+        .expect("defined memory above the Soroban limit should warn");
+
+    assert!(
+        warning.contains("Memory: maximum size 611 pages"),
+        "got: {warning}"
+    );
+}
+
+#[test]
 fn test_load_minimal_wasm() {
     let path = Path::new("tests/fixtures/minimal.wasm");
     assert!(path.exists(), "test WASM fixture not found");
@@ -1290,6 +1324,149 @@ fn test_fuzz_boundaries_malformed_wasm_inputs() {
         spec_res.is_err(),
         "malformed XDR payload in contractspecv0 must fail gracefully"
     );
+}
+
+/// Verifies that custom-section names and byte sizes are serialized in the
+/// structured WASM inspection output, and that repeated custom sections
+/// appear as separate entries in the sections array.
+#[test]
+fn test_custom_sections_serialized_with_names_and_sizes() {
+    let path = Path::new("tests/fixtures/contract.wasm");
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(path)
+        .expect("failed to load contract fixture");
+
+    // Sections must be captured
+    assert!(
+        !wasm_info.sections.is_empty(),
+        "sections should be captured"
+    );
+
+    // Each custom section must have a name and size
+    for section in wasm_info.custom_sections() {
+        assert!(
+            !section.name.is_empty(),
+            "custom section name must not be empty"
+        );
+        assert!(
+            section.size > 0,
+            "custom section {} has no size",
+            section.name
+        );
+        assert!(
+            section.end > section.offset,
+            "custom section {} end must be after offset",
+            section.name
+        );
+    }
+
+    // JSON serialization must include custom section names and sizes
+    let custom_json = soroban_cost_estimator::wasm::parser::custom_sections_json(&wasm_info);
+    let custom_array = custom_json.as_array().expect("custom_sections array");
+    assert!(
+        !custom_array.is_empty(),
+        "contract.wasm must have custom sections"
+    );
+    let spec = custom_array
+        .iter()
+        .find(|s| s["name"] == "contractspecv0")
+        .expect("contractspecv0 section must be in custom_sections");
+    assert!(spec["size"].as_u64().unwrap_or(0) > 0);
+
+    // JSON serialization must include section names and sizes deterministically
+    let breakdown = wasm_info.section_breakdown();
+    let section_sizes_map = breakdown.size_map();
+    // size_map should have an entry for every section in the breakdown (including module header)
+    assert_eq!(
+        section_sizes_map.len(),
+        breakdown.sections.len(),
+        "size_map entry count {} must match breakdown sections count {}",
+        section_sizes_map.len(),
+        breakdown.sections.len()
+    );
+
+    // Human-readable output must retain current format
+    let summary = soroban_cost_estimator::wasm::parser::format_sections(&wasm_info);
+    assert!(
+        summary.contains("WASM sections:"),
+        "human-readable output must contain 'WASM sections:'"
+    );
+    assert!(
+        summary.contains("contractspecv0"),
+        "human-readable output must contain 'contractspecv0'"
+    );
+}
+
+/// Tests that modules with repeated custom sections preserve each section as a separate entry.
+#[test]
+fn test_repeated_custom_sections_preserved_as_separate_entries() {
+    let mut bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
+    bytes.extend_from_slice(&custom_section("custom_meta", b"alpha"));
+    bytes.extend_from_slice(&custom_section("custom_meta", b"beta_longer_payload"));
+
+    let temp = std::env::temp_dir().join(format!("sce-repeated-{}.wasm", std::process::id()));
+    std::fs::write(&temp, &bytes).expect("write temp fixture");
+
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(&temp)
+        .expect("load wasm with repeated custom sections");
+
+    let custom_sections: Vec<_> = wasm_info.custom_sections().collect();
+    assert_eq!(
+        custom_sections.len(),
+        2,
+        "both repeated custom sections must be preserved"
+    );
+    assert_eq!(custom_sections[0].name, "custom_meta");
+    assert_eq!(custom_sections[1].name, "custom_meta");
+
+    let custom_json = soroban_cost_estimator::wasm::parser::custom_sections_json(&wasm_info);
+    let custom_array = custom_json.as_array().expect("custom_sections array");
+    let repeated: Vec<_> = custom_array
+        .iter()
+        .filter(|s| s["name"] == "custom_meta")
+        .collect();
+    assert_eq!(
+        repeated.len(),
+        2,
+        "repeated custom sections must be serialized as separate entries"
+    );
+    assert!(repeated[0]["size"].as_u64().unwrap() < repeated[1]["size"].as_u64().unwrap());
+    assert!(repeated[0]["offset"].as_u64().unwrap() < repeated[1]["offset"].as_u64().unwrap());
+
+    let _ = std::fs::remove_file(&temp);
+}
+
+/// Tests that modules with unknown custom section names are handled gracefully.
+#[test]
+fn test_unknown_custom_sections_handled_gracefully() {
+    let mut bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
+    bytes.extend_from_slice(&custom_section(
+        "unknown_custom_xyz",
+        b"payload_bytes_for_test",
+    ));
+
+    let temp = std::env::temp_dir().join(format!("sce-unknown-{}.wasm", std::process::id()));
+    std::fs::write(&temp, &bytes).expect("write temp fixture");
+
+    let wasm_info = soroban_cost_estimator::wasm::parser::load_wasm(&temp)
+        .expect("failed to load WASM with unknown custom section");
+
+    let custom_json = soroban_cost_estimator::wasm::parser::custom_sections_json(&wasm_info);
+    let custom_array = custom_json.as_array().expect("custom_sections array");
+    let unknown = custom_array
+        .iter()
+        .find(|s| s["name"] == "unknown_custom_xyz")
+        .expect("unknown custom section must be preserved");
+    assert!(unknown["size"].as_u64().unwrap() > 0);
+
+    for section in &wasm_info.sections {
+        assert!(!section.name.is_empty(), "section name must not be empty");
+        assert!(
+            section.end >= section.offset,
+            "section end must be >= offset"
+        );
+    }
+
+    let _ = std::fs::remove_file(&temp);
 }
 
 #[test]
