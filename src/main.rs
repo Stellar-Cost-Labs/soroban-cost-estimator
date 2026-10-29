@@ -298,6 +298,7 @@ async fn run_cli() -> i32 {
 async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> error::AppResult<()> {
     let file = file?;
     rpc::client::set_endpoint_overrides(file.rpc_urls.clone())?;
+    rpc::client::set_explicit_proxy(args.rpc_proxy.as_deref())?;
     let rps = args.rps;
     let timeout = args.timeout;
     let connect_timeout = args.connect_timeout;

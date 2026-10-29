@@ -194,6 +194,11 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "URL")]
     pub rpc_fallback_url: Option<String>,
 
+    /// HTTP or HTTPS proxy for RPC requests. Takes precedence over standard
+    /// proxy environment variables for this invocation.
+    #[arg(long, global = true, value_name = "URL")]
+    pub rpc_proxy: Option<String>,
+
     /// Retry transient RPC failures up to N times (default 3), using
     /// exponential backoff (500ms, then doubled between attempts). 0
     /// disables retries entirely.
