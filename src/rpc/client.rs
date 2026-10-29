@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -357,6 +357,12 @@ impl SharedFuture {
     }
 }
 
+/// Default maximum number of completed request entries retained in the deduplication cache.
+///
+/// Bounding the cache size ensures long-running processes making many unique RPC requests
+/// do not grow memory indefinitely.
+pub const DEFAULT_DEDUP_CACHE_CAPACITY: usize = 256;
+
 /// Private, shared deduplication state for a `RpcClient`.
 ///
 /// Deduplication collapses identical JSON-RPC requests — the same method with
@@ -364,16 +370,78 @@ impl SharedFuture {
 /// operations such as `estimate-all`, where several functions share the same
 /// WASM upload path and would otherwise transmit the identical upload request
 /// over and over.
-#[derive(Debug, Default)]
+///
+/// Completed response entries are bounded by `capacity` and evicted deterministically
+/// (LRU). In-flight single-flight requests are maintained separately so concurrent
+/// in-progress calls are never evicted.
+#[derive(Debug)]
 struct DedupState {
+    /// Maximum number of completed entries retained in the cache.
+    capacity: usize,
     /// Results of identical requests that already completed successfully,
     /// keyed by request. A cache hit skips the network entirely and also lets
     /// a request arriving *after* its twin finished share the result.
     completed: HashMap<RequestKey, Value>,
+    /// Access/insertion order for deterministic LRU eviction (least recently used at front).
+    order: VecDeque<RequestKey>,
     /// One single-flight handle per key currently in flight. Concurrent
     /// identical callers attach to the existing handle rather than opening a
     /// second request.
     in_flight: HashMap<RequestKey, SharedFuture>,
+}
+
+impl Default for DedupState {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_DEDUP_CACHE_CAPACITY)
+    }
+}
+
+impl DedupState {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            capacity,
+            completed: HashMap::new(),
+            order: VecDeque::new(),
+            in_flight: HashMap::new(),
+        }
+    }
+
+    /// Retrieves a cached completed result and marks it as most recently used.
+    fn get_completed(&mut self, key: &RequestKey) -> Option<Value> {
+        let value = self.completed.get(key)?.clone();
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+            self.order.push_back(key.clone());
+        }
+        Some(value)
+    }
+
+    /// Inserts a completed result, evicting the least recently used entry if over capacity.
+    fn insert_completed(&mut self, key: RequestKey, value: Value) {
+        if self.capacity == 0 {
+            return;
+        }
+
+        if self.completed.contains_key(&key) {
+            self.completed.insert(key.clone(), value);
+            if let Some(pos) = self.order.iter().position(|k| k == &key) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(key);
+            return;
+        }
+
+        while self.completed.len() >= self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.completed.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+
+        self.completed.insert(key.clone(), value);
+        self.order.push_back(key);
+    }
 }
 
 /// Response envelope for the `getHealth` JSON-RPC method.
@@ -803,6 +871,25 @@ impl RpcClient {
         self
     }
 
+    /// Sets the maximum capacity of the request deduplication completed-result cache.
+    ///
+    /// When new entries exceed this bound, older completed requests are deterministically
+    /// evicted using a Least-Recently-Used (LRU) policy. In-flight single-flight requests
+    /// remain unaffected. A capacity of `0` disables completed-request caching while
+    /// preserving single-flight deduplication for concurrent in-flight requests.
+    #[must_use]
+    pub fn with_dedup_capacity(mut self, capacity: usize) -> Self {
+        self.dedup = Arc::new(Mutex::new(DedupState::with_capacity(capacity)));
+        self
+    }
+
+    /// Returns the number of completed entries currently retained in the deduplication cache.
+    #[must_use]
+    pub async fn dedup_cache_len(&self) -> usize {
+        let state = self.dedup.lock().await;
+        state.completed.len()
+    }
+
     /// Returns the custom HTTP headers configured for this client.
     ///
     /// These are the headers parsed from the `--header` values and attached to
@@ -933,7 +1020,7 @@ impl RpcClient {
             {
                 let mut state = self.dedup.lock().await;
                 if let Ok(value) = &result {
-                    state.completed.insert(key.clone(), value.clone());
+                    state.insert_completed(key.clone(), value.clone());
                 }
                 state.in_flight.remove(&key);
             }
@@ -963,8 +1050,8 @@ impl RpcClient {
     /// Returns the cached result for `key`, if a prior identical request
     /// completed successfully.
     async fn cached_result(&self, key: &RequestKey) -> Option<Value> {
-        let state = self.dedup.lock().await;
-        state.completed.get(key).cloned()
+        let mut state = self.dedup.lock().await;
+        state.get_completed(key)
     }
 
     /// Performs the actual HTTP POST and extracts the raw `result` value.
@@ -2010,6 +2097,110 @@ mod tests {
         assert!(
             start.elapsed().as_millis() < 45,
             "a deduped request must not wait on the rate limiter"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dedup_cache_capacity_bound_and_lru_eviction() {
+        let (url, counter) = spawn_json_rpc_stub(0).await;
+        // Bounded client with capacity 2
+        let client = RpcClient::new(&url).with_dedup_capacity(2);
+
+        let p1 = serde_json::json!({"id": 1});
+        let p2 = serde_json::json!({"id": 2});
+        let p3 = serde_json::json!({"id": 3});
+
+        // Request 1: hits network
+        let _: Value = client
+            .call("test.method", p1.clone())
+            .await
+            .expect("call 1");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert_eq!(client.dedup_cache_len().await, 1);
+
+        // Request 2: hits network
+        let _: Value = client
+            .call("test.method", p2.clone())
+            .await
+            .expect("call 2");
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        assert_eq!(client.dedup_cache_len().await, 2);
+
+        // Access Request 1 again: served from cache (promoted to most recently used)
+        let _: Value = client
+            .call("test.method", p1.clone())
+            .await
+            .expect("call 1 repeat");
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "must be deduplicated");
+
+        // Request 3: exceeds capacity 2, evicts LRU entry (Request 2)
+        let _: Value = client
+            .call("test.method", p3.clone())
+            .await
+            .expect("call 3");
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+        assert_eq!(client.dedup_cache_len().await, 2);
+
+        // Request 1 should still be cached because it was accessed recently
+        let _: Value = client
+            .call("test.method", p1.clone())
+            .await
+            .expect("call 1 repeat");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            3,
+            "Request 1 must still be in cache"
+        );
+
+        // Request 2 should have been evicted; calling it hits the network
+        let _: Value = client
+            .call("test.method", p2.clone())
+            .await
+            .expect("call 2 after eviction");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            4,
+            "evicted Request 2 must hit network"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dedup_cache_zero_capacity_preserves_single_flight() {
+        let (url, counter) = spawn_json_rpc_stub(0).await;
+        let client = Arc::new(RpcClient::new(&url).with_dedup_capacity(0));
+        let params = serde_json::json!({"id": "zero-cap"});
+
+        // Sequential calls always hit network when capacity is 0
+        let _: Value = client
+            .call("test.method", params.clone())
+            .await
+            .expect("call 1");
+        let _: Value = client
+            .call("test.method", params.clone())
+            .await
+            .expect("call 2");
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        assert_eq!(client.dedup_cache_len().await, 0);
+
+        // Concurrent in-flight calls still deduplicate (single-flight)
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let client = Arc::clone(&client);
+            let params = params.clone();
+            handles.push(tokio::spawn(async move {
+                client
+                    .call::<Value>("test.method", params)
+                    .await
+                    .expect("concurrent call");
+            }));
+        }
+        for h in handles {
+            h.await.expect("join handle");
+        }
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            3,
+            "concurrent in-flight requests must share single flight even with zero cache capacity"
         );
     }
 
