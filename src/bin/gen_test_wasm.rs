@@ -8,11 +8,16 @@
 ///   no way to invent arguments), so a multi-function batch summary can only
 ///   be exercised end-to-end against a contract whose exports are all
 ///   zero-argument.
+/// * `imported_memory.wasm` — imports one memory whose maximum exceeds the
+///   Soroban transaction memory limit.
 use std::io::Write;
 use std::path::Path;
 
 /// File name of the zero-argument fixture, written next to `minimal.wasm`.
 const ZERO_ARG_FIXTURE_NAME: &str = "zeroarg.wasm";
+
+/// File name of the imported-memory fixture.
+const IMPORTED_MEMORY_FIXTURE_NAME: &str = "imported_memory.wasm";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_path = std::env::args()
@@ -26,7 +31,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sibling = Path::new(&out_path).with_file_name(ZERO_ARG_FIXTURE_NAME);
     write_fixture(&sibling.to_string_lossy(), &generate_zero_arg_wasm())?;
 
+    let sibling = Path::new(&out_path).with_file_name(IMPORTED_MEMORY_FIXTURE_NAME);
+    write_fixture(&sibling.to_string_lossy(), &generate_imported_memory_wasm())?;
+
     Ok(())
+}
+
+/// Generate a valid WASM module that imports memory index 0 from `env`.
+///
+/// Its maximum of 611 pages intentionally exceeds Soroban's 610-page
+/// transaction limit, so parser tests can assert the diagnostic without a
+/// locally defined memory section.
+fn generate_imported_memory_wasm() -> Vec<u8> {
+    let mut wasm = Vec::new();
+    wasm.extend_from_slice(b"\0asm");
+    wasm.extend_from_slice(&1u32.to_le_bytes());
+
+    // Import section: one `env.memory` memory import, min 1 / max 611 pages.
+    let mut imports = Vec::new();
+    write_leb_u32(&mut imports, 1);
+    write_name(&mut imports, b"env");
+    write_name(&mut imports, b"memory");
+    imports.push(0x02); // external kind: memory
+    imports.push(0x01); // limits: minimum and maximum are present
+    write_leb_u32(&mut imports, 1);
+    write_leb_u32(&mut imports, 611);
+
+    wasm.push(0x02);
+    write_leb_u32(&mut wasm, imports.len() as u32);
+    wasm.extend_from_slice(&imports);
+    wasm
+}
+
+/// Encode a WASM name, which is a length-prefixed byte string.
+fn write_name(buf: &mut Vec<u8>, name: &[u8]) {
+    write_leb_u32(buf, name.len() as u32);
+    buf.extend_from_slice(name);
 }
 
 /// Write `bytes` to `path` and report what was produced.

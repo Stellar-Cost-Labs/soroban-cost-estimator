@@ -1186,6 +1186,64 @@ fn test_estimate_cache_hit_skips_simulation() {
 }
 
 #[test]
+fn test_estimate_uses_default_seven_day_cache_ttl() {
+    // A fresh entry is reused even without --cache-ttl because the default
+    // cache TTL is seven days.
+    let home = temp_home("cache-ttl-default");
+    seed_cache_entry(&home, &chrono::Utc::now().to_rfc3339());
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--rpc-url",
+            DEAD_RPC,
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(
+        code, 0,
+        "the default TTL should reuse a fresh entry: {stderr}"
+    );
+    assert!(stdout.contains("Cache hit"), "got: {stdout}");
+}
+
+#[test]
+fn test_estimate_uses_cache_ttl_from_config() {
+    // A config TTL of 30 minutes expires this two-hour-old entry, so the
+    // command must attempt simulation instead of reporting a cache hit.
+    let home = temp_home("cache-ttl-config");
+    seed_cache_entry(
+        &home,
+        &(chrono::Utc::now() - chrono::TimeDelta::hours(2)).to_rfc3339(),
+    );
+    let config = home.join("config.toml");
+    std::fs::write(&config, "cache_ttl = \"30m\"\n").expect("write config");
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "--config",
+            config.to_str().expect("UTF-8 config path"),
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--rpc-url",
+            DEAD_RPC,
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 1, "the expired entry must re-simulate");
+    assert!(!stdout.contains("Cache hit"), "got: {stdout}");
+    assert!(
+        stderr.contains("HTTP request failed") || stderr.contains("error sending request"),
+        "re-simulation should hit the dead endpoint; got: {stderr}"
+    );
+}
+
+#[test]
 fn test_estimate_cache_hit_json_output() {
     let home = temp_home("cache-ttl-json");
     seed_cache_entry(&home, &chrono::Utc::now().to_rfc3339());
@@ -4942,6 +5000,47 @@ fn test_config_snapshot_diff_makes_no_network_calls() {
         !stderr.contains("failed to locate RPC endpoint"),
         "offline diff must not resolve a network; got: {stderr}"
     );
+}
+
+#[test]
+fn manifest_validates_relative_paths_and_network_overrides_offline() {
+    let manifest =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/manifests/valid.toml");
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .current_dir(std::env::temp_dir())
+        .env("RUST_LOG", "error")
+        .args(["estimate", "--manifest"])
+        .arg(manifest)
+        .arg("--dry-run")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let entries: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(entries[0]["function"], "ping");
+    assert_eq!(entries[1]["network"], "local");
+    assert_eq!(entries[1]["rpc_url"], DEAD_RPC);
+}
+
+#[test]
+fn manifest_errors_identify_entry_and_source_before_rpc() {
+    for (fixture, expected) in [
+        ("missing-field", "missing field `function`"),
+        ("unknown-version", "unsupported version 99"),
+        ("invalid-path", "contracts[2]"),
+        ("invalid-function", "unknown function"),
+        ("invalid-args", "expects 0 arguments"),
+    ] {
+        let path = format!("tests/fixtures/manifests/{fixture}.toml");
+        let (_, stderr, code) = run_cli(&["estimate", "--manifest", &path, "--rpc-url", DEAD_RPC]);
+        assert_ne!(code, 0);
+        assert!(stderr.contains(expected), "{fixture}: {stderr}");
+        assert!(stderr.contains(&format!("{path}:")), "{stderr}");
+        assert!(!stderr.contains("failed to send HTTP"), "{stderr}");
+    }
 }
 
 // ── Cache listing and filtered deletion (#516, #517) ───────────────────────
