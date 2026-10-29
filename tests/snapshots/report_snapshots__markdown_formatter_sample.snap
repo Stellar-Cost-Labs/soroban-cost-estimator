@@ -33,12 +33,14 @@ expression: MarkdownFormatter.format(&report)
 | Storage I/O | 4063 |  |
 | Transaction Size | 61 |  |
 | Base Fee | 100 |  |
-| Rent Fee | 10931 |  |
+| Refundable Fee | 10931 |  |
 | **Total** | **15427** (0.0015427) | **100.0%** |
+
+> Note: CPU, storage and transaction-size fees are derived from the network's config rates; the refundable fee is the remainder of the authoritative RPC total — an estimated rent + events budget, not a protocol-measured rent fee.
 
 ### Optimization Tips
 
-- Tip: 70% of the total fee is refundable, which comes from ledger rent bumps and contract events. Consider reducing state growth and the number or size of emitted events.
+- Tip: 70% of the total fee is refundable — the remainder of the resource fee after the config-derived non-refundable components, which the protocol spends on ledger rent bumps, contract events and the return value. Consider reducing state growth and the number or size of emitted events.
 
 ### Optimization Suggestions
 

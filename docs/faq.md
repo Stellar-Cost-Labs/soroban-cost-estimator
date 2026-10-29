@@ -3,13 +3,14 @@
 ## Why do fee numbers drift between runs of the same invocation?
 
 Because `simulateTransaction` applies a margin of roughly 20% as a buffer
-convention, and the rent component varies slightly with ledger state. The
+convention, and the refundable (rent + events) component varies slightly with
+ledger state. The
 recorded cross-check demonstrates this: the same `increment(step=5)` call
 reported 18,999 stroops in the original run, 19,001 an earlier run (~40–50
 ledgers prior), 17,606 on a re-check ~46,000 ledgers later, and 17,122 on the
 most recent re-check. CPU instructions, entry counts, and byte sizes
-reproduce exactly — the variance is a 1–2 stroop run-to-run rent difference
-plus slow rate/rent drift on the network, not a math error. If you need
+reproduce exactly — the variance is a 1–2 stroop run-to-run refundable
+difference plus slow rate/rent drift on the network, not a math error. If you need
 number stability, treat the fee as "approximately right within ~20%" and the
 resource footprint as exact.
 
@@ -46,9 +47,14 @@ responses no longer expose it.
 
 ## Can the refundable portion really be refunded?
 
-The refundable portion covers events and ledger **rent** — the deposit for
-keeping your contract's data alive. Whether and how much comes back depends
-on how long the data lives versus the TTL you pay for. The tool reports it
+The *refundable* line in the fee breakdown is the **remainder** of the
+authoritative resource fee after this tool's config-derived non-refundable
+components — an estimate of the allowance the protocol sets aside for ledger
+**rent** (keeping your contract's data alive), contract events, and the
+invocation return value. The simulation response reports a single resource
+fee and carries no rent breakdown, so there is no per-component rent
+measurement to display. Per the protocol, the *unused* allowance is refunded
+after execution; rent already charged is not. The tool reports the remainder
 separately so you can reason about it; it does not predict the refund.
 
 ## Which networks can I use?

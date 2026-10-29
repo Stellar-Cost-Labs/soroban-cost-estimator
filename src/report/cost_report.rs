@@ -37,9 +37,10 @@ struct BarRow {
 ///
 /// Each bar's length is proportional to that component's share of the total
 /// fee. The four displayed components are CPU instructions, read/write
-/// storage I/O, bandwidth (transaction size) and rent (the refundable
-/// portion); the fixed base-inclusion fee is intentionally left out of the
-/// distribution.
+/// storage I/O, bandwidth (transaction size) and the refundable remainder
+/// (an *estimated* rent + events budget derived as `total − non-refundable`,
+/// not a protocol-measured rent fee — issue #526); the fixed base-inclusion
+/// fee is intentionally left out of the distribution.
 ///
 /// Sub-cell precision is expressed with the block glyphs `█` (full), `▓`
 /// (three-quarters), `▒` (half) and `░` (quarter); remaining cells are spaces.
@@ -81,7 +82,7 @@ pub fn render_fee_bar_chart(breakdown: &FeeBreakdown, width: usize) -> String {
             stroops: breakdown.bandwidth_fee_stroops,
         },
         BarRow {
-            label: "Rent",
+            label: "Refundable",
             stroops: breakdown.refundable_stroops,
         },
     ];
@@ -332,6 +333,22 @@ fn push_resource_warning(
         percent,
         message: format!("{label} at {percent}% of the network limit ({used} of {limit})"),
     });
+}
+
+/// Provenance note for the displayed fee components (issue #526).
+///
+/// Rendered directly under every fee table so readers know which numbers the
+/// RPC actually measured and which ones this tool derives: the
+/// non-refundable components come from the network's config rates, and the
+/// refundable line is the remainder of the authoritative RPC total — an
+/// estimate of the protocol's rent + events allowance, never a
+/// protocol-measured rent fee. Returns a static string so every renderer
+/// stays word-for-word identical.
+#[must_use]
+pub fn fee_component_note() -> &'static str {
+    "Note: CPU, storage and transaction-size fees are derived from the network's \
+     config rates; the refundable fee is the remainder of the authoritative RPC \
+     total — an estimated rent + events budget, not a protocol-measured rent fee."
 }
 
 /// Render resource-limit warnings as a human-readable banner.
@@ -1362,8 +1379,8 @@ pub fn share_pct(part: i64, total: i64) -> u64 {
 /// * **CPU** — the instruction fee dominates.
 /// * **Argument payload** — a large transaction envelope whose bandwidth fee
 ///   dominates; suggests trimming the payload.
-/// * **Refundable fee** — rent bumps and events dominate; suggests reducing
-///   state growth and emitted events.
+/// * **Refundable fee** — the derived refundable remainder dominates;
+///   suggests reducing state growth and emitted events.
 ///
 /// Tips are returned in a fixed order (WASM, writes, reads, CPU, payload,
 /// refundable) so output is deterministic and snapshot-testable. An empty
@@ -1418,7 +1435,7 @@ pub fn generate_optimization_tips(report: &CostReport) -> Vec<String> {
     let refundable_share = share_pct(report.fee.refundable_stroops, total);
     if report.fee.refundable_stroops > 0 && refundable_share >= DOMINANT_COST_PCT {
         tips.push(format!(
-            "Tip: {}% of the total fee is refundable, which comes from ledger rent bumps and contract events. Consider reducing state growth and the number or size of emitted events.",
+            "Tip: {}% of the total fee is refundable — the remainder of the resource fee after the config-derived non-refundable components, which the protocol spends on ledger rent bumps, contract events and the return value. Consider reducing state growth and the number or size of emitted events.",
             refundable_share
         ));
     }
@@ -2071,11 +2088,11 @@ pub fn format_report_table(report: &CostReport) -> String {
         ),
     ]);
     fee_table.add_row(vec![
-        "Rent Fee",
+        "Refundable Fee",
         &format!(
             "{} stroops ({})",
             report.fee.refundable_stroops,
-            pct.get("rent").map(String::as_str).unwrap_or("")
+            pct.get("refundable").map(String::as_str).unwrap_or("")
         ),
     ]);
     fee_table.add_row(vec![
@@ -2088,6 +2105,11 @@ pub fn format_report_table(report: &CostReport) -> String {
 
     output.push_str(&fee_table.to_string());
     output.push('\n');
+
+    // Component provenance (#526): which numbers the RPC measured and which
+    // this tool derives.
+    output.push_str(fee_component_note());
+    output.push_str("\n\n");
 
     // ASCII bar chart for visual cost breakdown
     output.push_str(&render_fee_bar_chart(&report.fee, DEFAULT_CHART_WIDTH));
@@ -2962,6 +2984,25 @@ mod tests {
         assert!(out.contains("2500 stroops"));
     }
 
+    /// Issue #526: the table renderer labels the derived remainder
+    /// *refundable* — never *rent* — and carries the component provenance
+    /// note under the fee table.
+    #[test]
+    fn test_format_report_table_labels_refundable_not_rent() {
+        let report = report_with_rates(sample_rates());
+        let out = format_report_table(&report);
+        assert!(out.contains("Refundable Fee"), "{out}");
+        assert!(!out.contains("Rent Fee"), "{out}");
+        assert!(out.contains("not a protocol-measured rent fee"), "{out}");
+
+        // The shared note names the derived remainder as an estimate.
+        assert!(
+            fee_component_note().contains("estimated rent + events budget"),
+            "{}",
+            fee_component_note()
+        );
+    }
+
     #[test]
     fn test_format_report_table_and_json_populated_footprint() {
         let report = report_with_rates(sample_rates());
@@ -3120,9 +3161,12 @@ mod tests {
     fn test_render_fee_bar_chart_lists_all_components() {
         let chart = render_fee_bar_chart(&chart_breakdown(), DEFAULT_CHART_WIDTH);
         assert!(chart.starts_with("\nFee Distribution:\n\n"));
-        for label in ["CPU", "Storage I/O", "Bandwidth", "Rent"] {
+        // Issue #526: the chart labels the derived remainder refundable,
+        // never rent.
+        for label in ["CPU", "Storage I/O", "Bandwidth", "Refundable"] {
             assert!(chart.contains(label), "missing {label} in:\n{chart}");
         }
+        assert!(!chart.contains("  Rent"), "no Rent row in:\n{chart}");
         assert!(chart.contains("65.0%"), "missing 65.0% in:\n{chart}");
         assert!(chart.contains("20.0%"), "missing 20.0% in:\n{chart}");
         assert!(chart.contains("5.0%"), "missing 5.0% in:\n{chart}");

@@ -18,14 +18,20 @@ that keep the split exact — see
   instructions, ledger entries read and written, disk bytes read, and the
   transaction's own size. The network keeps this. It is charged regardless of
   what happens after the simulation.
-- **Refundable** — the deposit you put down for resources the network *may*
-  need later, primarily ledger **rent** (keeping your contract's data alive)
-  and contract events. If the data expires early or the rent liability is
-  lower than the deposit, part of this comes back.
+- **Refundable** — the *allowance* you put down for resources the network
+  *may* need later: ledger **rent** (keeping your contract's data alive),
+  contract events, and the invocation return value. After execution the
+  unused allowance is refunded; rent already charged is not
+  (CAP-0046-07 / CAP-0046-12).
 
 The split matters for long-running operations: the refundable portion is what
 you might get back, so an estimate that lumps it into the flat fee
 over-states your true long-term cost.
+
+The RPC reports only the single resource fee — the response carries no
+refundable/rent breakdown — so this tool's **Refundable** line is an
+*estimate* of that allowance (the remainder after the config-derived
+non-refundable components), not a protocol-measured rent fee (issue #526).
 
 ## How the fee is computed
 
@@ -84,11 +90,11 @@ Non-refundable = 367 + 1,563 + 2,500 + 61 = 4,491 stroops
 Refundable     = 17,122 − 4,491           = 12,631 stroops
 ```
 
-Both derived values match the report exactly. The refundable portion —
+Both derived values match the report exactly. The refundable allowance —
 12,631 of the 17,122 stroops, about 74% — is dominated by the ledger rent
-deposit for the counter entry the contract writes, which is why this
-`increment` contract's *actual* long-term cost is much lower than the
-up-front fee.
+deposit for the counter entry the contract writes (the response gives no
+rent breakdown to confirm the split), which is why this `increment`
+contract's *actual* long-term cost is much lower than the up-front fee.
 
 ## When a fee-rate source is missing
 

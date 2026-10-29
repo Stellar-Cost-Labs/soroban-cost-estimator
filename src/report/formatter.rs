@@ -140,11 +140,11 @@ fn fee_table(report: &CostReport) -> String {
         ),
     ]);
     fee_table.add_row(vec![
-        "Rent Fee",
+        "Refundable Fee",
         &format!(
             "{} stroops ({})",
             report.fee.refundable_stroops,
-            pct.get("rent").map(String::as_str).unwrap_or("")
+            pct.get("refundable").map(String::as_str).unwrap_or("")
         ),
     ]);
     fee_table.add_row(vec![
@@ -222,6 +222,11 @@ impl TableFormatter {
         output.push_str("\nFee Breakdown:\n\n");
         output.push_str(&fee_table(report));
         output.push('\n');
+
+        // Component provenance (#526): which numbers the RPC measured and
+        // which ones this tool derives.
+        output.push_str(crate::report::cost_report::fee_component_note());
+        output.push_str("\n\n");
 
         // The fee bar chart is a human-only visual; the CLI omits it for
         // `--quiet` and non-TTY output by passing `show_chart = false`.
@@ -525,13 +530,19 @@ impl ReportFormatter for MarkdownFormatter {
             pct.get("base_fee").map(String::as_str).unwrap_or("")
         ));
         output.push_str(&format!(
-            "| Rent Fee | {} | {} |\n",
+            "| Refundable Fee | {} | {} |\n",
             report.fee.refundable_stroops,
-            pct.get("rent").map(String::as_str).unwrap_or("")
+            pct.get("refundable").map(String::as_str).unwrap_or("")
         ));
         output.push_str(&format!(
             "| **Total** | **{}** ({}) | **100.0%** |\n",
             report.fee.total_stroops, report.fee.total_xlm,
+        ));
+        // Component provenance (#526) as a footnote: which numbers the RPC
+        // measured and which ones this tool derives.
+        output.push_str(&format!(
+            "\n> {}\n",
+            crate::report::cost_report::fee_component_note()
         ));
 
         if let Some(ref projections) = report.projections {
@@ -873,9 +884,13 @@ mod tests {
         let formatter = TableFormatter;
         let output = formatter.format(&sample_report());
         assert!(output.contains("CPU Instructions"));
-        assert!(output.contains("Rent Fee"));
+        // Issue #526: the derived remainder is labelled refundable, never rent.
+        assert!(output.contains("Refundable Fee"));
+        assert!(!output.contains("Rent Fee"));
         assert!(output.contains("Total"));
         assert!(output.contains("15427 stroops (0.0015427)"));
+        // The component provenance note is rendered under the fee table.
+        assert!(output.contains("not a protocol-measured rent fee"));
     }
 
     #[test]
@@ -916,7 +931,7 @@ mod tests {
             4,
             "chart should render one row per fee component"
         );
-        for label in ["CPU", "Storage I/O", "Bandwidth", "Rent"] {
+        for label in ["CPU", "Storage I/O", "Bandwidth", "Refundable"] {
             assert!(
                 output[chart_start..].contains(label),
                 "chart should visualize {label}: {output}"
@@ -1127,7 +1142,11 @@ mod tests {
         let output = formatter.format(&sample_report());
         assert!(output.contains("### Fee Breakdown"));
         assert!(output.contains("| CPU Instructions | 372 |"));
-        assert!(output.contains("| Rent Fee | 10931 |"));
+        // Issue #526: the derived remainder is labelled refundable, never rent.
+        assert!(output.contains("| Refundable Fee | 10931 |"));
+        assert!(!output.contains("Rent Fee"));
+        // The component provenance note is rendered as a footnote.
+        assert!(output.contains("> Note: CPU, storage and transaction-size fees"));
         assert!(output.contains("| **Total** | **15427** (0.0015427) |"));
     }
 
