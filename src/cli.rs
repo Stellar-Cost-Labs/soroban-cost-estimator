@@ -194,6 +194,11 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "URL")]
     pub rpc_fallback_url: Option<String>,
 
+    /// HTTP or HTTPS proxy for RPC requests. Takes precedence over standard
+    /// proxy environment variables for this invocation.
+    #[arg(long, global = true, value_name = "URL")]
+    pub rpc_proxy: Option<String>,
+
     /// Retry transient RPC failures up to N times (default 3), using
     /// exponential backoff (500ms, then doubled between attempts). 0
     /// disables retries entirely.
@@ -254,8 +259,12 @@ pub enum Command {
     Estimate {
         /// Path to a compiled Soroban contract `.wasm` file. Repeat the flag
         /// to evaluate multiple contracts in a single batch run.
-        #[arg(long, short, value_name = "PATH", required_unless_present = "wasm_dir")]
+        #[arg(long, short, value_name = "PATH", required_unless_present_any = ["wasm_dir", "manifest"])]
         wasm: Vec<PathBuf>,
+
+        /// Version 1 TOML batch manifest; paths are relative to this file.
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["wasm", "wasm_dir", "fn", "args", "id", "interactive", "cache_ttl", "compare", "clear_cache", "no_cache", "history", "auto_snapshot", "diff", "wasm_new", "watch", "project", "repeat"])]
+        manifest: Option<PathBuf>,
 
         /// Directory of `.wasm` files to evaluate as a batch (non-recursive).
         #[arg(long, value_name = "DIR")]
@@ -284,8 +293,8 @@ pub enum Command {
         #[arg(long, short = 'i')]
         interactive: bool,
 
-        /// Skip re-simulation when a cached estimate is still fresh
-        /// (e.g. "30m", "1h", "7d"; bare value = seconds).
+        /// Override the cache freshness TTL from config.toml (default: 7d).
+        /// Accepts "30m", "1h", "7d", or bare seconds.
         #[arg(long, value_name = "DURATION")]
         cache_ttl: Option<String>,
 
@@ -1060,9 +1069,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn threshold_percent_accepts_finite_non_negative_values() {
-        assert_eq!(parse_threshold_percent("10").unwrap(), 10.0);
-        assert_eq!(parse_threshold_percent("500.5").unwrap(), 500.5);
+        assert!((parse_threshold_percent("10").unwrap() - 10.0).abs() < f64::EPSILON);
+        assert!((parse_threshold_percent("500.5").unwrap() - 500.5).abs() < f64::EPSILON);
         assert!(parse_threshold_percent("-1").is_err());
         assert!(parse_threshold_percent("NaN").is_err());
         assert!(parse_threshold_percent("inf").is_err());
