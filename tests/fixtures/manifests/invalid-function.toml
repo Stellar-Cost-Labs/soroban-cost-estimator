@@ -1,0 +1,7 @@
+version = 1
+
+[[contracts]]
+wasm = "../zeroarg.wasm"
+function = "missing"
+args = []
+id = "0000000000000000000000000000000000000000000000000000000000000000"

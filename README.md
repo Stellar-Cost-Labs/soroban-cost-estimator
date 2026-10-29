@@ -817,3 +817,53 @@ holds scoped issues with Summary / Acceptance Criteria / Tech Stack — good
 first tasks for the Drips Stellar Wave contributor sprints.
 
 Fixing issue 112
+
+### Versioned batch manifests
+
+Run a reproducible suite with `soroban-cost-estimator estimate --manifest suite.toml`.
+Use `--format json` for CI, or `--dry-run` to validate offline and print the
+resolved entries. Version 1 uses TOML:
+
+```toml
+version = 1
+
+[[contracts]]
+wasm = "build/counter.wasm"
+function = "increment"
+args = ["5"]
+id = "0000000000000000000000000000000000000000000000000000000000000000"
+network = "testnet"
+
+[[contracts]]
+wasm = "build/other.wasm"
+function = "ping"
+args = []
+id = "0000000000000000000000000000000000000000000000000000000000000000"
+network = "local"
+rpc_url = "http://localhost:8000"
+```
+
+Replace the example IDs with deployed contract IDs. Each entry requires `wasm`,
+`function`, and `args` (including `[]` for no arguments). Invocation also requires
+`id`, accepting the same hex or Stellar contract address as `--id`. Arguments
+are ordered strings using the existing `--arg` syntax and validation; no scripting
+expressions are evaluated. Duplicate WASM paths are allowed for different calls.
+Relative WASM paths resolve from the manifest's parent directory, never the
+working directory. Absolute paths are also accepted.
+
+Optional `network` and `rpc_url` override the command's resolved defaults for that
+entry. An explicit entry network uses its standard endpoint unless the entry also
+sets `rpc_url`; it does not inherit an endpoint for another network. Custom
+networks such as `local` require an RPC URL. Unknown fields and versions, empty
+suites, invalid WASM, unknown functions, invalid arguments, and malformed endpoints
+are rejected before any RPC call. Diagnostics include the manifest path, line,
+column, and one-based `contracts[N]` entry location. Validation stops at the first
+error; execution starts only once all entries pass.
+
+Execution preserves manifest order and uses the existing batch upload/invocation
+simulation and summary formats. The summary's network label is `manifest` because
+entries may use different networks. Runtime contract failures appear in the batch
+summary and cause a nonzero exit. Manifest input conflicts with direct WASM and
+invocation flags and single-estimate options such as watch, repeat, and cache
+controls. Global RPC transport and output options remain available. This schema
+is independent of `config.toml`.

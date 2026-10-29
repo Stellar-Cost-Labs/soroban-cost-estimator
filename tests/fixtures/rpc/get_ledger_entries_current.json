@@ -1,0 +1,12 @@
+{
+  "entries": [
+    {
+      "key": "AAAAFA==",
+      "xdr": "AAAAFA==",
+      "lastModifiedLedgerSeq": 2539600,
+      "liveUntilLedgerSeq": 2600000
+    }
+  ],
+  "latestLedger": 2539605
+}
+

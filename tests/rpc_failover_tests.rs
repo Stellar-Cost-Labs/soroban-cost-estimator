@@ -1,6 +1,7 @@
 //! Integration tests for RPC endpoint failover (`--rpc-fallback-url`, #306),
 //! endpoint provenance metadata (`rpc_endpoint`, `rpc_role`, #501),
 //! and circuit breaking for persistently unhealthy endpoints (#505).
+//! Retry-After tests (#498) exercise HTTP headers through the public client.
 //!
 //! These drive the crate's public [`RpcClient`] and the built CLI binary
 //! against primary/fallback endpoint stubs, proving the client automatically
@@ -13,10 +14,10 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
-use soroban_cost_estimator::error::AppResult;
+use soroban_cost_estimator::error::{AppError, AppResult};
 use soroban_cost_estimator::report::cost_report::CostReport;
 use soroban_cost_estimator::report::fee_calc::FeeBreakdown;
 use soroban_cost_estimator::report::formatter::{JsonFormatter, ReportFormatter, TableFormatter};
@@ -24,7 +25,127 @@ use soroban_cost_estimator::rpc::circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitState, Clock,
 };
 use soroban_cost_estimator::rpc::client::RpcClient;
+use soroban_cost_estimator::rpc::retry::MAX_RETRY_DELAY;
 use soroban_cost_estimator::wasm::parser::ContractMeta;
+use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+/// Rate-limit the first request, then return a healthy JSON-RPC response.
+async fn retry_after_server(header: Option<&str>) -> MockServer {
+    let server = MockServer::start().await;
+    let mut response = ResponseTemplate::new(429);
+    if let Some(value) = header {
+        response = response.insert_header("Retry-After", value);
+    }
+    Mock::given(method("POST"))
+        .respond_with(response)
+        .with_priority(1)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"status": "healthy"}
+        })))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Verify recovery and the retry delay, excluding client construction and
+/// mock-server startup from the timing.
+async fn assert_retry_after_recovery(header: Option<&str>, minimum_delay: Duration) {
+    let server = retry_after_server(header).await;
+    let client = RpcClient::with_options(&server.uri(), None, Duration::from_secs(5), 1, false);
+    let start = Instant::now();
+    let result: Value = tokio::time::timeout(
+        Duration::from_secs(15),
+        client.call_uncached("getHealth", serde_json::json!({})),
+    )
+    .await
+    .expect("retry must finish within the test timeout")
+    .expect("client must recover after the 429 response");
+    let elapsed = start.elapsed();
+    assert_eq!(result["status"], "healthy");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2, "one initial request and one retry");
+    assert!(
+        elapsed >= minimum_delay,
+        "retry occurred after {elapsed:?}, before {minimum_delay:?}"
+    );
+}
+
+#[tokio::test]
+async fn retry_after_delta_seconds_delays_then_recovers() {
+    // Two seconds is longer than the first computed backoff (500–1000ms),
+    // so ignoring the header cannot satisfy the delay assertion.
+    assert_retry_after_recovery(Some("2"), Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
+async fn retry_after_http_date_delays_then_recovers() {
+    let date = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(4));
+    // HTTP dates have whole-second precision; allow for truncation and setup.
+    assert_retry_after_recovery(Some(&date), Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
+async fn retry_after_absent_uses_backoff_then_recovers() {
+    assert_retry_after_recovery(None, Duration::from_millis(500)).await;
+}
+
+#[tokio::test]
+async fn retry_after_malformed_uses_backoff_then_recovers() {
+    assert_retry_after_recovery(Some("not-a-date"), Duration::from_millis(500)).await;
+}
+
+#[tokio::test]
+async fn retry_after_excessive_headers_are_capped_in_client_errors() {
+    for header in ["3600", "Thu, 31 Dec 2099 23:59:59 GMT"] {
+        let server = retry_after_server(Some(header)).await;
+        // Exhaust immediately to inspect the delay parsed from the real HTTP
+        // response, without sleeping for the full 60-second cap.
+        let client = RpcClient::with_options(&server.uri(), None, Duration::from_secs(5), 0, false);
+        let error = client
+            .call_uncached::<Value>("getHealth", serde_json::json!({}))
+            .await
+            .expect_err("zero retries must surface the rate-limit error");
+        assert!(
+            matches!(error, AppError::HttpStatus {
+                status: 429,
+                retry_after: Some(delay),
+                ..
+            } if delay == MAX_RETRY_DELAY),
+            "excessive header {header:?} must be capped: {error:?}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn retry_after_excessive_delay_respects_overall_deadline() {
+    let server = retry_after_server(Some("3600")).await;
+    // A two-second deadline exceeds ordinary first-retry backoff but is below
+    // the capped header delay: ignoring Retry-After would incorrectly recover.
+    let client = RpcClient::with_options(&server.uri(), None, Duration::from_secs(5), 1, false)
+        .with_total_timeout(Some(Duration::from_secs(2)));
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.call_uncached::<Value>("getHealth", serde_json::json!({})),
+    )
+    .await
+    .expect("overall deadline must bound the header delay")
+    .expect_err("header delay must exceed the overall deadline");
+    assert!(matches!(error, AppError::TotalTimeout { timeout_ms: 2000 }));
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "no retry may be sent before the header delay elapses"
+    );
+}
 
 /// A hostname that is guaranteed never to resolve (RFC 6761 reserves the
 /// `.invalid` TLD), standing in for a misconfigured/unreachable primary
