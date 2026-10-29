@@ -52,7 +52,12 @@ async fn global_proxy_applies_to_standard_client_and_fallback() {
 use serde_json::json;
 
 use soroban_cost_estimator::error::AppError;
-use soroban_cost_estimator::rpc::client::RpcClient;
+use soroban_cost_estimator::rpc::client::{HealthResponse, RpcClient};
+use soroban_cost_estimator::rpc::config::{GetLatestLedgerResponse, GetLedgerEntriesResponse};
+use soroban_cost_estimator::rpc::simulate::{
+    SimulateTransactionResponse, parse_resource_fee, parse_transaction_data_resource_fee,
+    parse_transaction_data_resources,
+};
 
 #[tokio::test]
 async fn mock_rpc_fixture_handles_simulate_transaction_and_health() {
