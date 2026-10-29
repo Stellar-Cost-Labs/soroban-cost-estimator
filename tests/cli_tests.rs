@@ -5002,6 +5002,47 @@ fn test_config_snapshot_diff_makes_no_network_calls() {
     );
 }
 
+#[test]
+fn manifest_validates_relative_paths_and_network_overrides_offline() {
+    let manifest =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/manifests/valid.toml");
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .current_dir(std::env::temp_dir())
+        .env("RUST_LOG", "error")
+        .args(["estimate", "--manifest"])
+        .arg(manifest)
+        .arg("--dry-run")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let entries: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(entries[0]["function"], "ping");
+    assert_eq!(entries[1]["network"], "local");
+    assert_eq!(entries[1]["rpc_url"], DEAD_RPC);
+}
+
+#[test]
+fn manifest_errors_identify_entry_and_source_before_rpc() {
+    for (fixture, expected) in [
+        ("missing-field", "missing field `function`"),
+        ("unknown-version", "unsupported version 99"),
+        ("invalid-path", "contracts[2]"),
+        ("invalid-function", "unknown function"),
+        ("invalid-args", "expects 0 arguments"),
+    ] {
+        let path = format!("tests/fixtures/manifests/{fixture}.toml");
+        let (_, stderr, code) = run_cli(&["estimate", "--manifest", &path, "--rpc-url", DEAD_RPC]);
+        assert_ne!(code, 0);
+        assert!(stderr.contains(expected), "{fixture}: {stderr}");
+        assert!(stderr.contains(&format!("{path}:")), "{stderr}");
+        assert!(!stderr.contains("failed to send HTTP"), "{stderr}");
+    }
+}
+
 // ── Cache listing and filtered deletion (#516, #517) ───────────────────────
 
 #[test]

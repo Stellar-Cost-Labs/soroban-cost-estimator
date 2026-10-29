@@ -194,6 +194,11 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "URL")]
     pub rpc_fallback_url: Option<String>,
 
+    /// HTTP or HTTPS proxy for RPC requests. Takes precedence over standard
+    /// proxy environment variables for this invocation.
+    #[arg(long, global = true, value_name = "URL")]
+    pub rpc_proxy: Option<String>,
+
     /// Retry transient RPC failures up to N times (default 3), using
     /// exponential backoff (500ms, then doubled between attempts). 0
     /// disables retries entirely.
@@ -254,8 +259,12 @@ pub enum Command {
     Estimate {
         /// Path to a compiled Soroban contract `.wasm` file. Repeat the flag
         /// to evaluate multiple contracts in a single batch run.
-        #[arg(long, short, value_name = "PATH", required_unless_present = "wasm_dir")]
+        #[arg(long, short, value_name = "PATH", required_unless_present_any = ["wasm_dir", "manifest"])]
         wasm: Vec<PathBuf>,
+
+        /// Version 1 TOML batch manifest; paths are relative to this file.
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["wasm", "wasm_dir", "fn", "args", "id", "interactive", "cache_ttl", "compare", "clear_cache", "no_cache", "history", "auto_snapshot", "diff", "wasm_new", "watch", "project", "repeat"])]
+        manifest: Option<PathBuf>,
 
         /// Directory of `.wasm` files to evaluate as a batch (non-recursive).
         #[arg(long, value_name = "DIR")]
