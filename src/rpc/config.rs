@@ -113,7 +113,10 @@ pub struct GetLedgerEntriesResponse {
     /// Entries returned, in the order they were requested.
     pub entries: Vec<LedgerEntryResult>,
     /// Latest ledger known to the node when it answered.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::rpc::simulate::deserialize_u64_flexible_opt"
+    )]
     pub latest_ledger: Option<u64>,
 }
 

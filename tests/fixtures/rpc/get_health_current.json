@@ -1,0 +1,7 @@
+{
+  "status": "healthy",
+  "networkPassphrase": "Test SDF Network ; September 2015",
+  "coreVersion": "stellar-core 21.0.0",
+  "latestLedger": 123456
+}
+

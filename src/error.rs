@@ -66,6 +66,10 @@ pub enum AppError {
     #[error("failed to parse HTTP header: {0}")]
     InvalidHeader(String),
 
+    /// An explicit HTTP proxy URL could not be parsed or applied.
+    #[error("failed to configure HTTP proxy: {0}")]
+    InvalidProxy(String),
+
     /// A user-supplied RPC endpoint (`--rpc-url` or a `[rpc_urls]` config
     /// entry) that is not a usable URL.
     ///

@@ -88,15 +88,69 @@ fn embedded_timestamp(network: &str, filename: &str) -> Option<DateTime<Utc>> {
         .map(|instant| instant.with_timezone(&Utc))
 }
 
+/// Writes a snapshot JSON file with user read/write permissions where supported.
+///
+/// On Unix-like systems, newly created files are opened with mode `0o600` (read/write
+/// by owner only) before data is written. If a caller specifies an existing file,
+/// its permissions are preserved to avoid modifying caller-specified files unexpectedly.
+/// Symbolic links are rejected to prevent symlink traversal.
+///
+/// On non-Unix platforms (e.g. Windows), standard file creation is used and permissions
+/// follow the operating system's default ACLs for the user's directory.
+pub fn write_snapshot_file(path: &Path, content: &str) -> AppResult<()> {
+    // Avoid following symlinks unexpectedly
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            return Err(AppError::General(format!(
+                "refusing to write snapshot through symbolic link '{}'",
+                path.display()
+            )));
+        }
+    }
+
+    #[cfg(unix)]
+    let file_existed = path.exists();
+
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true).mode(0o600);
+        opts.open(path)?
+    };
+
+    #[cfg(not(unix))]
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+
+    #[cfg(unix)]
+    if !file_existed {
+        use std::os::unix::fs::PermissionsExt;
+        // Explicitly set 0o600 on newly created files before writing data
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+
+    use std::io::Write;
+    file.write_all(content.as_bytes())?;
+    file.flush()?;
+    Ok(())
+}
+
 /// Saves a config snapshot to disk as a JSON file.
 ///
 /// The filename is `{network}-{timestamp}.json` within the snapshots directory,
 /// unless an explicit `--out` path is provided.
-///
 /// The written file always declares the current snapshot schema version, so a
 /// new capture is never mistaken for a legacy unversioned one. Reading a
 /// snapshot never writes anything back, so older files keep their shape until
 /// the user explicitly saves over them.
+///
+/// Newly created snapshot files are restricted to user read/write permissions (`0o600`
+/// on Unix systems) to prevent accidental exposure on shared machines. Existing
+/// caller-specified files retain their existing permissions.
 ///
 /// # Network calls
 /// None — pure file I/O.
@@ -118,7 +172,7 @@ pub fn save_snapshot(snapshot: &ConfigSnapshot, out_path: Option<&str>) -> AppRe
     };
 
     let json = serde_json::to_string_pretty(&snapshot)?;
-    std::fs::write(&path, json)?;
+    write_snapshot_file(&path, &json)?;
     debug!(
         path = %path.display(),
         network = snapshot.network,
@@ -971,7 +1025,7 @@ pub fn import_snapshots(bundle_path: &str) -> AppResult<usize> {
         if !path.exists() {
             let json = serde_json::to_string_pretty(&snapshot)
                 .map_err(|e| AppError::General(format!("failed to serialize snapshot: {e}")))?;
-            std::fs::write(&path, json)?;
+            write_snapshot_file(&path, &json)?;
             imported += 1;
             println!("  Imported snapshot: {}", filename);
         }

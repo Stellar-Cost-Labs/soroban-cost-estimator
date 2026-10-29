@@ -1,0 +1,13 @@
+{
+  "latestLedger": "3894195",
+  "minResourceFee": "AAAAAAA81a8=",
+  "cost": {
+    "cpuInsns": "100000",
+    "memBytes": "2000"
+  },
+  "transactionData": null,
+  "events": [],
+  "restoreFee": null,
+  "error": null
+}
+

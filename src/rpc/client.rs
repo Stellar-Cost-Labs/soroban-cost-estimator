@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroU32;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, SystemTime};
 
 use governor::{Quota, RateLimiter};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -13,7 +13,7 @@ use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
 use crate::rpc::circuit_breaker::CircuitBreaker;
-use crate::rpc::retry::{DEFAULT_MAX_RETRIES, with_retry_deadline};
+use crate::rpc::retry::{DEFAULT_MAX_RETRIES, MAX_RETRY_DELAY, with_retry_deadline};
 
 /// Default per-request HTTP timeout applied to every RPC call. Matches the
 /// CLI's `--timeout` default (30 seconds).
@@ -357,6 +357,12 @@ impl SharedFuture {
     }
 }
 
+/// Default maximum number of completed request entries retained in the deduplication cache.
+///
+/// Bounding the cache size ensures long-running processes making many unique RPC requests
+/// do not grow memory indefinitely.
+pub const DEFAULT_DEDUP_CACHE_CAPACITY: usize = 256;
+
 /// Private, shared deduplication state for a `RpcClient`.
 ///
 /// Deduplication collapses identical JSON-RPC requests — the same method with
@@ -364,32 +370,100 @@ impl SharedFuture {
 /// operations such as `estimate-all`, where several functions share the same
 /// WASM upload path and would otherwise transmit the identical upload request
 /// over and over.
-#[derive(Debug, Default)]
+///
+/// Completed response entries are bounded by `capacity` and evicted deterministically
+/// (LRU). In-flight single-flight requests are maintained separately so concurrent
+/// in-progress calls are never evicted.
+#[derive(Debug)]
 struct DedupState {
+    /// Maximum number of completed entries retained in the cache.
+    capacity: usize,
     /// Results of identical requests that already completed successfully,
     /// keyed by request. A cache hit skips the network entirely and also lets
     /// a request arriving *after* its twin finished share the result.
     completed: HashMap<RequestKey, Value>,
+    /// Access/insertion order for deterministic LRU eviction (least recently used at front).
+    order: VecDeque<RequestKey>,
     /// One single-flight handle per key currently in flight. Concurrent
     /// identical callers attach to the existing handle rather than opening a
     /// second request.
     in_flight: HashMap<RequestKey, SharedFuture>,
 }
 
+impl Default for DedupState {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_DEDUP_CACHE_CAPACITY)
+    }
+}
+
+impl DedupState {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            capacity,
+            completed: HashMap::new(),
+            order: VecDeque::new(),
+            in_flight: HashMap::new(),
+        }
+    }
+
+    /// Retrieves a cached completed result and marks it as most recently used.
+    fn get_completed(&mut self, key: &RequestKey) -> Option<Value> {
+        let value = self.completed.get(key)?.clone();
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+            self.order.push_back(key.clone());
+        }
+        Some(value)
+    }
+
+    /// Inserts a completed result, evicting the least recently used entry if over capacity.
+    fn insert_completed(&mut self, key: RequestKey, value: Value) {
+        if self.capacity == 0 {
+            return;
+        }
+
+        if self.completed.contains_key(&key) {
+            self.completed.insert(key.clone(), value);
+            if let Some(pos) = self.order.iter().position(|k| k == &key) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(key);
+            return;
+        }
+
+        while self.completed.len() >= self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.completed.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+
+        self.completed.insert(key.clone(), value);
+        self.order.push_back(key);
+    }
+}
+
 /// Response envelope for the `getHealth` JSON-RPC method.
 ///
 /// Stellar RPC returns node status and optional node identity metadata.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-struct HealthResponse {
+pub struct HealthResponse {
     /// Node health status: `healthy`, `degraded`, or `unhealthy`.
-    status: String,
+    pub status: String,
     /// Stellar network passphrase served by the node.
     #[serde(default)]
-    network_passphrase: Option<String>,
+    pub network_passphrase: Option<String>,
     /// Stellar Core version served by the node.
     #[serde(default)]
-    core_version: Option<String>,
+    pub core_version: Option<String>,
+    /// Latest ledger sequence number reported by the node.
+    #[serde(
+        default,
+        deserialize_with = "crate::rpc::simulate::deserialize_u64_flexible_opt"
+    )]
+    pub latest_ledger: Option<u64>,
 }
 
 /// Node identity metadata returned by `getHealth`.
@@ -414,7 +488,9 @@ pub struct HealthMetadata {
 pub struct RpcClient {
     url: String,
     fallback_url: Option<String>,
-    client: reqwest::Client,
+    // Legacy infallible constructors retain configuration failures and report
+    // them before sending any request. Never fall back to a direct connection.
+    client: Result<reqwest::Client, String>,
     dedup: Arc<Mutex<DedupState>>,
     /// Fixed-rate limiter shared by every network call, when enabled.
     limiter: Option<Arc<governor::DefaultDirectRateLimiter>>,
@@ -444,11 +520,61 @@ pub struct RpcClient {
     circuit_fallback: Option<CircuitBreaker>,
 }
 
+/// Explicit process-local proxy used by CLI-created RPC clients. This is not
+/// written to the environment, so one invocation cannot alter other tools.
+static EXPLICIT_PROXY: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+
+/// Configure the explicit HTTP(S) proxy for subsequently created clients.
+///
+/// An explicit proxy takes precedence over `HTTP_PROXY`/`HTTPS_PROXY` because
+/// reqwest evaluates configured proxies before environment-derived settings.
+/// Credentials are intentionally never retained in diagnostics or logs.
+pub fn set_explicit_proxy(proxy_url: Option<&str>) -> AppResult<()> {
+    if let Some(proxy_url) = proxy_url {
+        reqwest::Proxy::all(proxy_url)
+            .map_err(|_| AppError::InvalidProxy("invalid proxy URL".to_string()))?;
+    }
+    let proxy = EXPLICIT_PROXY.get_or_init(|| RwLock::new(None));
+    let mut configured = proxy
+        .write()
+        .map_err(|_| AppError::InvalidProxy("proxy configuration lock poisoned".to_string()))?;
+    *configured = proxy_url.map(str::to_owned);
+    Ok(())
+}
+
+fn explicit_proxy() -> Option<String> {
+    EXPLICIT_PROXY
+        .get()
+        .and_then(|proxy| proxy.read().ok().and_then(|configured| configured.clone()))
+}
+
 impl RpcClient {
     /// Create a new RPC client pointing at the given URL, without rate
     /// limiting and with the default request timeout.
     pub fn new(url: &str) -> Self {
         Self::with_rate_limit(url, None, false)
+    }
+
+    /// Create a client that routes its RPC traffic through `proxy_url`.
+    ///
+    /// This per-client constructor is primarily useful for embedders and
+    /// tests; the CLI configures the same behavior through `--rpc-proxy`.
+    pub fn with_proxy(url: &str, proxy_url: &str) -> AppResult<Self> {
+        reqwest::Proxy::all(proxy_url)
+            .map_err(|_| AppError::InvalidProxy("invalid proxy URL".to_string()))?;
+        let client = Self::from_parts_with_proxy(
+            url,
+            None,
+            None,
+            DEFAULT_TIMEOUT,
+            DEFAULT_CONNECT_TIMEOUT,
+            DEFAULT_MAX_RETRIES,
+            HeaderMap::new(),
+            false,
+            Some(proxy_url),
+        );
+        client.check_client_configuration()?;
+        Ok(client)
     }
 
     /// Create a new RPC client pointing at the given URL, optionally capping
@@ -641,7 +767,7 @@ impl RpcClient {
             "creating RPC client"
         );
         let headers = parse_headers(headers)?;
-        Ok(Self::from_parts(
+        let client = Self::from_parts(
             url,
             fallback_url,
             rps,
@@ -650,7 +776,9 @@ impl RpcClient {
             max_retries,
             headers,
             verbose,
-        ))
+        );
+        client.check_client_configuration()?;
+        Ok(client)
     }
 
     /// Shared, infallible construction path for every public constructor.
@@ -667,20 +795,36 @@ impl RpcClient {
         headers: HeaderMap,
         verbose: bool,
     ) -> Self {
+        Self::from_parts_with_proxy(
+            url,
+            fallback_url,
+            rps,
+            timeout,
+            connect_timeout,
+            max_retries,
+            headers,
+            verbose,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_parts_with_proxy(
+        url: &str,
+        fallback_url: Option<&str>,
+        rps: Option<u64>,
+        timeout: Duration,
+        connect_timeout: Duration,
+        max_retries: usize,
+        headers: HeaderMap,
+        verbose: bool,
+        proxy_url: Option<&str>,
+    ) -> Self {
         Self {
             url: url.to_string(),
             fallback_url: fallback_url.map(String::from),
-            // `ClientBuilder::build` only fails on invalid configuration (a
-            // default builder cannot), so fall back to a plain client to keep
-            // construction infallible.
-            client: reqwest::Client::builder()
-                .timeout(timeout)
-                .connect_timeout(connect_timeout)
-                .tcp_keepalive(Duration::from_secs(30))
-                .pool_idle_timeout(Duration::from_secs(90))
-                .default_headers(headers.clone())
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            client: build_http_client(timeout, connect_timeout, headers.clone(), proxy_url)
+                .map_err(|error| error.to_string()),
             dedup: Arc::new(Mutex::new(DedupState::default())),
             limiter: rps.and_then(build_rate_limiter),
             max_retries,
@@ -693,6 +837,13 @@ impl RpcClient {
             circuit_primary: None,
             circuit_fallback: None,
         }
+    }
+
+    fn check_client_configuration(&self) -> AppResult<()> {
+        self.client
+            .as_ref()
+            .map(|_| ())
+            .map_err(|message| AppError::Config(message.clone()))
     }
 
     /// Sets an overall per-operation deadline spanning all retry attempts,
@@ -718,6 +869,25 @@ impl RpcClient {
         self.circuit_primary = primary;
         self.circuit_fallback = fallback;
         self
+    }
+
+    /// Sets the maximum capacity of the request deduplication completed-result cache.
+    ///
+    /// When new entries exceed this bound, older completed requests are deterministically
+    /// evicted using a Least-Recently-Used (LRU) policy. In-flight single-flight requests
+    /// remain unaffected. A capacity of `0` disables completed-request caching while
+    /// preserving single-flight deduplication for concurrent in-flight requests.
+    #[must_use]
+    pub fn with_dedup_capacity(mut self, capacity: usize) -> Self {
+        self.dedup = Arc::new(Mutex::new(DedupState::with_capacity(capacity)));
+        self
+    }
+
+    /// Returns the number of completed entries currently retained in the deduplication cache.
+    #[must_use]
+    pub async fn dedup_cache_len(&self) -> usize {
+        let state = self.dedup.lock().await;
+        state.completed.len()
     }
 
     /// Returns the custom HTTP headers configured for this client.
@@ -850,7 +1020,7 @@ impl RpcClient {
             {
                 let mut state = self.dedup.lock().await;
                 if let Ok(value) = &result {
-                    state.completed.insert(key.clone(), value.clone());
+                    state.insert_completed(key.clone(), value.clone());
                 }
                 state.in_flight.remove(&key);
             }
@@ -880,8 +1050,8 @@ impl RpcClient {
     /// Returns the cached result for `key`, if a prior identical request
     /// completed successfully.
     async fn cached_result(&self, key: &RequestKey) -> Option<Value> {
-        let state = self.dedup.lock().await;
-        state.completed.get(key).cloned()
+        let mut state = self.dedup.lock().await;
+        state.get_completed(key)
     }
 
     /// Performs the actual HTTP POST and extracts the raw `result` value.
@@ -1070,7 +1240,11 @@ impl RpcClient {
         connect_timeout: Duration,
         deadline: Option<tokio::time::Instant>,
     ) -> AppResult<Value> {
-        let client = self.client.clone();
+        let client = self
+            .client
+            .as_ref()
+            .map_err(|message| AppError::Config(message.clone()))?
+            .clone();
         let url = url.to_string();
         let request_body = body.clone();
         let limiter = self.limiter.clone();
@@ -1202,6 +1376,44 @@ impl RpcClient {
     }
 }
 
+fn build_http_client(
+    timeout: Duration,
+    connect_timeout: Duration,
+    headers: HeaderMap,
+    proxy_url: Option<&str>,
+) -> AppResult<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(connect_timeout)
+        .tcp_keepalive(Duration::from_secs(30))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .default_headers(headers);
+    if let Some(proxy_url) = proxy_url.map(str::to_owned).or_else(explicit_proxy) {
+        let proxy = reqwest::Proxy::all(proxy_url)
+            .map_err(|_| AppError::InvalidProxy("invalid proxy URL".to_string()))?;
+        builder = builder.proxy(proxy);
+    }
+    builder
+        .build()
+        .map_err(|_| AppError::Config("failed to build RPC HTTP client".to_string()))
+}
+
+#[cfg(test)]
+mod proxy_builder_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_proxy_is_an_error_instead_of_a_direct_client() {
+        let result = build_http_client(
+            DEFAULT_TIMEOUT,
+            DEFAULT_CONNECT_TIMEOUT,
+            HeaderMap::new(),
+            Some("http://[invalid"),
+        );
+        assert!(matches!(result, Err(AppError::InvalidProxy(_))));
+    }
+}
+
 /// Rewrap a reqwest error whose connect phase timed out into an
 /// [`AppError::ConnectTimeout`], so an unreachable host produces a distinct,
 /// actionable message instead of a generic request timeout.
@@ -1249,13 +1461,55 @@ fn is_transient_status(status: reqwest::StatusCode) -> bool {
 
 /// Parses a `Retry-After` response header into a delay, if present.
 ///
-/// Only the delta-seconds form (e.g. `Retry-After: 5`) is supported; the
-/// HTTP-date form and unparseable values yield `None`, falling back to the
-/// retry loop's computed backoff.
-fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+/// Supports both delta-seconds (e.g. `Retry-After: 5`) and standard HTTP-date
+/// formats (RFC 9110 / RFC 7231: IMF-fixdate, RFC 850 date, and asctime).
+///
+/// The server-requested delay is capped at [`MAX_RETRY_DELAY`].
+/// HTTP-date values that specify a time already in the past evaluate to
+/// [`Duration::ZERO`]. Malformed values yield `None`, falling back to the retry
+/// loop's computed backoff.
+pub fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
-    let seconds: u64 = value.trim().parse().ok()?;
-    Some(Duration::from_secs(seconds))
+    parse_retry_after_value(value)
+}
+
+/// Parses a `Retry-After` header value string into a delay duration.
+///
+/// Evaluates delta-seconds first (non-negative integer seconds). If that fails,
+/// attempts to parse standard HTTP-date formats (RFC 9110 / RFC 7231: IMF-fixdate,
+/// RFC 850 date, and asctime).
+///
+/// Valid values are capped at [`MAX_RETRY_DELAY`]. HTTP-date values specifying
+/// a timestamp already in the past evaluate to [`Duration::ZERO`]. Malformed values
+/// return `None`.
+pub fn parse_retry_after_value(value: &str) -> Option<Duration> {
+    let trimmed = value.trim();
+
+    // 1. Delta-seconds: non-negative integer seconds (e.g. "120")
+    if let Ok(seconds) = trimmed.parse::<u64>() {
+        return Some(Duration::from_secs(seconds).min(MAX_RETRY_DELAY));
+    }
+
+    // 2. HTTP-date: RFC 9110 / RFC 7231 formats (IMF-fixdate, RFC 850, asctime)
+    if let Ok(target_time) = httpdate::parse_http_date(trimmed) {
+        let delay = match target_time.duration_since(SystemTime::now()) {
+            Ok(duration) => duration,
+            Err(_) => Duration::ZERO,
+        };
+        return Some(delay.min(MAX_RETRY_DELAY));
+    }
+
+    // 3. RFC 2822 fallback via chrono in case of minor syntax variations
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(trimmed) {
+        let target_time: SystemTime = dt.into();
+        let delay = match target_time.duration_since(SystemTime::now()) {
+            Ok(duration) => duration,
+            Err(_) => Duration::ZERO,
+        };
+        return Some(delay.min(MAX_RETRY_DELAY));
+    }
+
+    None
 }
 
 /// Deserializes a raw JSON-RPC `result` value into the caller's type.
@@ -1885,6 +2139,110 @@ mod tests {
         assert!(
             start.elapsed().as_millis() < 45,
             "a deduped request must not wait on the rate limiter"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dedup_cache_capacity_bound_and_lru_eviction() {
+        let (url, counter) = spawn_json_rpc_stub(0).await;
+        // Bounded client with capacity 2
+        let client = RpcClient::new(&url).with_dedup_capacity(2);
+
+        let p1 = serde_json::json!({"id": 1});
+        let p2 = serde_json::json!({"id": 2});
+        let p3 = serde_json::json!({"id": 3});
+
+        // Request 1: hits network
+        let _: Value = client
+            .call("test.method", p1.clone())
+            .await
+            .expect("call 1");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert_eq!(client.dedup_cache_len().await, 1);
+
+        // Request 2: hits network
+        let _: Value = client
+            .call("test.method", p2.clone())
+            .await
+            .expect("call 2");
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        assert_eq!(client.dedup_cache_len().await, 2);
+
+        // Access Request 1 again: served from cache (promoted to most recently used)
+        let _: Value = client
+            .call("test.method", p1.clone())
+            .await
+            .expect("call 1 repeat");
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "must be deduplicated");
+
+        // Request 3: exceeds capacity 2, evicts LRU entry (Request 2)
+        let _: Value = client
+            .call("test.method", p3.clone())
+            .await
+            .expect("call 3");
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+        assert_eq!(client.dedup_cache_len().await, 2);
+
+        // Request 1 should still be cached because it was accessed recently
+        let _: Value = client
+            .call("test.method", p1.clone())
+            .await
+            .expect("call 1 repeat");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            3,
+            "Request 1 must still be in cache"
+        );
+
+        // Request 2 should have been evicted; calling it hits the network
+        let _: Value = client
+            .call("test.method", p2.clone())
+            .await
+            .expect("call 2 after eviction");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            4,
+            "evicted Request 2 must hit network"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dedup_cache_zero_capacity_preserves_single_flight() {
+        let (url, counter) = spawn_json_rpc_stub(0).await;
+        let client = Arc::new(RpcClient::new(&url).with_dedup_capacity(0));
+        let params = serde_json::json!({"id": "zero-cap"});
+
+        // Sequential calls always hit network when capacity is 0
+        let _: Value = client
+            .call("test.method", params.clone())
+            .await
+            .expect("call 1");
+        let _: Value = client
+            .call("test.method", params.clone())
+            .await
+            .expect("call 2");
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        assert_eq!(client.dedup_cache_len().await, 0);
+
+        // Concurrent in-flight calls still deduplicate (single-flight)
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let client = Arc::clone(&client);
+            let params = params.clone();
+            handles.push(tokio::spawn(async move {
+                client
+                    .call::<Value>("test.method", params)
+                    .await
+                    .expect("concurrent call");
+            }));
+        }
+        for h in handles {
+            h.await.expect("join handle");
+        }
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            3,
+            "concurrent in-flight requests must share single flight even with zero cache capacity"
         );
     }
 
@@ -2812,5 +3170,113 @@ mod header_tests {
         // A malformed argument has no name to classify; it is echoed verbatim
         // because it cannot carry a parsed credential name.
         assert_eq!(redacted_headers(&["garbage".to_string()]), "garbage");
+    }
+
+    // ── Retry-After Parsing ───────────────────────────────────────
+
+    #[test]
+    fn test_parse_retry_after_delta_seconds() {
+        assert_eq!(
+            super::parse_retry_after_value("0"),
+            Some(Duration::from_secs(0))
+        );
+        assert_eq!(
+            super::parse_retry_after_value("5"),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            super::parse_retry_after_value("  30  "),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn test_parse_retry_after_excessive_delta_seconds_capped() {
+        assert_eq!(
+            super::parse_retry_after_value("3600"),
+            Some(super::MAX_RETRY_DELAY)
+        );
+        assert_eq!(
+            super::parse_retry_after_value("99999999"),
+            Some(super::MAX_RETRY_DELAY)
+        );
+    }
+
+    #[test]
+    fn test_parse_retry_after_http_date_future() {
+        let future = SystemTime::now() + Duration::from_secs(10);
+        let header_str = httpdate::fmt_http_date(future);
+        let parsed = super::parse_retry_after_value(&header_str);
+        assert!(parsed.is_some());
+        let delay = parsed.unwrap();
+        // Delay should be approximately 9-10 seconds
+        assert!(delay >= Duration::from_secs(8) && delay <= Duration::from_secs(11));
+    }
+
+    #[test]
+    fn test_parse_retry_after_http_date_past() {
+        let past = "Sun, 06 Nov 1994 08:49:37 GMT";
+        assert_eq!(super::parse_retry_after_value(past), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn test_parse_retry_after_rfc850_and_asctime_dates() {
+        let past_rfc850 = "Sunday, 06-Nov-94 08:49:37 GMT";
+        assert_eq!(
+            super::parse_retry_after_value(past_rfc850),
+            Some(Duration::ZERO)
+        );
+        let past_asctime = "Sun Nov  6 08:49:37 1994";
+        assert_eq!(
+            super::parse_retry_after_value(past_asctime),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn test_parse_retry_after_excessive_http_date_capped() {
+        let far_future = "Thu, 31 Dec 2099 23:59:59 GMT";
+        assert_eq!(
+            super::parse_retry_after_value(far_future),
+            Some(super::MAX_RETRY_DELAY)
+        );
+    }
+
+    #[test]
+    fn test_parse_retry_after_malformed_returns_none() {
+        for malformed in [
+            "",
+            "   ",
+            "not-a-date",
+            "-1",
+            "-60",
+            "2026-10-21",
+            "5 seconds",
+            "12.5",
+        ] {
+            assert_eq!(
+                super::parse_retry_after_value(malformed),
+                None,
+                "'{malformed}' should not parse as Retry-After"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_retry_after_header_map() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(super::parse_retry_after(&headers), None);
+
+        headers.insert(reqwest::header::RETRY_AFTER, HeaderValue::from_static("15"));
+        assert_eq!(
+            super::parse_retry_after(&headers),
+            Some(Duration::from_secs(15))
+        );
+
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            HeaderValue::from_static("invalid"),
+        );
+        assert_eq!(super::parse_retry_after(&headers), None);
     }
 }
