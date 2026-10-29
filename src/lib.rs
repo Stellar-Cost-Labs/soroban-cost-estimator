@@ -46,6 +46,8 @@ pub mod config_snapshot;
 pub mod error;
 /// Interactive estimate session (prompt-driven contract inspection).
 pub mod interactive;
+/// Versioned, offline-validated batch estimate manifests.
+pub mod manifest;
 /// Platform-specific directory resolution for data and cache files.
 pub mod paths;
 /// Cost models, fee calculation, and report formatting.

@@ -1,7 +1,8 @@
 use crate::config_snapshot::model::{
     ConfigSnapshot, ContractBandwidthV0, ContractComputeV0, ContractEventsV0,
-    ContractHistoricalDataV0, ContractLedgerCostV0, SnapshotPayload, StateArchivalV0,
-    config_setting_human_name, config_setting_id_for_prefix,
+    ContractHistoricalDataV0, ContractLedgerCostV0, PricingClassification, SnapshotPayload,
+    StateArchivalV0, config_setting_human_name, config_setting_id_for_prefix,
+    setting_pricing_classification, setting_unit,
 };
 
 /// Returns a human-readable explanation for a given config setting field path.
@@ -242,6 +243,11 @@ pub struct FieldDiff {
     pub old_state: SettingState,
     /// The state of the setting in the new snapshot.
     pub new_state: SettingState,
+    /// Unit of measurement for the setting (e.g. `instructions`, `bytes`,
+    /// `stroops per 1KB`), or `None` if unknown.
+    pub unit: Option<String>,
+    /// Pricing classification (e.g. `fee_rate`, `limit`, `archival`), or `None` if unknown.
+    pub pricing_classification: Option<PricingClassification>,
 }
 
 impl FieldDiff {
@@ -292,6 +298,8 @@ impl FieldDiff {
             Some(id) => config_setting_human_name(&id).to_string(),
             None => field_path.to_string(),
         };
+        let unit = setting_unit(field_path).map(|s| s.to_string());
+        let pricing_classification = setting_pricing_classification(field_path);
         Self {
             field_path: field_path.to_string(),
             setting_id,
@@ -303,6 +311,8 @@ impl FieldDiff {
             change_kind,
             old_state,
             new_state,
+            unit,
+            pricing_classification,
         }
     }
 }

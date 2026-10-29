@@ -73,6 +73,8 @@ pub struct UserConfig {
     pub format: Option<OutputFormat>,
     /// RPC timeout in seconds used when `--timeout` is not given.
     pub timeout_secs: Option<u64>,
+    /// Cache freshness period used when `estimate` omits `--cache-ttl`.
+    pub cache_ttl: Option<String>,
     /// Legacy: RPC URL applied to commands that accept `--rpc-url`,
     /// regardless of network. Prefer `[rpc_urls]`.
     pub rpc_url: Option<String>,
@@ -251,6 +253,7 @@ mod tests {
 default_network = "mainnet"
 format = "json"
 timeout_secs = 45
+cache_ttl = "30m"
 
 [rpc_urls]
 testnet = "https://t.example"
@@ -260,6 +263,7 @@ mainnet = "https://m.example"
         assert_eq!(cfg.default_network.as_deref(), Some("mainnet"));
         assert_eq!(cfg.format, Some(OutputFormat::Json));
         assert_eq!(cfg.timeout_secs, Some(45));
+        assert_eq!(cfg.cache_ttl.as_deref(), Some("30m"));
         assert_eq!(cfg.rpc_url_for("testnet"), Some("https://t.example"));
         assert_eq!(cfg.rpc_url_for("mainnet"), Some("https://m.example"));
         assert_eq!(cfg.rpc_url_for("futurenet"), None);
