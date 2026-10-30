@@ -408,6 +408,7 @@ mod tests {
             AppError::XdrDecode("invalid base64".to_string()),
             AppError::FileNotFound("a.wasm".to_string()),
             AppError::InvalidHeader("missing '=' separator".to_string()),
+            AppError::CacheCorrupt("/tmp/cache.db: file is not a database".to_string()),
         ];
         for sample in samples {
             let rendered = sample.to_string();

@@ -722,6 +722,292 @@ fn enable_wal_if_possible(conn: &Connection) {
     }
 }
 
+/// Classification of SQLite cache database errors so callers and operators can
+/// distinguish database corruption from permission, disk-full, and lock errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheDbFailureKind {
+    /// Database file header, pages, or B-tree structure is corrupt (`SQLITE_CORRUPT` or `SQLITE_NOTADB`).
+    Corrupt,
+    /// Insufficient permissions or read-only filesystem (`SQLITE_PERM`, `SQLITE_READONLY`, `SQLITE_CANTOPEN`).
+    PermissionDenied,
+    /// Storage device is out of space (`SQLITE_FULL`).
+    DiskFull,
+    /// Concurrent writer or table lock contention (`SQLITE_BUSY`, `SQLITE_LOCKED`).
+    Locked,
+    /// Any other SQLite or query error.
+    Other,
+}
+
+/// Classify a [`rusqlite::Error`] into a [`CacheDbFailureKind`].
+#[must_use]
+pub fn classify_sqlite_error(err: &rusqlite::Error) -> CacheDbFailureKind {
+    match err.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase) => {
+            CacheDbFailureKind::Corrupt
+        }
+        Some(
+            rusqlite::ErrorCode::PermissionDenied
+            | rusqlite::ErrorCode::ReadOnly
+            | rusqlite::ErrorCode::CannotOpen,
+        ) => CacheDbFailureKind::PermissionDenied,
+        Some(rusqlite::ErrorCode::DiskFull) => CacheDbFailureKind::DiskFull,
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
+            CacheDbFailureKind::Locked
+        }
+        _ => CacheDbFailureKind::Other,
+    }
+}
+
+/// Summary of an explicit corrupt-cache recovery operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheRecoveryReport {
+    /// Path to the original database file.
+    pub original_path: PathBuf,
+    /// Path to the timestamped backup where the original file was quarantined.
+    pub backup_path: PathBuf,
+    /// Sidecar files (`-wal`, `-shm`, `-journal`) that were quarantined alongside the database.
+    pub sidecars_quarantined: Vec<PathBuf>,
+    /// Path to the newly initialized database.
+    pub new_path: PathBuf,
+    /// Path of the active cache database that was re-initialized.
+    pub database_path: PathBuf,
+    /// Path where the corrupt database was quarantined (`<db>.corrupt.<timestamp>`).
+    pub quarantined_path: PathBuf,
+    /// Any sidecar files (`-wal`, `-shm`, `-journal`) quarantined alongside the database.
+    pub quarantined_sidecars: Vec<PathBuf>,
+    /// Operator notice explaining that cached estimates in the quarantined database are no longer in active use.
+    pub notice: String,
+}
+
+/// Process-wide explicit recovery mode toggle and most recent recovery report.
+static CACHE_RECOVERY_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static LAST_RECOVERY_REPORT: Mutex<Option<CacheRecoveryReport>> = Mutex::new(None);
+
+/// Enable or disable automatic quarantine-and-reinitialize recovery when opening
+/// a corrupt cache database.
+pub fn set_cache_recovery_mode(enabled: bool) {
+    CACHE_RECOVERY_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether explicit corrupt-cache recovery mode is active (via [`set_cache_recovery_mode`]
+/// or `--recover-corrupt-cache`).
+#[must_use]
+pub fn is_cache_recovery_enabled() -> bool {
+    CACHE_RECOVERY_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+        || crate::cli::should_recover_corrupt_cache()
+}
+
+/// Return the most recent [`CacheRecoveryReport`] recorded in this process, if any.
+pub fn last_cache_recovery_report() -> Option<CacheRecoveryReport> {
+    LAST_RECOVERY_REPORT
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+fn make_corrupt_err(path: &Path, reason: impl std::fmt::Display) -> AppError {
+    AppError::CacheCorrupt(format!(
+        "{}: {reason} (run `soroban-cost-estimator cache recover` or pass `--recover-corrupt-cache` to quarantine and start fresh; cached estimates in the broken database will no longer be in active use)",
+        path.display()
+    ))
+}
+
+/// Run `PRAGMA quick_check(1)` to detect B-tree or page corruption even when
+/// the 100-byte SQLite header and schema table appear readable.
+fn verify_db_quick_check(conn: &Connection, path: &Path) -> AppResult<()> {
+    let status: String = match conn.query_row("PRAGMA quick_check(1)", [], |row| row.get(0)) {
+        Ok(s) => s,
+        Err(e) => {
+            if classify_sqlite_error(&e) == CacheDbFailureKind::Corrupt {
+                return Err(make_corrupt_err(path, e));
+            }
+            return Err(AppError::Sqlite(e));
+        }
+    };
+    if !status.eq_ignore_ascii_case("ok") {
+        return Err(make_corrupt_err(
+            path,
+            format!("integrity check failed ({status})"),
+        ));
+    }
+    Ok(())
+}
+
+/// Convert a [`AppError`] encountered while opening/initializing `path` into
+/// [`AppError::CacheCorrupt`] if and only if the underlying SQLite error is a
+/// corruption error (`SQLITE_CORRUPT` / `SQLITE_NOTADB`). Permission, disk-full,
+/// and lock errors are preserved as [`AppError::Sqlite`].
+fn map_open_error(path: &Path, err: AppError) -> AppError {
+    match err {
+        AppError::Sqlite(sql_err)
+            if classify_sqlite_error(&sql_err) == CacheDbFailureKind::Corrupt =>
+        {
+            make_corrupt_err(path, sql_err)
+        }
+        other => other,
+    }
+}
+
+/// Open and validate `path` without performing recovery.
+fn open_and_validate_db(path: &Path) -> AppResult<Connection> {
+    if path.exists() {
+        if let Ok(metadata) = std::fs::metadata(path) {
+            if metadata.len() > 0 && metadata.len() < 100 {
+                return Err(make_corrupt_err(
+                    path,
+                    "file size is smaller than SQLite header",
+                ));
+            }
+            if metadata.len() >= 100 {
+                use std::io::Read;
+                let mut header = [0u8; 16];
+                if let Ok(mut f) = std::fs::File::open(path) {
+                    if f.read_exact(&mut header).is_err() || &header != b"SQLite format 3\0" {
+                        return Err(make_corrupt_err(path, "file is not a database"));
+                    }
+                }
+            }
+        }
+    }
+    let conn = Connection::open(path).map_err(|e| map_open_error(path, AppError::Sqlite(e)))?;
+    ensure_cache_schema(&conn).map_err(|e| map_open_error(path, e))?;
+    verify_db_quick_check(&conn, path)?;
+    Ok(conn)
+}
+
+/// Build a unique timestamped backup path (`<db>.corrupt.<YYYYMMDDTHHMMSSZ>`)
+/// in the same directory as `db_path` so the rename is atomic.
+fn next_quarantined_path(db_path: &Path) -> PathBuf {
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let base_name = db_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("cache.db");
+    let candidate = db_path.with_file_name(format!("{base_name}.corrupt.{stamp}"));
+    if !candidate.exists() {
+        return candidate;
+    }
+    for seq in 1..10_000u32 {
+        let numbered = db_path.with_file_name(format!("{base_name}.corrupt.{stamp}.{seq}"));
+        if !numbered.exists() {
+            return numbered;
+        }
+    }
+    candidate
+}
+
+/// Recover from a corrupt SQLite cache database at the default cache path by
+/// renaming the broken file to a timestamped backup and initializing a new
+/// empty database.
+pub fn recover_corrupt_cache() -> AppResult<CacheRecoveryReport> {
+    let path = db_path()?;
+    recover_corrupt_cache_at(&path)
+}
+
+/// Recover from a corrupt SQLite cache database at `db_path` by renaming the
+/// broken file to a timestamped backup before initializing a fresh database.
+///
+/// Refuses to overwrite or quarantine a healthy database or a database failing
+/// due to permissions, disk-full, or lock contention.
+pub fn recover_corrupt_cache_at(db_path: &Path) -> AppResult<CacheRecoveryReport> {
+    recover_corrupt_cache_with_initializer(db_path, |target| {
+        let conn = Connection::open(target)?;
+        ensure_cache_schema(&conn)?;
+        verify_db_quick_check(&conn, target)?;
+        Ok(())
+    })
+}
+
+/// Recover from a corrupt SQLite cache database at `db_path` using a custom
+/// initializer closure (allowing tests to simulate failed initialization after
+/// quarantine and verify the original database remains preserved).
+pub fn recover_corrupt_cache_with_initializer<F>(
+    db_path: &Path,
+    initializer: F,
+) -> AppResult<CacheRecoveryReport>
+where
+    F: FnOnce(&Path) -> AppResult<()>,
+{
+    if !db_path.exists() {
+        return Err(AppError::FileNotFound(db_path.display().to_string()));
+    }
+
+    // Probe the existing file first; ensure we drop any Connection handle
+    // before renaming on Windows.
+    match open_and_validate_db(db_path) {
+        Ok(conn) => {
+            drop(conn);
+            return Err(AppError::General(format!(
+                "cache database at {} is healthy; recovery is only permitted for corrupt databases",
+                db_path.display()
+            )));
+        }
+        Err(AppError::CacheCorrupt(_)) => {
+            // Confirmed corrupt; proceed with atomic quarantine.
+        }
+        Err(other_err) => {
+            // Permission, disk-full, lock, or I/O error: never quarantine.
+            return Err(other_err);
+        }
+    }
+
+    let quarantined_path = next_quarantined_path(db_path);
+    std::fs::rename(db_path, &quarantined_path)?;
+
+    let mut quarantined_sidecars = Vec::new();
+    let db_os = db_path.as_os_str();
+    let q_os = quarantined_path.as_os_str();
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut src_os = db_os.to_os_string();
+        src_os.push(suffix);
+        let src_sidecar = PathBuf::from(src_os);
+        if src_sidecar.exists() {
+            let mut dst_os = q_os.to_os_string();
+            dst_os.push(suffix);
+            let dst_sidecar = PathBuf::from(dst_os);
+            if std::fs::rename(&src_sidecar, &dst_sidecar).is_ok() {
+                quarantined_sidecars.push(dst_sidecar);
+            }
+        }
+    }
+
+    if let Err(init_err) = initializer(db_path) {
+        // Clean up any partial new file at db_path, while keeping the original
+        // corrupt database safely quarantined at quarantined_path.
+        let _ = std::fs::remove_file(db_path);
+        return Err(init_err);
+    }
+
+    let notice = format!(
+        "quarantined corrupt cache database to {} and initialized a new empty cache at {}; \
+         cached estimates from the broken database are no longer in active use",
+        quarantined_path.display(),
+        db_path.display()
+    );
+    warn!(
+        database = %db_path.display(),
+        quarantined = %quarantined_path.display(),
+        "{notice}"
+    );
+
+    let report = CacheRecoveryReport {
+        original_path: db_path.to_path_buf(),
+        backup_path: quarantined_path.clone(),
+        sidecars_quarantined: quarantined_sidecars.clone(),
+        new_path: db_path.to_path_buf(),
+        database_path: db_path.to_path_buf(),
+        quarantined_path,
+        quarantined_sidecars,
+        notice,
+    };
+    if let Ok(mut guard) = LAST_RECOVERY_REPORT.lock() {
+        *guard = Some(report.clone());
+    }
+    Ok(report)
+}
+
 /// Open a connection to the cache database, ensure the schema exists, and
 /// import any pre-SQLite JSON cache files left behind by older releases.
 ///
@@ -736,61 +1022,22 @@ fn open_db() -> AppResult<Connection> {
     let path = db_path()?;
     let newly_created = create_user_only_db_file(&path)?;
 
-    // If an existing file is present, verify it has a valid SQLite header before handing it
-    // to SQLite VFS, preventing SQLite from unlinking sidecars on non-database/corrupted files.
-    if !newly_created && path.exists() {
-        if let Ok(metadata) = std::fs::metadata(&path) {
-            if metadata.len() < 100 {
-                return Err(AppError::CacheCorrupt(format!(
-                    "{}: file size is smaller than SQLite header (run `soroban-cost-estimator cache recover` to quarantine and start fresh)",
-                    path.display()
-                )));
-            }
-            use std::io::Read;
-            let mut header = [0u8; 16];
-            if let Ok(mut f) = std::fs::File::open(&path) {
-                if f.read_exact(&mut header).is_err() || &header != b"SQLite format 3\0" {
-                    return Err(AppError::CacheCorrupt(format!(
-                        "{}: file is not a database (run `soroban-cost-estimator cache recover` to quarantine and start fresh)",
-                        path.display()
-                    )));
-                }
+    let conn = match open_and_validate_db(&path) {
+        Ok(conn) => conn,
+        Err(AppError::CacheCorrupt(msg)) => {
+            if is_cache_recovery_enabled() {
+                recover_corrupt_cache_at(&path)?;
+                open_and_validate_db(&path)?
+            } else {
+                return Err(AppError::CacheCorrupt(msg));
             }
         }
-    }
-
-    let conn = match Connection::open(&path) {
-        Ok(c) => c,
-        Err(e) => {
-            if is_database_corrupt_error(&e) {
-                return Err(AppError::CacheCorrupt(format!(
-                    "{}: {} (run `soroban-cost-estimator cache recover` to quarantine and start fresh)",
-                    path.display(),
-                    e
-                )));
-            }
-            return Err(AppError::Sqlite(e));
-        }
+        Err(other) => return Err(other),
     };
-
-    if let Err(e) = ensure_cache_schema(&conn) {
-        drop(conn);
-        if let AppError::Sqlite(ref sql_err) = e {
-            if is_database_corrupt_error(sql_err) {
-                return Err(AppError::CacheCorrupt(format!(
-                    "{}: {} (run `soroban-cost-estimator cache recover` to quarantine and start fresh)",
-                    path.display(),
-                    sql_err
-                )));
-            }
-        }
-        return Err(e);
-    }
 
     if newly_created {
         ensure_sidecar_permissions(&path);
     }
-
     // Transparent, one-time upgrade from the old per-entry JSON cache.
     // The directory is removed once every file is imported, so subsequent
     // opens short-circuit on `!dir.is_dir()`.
@@ -2434,20 +2681,6 @@ fn wasm_file_mtime_nanos(wasm_path: &Path) -> AppResult<u64> {
     Ok(nanos)
 }
 
-/// Report describing the result of quarantining a corrupt cache database and
-/// reinitializing a fresh one.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CacheRecoveryReport {
-    /// Path to the original database file.
-    pub original_path: PathBuf,
-    /// Path to the timestamped backup where the original file was quarantined.
-    pub backup_path: PathBuf,
-    /// Sidecar files (`-wal`, `-shm`, `-journal`) that were quarantined alongside the database.
-    pub sidecars_quarantined: Vec<PathBuf>,
-    /// Path to the newly initialized database.
-    pub new_path: PathBuf,
-}
-
 /// Verify whether the on-disk SQLite cache database is healthy.
 ///
 /// Returns `Ok(true)` if healthy or not present, `Ok(false)` if corruption is detected,
@@ -2458,9 +2691,6 @@ pub fn check_cache_health() -> AppResult<bool> {
         return Ok(true);
     }
 
-    // Inspect file header before invoking SQLite VFS.
-    // Every valid SQLite 3 database must be at least 100 bytes and start with "SQLite format 3\0".
-    // Checking this first avoids SQLite VFS attempting rollback or unlinking sidecars on non-database files.
     if let Ok(metadata) = std::fs::metadata(&path) {
         if metadata.len() < 100 {
             return Ok(false);
@@ -2495,14 +2725,6 @@ pub fn check_cache_health() -> AppResult<bool> {
 
 /// Quarantine a corrupt SQLite cache database to a timestamped backup and
 /// initialize a clean database.
-///
-/// If `force` is false, verifies that the database is actually corrupt before
-/// performing recovery.
-///
-/// The recovery operation atomically renames the corrupt `cache.db` (and any
-/// `-wal`/`-shm`/`-journal` sidecars) to `cache.db.corrupt-<timestamp>.bak*` so
-/// the corrupt file is preserved for operator inspection. A fresh, empty cache
-/// database is then initialized with user-only permissions (`0600`).
 pub fn recover_cache(force: bool) -> AppResult<CacheRecoveryReport> {
     let _guard = WRITE_LOCK
         .lock()
@@ -2518,7 +2740,11 @@ pub fn recover_cache(force: bool) -> AppResult<CacheRecoveryReport> {
             original_path: path.clone(),
             backup_path: path.clone(),
             sidecars_quarantined: Vec::new(),
-            new_path: path,
+            new_path: path.clone(),
+            database_path: path.clone(),
+            quarantined_path: path,
+            quarantined_sidecars: Vec::new(),
+            notice: "initialized fresh cache database".to_string(),
         });
     }
 
@@ -2557,10 +2783,21 @@ pub fn recover_cache(force: bool) -> AppResult<CacheRecoveryReport> {
         "quarantined corrupt cache database and initialized fresh cache"
     );
 
+    let notice = format!(
+        "quarantined corrupt cache database to {} and initialized a new empty cache at {}; \
+         cached estimates from the broken database are no longer in active use",
+        backup_path.display(),
+        path.display()
+    );
+
     Ok(CacheRecoveryReport {
         original_path: path.clone(),
-        backup_path,
-        sidecars_quarantined,
-        new_path: path,
+        backup_path: backup_path.clone(),
+        sidecars_quarantined: sidecars_quarantined.clone(),
+        new_path: path.clone(),
+        database_path: path,
+        quarantined_path: backup_path,
+        quarantined_sidecars: sidecars_quarantined,
+        notice,
     })
 }
