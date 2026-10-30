@@ -5744,6 +5744,8 @@ async fn handle_cache_action(
             network,
             r#fn,
             wasm_hash,
+            min_fee,
+            max_fee,
             since,
             to,
             older_than,
@@ -5755,6 +5757,8 @@ async fn handle_cache_action(
             network.as_deref(),
             r#fn.as_deref(),
             wasm_hash.as_deref(),
+            min_fee,
+            max_fee,
             since.as_deref(),
             to.as_deref(),
             older_than.as_deref(),
@@ -5978,6 +5982,8 @@ fn cmd_cache_delete(
     network: Option<&str>,
     function: Option<&str>,
     wasm_hash: Option<&str>,
+    min_fee: Option<i64>,
+    max_fee: Option<i64>,
     since: Option<&str>,
     to: Option<&str>,
     older_than: Option<&str>,
@@ -5986,7 +5992,10 @@ fn cmd_cache_delete(
     yes: bool,
     json: bool,
 ) -> error::AppResult<()> {
-    let filter = build_cache_filter(network, function, wasm_hash, since, to, older_than)?;
+    let mut filter = build_cache_filter(network, function, wasm_hash, since, to, older_than)?;
+    filter.min_fee = min_fee;
+    filter.max_fee = max_fee;
+    filter.validate()?;
 
     // `--all` means "every entry on every network". Combining it with a
     // filter would be ambiguous — the filter would silently narrow a
@@ -6071,7 +6080,6 @@ fn filter_is_empty(filter: &cache::CacheFilter) -> bool {
         && filter.since.is_none()
         && filter.to.is_none()
 }
-
 /// `cache query` / `config cache query` command: list cached estimates matching the given filters.
 ///
 /// Prints a table (or JSON when `--json` is passed). An empty result prints a
