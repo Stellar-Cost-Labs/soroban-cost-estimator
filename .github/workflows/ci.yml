@@ -37,8 +37,8 @@ jobs:
       - name: Run tests
         run: cargo test
 
-  security-audit:
-    name: Security Audit
+  audit:
+    name: Audit dependencies
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
