@@ -60,7 +60,8 @@ use crate::error::AppError;
 use crate::error::AppResult;
 
 /// Check whether a rusqlite error is `SQLITE_BUSY`.
-fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
+#[must_use]
+pub fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
     err.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
 }
 
@@ -991,13 +992,21 @@ fn import_legacy_json_file(conn: &Connection, path: &Path) -> AppResult<bool> {
     Ok(true)
 }
 
-/// Retry limit and base delay for `SQLITE_BUSY` backoff.
-const MAX_RETRIES: u32 = 5;
-const BASE_RETRY_DELAY_MS: u64 = 10;
+/// Retry limit and bounded delay parameters for `SQLITE_BUSY` backoff.
+pub const MAX_BUSY_RETRIES: u32 = 5;
+pub const BASE_BUSY_RETRY_DELAY_MS: u64 = 10;
+pub const MAX_BUSY_RETRY_DELAY_MS: u64 = 100;
 
-/// Execute a SQLite write operation, retrying on `SQLITE_BUSY` with
-/// exponential backoff.
-fn execute_with_retry<F, T>(mut operation: F) -> AppResult<T>
+const MAX_RETRIES: u32 = MAX_BUSY_RETRIES;
+const BASE_RETRY_DELAY_MS: u64 = BASE_BUSY_RETRY_DELAY_MS;
+
+/// Execute a SQLite operation, retrying only `SQLITE_BUSY` errors with bounded
+/// exponential backoff (`BASE_BUSY_RETRY_DELAY_MS` up to
+/// `MAX_BUSY_RETRY_DELAY_MS`).
+///
+/// Corruption, permission, constraint, and disk I/O errors are never retried
+/// and return immediately on the first attempt.
+pub fn execute_with_busy_retry<F, T>(mut operation: F) -> AppResult<T>
 where
     F: FnMut() -> Result<T, rusqlite::Error>,
 {
@@ -1009,10 +1018,10 @@ where
                 warn!(
                     attempt,
                     delay_ms = delay,
-                    "SQLITE_BUSY, retrying after backoff"
+                    "SQLITE_BUSY, retrying after bounded backoff"
                 );
                 std::thread::sleep(std::time::Duration::from_millis(delay));
-                delay *= 2;
+                delay = (delay * 2).min(MAX_BUSY_RETRY_DELAY_MS);
             }
             Err(e) if is_database_corrupt_error(&e) => {
                 let path_display = db_path()
@@ -1026,6 +1035,13 @@ where
         }
     }
     unreachable!()
+}
+
+fn execute_with_retry<F, T>(operation: F) -> AppResult<T>
+where
+    F: FnMut() -> Result<T, rusqlite::Error>,
+{
+    execute_with_busy_retry(operation)
 }
 
 /// Save an estimate result to the cache using the process-wide
@@ -1224,72 +1240,78 @@ pub fn save_estimate_with_limits_and_metadata(
     let mut conn = open_db()?;
     let now = chrono::Utc::now().to_rfc3339();
 
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    tx.execute(
-        "INSERT INTO estimates \
-         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
-          cpu_instructions, memory_bytes, timestamp, duration_ms, execution_duration_ms, \
-          network_passphrase, core_version, success, last_accessed, io_json) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
-         ON CONFLICT(wasm_hash, function, args_hash) DO UPDATE SET \
-            version = excluded.version, \
-            network = excluded.network, \
-            ledger = excluded.ledger, \
-            total_stroops = excluded.total_stroops, \
-            cpu_instructions = excluded.cpu_instructions, \
-            memory_bytes = excluded.memory_bytes, \
-            timestamp = excluded.timestamp, \
-            duration_ms = excluded.duration_ms, \
-            execution_duration_ms = excluded.execution_duration_ms, \
-            network_passphrase = excluded.network_passphrase, \
-            core_version = excluded.core_version, \
-            success = excluded.success, \
-            last_accessed = excluded.last_accessed, \
-            io_json = excluded.io_json",
-        rusqlite::params![
-            CACHE_SCHEMA_VERSION as i64,
-            wasm_hash,
-            function,
-            args_hash.as_str(),
-            network,
-            ledger as i64,
-            total_stroops,
-            cpu_instructions as i64,
-            memory_bytes as i64,
-            now,
-            duration_ms.map(|v| v as i64),
-            duration_ms.unwrap_or_default() as i64,
-            network_passphrase,
-            core_version,
-            success as i64,
-            now,
-            io_json,
-        ],
-    )?;
+    let evicted = execute_with_retry(|| {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO estimates \
+             (version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
+              cpu_instructions, memory_bytes, timestamp, duration_ms, execution_duration_ms, \
+              network_passphrase, core_version, success, last_accessed, io_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
+             ON CONFLICT(wasm_hash, function, args_hash) DO UPDATE SET \
+                version = excluded.version, \
+                network = excluded.network, \
+                ledger = excluded.ledger, \
+                total_stroops = excluded.total_stroops, \
+                cpu_instructions = excluded.cpu_instructions, \
+                memory_bytes = excluded.memory_bytes, \
+                timestamp = excluded.timestamp, \
+                duration_ms = excluded.duration_ms, \
+                execution_duration_ms = excluded.execution_duration_ms, \
+                network_passphrase = excluded.network_passphrase, \
+                core_version = excluded.core_version, \
+                success = excluded.success, \
+                last_accessed = excluded.last_accessed, \
+                io_json = excluded.io_json",
+            rusqlite::params![
+                CACHE_SCHEMA_VERSION as i64,
+                wasm_hash,
+                function,
+                args_hash.as_str(),
+                network,
+                ledger as i64,
+                total_stroops,
+                cpu_instructions as i64,
+                memory_bytes as i64,
+                &now,
+                duration_ms.map(|v| v as i64),
+                duration_ms.unwrap_or_default() as i64,
+                network_passphrase,
+                core_version,
+                success as i64,
+                &now,
+                &io_json,
+            ],
+        )?;
 
-    // Append to the unbounded history log so `estimate --history` can show
-    // how this function's cost evolved across runs (#321), including the
-    // ledger I/O each run consumed (#530). Unlike the `estimates` upsert
-    // above, every call adds a row here.
-    tx.execute(
-        "INSERT INTO estimate_history \
-         (wasm_hash, function, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, io_json) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        rusqlite::params![
-            wasm_hash,
-            function,
-            network,
-            ledger as i64,
-            total_stroops,
-            cpu_instructions as i64,
-            memory_bytes as i64,
-            now,
-            io_json,
-        ],
-    )?;
+        // Append to the unbounded history log so `estimate --history` can show
+        // how this function's cost evolved across runs (#321), including the
+        // ledger I/O each run consumed (#530). Unlike the `estimates` upsert
+        // above, every call adds a row here.
+        tx.execute(
+            "INSERT INTO estimate_history \
+             (wasm_hash, function, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, io_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                wasm_hash,
+                function,
+                network,
+                ledger as i64,
+                total_stroops,
+                cpu_instructions as i64,
+                memory_bytes as i64,
+                &now,
+                &io_json,
+            ],
+        )?;
 
-    let evicted = enforce_limits_in_tx(&tx, limits)?;
-    tx.commit()?;
+        let evicted = enforce_limits_in_tx(&tx, limits).map_err(|e| match e {
+            AppError::Sqlite(s) => s,
+            other => rusqlite::Error::ToSqlConversionFailure(Box::new(other)),
+        })?;
+        tx.commit()?;
+        Ok(evicted)
+    })?;
 
     if evicted > 0 {
         info_eviction(evicted, limits);
@@ -1550,9 +1572,15 @@ pub fn evict_lru() -> AppResult<usize> {
         .lock()
         .map_err(|e| AppError::General(format!("cache write lock poisoned: {e}")))?;
     let mut conn = open_db()?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let evicted = enforce_limits_in_tx(&tx, limits)?;
-    tx.commit()?;
+    let evicted = execute_with_retry(|| {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let evicted = enforce_limits_in_tx(&tx, limits).map_err(|e| match e {
+            AppError::Sqlite(s) => s,
+            other => rusqlite::Error::ToSqlConversionFailure(Box::new(other)),
+        })?;
+        tx.commit()?;
+        Ok(evicted)
+    })?;
     if evicted > 0 {
         info_eviction(evicted, limits);
     }
@@ -1677,7 +1705,7 @@ pub fn load_estimate(
     let args_hash = hash_args(args);
 
     let conn = open_db()?;
-    let cached = {
+    let raw_cached = execute_with_retry(|| {
         let mut stmt = conn.prepare(
             "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
              cpu_instructions, memory_bytes, timestamp, execution_duration_ms, success, \
@@ -1686,9 +1714,13 @@ pub fn load_estimate(
         )?;
         let mut rows = stmt.query(rusqlite::params![wasm_hash, function, args_hash.as_str()])?;
         match rows.next()? {
-            None => None,
-            Some(row) => Some(migrate_to_latest(estimate_from_row(row)?)?),
+            None => Ok(None),
+            Some(row) => Ok(Some(estimate_from_row(row)?)),
         }
+    })?;
+    let cached = match raw_cached {
+        None => None,
+        Some(raw) => Some(migrate_to_latest(raw)?),
     };
 
     if cached.is_some() {
