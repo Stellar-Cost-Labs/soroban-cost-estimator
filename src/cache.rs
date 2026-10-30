@@ -1719,6 +1719,162 @@ pub fn is_cache_entry_fresh(entry: &CachedEstimate, ttl: std::time::Duration) ->
     chrono::Utc::now().signed_duration_since(ts) <= ttl
 }
 
+/// Safe, machine-readable reason code describing why a cached estimate was
+/// reused or skipped.
+///
+/// Never contains raw invocation arguments or credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheDecisionReason {
+    /// A fresh cached estimate was reused.
+    Hit,
+    /// No cached estimate existed for the requested key.
+    Miss,
+    /// A cached estimate existed, but its timestamp exceeded the configured TTL.
+    Expired,
+    /// A cached estimate existed for the key, but it was recorded on a different network.
+    NetworkMismatch,
+    /// Cache lookup was explicitly bypassed (`--no-cache` or no `--cache-ttl`).
+    Bypassed,
+}
+
+impl CacheDecisionReason {
+    /// Stable `snake_case` reason code suitable for structured logs and diagnostics.
+    #[must_use]
+    pub const fn as_code(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Miss => "miss",
+            Self::Expired => "expired",
+            Self::NetworkMismatch => "network_mismatch",
+            Self::Bypassed => "bypassed",
+        }
+    }
+}
+
+/// Result of evaluating whether an estimate can be served from the local cache.
+#[derive(Debug, Clone)]
+pub struct CacheDecision {
+    /// Why the cache entry was reused (`Hit`) or skipped (`Miss`, `Expired`,
+    /// `NetworkMismatch`, `Bypassed`).
+    pub reason: CacheDecisionReason,
+    /// The fresh cached estimate when `reason == CacheDecisionReason::Hit`,
+    /// otherwise `None`.
+    pub estimate: Option<CachedEstimate>,
+}
+
+impl CacheDecision {
+    /// Format a concise, safe diagnostic summary that never includes invocation
+    /// arguments or credentials.
+    #[must_use]
+    pub fn diagnostic_summary(&self, function: &str, network: &str) -> String {
+        match (&self.reason, &self.estimate) {
+            (CacheDecisionReason::Hit, Some(entry)) => format!(
+                "cache decision={} function={} network={} ledger={} timestamp={}",
+                self.reason.as_code(),
+                function,
+                network,
+                entry.ledger,
+                entry.timestamp
+            ),
+            _ => format!(
+                "cache decision={} function={} network={}",
+                self.reason.as_code(),
+                function,
+                network
+            ),
+        }
+    }
+}
+
+/// Evaluate whether a cached estimate should be reused or skipped, emitting one
+/// structured `tracing::debug!` event with a safe [`CacheDecisionReason`] code.
+///
+/// Raw invocation arguments (`args`) are used only to compute the SHA-256 key
+/// digest and are never included in diagnostic events or summaries.
+pub fn evaluate_cache_decision(
+    wasm_hash: &str,
+    function: &str,
+    args: &[String],
+    expected_network: Option<&str>,
+    ttl: Option<std::time::Duration>,
+    no_cache: bool,
+) -> AppResult<CacheDecision> {
+    if no_cache || ttl.is_none() {
+        debug!(
+            reason = CacheDecisionReason::Bypassed.as_code(),
+            function,
+            network = expected_network.unwrap_or(""),
+            no_cache,
+            "estimate cache decision"
+        );
+        return Ok(CacheDecision {
+            reason: CacheDecisionReason::Bypassed,
+            estimate: None,
+        });
+    }
+
+    let ttl = ttl.unwrap_or_default();
+    let Some(cached) = load_estimate(wasm_hash, function, args)? else {
+        debug!(
+            reason = CacheDecisionReason::Miss.as_code(),
+            function,
+            network = expected_network.unwrap_or(""),
+            ttl_secs = ttl.as_secs(),
+            "estimate cache decision"
+        );
+        return Ok(CacheDecision {
+            reason: CacheDecisionReason::Miss,
+            estimate: None,
+        });
+    };
+
+    if let Some(net) = expected_network {
+        if cached.network != net {
+            debug!(
+                reason = CacheDecisionReason::NetworkMismatch.as_code(),
+                function,
+                expected_network = net,
+                cached_network = %cached.network,
+                "estimate cache decision"
+            );
+            return Ok(CacheDecision {
+                reason: CacheDecisionReason::NetworkMismatch,
+                estimate: None,
+            });
+        }
+    }
+
+    if !is_cache_entry_fresh(&cached, ttl) {
+        debug!(
+            reason = CacheDecisionReason::Expired.as_code(),
+            function,
+            network = %cached.network,
+            ttl_secs = ttl.as_secs(),
+            timestamp = %cached.timestamp,
+            "estimate cache decision"
+        );
+        return Ok(CacheDecision {
+            reason: CacheDecisionReason::Expired,
+            estimate: None,
+        });
+    }
+
+    debug!(
+        reason = CacheDecisionReason::Hit.as_code(),
+        function,
+        network = %cached.network,
+        ledger = cached.ledger,
+        ttl_secs = ttl.as_secs(),
+        timestamp = %cached.timestamp,
+        "estimate cache decision"
+    );
+    Ok(CacheDecision {
+        reason: CacheDecisionReason::Hit,
+        estimate: Some(cached),
+    })
+}
+
 /// Load a cached estimate only if it is still fresh (within `ttl`).
 ///
 /// Returns `Ok(None)` when no entry exists **or** when the entry has
@@ -1733,17 +1889,31 @@ pub fn load_fresh_estimate(
     ttl: std::time::Duration,
 ) -> AppResult<Option<CachedEstimate>> {
     let Some(cached) = load_estimate(wasm_hash, function, args)? else {
+        debug!(
+            reason = CacheDecisionReason::Miss.as_code(),
+            function,
+            ttl_secs = ttl.as_secs(),
+            "estimate cache decision"
+        );
         return Ok(None);
     };
     if is_cache_entry_fresh(&cached, ttl) {
-        trace!(function, ttl_secs = ttl.as_secs(), "fresh cached estimate");
+        debug!(
+            reason = CacheDecisionReason::Hit.as_code(),
+            function,
+            ttl_secs = ttl.as_secs(),
+            ledger = cached.ledger,
+            timestamp = %cached.timestamp,
+            "estimate cache decision"
+        );
         Ok(Some(cached))
     } else {
-        trace!(
+        debug!(
+            reason = CacheDecisionReason::Expired.as_code(),
             function,
             ttl_secs = ttl.as_secs(),
             timestamp = %cached.timestamp,
-            "cached estimate expired"
+            "estimate cache decision"
         );
         Ok(None)
     }
