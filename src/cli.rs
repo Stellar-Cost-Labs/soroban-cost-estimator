@@ -695,6 +695,20 @@ pub enum CacheAction {
         json: bool,
     },
 
+    /// Create a transactionally consistent online SQLite backup of the estimate cache.
+    Backup {
+        /// Destination file path for the SQLite backup.
+        #[arg(long, short, value_name = "PATH")]
+        out: PathBuf,
+    },
+
+    /// Validate and transactionally restore a SQLite backup into the active estimate cache.
+    Restore {
+        /// Source SQLite backup file path to restore from.
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+    },
+
     /// Recover safely from a corrupt SQLite cache database by quarantining it to a timestamped backup and initializing a new cache.
     Recover {
         /// Force recovery even if corruption is not automatically detected.

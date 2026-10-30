@@ -2100,6 +2100,232 @@ pub fn export_cache(network: Option<&str>) -> AppResult<CacheExport> {
     })
 }
 
+/// Restrict a newly created cache/backup file to owner-only permissions (`0600`)
+/// on Unix platforms so cache data is never world-readable.
+#[allow(clippy::unnecessary_wraps)]
+fn set_owner_only_file_permissions(path: &Path) -> AppResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(path, perms)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+/// Create a transactionally consistent online SQLite backup of the estimate
+/// cache at `dest_path`.
+///
+/// Uses SQLite's `VACUUM INTO` snapshot mechanism so concurrent writers do not
+/// produce a torn or incomplete database copy. Writes to a temporary file with
+/// owner-only permissions before atomically renaming to `dest_path`.
+/// Returns the number of cached estimates written to the backup.
+pub fn backup_cache_db(dest_path: &Path) -> AppResult<usize> {
+    let active_path = db_path()?;
+    if dest_path == active_path {
+        return Err(AppError::General(
+            "backup destination cannot be the active cache database".to_string(),
+        ));
+    }
+    if let Some(parent) = dest_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    let conn = open_db()?;
+    let staging = dest_path.with_extension("sqlite.bak.tmp");
+    if staging.exists() {
+        let _ = std::fs::remove_file(&staging);
+    }
+
+    let staging_str = staging.to_string_lossy().to_string();
+    execute_with_retry(|| conn.execute("VACUUM INTO ?1", [staging_str.as_str()]))?;
+    set_owner_only_file_permissions(&staging)?;
+
+    let backup_conn = Connection::open(&staging)?;
+    let count: usize =
+        backup_conn.query_row("SELECT COUNT(*) FROM estimates", [], |row| row.get(0))?;
+    drop(backup_conn);
+
+    std::fs::rename(&staging, dest_path)?;
+    debug!(
+        dest = %dest_path.display(),
+        entries = count,
+        "created online SQLite cache backup"
+    );
+    Ok(count)
+}
+
+/// Validate a SQLite backup file and transactionally restore it into the active
+/// estimate cache.
+///
+/// The active database is kept untouched until the backup passes integrity,
+/// table-presence, and schema-version checks. Returns the number of restored
+/// estimates.
+#[allow(clippy::too_many_lines)]
+pub fn restore_cache_db(source_path: &Path) -> AppResult<usize> {
+    if !source_path.is_file() {
+        return Err(AppError::FileNotFound(source_path.display().to_string()));
+    }
+
+    // Stage a copy of the source file so we can run schema checks and upgrade
+    // pre-v3 tables without mutating the caller's backup file.
+    let dir = data_dir()?;
+    let staged_path = dir.join("cache.restore.staging.db");
+    if staged_path.exists() {
+        let _ = std::fs::remove_file(&staged_path);
+    }
+    std::fs::copy(source_path, &staged_path)?;
+    set_owner_only_file_permissions(&staged_path)?;
+
+    let validation_result = (|| -> AppResult<(Vec<CachedEstimate>, Vec<EstimateHistoryEntry>)> {
+        let src_conn = Connection::open(&staged_path)?;
+        let integrity: String = src_conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .map_err(|e| AppError::General(format!("invalid SQLite backup file: {e}")))?;
+        if !integrity.eq_ignore_ascii_case("ok") {
+            return Err(AppError::General(format!(
+                "backup database failed integrity check: {integrity}"
+            )));
+        }
+
+        let has_estimates_table: i64 = src_conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'estimates'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_estimates_table == 0 {
+            return Err(AppError::General(
+                "backup database does not contain an estimates table".to_string(),
+            ));
+        }
+
+        ensure_cache_schema(&src_conn)?;
+
+        let mut stmt = src_conn.prepare(
+            "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
+             cpu_instructions, memory_bytes, timestamp, execution_duration_ms, success, io_json, \
+             network_passphrase, core_version \
+             FROM estimates",
+        )?;
+        let rows = stmt.query_map([], estimate_from_row)?;
+        let mut restored_estimates = Vec::new();
+        for row in rows {
+            let entry = row?;
+            // Reject any entry written by a newer schema version before touching the active DB
+            let migrated = migrate_to_latest(entry)?;
+            restored_estimates.push(migrated);
+        }
+
+        let mut hist_stmt = src_conn.prepare(
+            "SELECT wasm_hash, function, network, ledger, total_stroops, \
+             cpu_instructions, memory_bytes, timestamp, io_json \
+             FROM estimate_history ORDER BY id ASC",
+        )?;
+        let hist_rows = hist_stmt.query_map([], |row| {
+            let io_json: Option<String> = row.get(8)?;
+            let io = io_json.and_then(|raw| serde_json::from_str(&raw).ok());
+            Ok(EstimateHistoryEntry {
+                wasm_hash: row.get(0)?,
+                function: row.get(1)?,
+                network: row.get(2)?,
+                ledger: row.get::<_, i64>(3)? as u32,
+                total_stroops: row.get(4)?,
+                cpu_instructions: row.get::<_, i64>(5)? as u64,
+                memory_bytes: row.get::<_, i64>(6)? as u64,
+                timestamp: row.get(7)?,
+                io,
+            })
+        })?;
+        let mut restored_history = Vec::new();
+        for row in hist_rows {
+            restored_history.push(row?);
+        }
+
+        Ok((restored_estimates, restored_history))
+    })();
+
+    let _ = std::fs::remove_file(&staged_path);
+    let (restored_estimates, restored_history) = validation_result?;
+
+    let _guard = WRITE_LOCK
+        .lock()
+        .map_err(|e| AppError::General(format!("cache write lock poisoned: {e}")))?;
+    let mut conn = open_db()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute("DELETE FROM estimates", [])?;
+    tx.execute("DELETE FROM estimate_history", [])?;
+
+    for entry in &restored_estimates {
+        let io_json = match entry.io {
+            Some(io) => Some(serde_json::to_string(&io)?),
+            None => None,
+        };
+        tx.execute(
+            "INSERT INTO estimates \
+             (version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
+              cpu_instructions, memory_bytes, timestamp, duration_ms, execution_duration_ms, \
+              network_passphrase, core_version, success, last_accessed, io_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            rusqlite::params![
+                CACHE_SCHEMA_VERSION as i64,
+                entry.wasm_hash,
+                entry.function,
+                entry.args_hash,
+                entry.network,
+                entry.ledger as i64,
+                entry.total_stroops,
+                entry.cpu_instructions as i64,
+                entry.memory_bytes as i64,
+                entry.timestamp,
+                entry.duration_ms().map(|v| v as i64),
+                entry.execution_duration_ms as i64,
+                entry.network_passphrase,
+                entry.core_version,
+                entry.success as i64,
+                entry.timestamp,
+                io_json,
+            ],
+        )?;
+    }
+
+    for hist in &restored_history {
+        let io_json = match hist.io {
+            Some(io) => Some(serde_json::to_string(&io)?),
+            None => None,
+        };
+        tx.execute(
+            "INSERT INTO estimate_history \
+             (wasm_hash, function, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, io_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                hist.wasm_hash,
+                hist.function,
+                hist.network,
+                hist.ledger as i64,
+                hist.total_stroops,
+                hist.cpu_instructions as i64,
+                hist.memory_bytes as i64,
+                hist.timestamp,
+                io_json,
+            ],
+        )?;
+    }
+
+    tx.commit()?;
+    debug!(
+        source = %source_path.display(),
+        entries = restored_estimates.len(),
+        "restored SQLite cache backup"
+    );
+    Ok(restored_estimates.len())
+}
+
 /// Integrity status of a single cache entry file.
 #[derive(Debug, Clone)]
 pub struct CacheEntryStatus {
