@@ -2842,6 +2842,86 @@ fn test_legacy_database_without_io_column_still_loads() {
     });
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// User-only cache directory and database permissions (#519)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_cache_creates_private_directory_and_database_without_altering_existing() {
+    with_temp_home(|home| {
+        let data_dir = home.join(".soroban-cost-estimator");
+        let db_path = data_dir.join("cache.db");
+        assert!(!data_dir.exists());
+
+        cache::save_estimate(
+            "perm_h",
+            "perm_fn",
+            &[],
+            "testnet",
+            1,
+            100,
+            10,
+            5,
+            None,
+            true,
+        )
+        .expect("save creates private dir and db");
+
+        assert!(data_dir.is_dir());
+        assert!(db_path.is_file());
+
+        // Calling create_private_file_if_missing on an existing file returns false
+        assert!(
+            !soroban_cost_estimator::paths::create_private_file_if_missing(&db_path)
+                .expect("check existing")
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(&data_dir)
+                .expect("dir metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700, "data directory must be 0700 on Unix");
+
+            let db_mode = std::fs::metadata(&db_path)
+                .expect("db metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(db_mode, 0o600, "new cache.db must be 0600 on Unix");
+
+            // Custom permissions on an existing database must not be silently altered
+            std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o640))
+                .expect("set custom 0640 mode");
+            cache::save_estimate(
+                "perm_h2",
+                "perm_fn2",
+                &[],
+                "testnet",
+                2,
+                200,
+                20,
+                10,
+                None,
+                true,
+            )
+            .expect("save on existing db");
+            let preserved_mode = std::fs::metadata(&db_path)
+                .expect("db metadata after second save")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                preserved_mode, 0o640,
+                "existing database permissions must not be silently altered"
+            );
+        }
+    });
+}
+
 /// A history log written before the footprint column existed is migrated in
 /// place, and its rows read back with an *unknown* footprint (#530) rather
 /// than a zeroed one.
