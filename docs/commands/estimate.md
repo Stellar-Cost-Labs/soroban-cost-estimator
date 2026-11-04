@@ -92,7 +92,16 @@ Network: testnet (ledger 3961551)
 Simulated at ledger sequence: 3,961,551
 WASM hash: ea14bca998e98f0ddb338e8e5cef6e19f07378a3b71e8b4f8868cedc857e4ecd
 
-+------------------+----------+---------------+
++------------------+----------+-----------failing checks
+
+    ci / Soroban contracts (pull_request)
+    ci / Soroban contracts (pull_request)Failing after 7m
+    ci / TypeScript build + tests (pull_request)
+    ci / TypeScript build + tests (pull_request)Failing after 38s
+    contracts / Foundry fuzz + invariant tests (pull_request)
+    contracts / Foundry fuzz + invariant tests (pull_request)Failing after 29s
+    Vercel – oversync
+    Vercel – oversync — Authorization required to deploy.----+
 | Resource         | Consumed | Fee (stroops) |
 +=============================================+
 | CPU Instructions | 524389   |               |
@@ -144,13 +153,27 @@ soroban-cost-estimator estimate \
   "fee": {
     "non_refundable_stroops": 4491,
     "refundable_stroops": 12631,
+    "cpu_fee_stroops": 360,
+    "storage_fee_stroops": 4020,
+    "bandwidth_fee_stroops": 11,
+    "base_fee_stroops": 100,
     "total_stroops": 17122,
-    "total_xlm": "0.0017122"
+    "total_xlm": "0.0017122",
+    "fee_percentages": {}
   },
   "ledger_sequence": 3961544,
-  "network": "testnet"
+  "network": "testnet",
+  "rpc_latency_ms": 84,
+  "warnings": [],
+  "contract_meta": {},
+  "suggestions": [],
+  "optimization_suggestions": []
 }
 ```
+
+(The example above is elided: real output also includes `wasm_size`, and
+optional keys like `history` appear when requested. The key sets and their
+compatibility guarantees are specified in the next section.)
 
 The `ledger_sequence` field records the ledger the simulation ran against,
 so consumers can tell how fresh an estimate is. The human-readable header
