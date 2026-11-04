@@ -1305,6 +1305,7 @@ impl RpcClient {
             Some(&self.last_attempt_count),
         )
         .await?;
+
         let status = response.status();
 
         // A 502/503/504 means the endpoint is briefly unavailable rather than
@@ -1893,7 +1894,7 @@ mod tests {
     #[tokio::test]
     async fn test_dedup_sequential_identical_requests() {
         let (url, counter) = spawn_json_rpc_stub(0).await;
-        let client = RpcClient::new(&url);
+        let client = RpcClient::new(&url, false);
         let params = serde_json::json!({"k": "v"});
 
         let _: Value = client
@@ -1939,7 +1940,7 @@ mod tests {
     #[tokio::test]
     async fn test_dedup_distinct_params_not_deduplicated() {
         let (url, counter) = spawn_json_rpc_stub(0).await;
-        let client = RpcClient::new(&url);
+        let client = RpcClient::new(&url, false);
 
         let _: Value = client
             .call("test.method", serde_json::json!({"k": 1}))
@@ -1960,7 +1961,7 @@ mod tests {
     #[tokio::test]
     async fn test_dedup_concurrent_identical_requests() {
         let (url, counter) = spawn_json_rpc_stub(0).await;
-        let client = Arc::new(RpcClient::new(&url));
+        let client = Arc::new(RpcClient::new(&url, false));
 
         let mut handles = Vec::new();
         for _ in 0..5 {
@@ -2055,7 +2056,7 @@ mod tests {
     #[tokio::test]
     async fn test_dedup_failed_leader_followers_retry() {
         let (url, counter) = spawn_json_rpc_stub(1).await;
-        let client = Arc::new(RpcClient::new(&url));
+        let client = Arc::new(RpcClient::new(&url, false));
 
         let params = serde_json::json!({"k": "v"});
         let task_a = {
@@ -2533,7 +2534,7 @@ mod tests {
     async fn test_health_check_ok_when_healthy() {
         let (url, _) =
             spawn_json_rpc_stub_with_result(0, r#"{"status":"healthy","latestLedger":42}"#).await;
-        let client = RpcClient::new(&url);
+        let client = RpcClient::new(&url, false);
 
         let meta = client
             .health_check()
@@ -2569,7 +2570,7 @@ mod tests {
     #[tokio::test]
     async fn test_health_check_errs_on_non_healthy_status() {
         let (url, _) = spawn_json_rpc_stub_with_result(0, r#"{"status":"degraded"}"#).await;
-        let client = RpcClient::new(&url);
+        let client = RpcClient::new(&url, false);
 
         let err = client
             .health_check()
