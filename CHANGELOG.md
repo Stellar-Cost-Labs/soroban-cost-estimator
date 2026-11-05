@@ -28,6 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cargo deny` plus `cargo audit`.
 - Added `.github/CODEOWNERS`, `.gitattributes`, `.github/dependabot.yml`, and a
   pull-request template with a supply-chain checklist.
+- Added `scripts/assert-no-known-bad.sh` and a `known-bad guard` CI job: the
+  build fails if either incident blob (the obfuscated fonts, the NUL-poisoned
+  `.gitignore`) or any removed path (`.vscode/`, `public/`, `test_comfy/`,
+  `target2/`) is reachable from **any** ref. The banned IDs are embedded in the
+  script and CI runs it from the base branch, so a pull request cannot widen the
+  allowlist.
 
 ### Added
 

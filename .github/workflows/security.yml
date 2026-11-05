@@ -101,6 +101,54 @@ jobs:
           } >>"${GITHUB_STEP_SUMMARY}"
           exit "${status}"
 
+  known-bad-guard:
+    name: known-bad guard
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out with full history
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch every branch
+        run: |
+          set -euo pipefail
+          # The guard inspects every ref, not just the one being built.
+          git fetch --no-tags --prune origin '+refs/heads/*:refs/remotes/origin/*'
+
+      - name: Load the guard (base branch on pull requests)
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "${BASE_REF}" ]; then
+            # A pull request must not be able to edit the guard that judges it.
+            if ! git show "origin/${BASE_REF}:scripts/assert-no-known-bad.sh" \
+              >"${RUNNER_TEMP}/guard.sh"; then
+              echo "::error::scripts/assert-no-known-bad.sh is missing on '${BASE_REF}'."
+              exit 1
+            fi
+            echo "Using the guard from origin/${BASE_REF}."
+          else
+            cp scripts/assert-no-known-bad.sh "${RUNNER_TEMP}/guard.sh"
+            echo "Using the guard from the pushed commit."
+          fi
+
+      - name: Assert no known-bad blob or removed path is reachable
+        run: |
+          set -uo pipefail
+          bash "${RUNNER_TEMP}/guard.sh" | tee "${RUNNER_TEMP}/guard.md"
+          status="${PIPESTATUS[0]}"
+          {
+            echo "## Known-bad guard"
+            echo
+            cat "${RUNNER_TEMP}/guard.md"
+          } >>"${GITHUB_STEP_SUMMARY}"
+          exit "${status}"
+
   supply-chain:
     name: supply chain (deny + audit)
     runs-on: ubuntu-latest
