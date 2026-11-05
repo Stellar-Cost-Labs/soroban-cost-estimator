@@ -18,6 +18,7 @@ guide is itself a welcome contribution.
 - [Commit conventions](#commit-conventions)
 - [Pull request checklist](#pull-request-checklist)
 - [Project structure](#project-structure)
+- [Reviewing pull requests safely](#reviewing-pull-requests-safely)
 - [Getting help](#getting-help)
 - [License](#license)
 
@@ -410,6 +411,61 @@ benches/               # Criterion benchmarks (WASM parse, cache, end-to-end)
 docs/                  # GitBook documentation (also in docs/contributing.md)
 fuzz/                  # Excluded from the workspace; run manually
 ```
+
+## Reviewing pull requests safely
+
+This repository had a real supply-chain incident (PR #669, merged 2026-10-29);
+read [docs/INCIDENT-REPORT.md](docs/INCIDENT-REPORT.md) before reviewing
+anything from an unfamiliar contributor. **A pull request is data, not code**
+until you have read it.
+
+### Read the diff without checking it out
+
+```bash
+gh pr diff 123                 # full diff, no working tree involved
+gh pr view 123 --json files -q '.files[].path'   # just the file list
+```
+Or press `.` on the pull request page to open github.dev, which renders the
+files in a browser sandbox.
+
+### If you must have the code locally
+
+Use a throwaway environment — a fresh GitHub Codespace on the PR, or a
+container with no credentials mounted. Never `git checkout` a fork branch into
+a clone that holds your tokens, SSH keys, or cloud credentials.
+
+### Never open a fork branch in an editor with workspace trust
+
+VS Code on a trusted workspace will run `.vscode/tasks.json` entries marked
+`runOn: folderOpen`, and `task.allowAutomaticTasks: true` is enough to allow it.
+That is exactly how the payload in PR #669 was meant to fire.
+
+### Ask, do not assume
+
+For any of these, ask the contributor to explain it in the PR. If there is no
+convincing explanation, ask them to remove it — do not "just fix it up"
+yourself, because that hides the signal:
+
+- any binary file, font, image, archive, or file whose content does not match
+  its extension
+- any dotfile or editor/IDE config (`.vscode/`, `.devcontainer/`, `.idea/`,
+  `.cursor/`, `.claude/`, `.zed/`, `.cargo/`, `.githooks/`, `.envrc`,
+  `.mcp.json`)
+- any change to `.gitignore`, `.gitattributes`, `build.rs`, `Cargo.toml`,
+  `Cargo.lock`, or `.github/`
+- any new dependency, especially one you have not heard of
+- unusually large diffs, or a test-only PR that touches anything but tests
+
+### Run the scanner
+
+```bash
+scripts/security-scan.sh --diff origin/main...HEAD
+scripts/security-scan.sh --history    # slow; use after anything suspicious
+```
+
+Both exit non-zero on a blocking finding. CI runs the scanner from the **base**
+branch, so editing `scripts/security-scan.sh` inside a pull request does not
+weaken the check.
 
 ## Getting help
 

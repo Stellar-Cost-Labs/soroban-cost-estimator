@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Removed a supply-chain payload that entered the repository through PR #669
+  (merged 2026-10-29): a VS Code task that ran on folder open, two files named
+  as web fonts whose contents were obfuscated JavaScript, a `.gitignore`
+  rewritten with NUL bytes so its diff rendered as binary, and roughly 149 MB
+  of committed build output. The published crate `0.1.0` and the `v0.1.0` tag
+  predate the change, and no source, build input, or workflow file was
+  modified by it. Details and indicators of compromise are in
+  [docs/INCIDENT-REPORT.md](docs/INCIDENT-REPORT.md).
+- Added `scripts/security-scan.sh`, a structural scanner that fails on text
+  hidden behind a binary extension, NUL bytes in text or config files,
+  committed ELF/PE binaries, editor auto-run hooks, and download-and-execute
+  patterns. It scans a commit range (`--diff <base>..<head>`) or every ref and
+  blob (`--history`).
+- Added `.github/workflows/security.yml`: a pull-request gate that runs the
+  scanner **from the base branch** against the PR range, with `contents: read`
+  permissions, no `pull_request_target`, actions pinned to commit SHAs, and
+  `cargo deny` plus `cargo audit`.
+- Added `.github/CODEOWNERS`, `.gitattributes`, `.github/dependabot.yml`, and a
+  pull-request template with a supply-chain checklist.
+
 ### Added
 
 - `config snapshot --skip-unchanged` — compare the fetched configuration with
@@ -58,6 +80,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshots against each other without contacting the live network. Works
   offline, honors `--summary` and `--json`, and errors with the snapshot count
   when fewer than two exist for the network.
+
+### Removed
+
+- `.vscode/`, `public/` (unrelated Font Awesome assets and a README for an
+  application that does not exist in this repository), and `test_comfy/` (a
+  nested crate with committed `target/` output, ~149 MB).
 - `config snapshot --retain <N>` — keep only the N most recent snapshots for a
   network, pruning older ones after the new snapshot is safely on disk.
 - `config snapshot prune --older-than <DAYS>` — delete snapshots recorded more
