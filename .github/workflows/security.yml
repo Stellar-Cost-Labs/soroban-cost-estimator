@@ -1,0 +1,124 @@
+name: Security
+
+# Runs on pull_request only (never pull_request_target): the workflow runs the
+# scanner as it exists on the BASE branch, so a PR cannot weaken its own gate.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  structural-scan:
+    name: structural scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the pull request head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch the base branch
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --prune origin \
+            "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+
+      - name: Load the scanner from the base branch
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          # Deliberately NOT the copy in the pull request: a PR must not be
+          # able to edit the check that judges it.
+          if ! git show "origin/${BASE_REF}:scripts/security-scan.sh" \
+            >"${RUNNER_TEMP}/security-scan.sh"; then
+            echo "::error::scripts/security-scan.sh is missing on '${BASE_REF}'."
+            echo "Land the security scanner on main before opening further PRs."
+            exit 1
+          fi
+          chmod +x "${RUNNER_TEMP}/security-scan.sh"
+          echo "Using scanner from origin/${BASE_REF} ($(wc -c <"${RUNNER_TEMP}/security-scan.sh") bytes)."
+
+      - name: Run the structural scan
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          APPROVED: ${{ contains(github.event.pull_request.labels.*.name, 'security-review-approved') }}
+        run: |
+          set -uo pipefail
+          args=(--diff "origin/${BASE_REF}...HEAD")
+          if [ "${APPROVED}" = "true" ]; then
+            echo "::notice::'security-review-approved' label present — REVIEW findings recorded as notes."
+            args+=(--allow-review)
+          fi
+
+          bash "${RUNNER_TEMP}/security-scan.sh" "${args[@]}" | tee "${RUNNER_TEMP}/scan.md"
+          status="${PIPESTATUS[0]}"
+
+          {
+            echo "## Structural security scan"
+            echo
+            cat "${RUNNER_TEMP}/scan.md"
+          } >>"${GITHUB_STEP_SUMMARY}"
+
+          exit "${status}"
+
+      - name: Scan the pushed commit range on main
+        if: github.event_name == 'push'
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          if [ "${BEFORE}" = "0000000000000000000000000000000000000000" ]; then
+            echo "New branch push — no range to compare."
+            exit 0
+          fi
+          # Already-merged commits: record review-required paths as notes
+          # rather than failing a merge the maintainer just performed.
+          bash scripts/security-scan.sh --allow-review --diff "${BEFORE}..${AFTER}" \
+            | tee "${RUNNER_TEMP}/scan.md"
+          status="${PIPESTATUS[0]}"
+          {
+            echo "## Structural security scan (push to main)"
+            echo
+            cat "${RUNNER_TEMP}/scan.md"
+          } >>"${GITHUB_STEP_SUMMARY}"
+          exit "${status}"
+
+  supply-chain:
+    name: supply chain (deny + audit)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: cargo deny
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check
+          arguments: --all-features
+
+      - name: cargo audit
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
