@@ -1,0 +1,30 @@
+# Keep text files text: normalize line endings and stop the "Binary files
+# differ" rendering from hiding a payload inside a text diff.
+* text=auto eol=lf
+
+*.rs     text diff=rust
+*.toml   text
+*.md     text
+*.yml    text
+*.yaml   text
+*.json   text
+*.sh     text
+.gitignore     text
+.gitattributes text
+
+# Genuine binaries. Anything here that is actually text is a red flag, and
+# scripts/security-scan.sh fails on it.
+*.wasm   binary
+*.ttf    binary
+*.otf    binary
+*.woff   binary
+*.woff2  binary
+*.eot    binary
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.ico    binary
+*.pdf    binary
+*.zip    binary
+*.gz     binary
