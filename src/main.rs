@@ -865,18 +865,29 @@ fn fee_rates_from_config(
     verbose: bool,
     quiet: bool,
 ) -> report::fee_calc::FeeRates {
+    fee_rates_from_config_with_provenance(config, verbose, quiet).0
+}
+
+fn fee_rates_from_config_with_provenance(
+    config: Option<&rpc::config::NetworkConfig>,
+    verbose: bool,
+    quiet: bool,
+) -> (
+    report::fee_calc::FeeRates,
+    report::cost_report::FeeRateProvenance,
+) {
+    use rpc::config::ConfigSettingId;
     use tracing::{debug, warn};
 
-    use rpc::config::ConfigSettingId;
-
     let mut degraded: Vec<&'static str> = Vec::new();
+    let mut fetched_sources: Vec<(&'static str, Option<u32>)> = Vec::new();
 
-    // Decode one config setting, recording it as degraded when the config is
-    // absent, the setting is missing, or its XDR does not decode.
-    let decode = |id: ConfigSettingId| -> Option<stellar_xdr::ConfigSettingEntry> {
+    // Decode one config setting, returning both the decoded XDR entry and its
+    // RPC source ledger (`latestLedger`), or `None` when absent/undecodable.
+    let decode = |id: ConfigSettingId| -> Option<(stellar_xdr::ConfigSettingEntry, Option<u32>)> {
         let raw = config?.get(id).ok()?;
         match xdr_helper::decode_config_entry_xdr(&raw.config_xdr, verbose) {
-            Ok(entry) => Some(entry),
+            Ok(entry) => Some((entry, raw.source_ledger)),
             Err(e) => {
                 debug!(setting = id.human_name(), error = %e, "config entry decode failed");
                 None
@@ -887,7 +898,8 @@ fn fee_rates_from_config(
     // ConfigSettingContractComputeV0.fee_rate_per_instructions_increment
     // is stroops per 10,000 instructions (not per instruction).
     let compute_per_10k = match decode(ConfigSettingId::ContractComputeV0) {
-        Some(stellar_xdr::ConfigSettingEntry::ContractComputeV0(s)) => {
+        Some((stellar_xdr::ConfigSettingEntry::ContractComputeV0(s), source_ledger)) => {
+            fetched_sources.push(("ContractComputeV0", source_ledger));
             s.fee_rate_per_instructions_increment
         }
         _ => {
@@ -897,14 +909,17 @@ fn fee_rates_from_config(
     };
 
     // ConfigSettingContractLedgerCostV0: per-entry read/write fees and the
-    // per-KB disk read fee â€” all part of the non-refundable fee in
+    // per-KB disk read fee — all part of the non-refundable fee in
     // stellar-core's resource fee model.
     let (read_entry, write_entry, read_1kb) = match decode(ConfigSettingId::ContractLedgerCostV0) {
-        Some(stellar_xdr::ConfigSettingEntry::ContractLedgerCostV0(s)) => (
-            s.fee_disk_read_ledger_entry,
-            s.fee_write_ledger_entry,
-            s.fee_disk_read1_kb,
-        ),
+        Some((stellar_xdr::ConfigSettingEntry::ContractLedgerCostV0(s), source_ledger)) => {
+            fetched_sources.push(("ContractLedgerCostV0", source_ledger));
+            (
+                s.fee_disk_read_ledger_entry,
+                s.fee_write_ledger_entry,
+                s.fee_disk_read1_kb,
+            )
+        }
         _ => {
             degraded.push("ContractLedgerCostV0");
             (0, 0, 0)
@@ -914,7 +929,10 @@ fn fee_rates_from_config(
     // ConfigSettingContractBandwidthV0.fee_tx_size1_kb
     // is stroops per 1KB of tx size (not per byte).
     let bandwidth_per_kb = match decode(ConfigSettingId::ContractBandwidthV0) {
-        Some(stellar_xdr::ConfigSettingEntry::ContractBandwidthV0(s)) => s.fee_tx_size1_kb,
+        Some((stellar_xdr::ConfigSettingEntry::ContractBandwidthV0(s), source_ledger)) => {
+            fetched_sources.push(("ContractBandwidthV0", source_ledger));
+            s.fee_tx_size1_kb
+        }
         _ => {
             degraded.push("ContractBandwidthV0");
             0
@@ -922,10 +940,10 @@ fn fee_rates_from_config(
     };
 
     if !degraded.is_empty() {
-        warn!(sources = ?degraded, "fee rate source(s) unavailable â€” affected rate(s) set to 0");
+        warn!(sources = ?degraded, "fee rate source(s) unavailable — affected rate(s) set to 0");
         if !quiet {
             eprintln!(
-                "Warning: fee rate source(s) {} unavailable â€” affected rate(s) set to 0 (non-refundable fee understated)",
+                "Warning: fee rate source(s) {} unavailable — affected rate(s) set to 0 (non-refundable fee understated)",
                 degraded.join(", ")
             );
         }
@@ -938,8 +956,10 @@ fn fee_rates_from_config(
         fee_per_read_1kb: read_1kb,
         fee_per_1kb: bandwidth_per_kb,
     };
-    debug!(?rates, "fetched fee rates");
-    rates
+    let provenance =
+        report::cost_report::FeeRateProvenance::from_sources(&fetched_sources, &degraded);
+    debug!(?rates, ?provenance, "fetched fee rates");
+    (rates, provenance)
 }
 
 /// Outcome of one `estimate` run, letting the caller decide how to render it.
@@ -1147,7 +1167,8 @@ async fn simulate_report(
     // One batched config fetch for the whole run, reused by every fee
     // evaluation below.
     let config_cache = fetch_config_cache(&client).await;
-    let fee_rates = fee_rates_from_config(config_cache.peek(), req.verbose, req.quiet);
+    let (fee_rates, fee_rate_provenance) =
+        fee_rates_from_config_with_provenance(config_cache.peek(), req.verbose, req.quiet);
 
     let fee = report::fee_calc::compute_fee_breakdown(
         total_fee_stroops,
@@ -1206,6 +1227,7 @@ async fn simulate_report(
         history: None,
         projections: None,
         contract_meta: req.contract_meta.clone(),
+        fee_rate_provenance: Some(fee_rate_provenance),
         diagnostics,
     })
 }
@@ -1738,7 +1760,8 @@ async fn cmd_estimate_repeat(
 
             if iteration == 1 {
                 let config_cache = fetch_config_cache(&client).await;
-                let fee_rates = fee_rates_from_config(config_cache.peek(), verbose, quiet);
+                let (fee_rates, fee_rate_provenance) =
+                    fee_rates_from_config_with_provenance(config_cache.peek(), verbose, quiet);
                 let fee = report::fee_calc::compute_fee_breakdown(
                     total_fee_stroops,
                     cpu_instructions,
@@ -1791,6 +1814,7 @@ async fn cmd_estimate_repeat(
                     history: None,
                     projections: None,
                     contract_meta: wasm_info.contract_meta.clone(),
+                    fee_rate_provenance: Some(fee_rate_provenance),
                     diagnostics: None,
                 });
             }
@@ -6683,6 +6707,7 @@ mod tests {
                     id: **id,
                     config_xdr: "x".to_string(),
                     last_modified_ledger: *ledger,
+                    source_ledger: None,
                 })
                 .collect(),
             latest_ledger,
@@ -7365,6 +7390,7 @@ mod tests {
             history: None,
             projections: None,
             contract_meta: soroban_cost_estimator::wasm::parser::ContractMeta::default(),
+            fee_rate_provenance: None,
             diagnostics: None,
         }
     }
