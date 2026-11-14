@@ -580,75 +580,88 @@ pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
     // when set before the first table is created, which is the case for new
     // databases; existing databases keep their current setting.
     conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS estimates (
-            version          INTEGER NOT NULL,
-            wasm_hash        TEXT NOT NULL,
-            function         TEXT NOT NULL,
-            args_hash        TEXT NOT NULL,
-            network          TEXT NOT NULL,
-            ledger           INTEGER NOT NULL,
-            total_stroops    INTEGER NOT NULL,
-            cpu_instructions INTEGER NOT NULL,
-            memory_bytes     INTEGER NOT NULL,
-            timestamp        TEXT NOT NULL,
-            duration_ms      INTEGER,
-            execution_duration_ms INTEGER NOT NULL DEFAULT 0,
-            network_passphrase TEXT,
-            core_version     TEXT,
-            success          INTEGER NOT NULL DEFAULT 1,
-            last_accessed    TEXT NOT NULL DEFAULT '',
-            io_json          TEXT,
-            PRIMARY KEY (wasm_hash, function, args_hash)
-        );",
-    )?;
-    // Append-only log of every estimate ever saved, used by `estimate
-    // --history` to show how a function's cost evolved across runs (#321).
-    // The `estimates` table upserts on its primary key, so it cannot answer
-    // "what did this function cost last build?" on its own.
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS estimate_history (
-            id               INTEGER PRIMARY KEY AUTOINCREMENT,
-            wasm_hash        TEXT NOT NULL,
-            function         TEXT NOT NULL,
-            network          TEXT NOT NULL,
-            ledger           INTEGER NOT NULL,
-            total_stroops    INTEGER NOT NULL,
-            cpu_instructions INTEGER NOT NULL,
-            memory_bytes     INTEGER NOT NULL,
-            timestamp        TEXT NOT NULL,
-            io_json          TEXT
+    conn.execute_batch("SAVEPOINT soroban_schema_migration;")?;
+    let migration_result = (|| -> AppResult<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS estimates (
+                version          INTEGER NOT NULL,
+                wasm_hash        TEXT NOT NULL,
+                function         TEXT NOT NULL,
+                args_hash        TEXT NOT NULL,
+                network          TEXT NOT NULL,
+                ledger           INTEGER NOT NULL,
+                total_stroops    INTEGER NOT NULL,
+                cpu_instructions INTEGER NOT NULL,
+                memory_bytes     INTEGER NOT NULL,
+                timestamp        TEXT NOT NULL,
+                duration_ms      INTEGER,
+                execution_duration_ms INTEGER NOT NULL DEFAULT 0,
+                network_passphrase TEXT,
+                core_version     TEXT,
+                success          INTEGER NOT NULL DEFAULT 1,
+                last_accessed    TEXT NOT NULL DEFAULT '',
+                io_json          TEXT,
+                PRIMARY KEY (wasm_hash, function, args_hash)
+            );",
+        )?;
+        // Append-only log of every estimate ever saved, used by `estimate
+        // --history` to show how a function's cost evolved across runs (#321).
+        // The `estimates` table upserts on its primary key, so it cannot answer
+        // "what did this function cost last build?" on its own.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS estimate_history (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                wasm_hash        TEXT NOT NULL,
+                function         TEXT NOT NULL,
+                network          TEXT NOT NULL,
+                ledger           INTEGER NOT NULL,
+                total_stroops    INTEGER NOT NULL,
+                cpu_instructions INTEGER NOT NULL,
+                memory_bytes     INTEGER NOT NULL,
+                timestamp        TEXT NOT NULL,
+                io_json          TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_estimate_history_lookup
+                ON estimate_history (wasm_hash, function, timestamp DESC);",
+        )?;
+        // The history log records the ledger I/O footprint of each run too, so a
+        // later trend table can explain a fee change by the I/O it came from
+        // (#530). Nullable and additive: rows written before this column existed
+        // keep a NULL footprint, which reads back as "unavailable", never as zero.
+        ensure_table_column(conn, "estimate_history", "io_json", "TEXT")?;
+        // Migrate a pre-v3 table (created before LRU access tracking) in place.
+        ensure_column(conn, "last_accessed", "TEXT NOT NULL DEFAULT ''")?;
+        // The ledger I/O footprint is additive and nullable, so adding it in
+        // place keeps older databases readable without a schema-version bump.
+        ensure_column(conn, "io_json", "TEXT")?;
+        ensure_column(conn, "execution_duration_ms", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(conn, "network_passphrase", "TEXT")?;
+        ensure_column(conn, "core_version", "TEXT")?;
+        let _ = conn.execute(
+            "UPDATE estimates SET execution_duration_ms = duration_ms WHERE execution_duration_ms = 0 AND duration_ms IS NOT NULL",
+            [],
         );
-        CREATE INDEX IF NOT EXISTS idx_estimate_history_lookup
-            ON estimate_history (wasm_hash, function, timestamp DESC);",
-    )?;
-    // The history log records the ledger I/O footprint of each run too, so a
-    // later trend table can explain a fee change by the I/O it came from
-    // (#530). Nullable and additive: rows written before this column existed
-    // keep a NULL footprint, which reads back as "unavailable", never as zero.
-    ensure_table_column(conn, "estimate_history", "io_json", "TEXT")?;
-    // Migrate a pre-v3 table (created before LRU access tracking) in place.
-    ensure_column(conn, "last_accessed", "TEXT NOT NULL DEFAULT ''")?;
-    // The ledger I/O footprint is additive and nullable, so adding it in
-    // place keeps older databases readable without a schema-version bump.
-    ensure_column(conn, "io_json", "TEXT")?;
-    ensure_column(conn, "execution_duration_ms", "INTEGER NOT NULL DEFAULT 0")?;
-    ensure_column(conn, "network_passphrase", "TEXT")?;
-    ensure_column(conn, "core_version", "TEXT")?;
-    let _ = conn.execute(
-        "UPDATE estimates SET execution_duration_ms = duration_ms WHERE execution_duration_ms = 0 AND duration_ms IS NOT NULL",
-        [],
-    );
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_estimates_lookup
-             ON estimates (wasm_hash, function);
-         CREATE INDEX IF NOT EXISTS idx_estimates_network_created
-             ON estimates (network, timestamp DESC);
-         CREATE INDEX IF NOT EXISTS idx_estimates_key_net_created
-             ON estimates (wasm_hash, function, network, timestamp DESC);
-         CREATE INDEX IF NOT EXISTS idx_estimates_last_accessed
-             ON estimates (last_accessed);",
-    )?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_estimates_lookup
+                 ON estimates (wasm_hash, function);
+             CREATE INDEX IF NOT EXISTS idx_estimates_network_created
+                 ON estimates (network, timestamp DESC);
+             CREATE INDEX IF NOT EXISTS idx_estimates_key_net_created
+                 ON estimates (wasm_hash, function, network, timestamp DESC);
+             CREATE INDEX IF NOT EXISTS idx_estimates_last_accessed
+                 ON estimates (last_accessed);",
+        )?;
+        Ok(())
+    })();
+
+    if let Err(err) = migration_result {
+        let _ = conn.execute_batch(
+            "ROLLBACK TO SAVEPOINT soroban_schema_migration; \
+             RELEASE SAVEPOINT soroban_schema_migration;",
+        );
+        return Err(err);
+    }
+    conn.execute_batch("RELEASE SAVEPOINT soroban_schema_migration;")?;
     enable_wal_if_possible(conn);
     Ok(())
 }
