@@ -540,6 +540,7 @@ async fn fallback_success_records_provenance_and_scrubs_credentials_in_cost_repo
         history: None,
         projections: None,
         contract_meta: ContractMeta::default(),
+        fee_rate_provenance: None,
         diagnostics: None,
     };
 
