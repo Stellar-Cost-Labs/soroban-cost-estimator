@@ -267,6 +267,7 @@ async fn run_cli() -> i32 {
 
     cli::init_color(args.color);
     cli::init_quiet(args.quiet);
+    cli::init_recover_corrupt_cache(args.recover_corrupt_cache);
 
     let default_level = if args.quiet {
         "warn"

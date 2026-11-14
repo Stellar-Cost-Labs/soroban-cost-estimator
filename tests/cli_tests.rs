@@ -5895,3 +5895,87 @@ fn test_cache_delete_all_cannot_be_combined_with_a_filter() {
         "a rejected deletion must not remove anything"
     );
 }
+
+#[test]
+fn test_recover_corrupt_cache_cli_flag_and_json_schema() {
+    let home = temp_home("cli-recover-corrupt-cache-e2e");
+    let dir = home.join(".soroban-cost-estimator");
+    std::fs::create_dir_all(&dir).expect("create data dir");
+    let db = dir.join("cache.db");
+    let corrupt_payload = b"CORRUPT SQLITE HEADER FOR E2E CLI RECOVERY TEST";
+    std::fs::write(&db, corrupt_payload).expect("write corrupt cache.db");
+
+    // 1. Without `--recover-corrupt-cache`, CLI refuses to touch the corrupt file and hints the flag.
+    let (_stdout, stderr, code) = run_cli_quiet(&["cache", "list"], Some(&home));
+    assert_ne!(code, 0, "corrupt cache without recovery flag must fail");
+    assert!(
+        stderr.contains("--recover-corrupt-cache"),
+        "stderr must guide user to --recover-corrupt-cache; got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&db).expect("corrupt db preserved"),
+        corrupt_payload
+    );
+
+    // 2. Passing global `--recover-corrupt-cache` quarantines the corrupt file and succeeds end-to-end.
+    let (stdout, stderr, code) =
+        run_cli_quiet(&["--recover-corrupt-cache", "cache", "list"], Some(&home));
+    assert_eq!(
+        code, 0,
+        "--recover-corrupt-cache should quarantine and succeed; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("No cached estimates"),
+        "freshly recovered cache should list empty; got: {stdout}"
+    );
+    let backups: Vec<_> = std::fs::read_dir(&dir)
+        .expect("read data dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("cache.db.corrupt."))
+        })
+        .collect();
+    assert_eq!(
+        backups.len(),
+        1,
+        "expected exactly one quarantined backup from --recover-corrupt-cache"
+    );
+    assert_eq!(
+        std::fs::read(&backups[0]).expect("read quarantined backup"),
+        corrupt_payload
+    );
+
+    // 3. `cache recover --json` emits the unified non-duplicated JSON schema.
+    let home_json = temp_home("cli-cache-recover-json-schema");
+    let dir_json = home_json.join(".soroban-cost-estimator");
+    std::fs::create_dir_all(&dir_json).expect("create json data dir");
+    std::fs::write(dir_json.join("cache.db"), corrupt_payload).expect("write corrupt db for json");
+
+    let (stdout_j, stderr_j, code_j) =
+        run_cli_quiet(&["cache", "recover", "--json"], Some(&home_json));
+    assert_eq!(
+        code_j, 0,
+        "cache recover --json should exit 0; stderr: {stderr_j}"
+    );
+    let obj = serde_json::from_str::<serde_json::Value>(stdout_j.trim())
+        .expect("valid JSON from cache recover --json")
+        .as_object()
+        .cloned()
+        .expect("JSON object");
+    let mut keys: Vec<String> = obj.keys().cloned().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "backup_path",
+            "new_path",
+            "notice",
+            "original_path",
+            "sidecars_quarantined"
+        ],
+        "CacheRecoveryReport JSON must contain only unified canonical fields"
+    );
+}
