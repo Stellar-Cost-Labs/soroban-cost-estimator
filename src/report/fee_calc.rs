@@ -8,27 +8,134 @@ pub const DEFAULT_PRECISION: u32 = 7;
 /// The fee breakdown for a single simulation.
 ///
 /// All values are in stroops (1 stroop = 10^{-7} XLM).
+///
+/// # Component provenance and limitations
+/// * `cpu_fee_stroops`, `storage_fee_stroops`, `bandwidth_fee_stroops` —
+///   locally derived from consumed resources and the network's
+///   `ConfigSettingContract*` rate entries (`non_refundable_stroops` is their sum).
+/// * `refundable_stroops` — inferred remainder of the authoritative RPC
+///   resource fee (`max(total_resource_fee - non_refundable_stroops, 0)`).
+///   Because `simulateTransaction` reports a single combined `minResourceFee`
+///   without splitting ledger rent bumps from contract/diagnostic event fees,
+///   this value is the total refundable resource fee (rent + events remainder),
+///   **not** a standalone protocol-measured rent figure.
+/// * `base_fee_stroops` — fixed 100-stroop Stellar base inclusion fee when the
+///   resource fee is positive (`0` when the RPC omitted the fee).
+/// * `total_stroops` — authoritative RPC resource fee plus `base_fee_stroops`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeeBreakdown {
-    /// Non-refundable resource fee (charged regardless of success).
+    /// Non-refundable resource fee (CPU + storage I/O + bandwidth, derived from network config rates).
     pub non_refundable_stroops: i64,
-    /// Refundable resource fee (refunded if not fully consumed).
+    /// Inferred refundable resource fee remainder (`max(resource_fee - non_refundable, 0)`),
+    /// covering ledger rent bumps and contract events together.
     pub refundable_stroops: i64,
-    /// CPU instruction fee (subset of non-refundable).
+    /// CPU instruction fee (rate-derived subset of non-refundable).
     pub cpu_fee_stroops: i64,
     /// Storage I/O fee — read entries + write entries + disk read bytes
-    /// (subset of non-refundable).
+    /// (rate-derived subset of non-refundable).
     pub storage_fee_stroops: i64,
-    /// Transaction size / bandwidth fee (subset of non-refundable).
+    /// Transaction size / bandwidth fee (rate-derived subset of non-refundable).
     pub bandwidth_fee_stroops: i64,
-    /// Base inclusion fee.
+    /// Base inclusion fee (100 stroops when resource fee > 0).
     pub base_fee_stroops: i64,
-    /// Total resource fee.
+    /// Authoritative total fee (`resource_fee + base_fee_stroops`).
     pub total_stroops: i64,
     /// Total fee in XLM (as a string to avoid float precision issues).
     pub total_xlm: String,
     /// Percentage contribution of each fee component, summing to exactly 100.0%.
     pub fee_percentages: std::collections::BTreeMap<String, String>,
+}
+
+/// How a displayed fee component was obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeeComponentOrigin {
+    /// Derived locally from resource counts and `ConfigSettingContract*` rates.
+    RateDerivedNonRefundable,
+    /// Inferred as `max(authoritative_resource_fee - non_refundable_stroops, 0)`;
+    /// combines ledger rent extensions and contract event fees.
+    InferredRefundableRemainder,
+    /// Fixed protocol base inclusion fee (100 stroops per operation).
+    ProtocolFixedBaseFee,
+    /// Authoritative simulation resource fee plus the base inclusion fee.
+    AuthoritativeTotal,
+}
+
+/// Self-describing fee component record documenting its label, stroop amount,
+/// share of the total, data source, and measurement limitations (#526).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeeComponentSemantics {
+    /// Machine-readable component key.
+    pub key: String,
+    /// Accurate human-readable label that does not overstate RPC granularity.
+    pub label: String,
+    /// Component fee in stroops.
+    pub stroops: i64,
+    /// Formatted percentage share of `total_stroops` (e.g. `"70.4%"`).
+    pub percentage: String,
+    /// Provenance category for this component.
+    pub origin: FeeComponentOrigin,
+    /// Explanation of how the value is computed and any protocol limitation.
+    pub limitation: String,
+}
+
+impl FeeBreakdown {
+    /// Return the documented semantics and provenance for every displayed fee
+    /// component (#526).
+    ///
+    /// Explicitly distinguishes the inferred refundable remainder (rent +
+    /// events) from a measured rent fee.
+    #[must_use]
+    pub fn component_semantics(&self) -> Vec<FeeComponentSemantics> {
+        let pct = |key: &str| {
+            self.fee_percentages
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| "0.0%".to_string())
+        };
+        vec![
+            FeeComponentSemantics {
+                key: "cpu_instructions".to_string(),
+                label: "CPU Instructions".to_string(),
+                stroops: self.cpu_fee_stroops,
+                percentage: pct("cpu_instructions"),
+                origin: FeeComponentOrigin::RateDerivedNonRefundable,
+                limitation: "Derived locally from simulated CPU instructions and ConfigSettingContractComputeV0; floor-divided per 10,000 instructions.".to_string(),
+            },
+            FeeComponentSemantics {
+                key: "storage_read_write".to_string(),
+                label: "Storage I/O".to_string(),
+                stroops: self.storage_fee_stroops,
+                percentage: pct("storage_read_write"),
+                origin: FeeComponentOrigin::RateDerivedNonRefundable,
+                limitation: "Derived locally from footprint read/write entries and disk read bytes using ConfigSettingContractLedgerCostV0.".to_string(),
+            },
+            FeeComponentSemantics {
+                key: "transaction_size".to_string(),
+                label: "Transaction Size".to_string(),
+                stroops: self.bandwidth_fee_stroops,
+                percentage: pct("transaction_size"),
+                origin: FeeComponentOrigin::RateDerivedNonRefundable,
+                limitation: "Derived locally from XDR envelope byte length and ConfigSettingContractBandwidthV0.".to_string(),
+            },
+            FeeComponentSemantics {
+                key: "base_fee".to_string(),
+                label: "Base Fee".to_string(),
+                stroops: self.base_fee_stroops,
+                percentage: pct("base_fee"),
+                origin: FeeComponentOrigin::ProtocolFixedBaseFee,
+                limitation: "Fixed 100-stroop network base inclusion fee added when the simulation reports a positive resource fee.".to_string(),
+            },
+            FeeComponentSemantics {
+                key: "refundable_resource_fee".to_string(),
+                label: "Refundable Fee (rent + events remainder)".to_string(),
+                stroops: self.refundable_stroops,
+                percentage: pct("rent"),
+                origin: FeeComponentOrigin::InferredRefundableRemainder,
+                limitation: "Inferred as max(minResourceFee - non_refundable_stroops, 0); combines ledger rent bumps and contract events because simulateTransaction does not itemize rent separately.".to_string(),
+            },
+        ]
+    }
 }
 
 /// Fee rates sourced from the network's `ConfigSettingContract*` entries.
