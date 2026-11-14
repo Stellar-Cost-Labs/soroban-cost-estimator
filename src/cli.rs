@@ -587,6 +587,14 @@ pub enum CacheAction {
         #[arg(long)]
         wasm_hash: Option<String>,
 
+        /// Minimum total fee in stroops (--min-stroops, --min-fee).
+        #[arg(long = "min-fee", visible_alias = "min-stroops", value_name = "FEE")]
+        min_fee: Option<i64>,
+
+        /// Maximum total fee in stroops (--max-stroops, --max-fee).
+        #[arg(long = "max-fee", visible_alias = "max-stroops", value_name = "FEE")]
+        max_fee: Option<i64>,
+
         /// Earliest timestamp or date.
         #[arg(long = "since", visible_alias = "from", value_name = "DATE/TIME")]
         since: Option<String>,
