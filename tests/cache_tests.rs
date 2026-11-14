@@ -2842,6 +2842,122 @@ fn test_legacy_database_without_io_column_still_loads() {
     });
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Consistent SQLite backup and restore workflow (#520)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_sqlite_backup_during_writes_and_restore_into_empty_location() {
+    with_temp_home(|home| {
+        for idx in 0..5u32 {
+            cache::save_estimate(
+                &format!("hash_b_{idx}"),
+                "fn_backup",
+                &[],
+                "testnet",
+                100 + idx,
+                1_000 + i64::from(idx),
+                500,
+                128,
+                None,
+                true,
+            )
+            .expect("seed entry");
+        }
+
+        // Spawn a background writer thread while taking an online backup
+        let writer = std::thread::spawn(|| {
+            for idx in 5..10u32 {
+                cache::save_estimate(
+                    &format!("hash_b_{idx}"),
+                    "fn_backup",
+                    &[],
+                    "testnet",
+                    100 + idx,
+                    1_000 + i64::from(idx),
+                    500,
+                    128,
+                    None,
+                    true,
+                )
+                .expect("concurrent writer save");
+            }
+        });
+
+        let backup_file = home.join("cache_online_backup.sqlite");
+        let backed_up = cache::backup_cache_db(&backup_file).expect("online backup");
+        writer.join().expect("writer finished");
+        assert!(
+            (5..=10).contains(&backed_up),
+            "online backup should capture a consistent snapshot of 5..=10 rows, got {backed_up}"
+        );
+
+        // Wipe the active cache directory to simulate restoring into an empty location
+        let data_dir = home.join(".soroban-cost-estimator");
+        let _ = std::fs::remove_dir_all(&data_dir);
+        assert!(
+            cache::list_all_cached_estimates()
+                .expect("list empty")
+                .is_empty()
+        );
+
+        let restored = cache::restore_cache_db(&backup_file).expect("restore into empty location");
+        assert_eq!(restored, backed_up);
+
+        let all = cache::list_all_cached_estimates().expect("list after restore");
+        assert_eq!(all.len(), restored);
+    });
+}
+
+#[test]
+fn test_sqlite_restore_rejects_incompatible_data_and_preserves_active_database() {
+    with_temp_home(|home| {
+        cache::save_estimate(
+            "active_hash",
+            "active_fn",
+            &[],
+            "testnet",
+            99,
+            7_777,
+            250,
+            64,
+            None,
+            true,
+        )
+        .expect("save active entry");
+
+        // 1. Non-SQLite / corrupt file is rejected and active DB stays intact
+        let bad_file = home.join("not_a_sqlite_db.sqlite");
+        std::fs::write(&bad_file, b"not a valid sqlite file").expect("write bad file");
+        assert!(cache::restore_cache_db(&bad_file).is_err());
+
+        // 2. Backup containing a future schema version is rejected before touching active DB
+        let future_backup = home.join("future_schema_backup.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&future_backup).expect("open future backup");
+            cache::ensure_cache_schema(&conn).expect("ensure schema");
+            conn.execute(
+                "INSERT INTO estimates \
+                 (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp, success, last_accessed) \
+                 VALUES (?1, 'future_h', 'future_fn', 'args', 'testnet', 1, 100, 10, 5, '2026-01-01T00:00:00Z', 1, '2026-01-01T00:00:00Z')",
+                rusqlite::params![(cache::CACHE_SCHEMA_VERSION + 1) as i64],
+            )
+            .expect("insert future row");
+        }
+        assert!(
+            cache::restore_cache_db(&future_backup).is_err(),
+            "future schema backup must be rejected"
+        );
+
+        // Verify original active estimate is untouched
+        let active = cache::load_estimate("active_hash", "active_fn", &[])
+            .expect("load active")
+            .expect("active entry must still exist");
+        assert_eq!(active.ledger, 99);
+        assert_eq!(active.total_stroops, 7_777);
+    });
+}
+
 /// A history log written before the footprint column existed is migrated in
 /// place, and its rows read back with an *unknown* footprint (#530) rather
 /// than a zeroed one.
