@@ -1901,6 +1901,117 @@ pub fn query_estimates(network: &str, filter: &QueryFilter) -> AppResult<Vec<Cac
     query_cache(&cache_filter)
 }
 
+/// Default maximum number of records returned by [`inspect_cache`].
+pub const DEFAULT_CACHE_INSPECT_LIMIT: usize = 50;
+
+/// Upper bound on the `--limit` parameter accepted by [`inspect_cache`].
+pub const MAX_CACHE_INSPECT_LIMIT: usize = 1_000;
+
+/// Sanitized read-only cache record returned by [`inspect_cache`].
+///
+/// Uses stable field names and exposes only hashed argument identity (`args_hash`),
+/// never raw transaction envelopes, argument values, or secrets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheInspectEntry {
+    /// Cache entry schema version.
+    pub schema_version: u32,
+    /// Target Stellar network name.
+    pub network: String,
+    /// SHA-256 hex digest of the contract WASM binary.
+    pub wasm_hash: String,
+    /// Contract function name estimated.
+    pub function: String,
+    /// Hashed invocation arguments identifier (never raw argument values).
+    pub args_hash: String,
+    /// Ledger sequence at which the estimate was simulated.
+    pub ledger: u32,
+    /// Total estimated transaction fee in stroops.
+    pub total_stroops: i64,
+    /// Simulated CPU instructions consumed.
+    pub cpu_instructions: u64,
+    /// Simulated memory bytes consumed.
+    pub memory_bytes: u64,
+    /// ISO-8601 UTC timestamp when the estimate was cached.
+    pub timestamp: String,
+    /// Optional wall-clock simulation duration in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Whether the simulated invocation succeeded.
+    pub success: bool,
+    /// Optional ledger I/O footprint summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io: Option<IoFootprint>,
+}
+
+impl From<CachedEstimate> for CacheInspectEntry {
+    fn from(entry: CachedEstimate) -> Self {
+        let duration_ms = entry.duration_ms();
+        Self {
+            schema_version: entry.version,
+            network: entry.network,
+            wasm_hash: entry.wasm_hash,
+            function: entry.function,
+            args_hash: entry.args_hash,
+            ledger: entry.ledger,
+            total_stroops: entry.total_stroops,
+            cpu_instructions: entry.cpu_instructions,
+            memory_bytes: entry.memory_bytes,
+            timestamp: entry.timestamp,
+            duration_ms,
+            success: entry.success,
+            io: entry.io,
+        }
+    }
+}
+
+/// Paginated, bounded result page returned by [`inspect_cache`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheInspectPage {
+    /// Total number of cached estimates matching the filter before pagination.
+    pub total_matched: usize,
+    /// Starting offset applied to the matched results.
+    pub offset: usize,
+    /// Bounded result limit applied (`1..=MAX_CACHE_INSPECT_LIMIT`).
+    pub limit: usize,
+    /// Whether additional matching entries exist beyond `offset + entries.len()`.
+    pub has_more: bool,
+    /// Sanitized cache metadata records.
+    pub entries: Vec<CacheInspectEntry>,
+}
+
+/// Inspect cached estimates using [`CacheFilter`] with a bounded result limit
+/// and optional pagination offset.
+pub fn inspect_cache(
+    filter: &CacheFilter,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> AppResult<CacheInspectPage> {
+    let limit = limit.unwrap_or(DEFAULT_CACHE_INSPECT_LIMIT);
+    if limit == 0 || limit > MAX_CACHE_INSPECT_LIMIT {
+        return Err(AppError::General(format!(
+            "invalid cache inspect limit {limit}: expected between 1 and {MAX_CACHE_INSPECT_LIMIT}"
+        )));
+    }
+    let offset = offset.unwrap_or(0);
+    let matched = query_cache(filter)?;
+    let total_matched = matched.len();
+    let entries: Vec<CacheInspectEntry> = matched
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(CacheInspectEntry::from)
+        .collect();
+    let has_more = offset.saturating_add(entries.len()) < total_matched;
+
+    Ok(CacheInspectPage {
+        total_matched,
+        offset,
+        limit,
+        has_more,
+        entries,
+    })
+}
+
 /// Default number of entries returned by a cache listing.
 pub const DEFAULT_LIST_LIMIT: usize = 50;
 
@@ -2012,7 +2123,6 @@ pub fn delete_cached_estimates(filter: &CacheFilter) -> AppResult<usize> {
     debug!(removed, "deleted cached estimates");
     Ok(removed)
 }
-
 /// Export every cached estimate as a deterministic, JSON-serializable list.
 ///
 /// All rows are read from the SQLite cache, migrated to the current schema,

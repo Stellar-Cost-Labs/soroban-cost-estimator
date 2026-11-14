@@ -688,6 +688,49 @@ pub enum CacheAction {
         json: bool,
     },
 
+    /// Inspect cached estimates by network, contract WASM hash, function, and time range with bounded pagination.
+    Inspect {
+        /// Network to filter by.
+        #[arg(long)]
+        network: Option<String>,
+
+        /// Filter by function name (--function, --fn).
+        #[arg(long = "fn", visible_alias = "function")]
+        r#fn: Option<String>,
+
+        /// Filter by WASM hash prefix or full SHA-256 hex.
+        #[arg(long)]
+        wasm_hash: Option<String>,
+
+        /// Minimum total fee in stroops (--min-stroops, --min-fee).
+        #[arg(long = "min-fee", visible_alias = "min-stroops", value_name = "FEE")]
+        min_fee: Option<i64>,
+
+        /// Maximum total fee in stroops (--max-stroops, --max-fee).
+        #[arg(long = "max-fee", visible_alias = "max-stroops", value_name = "FEE")]
+        max_fee: Option<i64>,
+
+        /// Earliest timestamp or date (--from, --since).
+        #[arg(long = "since", visible_alias = "from", value_name = "DATE/TIME")]
+        since: Option<String>,
+
+        /// Latest timestamp (ISO-8601, e.g. "2024-12-31T23:59:59Z").
+        #[arg(long, value_name = "TIMESTAMP")]
+        to: Option<String>,
+
+        /// Maximum number of entries to return (1..=1000, default 50).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+
+        /// Number of matching entries to skip for pagination (default 0).
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+
+        /// Output as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Show cache health overview: total entries, disk usage, and age.
     Stats {
         /// Output as JSON instead of human-readable text.
