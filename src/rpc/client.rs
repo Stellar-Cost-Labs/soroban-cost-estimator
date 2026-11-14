@@ -464,6 +464,18 @@ pub struct HealthResponse {
         deserialize_with = "crate::rpc::simulate::deserialize_u64_flexible_opt"
     )]
     pub latest_ledger: Option<u64>,
+    /// Oldest ledger sequence retained by the node, if reported.
+    #[serde(
+        default,
+        deserialize_with = "crate::rpc::simulate::deserialize_u64_flexible_opt"
+    )]
+    pub oldest_ledger: Option<u64>,
+    /// Ledger retention window size, if reported.
+    #[serde(
+        default,
+        deserialize_with = "crate::rpc::simulate::deserialize_u64_flexible_opt"
+    )]
+    pub ledger_retention_window: Option<u64>,
 }
 
 /// Node identity metadata returned by `getHealth`.
