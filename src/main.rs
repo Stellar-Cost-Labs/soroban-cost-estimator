@@ -1580,6 +1580,13 @@ async fn cmd_estimate_repeat(
 
         let ttl_secs = cache_ttl.map(parse_interval_secs);
         let fresh = if no_cache {
+            debug!(
+                reason = cache::CacheDecisionReason::Bypassed.as_code(),
+                function = %function_name,
+                network,
+                no_cache,
+                "estimate cache decision"
+            );
             None
         } else {
             fresh_cached_estimate(&wasm_hash, function_name, args, ttl_secs)?
@@ -1982,6 +1989,13 @@ async fn estimate_once(
         let ttl_secs = cache_ttl.map(parse_interval_secs);
         let fresh = if no_cache {
             // Bypass every cache read, even under `--cache-ttl`.
+            debug!(
+                reason = cache::CacheDecisionReason::Bypassed.as_code(),
+                function = %function_name,
+                network,
+                no_cache,
+                "estimate cache decision"
+            );
             None
         } else {
             fresh_cached_estimate(&wasm_hash, &function_name, args, ttl_secs)?
@@ -4844,6 +4858,10 @@ fn fresh_cached_estimate(
     ttl_secs: Option<u64>,
 ) -> error::AppResult<Option<cache::CachedEstimate>> {
     let Some(ttl_secs) = ttl_secs else {
+        debug!(
+            reason = cache::CacheDecisionReason::Bypassed.as_code(),
+            function, "estimate cache decision"
+        );
         return Ok(None);
     };
     cache::load_fresh_estimate(
