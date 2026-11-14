@@ -82,7 +82,7 @@ toml = "0.8.20"
 wasmparser = "0.254.0"
 
 # XDR types and decoding
-stellar-xdr = "27.0.0"
+stellar-xdr = "28.0.1"
 
 # Table formatting
 comfy-table = "7.2.2"
