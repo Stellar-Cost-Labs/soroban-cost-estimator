@@ -253,3 +253,101 @@ fn test_round_trip_with_stroops_to_xlm() {
         );
     }
 }
+
+#[test]
+fn test_fee_consistency_exact_match_has_no_warning() {
+    use soroban_cost_estimator::report::fee_calc::{
+        DEFAULT_PRECISION, FeeRates, check_fee_consistency, compute_fee_breakdown,
+    };
+
+    let rates = FeeRates {
+        fee_per_10k_insns: 1_000,
+        fee_per_read_entry: 500,
+        fee_per_write_entry: 1_500,
+        fee_per_read_1kb: 1_024,
+        fee_per_1kb: 1_024,
+    };
+    // cpu = 1_000, read_entry = 500, write_entry = 1_500, read_bytes = 1_024, bw = 1_024 -> non_refundable = 5_048
+    let breakdown =
+        compute_fee_breakdown(5_048, 10_000, 1, 1, 1024, 1024, rates, DEFAULT_PRECISION);
+    assert_eq!(breakdown.non_refundable_stroops, 5_048);
+    assert_eq!(breakdown.authoritative_resource_fee_stroops(), 5_048);
+    assert_eq!(breakdown.refundable_stroops, 0);
+    assert_eq!(breakdown.consistency_warning(), None);
+    assert_eq!(check_fee_consistency(5_048, 5_048), None);
+}
+
+#[test]
+fn test_fee_consistency_rounding_boundary() {
+    use soroban_cost_estimator::report::fee_calc::{
+        DEFAULT_PRECISION, FeeRates, check_fee_consistency, compute_fee_breakdown,
+    };
+
+    let rates = FeeRates {
+        fee_per_10k_insns: 100,
+        fee_per_read_entry: 0,
+        fee_per_write_entry: 0,
+        fee_per_read_1kb: 0,
+        fee_per_1kb: 0,
+    };
+    // 19_999 * 100 / 10_000 = 199 stroops (floor-divided at the rounding boundary).
+    let exact_boundary = compute_fee_breakdown(199, 19_999, 0, 0, 0, 0, rates, DEFAULT_PRECISION);
+    assert_eq!(exact_boundary.non_refundable_stroops, 199);
+    assert_eq!(exact_boundary.consistency_warning(), None);
+
+    // 20_000 * 100 / 10_000 = 200 stroops: 1 stroop above the 199 RPC total triggers warning.
+    let one_over = compute_fee_breakdown(199, 20_000, 0, 0, 0, 0, rates, DEFAULT_PRECISION);
+    assert_eq!(one_over.non_refundable_stroops, 200);
+    assert_eq!(one_over.refundable_stroops, 0);
+    assert_eq!(one_over.total_stroops, 299); // 199 resource + 100 base
+    let warning = one_over
+        .consistency_warning()
+        .expect("1 stroop excess should warn");
+    assert_eq!(warning.derived_non_refundable_stroops, 200);
+    assert_eq!(warning.authoritative_resource_fee_stroops, 199);
+    assert_eq!(warning.excess_stroops, 1);
+
+    assert!(check_fee_consistency(200, 199).is_none());
+}
+
+#[test]
+fn test_fee_consistency_derived_components_greater_than_total() {
+    use soroban_cost_estimator::report::cost_report::format_fee_consistency_warning;
+    use soroban_cost_estimator::report::fee_calc::{
+        DEFAULT_PRECISION, FeeRates, compute_fee_breakdown,
+    };
+
+    let rates = FeeRates {
+        fee_per_10k_insns: 1_024,
+        fee_per_read_entry: 1_500,
+        fee_per_write_entry: 2_500,
+        fee_per_read_1kb: 512,
+        fee_per_1kb: 400,
+    };
+    // Derived non-refundable:
+    // cpu = 10_240, read = 1_500, write = 2_500, read_bytes = 512, bw = 400 -> 15_152 stroops
+    // Authoritative RPC total_resource_fee = 5_000 stroops
+    let breakdown =
+        compute_fee_breakdown(5_000, 100_000, 1, 1, 1024, 1024, rates, DEFAULT_PRECISION);
+    // Authoritative total and component arithmetic remain unchanged.
+    assert_eq!(breakdown.total_stroops, 5_100);
+    assert_eq!(breakdown.non_refundable_stroops, 15_152);
+    assert_eq!(breakdown.refundable_stroops, 0);
+
+    let warning = breakdown
+        .consistency_warning()
+        .expect("mismatch should produce structured warning");
+    assert_eq!(warning.code, "derived_non_refundable_exceeds_resource_fee");
+    assert_eq!(warning.derived_non_refundable_stroops, 15_152);
+    assert_eq!(warning.authoritative_resource_fee_stroops, 5_000);
+    assert_eq!(warning.excess_stroops, 10_152);
+    assert!(warning.message.contains("15152 stroops"));
+    assert!(warning.message.contains("5000 stroops"));
+    assert!(warning.message.contains("10152 stroops"));
+    assert!(warning.message.contains("stale fee rates"));
+
+    let formatted = format_fee_consistency_warning(Some(&warning));
+    assert!(formatted.contains("Fee consistency warning:"));
+    assert!(formatted.contains("15152 stroops"));
+    assert_eq!(format_fee_consistency_warning(None), "");
+}

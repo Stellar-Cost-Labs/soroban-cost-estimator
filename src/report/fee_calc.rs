@@ -31,6 +31,69 @@ pub struct FeeBreakdown {
     pub fee_percentages: std::collections::BTreeMap<String, String>,
 }
 
+/// Structured warning surfaced when locally derived non-refundable fee
+/// components exceed the authoritative resource fee reported by the RPC.
+///
+/// All values are in stroops and compared using integer arithmetic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeeConsistencyWarning {
+    /// Machine-readable warning code (`"derived_non_refundable_exceeds_resource_fee"`).
+    pub code: String,
+    /// Locally derived non-refundable fee (CPU + storage I/O + bandwidth), in stroops.
+    pub derived_non_refundable_stroops: i64,
+    /// Authoritative resource fee reported by the simulation (`total_stroops - base_fee_stroops`), in stroops.
+    pub authoritative_resource_fee_stroops: i64,
+    /// Positive difference (`derived_non_refundable_stroops - authoritative_resource_fee_stroops`), in stroops.
+    pub excess_stroops: i64,
+    /// Neutral explanation of why the mismatch may occur.
+    pub message: String,
+}
+
+/// Check whether locally derived non-refundable components exceed the
+/// authoritative simulation resource fee without altering either value.
+///
+/// Uses integer-only comparison (`derived_non_refundable_stroops > authoritative_resource_fee_stroops`).
+#[must_use]
+pub fn check_fee_consistency(
+    authoritative_resource_fee_stroops: i64,
+    derived_non_refundable_stroops: i64,
+) -> Option<FeeConsistencyWarning> {
+    if derived_non_refundable_stroops <= authoritative_resource_fee_stroops {
+        return None;
+    }
+    let excess_stroops =
+        derived_non_refundable_stroops.saturating_sub(authoritative_resource_fee_stroops);
+    Some(FeeConsistencyWarning {
+        code: "derived_non_refundable_exceeds_resource_fee".to_string(),
+        derived_non_refundable_stroops,
+        authoritative_resource_fee_stroops,
+        excess_stroops,
+        message: format!(
+            "Locally derived non-refundable fee components ({derived_non_refundable_stroops} stroops) exceed the authoritative simulation resource fee ({authoritative_resource_fee_stroops} stroops) by {excess_stroops} stroops; this may reflect stale fee rates, updated RPC response semantics, or an omitted fee field."
+        ),
+    })
+}
+
+impl FeeBreakdown {
+    /// Authoritative resource fee reported by the simulation, in stroops
+    /// (`total_stroops - base_fee_stroops`).
+    #[must_use]
+    pub fn authoritative_resource_fee_stroops(&self) -> i64 {
+        self.total_stroops.saturating_sub(self.base_fee_stroops)
+    }
+
+    /// Surface a structured consistency warning when locally derived
+    /// non-refundable components exceed the authoritative simulation resource
+    /// fee.
+    #[must_use]
+    pub fn consistency_warning(&self) -> Option<FeeConsistencyWarning> {
+        check_fee_consistency(
+            self.authoritative_resource_fee_stroops(),
+            self.non_refundable_stroops,
+        )
+    }
+}
+
 /// Fee rates sourced from the network's `ConfigSettingContract*` entries.
 ///
 /// All rates are raw config values: stroops per 10,000 instructions
