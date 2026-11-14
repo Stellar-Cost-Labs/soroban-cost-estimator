@@ -734,6 +734,13 @@ fn open_db() -> AppResult<Connection> {
         .lock()
         .map_err(|e| AppError::General(format!("cache open lock poisoned: {e}")))?;
     let path = db_path()?;
+    let sidecars: Vec<(PathBuf, bool)> = crate::paths::sqlite_sidecar_paths(&path)
+        .into_iter()
+        .map(|p| {
+            let existed = p.exists();
+            (p, existed)
+        })
+        .collect();
     let newly_created = create_user_only_db_file(&path)?;
 
     // If an existing file is present, verify it has a valid SQLite header before handing it
@@ -787,10 +794,10 @@ fn open_db() -> AppResult<Connection> {
         return Err(e);
     }
 
+    crate::paths::restrict_new_sidecar_permissions(&sidecars);
     if newly_created {
         ensure_sidecar_permissions(&path);
     }
-
     // Transparent, one-time upgrade from the old per-entry JSON cache.
     // The directory is removed once every file is imported, so subsequent
     // opens short-circuit on `!dir.is_dir()`.
