@@ -611,6 +611,19 @@ async fn run(args: cli::Cli, file: error::AppResult<config::UserConfig>) -> erro
                     file_b,
                     json,
                 }) => cmd_config_snapshot_diff(&file_a, &file_b, json),
+                Some(cli::SnapshotAction::Show {
+                    snapshot,
+                    latest,
+                    at,
+                    network,
+                    json,
+                }) => cmd_config_snapshot_show(
+                    snapshot.as_deref(),
+                    latest,
+                    at.as_deref(),
+                    &network,
+                    json,
+                ),
                 Some(cli::SnapshotAction::Validate { path, all }) => {
                     cmd_config_snapshot_validate(path.as_deref(), all)
                 }
@@ -4529,6 +4542,45 @@ fn cmd_config_snapshot_diff(file_a: &Path, file_b: &Path, json: bool) -> error::
 
     if diff.has_pricing_changes {
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `config snapshot show`: print every setting of one saved snapshot (#344).
+///
+/// The snapshot is chosen by filename/path, as the newest for `network`
+/// (`--latest`), or as the newest taken at or before `at`. A request that
+/// matches no snapshot fails with [`error::AppError::SnapshotNotFound`].
+fn cmd_config_snapshot_show(
+    snapshot: Option<&str>,
+    latest: bool,
+    at: Option<&str>,
+    network: &str,
+    json: bool,
+) -> error::AppResult<()> {
+    let snapshot = match (snapshot, at) {
+        (Some(identifier), _) => {
+            let path = config_snapshot::store::resolve_snapshot_path(identifier)?;
+            config_snapshot::store::load_snapshot_checked(&path)?
+        }
+        (None, Some(at)) => {
+            let at = cache::parse_to_timestamp(at)?;
+            let path = config_snapshot::store::find_snapshot_at_or_before(network, at)?;
+            config_snapshot::store::load_snapshot_checked(&path)?
+        }
+        (None, None) => {
+            debug_assert!(latest, "clap requires a filename, --latest or --at");
+            config_snapshot::store::load_latest_snapshot(network)?
+        }
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+    } else {
+        print!(
+            "{}",
+            config_snapshot::display::format_snapshot_details(&snapshot)
+        );
     }
     Ok(())
 }

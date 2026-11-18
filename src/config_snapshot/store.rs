@@ -615,6 +615,40 @@ pub fn load_snapshot_by_timestamp(network: &str, timestamp: &str) -> AppResult<C
     parse_snapshot_at(&path, &content)
 }
 
+/// Finds the newest `network` snapshot taken at or before `at` (#344).
+///
+/// Snapshots are placed on the timeline by the timestamp encoded in their
+/// file name; files whose name carries no valid timestamp are ignored.
+/// Returns [`AppError::SnapshotNotFound`] when no snapshot is that old.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn find_snapshot_at_or_before(network: &str, at: DateTime<Utc>) -> AppResult<PathBuf> {
+    let snapshots = list_snapshots(network)?;
+    select_snapshot_at_or_before(network, &snapshots, at).ok_or_else(|| {
+        AppError::SnapshotNotFound(format!(
+            "no {network} snapshot taken at or before {}",
+            at.to_rfc3339()
+        ))
+    })
+}
+
+fn select_snapshot_at_or_before(
+    network: &str,
+    snapshots: &[PathBuf],
+    at: DateTime<Utc>,
+) -> Option<PathBuf> {
+    snapshots
+        .iter()
+        .filter_map(|path| {
+            let name = path.file_name()?.to_str()?;
+            let taken = parse_snapshot_timestamp(&timestamp_from_filename(network, name)?)?;
+            (taken <= at).then_some((taken, path))
+        })
+        .max_by_key(|(taken, _)| *taken)
+        .map(|(_, path)| path.clone())
+}
+
 /// Result of validating a single snapshot file.
 #[derive(Debug, Clone)]
 pub struct SnapshotValidation {
@@ -1293,6 +1327,33 @@ mod offline_tests {
     fn parse_snapshot_timestamp_tolerates_whitespace() {
         let parsed = parse_snapshot_timestamp(" 2026-01-01T00:00:00Z ");
         assert!(parsed.is_some());
+    }
+
+    #[test]
+    fn select_snapshot_at_or_before_picks_newest_not_after() {
+        let paths: Vec<PathBuf> = [
+            "testnet-2026-01-01T00-00-00+00-00.json",
+            "testnet-2026-02-01T00-00-00+00-00.json",
+            "testnet-2026-03-01T00-00-00+00-00.json",
+            "testnet-not-a-timestamp.json",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        let at = |s: &str| parse_snapshot_timestamp(s).unwrap();
+
+        assert_eq!(
+            select_snapshot_at_or_before("testnet", &paths, at("2026-02-15T00:00:00Z")),
+            Some(PathBuf::from("testnet-2026-02-01T00-00-00+00-00.json"))
+        );
+        assert_eq!(
+            select_snapshot_at_or_before("testnet", &paths, at("2026-03-01T00:00:00Z")),
+            Some(PathBuf::from("testnet-2026-03-01T00-00-00+00-00.json"))
+        );
+        assert_eq!(
+            select_snapshot_at_or_before("testnet", &paths, at("2025-12-31T23:59:59Z")),
+            None
+        );
     }
 
     #[test]

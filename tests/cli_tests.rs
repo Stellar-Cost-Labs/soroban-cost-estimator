@@ -1465,6 +1465,91 @@ fn test_config_snapshot_retain_flag_is_accepted() {
     );
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// `config snapshot show` (#344)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_config_snapshot_show_latest_and_at() {
+    let home = temp_home("snapshot-show");
+    write_snapshot(&home, "testnet", "2026-01-01T00:00:00+00:00", 100);
+    write_snapshot(&home, "testnet", "2026-02-01T00:00:00+00:00", 200);
+    write_snapshot(&home, "testnet", "2026-03-01T00:00:00+00:00", 300);
+
+    let (stdout, stderr, code) =
+        run_cli_in_home(&["config", "snapshot", "show", "--latest"], Some(&home));
+    assert_eq!(code, 0, "show --latest should succeed: {stderr}");
+    assert!(stdout.contains("Network: testnet"), "got: {stdout}");
+    assert!(
+        stdout.contains("Ledger: 300"),
+        "latest should be ledger 300; got: {stdout}"
+    );
+    assert!(stdout.contains("Protocol version:"), "got: {stdout}");
+
+    // `--at` navigates to the newest snapshot taken at or before the time;
+    // a bare date means the end of that day.
+    let (stdout, stderr, code) = run_cli_in_home(
+        &["config", "snapshot", "show", "--at", "2026-02-15"],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "show --at should succeed: {stderr}");
+    assert!(stdout.contains("Ledger: 200"), "got: {stdout}");
+
+    let (stdout, stderr, code) = run_cli_quiet(
+        &[
+            "config",
+            "snapshot",
+            "show",
+            "--at",
+            "2026-03-01T00:00:00Z",
+            "--json",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "show --at --json should succeed: {stderr}");
+    let json: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout should be the snapshot JSON");
+    assert_eq!(json["ledger"], 300);
+    assert_eq!(json["network"], "testnet");
+}
+
+#[test]
+fn test_config_snapshot_show_by_filename() {
+    let home = temp_home("snapshot-show-file");
+    let path = write_snapshot(&home, "testnet", "2026-01-01T00:00:00+00:00", 42);
+    let filename = path.file_name().unwrap().to_str().unwrap().to_string();
+
+    let (stdout, stderr, code) =
+        run_cli_in_home(&["config", "snapshot", "show", &filename], Some(&home));
+    assert_eq!(code, 0, "show <filename> should succeed: {stderr}");
+    assert!(stdout.contains("Ledger: 42"), "got: {stdout}");
+}
+
+#[test]
+fn test_config_snapshot_show_missing_snapshot_errors() {
+    let home = temp_home("snapshot-show-missing");
+    write_snapshot(&home, "testnet", "2026-02-01T00:00:00+00:00", 200);
+
+    let (_, stderr, code) = run_cli_in_home(
+        &["config", "snapshot", "show", "--at", "2026-01-01"],
+        Some(&home),
+    );
+    assert_ne!(code, 0, "no snapshot that old should fail");
+    assert!(stderr.contains("at or before"), "got: {stderr}");
+
+    let (_, _, code) = run_cli_in_home(
+        &["config", "snapshot", "show", "does-not-exist.json"],
+        Some(&home),
+    );
+    assert_ne!(code, 0, "an unknown filename should fail");
+
+    let (_, stderr, code) = run_cli_in_home(&["config", "snapshot", "show"], Some(&home));
+    assert_eq!(
+        code, 2,
+        "a filename, --latest or --at is required: {stderr}"
+    );
+}
+
 #[test]
 fn test_config_snapshot_prune_help() {
     let (stdout, stderr, code) = run_cli(&["config", "snapshot", "prune", "--help"]);
