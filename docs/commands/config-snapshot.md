@@ -245,6 +245,33 @@ match `config diff`:
 
 The error message names the offending file, since two files are read in one run.
 
+## Showing a saved snapshot
+
+`config snapshot show` prints every configuration setting stored in one saved
+snapshot, without contacting the network. Pick the snapshot in one of three
+ways:
+
+```
+soroban-cost-estimator config snapshot show testnet-2026-02-01T00-00-00+00-00.json
+soroban-cost-estimator config snapshot show --latest --network mainnet
+soroban-cost-estimator config snapshot show --at 2026-02-15 --network testnet
+```
+
+- `<FILENAME>` — a snapshot file name in the snapshots directory, or a path.
+- `--latest` — the newest snapshot for `--network` (default `testnet`).
+- `--at <TIMESTAMP>` — the newest snapshot taken **at or before** an RFC 3339
+  timestamp or a `YYYY-MM-DD` date (a date means the end of that day), so you
+  can see the fee parameters and limits that were in force on a given day.
+
+The output starts with the snapshot's metadata (network, timestamp, ledger
+sequence, protocol version), followed by one `Setting | Value` table per
+category: compute, ledger cost, historical data, events, bandwidth and state
+archival. A category the snapshot did not capture is shown as absent. `--json`
+prints the full snapshot as JSON instead.
+
+The command exits non-zero when no snapshot matches, e.g. an unknown file name
+or an `--at` time older than every saved snapshot.
+
 ## Retention
 
 A scheduled `config snapshot` (or a long-running `watch`) can leave hundreds of

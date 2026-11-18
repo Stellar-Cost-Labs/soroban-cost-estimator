@@ -783,6 +783,38 @@ pub enum SnapshotAction {
         json: bool,
     },
 
+    /// Show every configuration setting stored in one saved snapshot.
+    ///
+    /// Pick the snapshot by filename (or path), with `--latest`, or with
+    /// `--at <TIMESTAMP>` to get the newest snapshot taken at or before
+    /// that time.
+    Show {
+        /// Snapshot filename (or path) to show.
+        #[arg(
+            value_name = "FILENAME",
+            conflicts_with_all = ["latest", "at"],
+            required_unless_present_any = ["latest", "at"]
+        )]
+        snapshot: Option<String>,
+
+        /// Show the newest snapshot for `--network`.
+        #[arg(long, conflicts_with = "at")]
+        latest: bool,
+
+        /// Show the newest snapshot taken at or before this RFC 3339
+        /// timestamp or YYYY-MM-DD date (a date means the end of that day).
+        #[arg(long, value_name = "TIMESTAMP")]
+        at: Option<String>,
+
+        /// Network whose snapshots `--latest` and `--at` search.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+
+        /// Output the full snapshot as JSON instead of tables.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Validate a snapshot file or every stored snapshot.
     Validate {
         /// Explicit snapshot file to validate.

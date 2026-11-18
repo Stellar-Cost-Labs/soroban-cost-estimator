@@ -4,6 +4,8 @@
 /// read, write, and ledger-entry limits along with their fees) at one ledger
 /// sequence, so later runs can detect drift and price changes.
 pub mod diff;
+/// Human-readable rendering of one stored snapshot (`config snapshot show`).
+pub mod display;
 /// Helpers for reading a network's snapshot history in ledger order.
 pub mod history;
 /// Snapshot data model: configuration settings, resource limits, and fees.
