@@ -144,6 +144,11 @@ pub struct ConfigSnapshot {
     /// files and outputs are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_version: Option<u32>,
+    /// Annotations recorded when a snapshot is captured automatically, e.g.
+    /// `protocol_upgrade_v23` on the snapshot that marks a protocol upgrade.
+    /// Omitted from JSON when empty, so untagged snapshots are unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     /// `ConfigSettingContractComputeV0`: CPU instruction limits and fees.
     pub contract_compute: Option<ContractComputeV0>,
     /// `ConfigSettingContractLedgerCostV0`: disk read/write limits and fees.
@@ -172,6 +177,7 @@ impl ConfigSnapshot {
     ///   modified, not the current ledger. An entry rewritten with identical
     ///   values has not changed the configuration.
     /// * `schema_version` — a file-format detail, not a pricing input.
+    /// * `tags` — annotations about the capture, not configuration.
     ///
     /// Used by `config snapshot --skip-unchanged` to avoid writing a duplicate
     /// file for a network whose pricing is stable.
@@ -186,6 +192,30 @@ impl ConfigSnapshot {
             && self.contract_bandwidth == other.contract_bandwidth
             && self.state_archival == other.state_archival
     }
+
+    /// The `(previous, current)` protocol versions when this snapshot was
+    /// captured on a newer network protocol than `previous`.
+    ///
+    /// Returns `None` when either snapshot has no recorded protocol version,
+    /// when the version did not increase, or when the snapshots belong to
+    /// different networks, so a first capture never claims a transition.
+    #[must_use]
+    pub fn protocol_upgrade_from(&self, previous: &Self) -> Option<(u32, u32)> {
+        if self.network != previous.network {
+            return None;
+        }
+        match (previous.protocol_version, self.protocol_version) {
+            (Some(old), Some(new)) if new > old => Some((old, new)),
+            _ => None,
+        }
+    }
+}
+
+/// The tag recorded on the snapshot that marks an upgrade to protocol
+/// `version`, e.g. `protocol_upgrade_v23`.
+#[must_use]
+pub fn protocol_upgrade_tag(version: u32) -> String {
+    format!("protocol_upgrade_v{version}")
 }
 
 /// Top-level field names of [`ConfigSnapshot`] understood by this build.
@@ -198,6 +228,7 @@ pub const KNOWN_SNAPSHOT_FIELDS: &[&str] = &[
     "timestamp",
     "ledger",
     "protocol_version",
+    "tags",
     "contract_compute",
     "contract_ledger_cost",
     "contract_historical_data",
@@ -534,6 +565,62 @@ mod tests {
         let back: ConfigSnapshot =
             serde_json::from_str(&serde_json::to_string(&snap).unwrap()).unwrap();
         assert_eq!(back.protocol_version, Some(23));
+    }
+
+    #[test]
+    fn untagged_snapshot_does_not_write_tags() {
+        let snap: ConfigSnapshot = serde_json::from_str(LEGACY).unwrap();
+        assert!(snap.tags.is_empty());
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(!json.contains("tags"), "{json}");
+    }
+
+    #[test]
+    fn tags_round_trip_and_are_a_known_field() {
+        let mut snap: ConfigSnapshot = serde_json::from_str(LEGACY).unwrap();
+        snap.tags.push(protocol_upgrade_tag(23));
+        let json = serde_json::to_string(&snap).unwrap();
+        let back = SnapshotPayload::parse(&json).unwrap();
+        assert_eq!(back.snapshot.tags, vec!["protocol_upgrade_v23".to_string()]);
+        assert!(back.unknown_fields.is_empty(), "{:?}", back.unknown_fields);
+    }
+
+    #[test]
+    fn protocol_upgrade_is_detected_only_when_the_version_increases() {
+        let mut previous: ConfigSnapshot = serde_json::from_str(LEGACY).unwrap();
+        previous.protocol_version = Some(22);
+
+        let mut upgraded = previous.clone();
+        upgraded.protocol_version = Some(23);
+        assert_eq!(upgraded.protocol_upgrade_from(&previous), Some((22, 23)));
+
+        let same = previous.clone();
+        assert_eq!(same.protocol_upgrade_from(&previous), None);
+
+        let mut downgraded = previous.clone();
+        downgraded.protocol_version = Some(21);
+        assert_eq!(downgraded.protocol_upgrade_from(&previous), None);
+
+        let mut other_network = upgraded.clone();
+        other_network.network = "mainnet".to_string();
+        assert_eq!(other_network.protocol_upgrade_from(&previous), None);
+    }
+
+    #[test]
+    fn protocol_upgrade_needs_both_versions() {
+        let unknown: ConfigSnapshot = serde_json::from_str(LEGACY).unwrap();
+        let mut known = unknown.clone();
+        known.protocol_version = Some(23);
+        assert_eq!(known.protocol_upgrade_from(&unknown), None);
+        assert_eq!(unknown.protocol_upgrade_from(&known), None);
+    }
+
+    #[test]
+    fn same_configuration_ignores_tags() {
+        let a: ConfigSnapshot = serde_json::from_str(LEGACY).unwrap();
+        let mut b = a.clone();
+        b.tags.push(protocol_upgrade_tag(23));
+        assert!(a.same_configuration(&b));
     }
 
     // ── Schema versioning (#508) ──────────────────────────────────────────

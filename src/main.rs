@@ -4201,6 +4201,30 @@ fn print_unchanged_snapshot(
     }
 }
 
+/// Tells the user that a capture marks a network protocol upgrade and shows
+/// what changed since the snapshot taken on the previous protocol version.
+///
+/// Written to stderr so machine-readable stdout (`--format json`, `csv`)
+/// stays parseable.
+fn announce_protocol_upgrade(
+    previous: &config_snapshot::model::ConfigSnapshot,
+    current: &config_snapshot::model::ConfigSnapshot,
+    (from, to): (u32, u32),
+    path: &Path,
+    quiet: bool,
+) {
+    info!(from, to, path = %path.display(), "protocol upgrade snapshot saved");
+    if quiet {
+        return;
+    }
+    eprintln!(
+        "\u{1f389} Stellar Protocol Upgrade detected (v{from} -> v{to}). Created snapshot: {}",
+        path.display()
+    );
+    let diff = config_snapshot::diff::diff_snapshots(previous, current);
+    eprintln!("{}", config_snapshot::diff::format_diff_summary(&diff));
+}
+
 /// `config snapshot` command: fetch config settings and save snapshot.
 ///
 /// With `--retain <N>`, a retention pass runs *after* the new snapshot is
@@ -4213,6 +4237,10 @@ fn print_unchanged_snapshot(
 /// successful run, not a drift error. Machine formats report which happened
 /// via a `status` field (`saved` is implied by the snapshot document, while
 /// the unchanged document carries `"status": "unchanged"`).
+///
+/// When the network's protocol version is higher than the latest saved
+/// snapshot's, the new snapshot is tagged `protocol_upgrade_v{N}` and the
+/// upgrade is announced with a diff against that previous snapshot.
 async fn cmd_config_snapshot(
     network: &str,
     rpc_url: Option<&str>,
@@ -4235,7 +4263,7 @@ async fn cmd_config_snapshot(
     let span = info_span!("cmd_config_snapshot", network);
     async {
         info!("taking config snapshot");
-        let snapshot = fetch_config_snapshot(
+        let mut snapshot = fetch_config_snapshot(
             network,
             rpc_url,
             rpc_fallback_url,
@@ -4247,6 +4275,18 @@ async fn cmd_config_snapshot(
             verbose,
         )
         .await?;
+
+        // Compare the network's protocol version with the latest saved
+        // snapshot: an increase tags this capture as the upgrade marker.
+        let previous = config_snapshot::store::load_latest_snapshot(network).ok();
+        let upgrade = previous
+            .as_ref()
+            .and_then(|prev| snapshot.protocol_upgrade_from(prev));
+        if let Some((_, to)) = upgrade {
+            snapshot
+                .tags
+                .push(config_snapshot::model::protocol_upgrade_tag(to));
+        }
 
         let save_outcome = if skip_unchanged {
             config_snapshot::store::save_snapshot_if_changed(&snapshot, out_path)?
@@ -4270,6 +4310,9 @@ async fn cmd_config_snapshot(
         match save_outcome {
             config_snapshot::store::SnapshotSaveOutcome::Saved(path) => {
                 info!(path = %path.display(), ledger = snapshot.ledger, "snapshot saved");
+                if let (Some((from, to)), Some(prev)) = (upgrade, previous.as_ref()) {
+                    announce_protocol_upgrade(prev, &snapshot, (from, to), &path, quiet);
+                }
                 if print_saved_snapshot(&snapshot, &path, format, quiet)? {
                     return Ok(());
                 }
@@ -6833,6 +6876,7 @@ mod tests {
             ledger: 100,
             settings_last_modified: std::collections::BTreeMap::new(),
             protocol_version: None,
+            tags: Vec::new(),
             contract_compute: Some(ContractComputeV0 {
                 ledger_max_instructions: 1_000_000,
                 tx_max_instructions: 100_000,
