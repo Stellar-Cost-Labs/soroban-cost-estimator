@@ -25,7 +25,7 @@ All data lives in your home directory:
 SQLite replaced the old one-file-per-estimate store because a directory of
 thousands of JSON files means inode overhead and an O(n) directory scan for
 every lookup, listing, and stats call. The current schema keys rows by
-`(wasm_hash, function, args_hash)` and adds secondary indexes on
+`(wasm_hash, function, args_hash, network)` and adds secondary indexes on
 `(wasm_hash, function)`, `(network, timestamp)`, the full
 `(wasm_hash, function, network, timestamp)` combination, and `last_accessed`
 (the eviction order). Writes are transactional, so an interrupted run can
@@ -33,15 +33,30 @@ never leave a half-written entry behind.
 
 ## How entries are keyed
 
-Each cached estimate is keyed by three things:
+Each cached estimate is keyed by four things:
 
 1. **WASM hash** — the SHA-256 of the contract's `.wasm` bytes (hex). The
    same contract compiled twice yields the same hash; any rebuild changes it.
 2. **Function** — the invoked function name, or `(wasm upload)` for the
    upload-only simulation (an `estimate` without `--fn`).
 3. **Args hash** — the SHA-256 of the joined raw `--arg` values.
+4. **Network** — the network the simulation ran against (`testnet`,
+   `mainnet`, `futurenet`, or a custom network name).
 
-The tuple is the table's primary key. The fixture contract's deployed WASM
+The tuple is the table's primary key.
+
+### Network isolation
+
+Because the network is part of the key, caches for different networks never
+interact. Estimating the same contract call on `testnet` and then on
+`mainnet` stores two entries side by side; neither run overwrites the other,
+`--cache-ttl` and `--compare` only ever reuse an entry from the network being
+estimated, `--history` only lists runs from that network, and
+`cache clear --network <name>` only removes that network's entries.
+
+Caches created by releases that keyed entries without the network are
+rebuilt in place the first time a newer release opens them. Existing entries
+keep the network they were recorded on. The fixture contract's deployed WASM
 carries the hash
 `ea14bca998e98f0ddb338e8e5cef6e19f07378a3b71e8b4f8868cedc857e4ecd`, which is
 why the tool's cached estimate for the deployed contract matches the fixture

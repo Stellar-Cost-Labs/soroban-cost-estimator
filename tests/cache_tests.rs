@@ -110,6 +110,7 @@ fn test_save_and_load_estimate() {
             "abc123",
             "my_func",
             &["arg1".to_string(), "arg2".to_string()],
+            "testnet",
         )
         .expect("load estimate")
         .expect("estimate should exist");
@@ -127,7 +128,8 @@ fn test_save_and_load_estimate() {
 #[test]
 fn test_load_nonexistent_estimate() {
     with_temp_home(|_tmp| {
-        let result = cache::load_estimate("nope", "no_func", &[]).expect("load nonexistent");
+        let result =
+            cache::load_estimate("nope", "no_func", &[], "testnet").expect("load nonexistent");
         assert!(result.is_none(), "nonexistent estimate should return None");
     });
 }
@@ -166,13 +168,13 @@ fn test_different_args_produce_different_cache_keys() {
         .expect("save with args [b]");
 
         // Load with first args → should get ledger 1
-        let r1 = cache::load_estimate("hash1", "fn1", &["a".to_string()])
+        let r1 = cache::load_estimate("hash1", "fn1", &["a".to_string()], "testnet")
             .expect("load [a]")
             .expect("should exist");
         assert_eq!(r1.ledger, 1);
 
         // Load with second args → should get ledger 2
-        let r2 = cache::load_estimate("hash1", "fn1", &["b".to_string()])
+        let r2 = cache::load_estimate("hash1", "fn1", &["b".to_string()], "testnet")
             .expect("load [b]")
             .expect("should exist");
         assert_eq!(r2.ledger, 2);
@@ -289,7 +291,7 @@ fn test_overwrite_existing_estimate() {
         .expect("overwrite");
 
         // Load → should get ledger 20
-        let loaded = cache::load_estimate("h1", "f1", &["x".to_string()])
+        let loaded = cache::load_estimate("h1", "f1", &["x".to_string()], "testnet")
             .expect("load")
             .expect("should exist");
         assert_eq!(loaded.ledger, 20);
@@ -376,65 +378,36 @@ fn test_verify_cache_ignores_non_json_files() {
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Saving the same key (wasm_hash + function + args) on two different
-/// networks overwrites the previous entry.  This documents the current
-/// behaviour so any future fix can be detected by these tests.
+/// networks keeps both entries: the network is part of the cache key (#337).
 #[test]
-fn test_same_key_different_networks_overwrites_previous() {
+fn test_same_key_different_networks_kept_separately() {
     with_temp_home(|_tmp| {
-        // First write: testnet, ledger 10
+        let args = ["arg".to_string()];
         cache::save_estimate(
-            "hash1",
-            "func1",
-            &["arg".to_string()],
-            "testnet",
-            10,
-            100,
-            10,
-            5,
-            None,
-            true,
+            "hash1", "func1", &args, "testnet", 10, 100, 10, 5, None, true,
         )
         .expect("save testnet");
-
-        let loaded = cache::load_estimate("hash1", "func1", &["arg".to_string()])
-            .expect("load")
-            .expect("should exist");
-        assert_eq!(loaded.network, "testnet");
-        assert_eq!(loaded.ledger, 10);
-
-        // Second write: mainnet, same key, ledger 20
         cache::save_estimate(
-            "hash1",
-            "func1",
-            &["arg".to_string()],
-            "mainnet",
-            20,
-            200,
-            20,
-            10,
-            None,
-            true,
+            "hash1", "func1", &args, "mainnet", 20, 200, 20, 10, None, true,
         )
         .expect("save mainnet");
 
-        // The testnet entry is gone — the file was overwritten.
-        let loaded = cache::load_estimate("hash1", "func1", &["arg".to_string()])
-            .expect("load")
-            .expect("should still exist");
-        assert_eq!(
-            loaded.network, "mainnet",
-            "mainnet should have overwritten testnet"
-        );
-        assert_eq!(loaded.ledger, 20);
+        let tn = cache::load_estimate("hash1", "func1", &args, "testnet")
+            .expect("load testnet")
+            .expect("testnet entry must survive the mainnet save");
+        assert_eq!(tn.network, "testnet");
+        assert_eq!(tn.ledger, 10);
+        assert_eq!(tn.total_stroops, 100);
 
-        // list_cached_estimates confirms the leak.
-        let testnet = cache::list_cached_estimates("testnet").expect("list");
-        assert!(
-            testnet.is_empty(),
-            "testnet should have no entries after overwrite"
-        );
-        let mainnet = cache::list_cached_estimates("mainnet").expect("list");
-        assert_eq!(mainnet.len(), 1);
+        let mn = cache::load_estimate("hash1", "func1", &args, "mainnet")
+            .expect("load mainnet")
+            .expect("mainnet entry must exist");
+        assert_eq!(mn.network, "mainnet");
+        assert_eq!(mn.ledger, 20);
+        assert_eq!(mn.total_stroops, 200);
+
+        assert_eq!(cache::list_cached_estimates("testnet").unwrap().len(), 1);
+        assert_eq!(cache::list_cached_estimates("mainnet").unwrap().len(), 1);
     });
 }
 
@@ -500,80 +473,83 @@ fn test_different_keys_different_networks_are_isolated() {
     });
 }
 
-/// load_estimate does not filter by network — it returns whatever the file
-/// contains.  This test documents that cross-network calls return the
-/// *stored* network, even if the caller intended a different one.
+/// A lookup on a network the call was never estimated against is a miss,
+/// even when an identical call is cached for another network (#337).
 #[test]
-fn test_load_estimate_returns_stored_network_not_caller_network() {
+fn test_load_estimate_misses_on_other_network() {
     with_temp_home(|_tmp| {
-        // Save on testnet
-        cache::save_estimate(
-            "hash",
-            "fn",
-            &["x".to_string()],
-            "testnet",
-            10,
-            100,
-            10,
-            5,
-            None,
-            true,
-        )
-        .expect("save");
+        let args = ["x".to_string()];
+        cache::save_estimate("hash", "fn", &args, "testnet", 10, 100, 10, 5, None, true)
+            .expect("save");
 
-        // load_estimate has no network parameter — it returns whatever was saved.
-        let loaded = cache::load_estimate("hash", "fn", &["x".to_string()])
-            .expect("load")
-            .expect("should exist");
-        assert_eq!(loaded.network, "testnet");
+        let hit = cache::load_estimate("hash", "fn", &args, "testnet")
+            .expect("load testnet")
+            .expect("should exist on testnet");
+        assert_eq!(hit.network, "testnet");
+
+        for other in ["mainnet", "futurenet", "TESTNET", "custom"] {
+            assert!(
+                cache::load_estimate("hash", "fn", &args, other)
+                    .expect("load other")
+                    .is_none(),
+                "testnet entry must not be served for {other}"
+            );
+            assert!(
+                cache::load_fresh_estimate(
+                    "hash",
+                    "fn",
+                    &args,
+                    other,
+                    std::time::Duration::from_secs(3600)
+                )
+                .expect("load fresh other")
+                .is_none(),
+                "testnet entry must not be a fresh hit for {other}"
+            );
+        }
     });
 }
 
-/// Multiple networks with the same wasm_hash and function but different args
-/// should not leak — the args hash isolates them.
+/// Different args on different networks stay isolated on both axes: each
+/// entry is only reachable with its own args *and* its own network.
 #[test]
 fn test_same_wasm_function_different_args_different_networks_isolated() {
     with_temp_home(|_tmp| {
+        let tn_args = ["arg-tn".to_string()];
+        let mn_args = ["arg-mn".to_string()];
         cache::save_estimate(
-            "hash",
-            "func",
-            &["arg-tn".to_string()],
-            "testnet",
-            1,
-            100,
-            10,
-            5,
-            None,
-            true,
+            "hash", "func", &tn_args, "testnet", 1, 100, 10, 5, None, true,
         )
         .expect("testnet save");
         cache::save_estimate(
-            "hash",
-            "func",
-            &["arg-mn".to_string()],
-            "mainnet",
-            2,
-            200,
-            20,
-            10,
-            None,
-            true,
+            "hash", "func", &mn_args, "mainnet", 2, 200, 20, 10, None, true,
         )
         .expect("mainnet save");
 
-        let tn = cache::load_estimate("hash", "func", &["arg-tn".to_string()])
+        let tn = cache::load_estimate("hash", "func", &tn_args, "testnet")
             .expect("load tn")
             .expect("should exist");
         assert_eq!(tn.network, "testnet");
         assert_eq!(tn.ledger, 1);
 
-        let mn = cache::load_estimate("hash", "func", &["arg-mn".to_string()])
+        let mn = cache::load_estimate("hash", "func", &mn_args, "mainnet")
             .expect("load mn")
             .expect("should exist");
         assert_eq!(mn.network, "mainnet");
         assert_eq!(mn.ledger, 2);
 
-        // Both still appear under their respective network lists.
+        // Crossing either axis is a miss.
+        assert!(
+            cache::load_estimate("hash", "func", &tn_args, "mainnet")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cache::load_estimate("hash", "func", &mn_args, "testnet")
+                .unwrap()
+                .is_none()
+        );
+
         assert_eq!(cache::list_cached_estimates("testnet").unwrap().len(), 1);
         assert_eq!(cache::list_cached_estimates("mainnet").unwrap().len(), 1);
     });
@@ -621,8 +597,9 @@ fn test_verify_cache_across_networks_all_valid() {
     });
 }
 
-/// Concurrent saves from two different networks to the same key must leave
-/// a valid entry behind — no torn writes, no corruption.
+/// Concurrent saves from two different networks to the same call must leave
+/// one valid entry per network — no torn writes and no cross-network
+/// overwrite.
 #[test]
 fn test_concurrent_cross_network_same_key_no_corruption() {
     with_temp_home(|_tmp| {
@@ -664,76 +641,102 @@ fn test_concurrent_cross_network_same_key_no_corruption() {
         tn.join().expect("testnet thread panicked");
         mn.join().expect("mainnet thread panicked");
 
-        // The surviving entry must be valid JSON.
-        let loaded = cache::load_estimate("shared-hash", "shared-func", &args)
-            .expect("load")
-            .expect("shared key should exist");
-        assert!(
-            loaded.network == "testnet" || loaded.network == "mainnet",
-            "surviving entry must be from one of the two networks: {loaded:?}"
-        );
+        for (network, ledger) in [("testnet", 1), ("mainnet", 2)] {
+            let loaded = cache::load_estimate("shared-hash", "shared-func", &args, network)
+                .expect("load")
+                .unwrap_or_else(|| panic!("{network} entry should exist"));
+            assert_eq!(loaded.network, network);
+            assert_eq!(loaded.ledger, ledger);
+        }
 
         let statuses = cache::verify_cache().expect("verify");
-        assert_eq!(statuses.len(), 1, "one entry for the shared key");
-        assert!(statuses[0].valid, "entry must be valid: {statuses:?}");
+        assert_eq!(statuses.len(), 2, "one entry per network: {statuses:?}");
+        assert!(
+            statuses.iter().all(|s| s.valid),
+            "entries must be valid: {statuses:?}"
+        );
     });
 }
 
-/// Load after cross-network overwrite must return the latest writer's data,
-/// not the first writer's. This is the "leak" scenario: a testnet cache
-/// entry is silently replaced by a mainnet write.
+/// Re-saving a call on the *same* network still updates that network's entry
+/// in place, while the other network's entry is untouched.
 #[test]
-fn test_load_after_cross_network_overwrite_returns_latest_writer() {
+fn test_resave_same_network_updates_only_that_network() {
     with_temp_home(|_tmp| {
-        cache::save_estimate(
-            "h",
-            "f",
-            &["x".to_string()],
-            "testnet",
-            100,
-            1000,
-            100,
-            50,
-            None,
-            true,
-        )
-        .expect("save testnet");
+        let args = ["x".to_string()];
+        cache::save_estimate("h", "f", &args, "testnet", 100, 1000, 100, 50, None, true)
+            .expect("save testnet");
+        cache::save_estimate("h", "f", &args, "mainnet", 200, 2000, 200, 100, None, true)
+            .expect("save mainnet");
+        cache::save_estimate("h", "f", &args, "testnet", 300, 3000, 300, 150, None, true)
+            .expect("re-save testnet");
 
-        let before = cache::load_estimate("h", "f", &["x".to_string()])
-            .unwrap()
-            .unwrap();
-        assert_eq!(before.network, "testnet");
-        assert_eq!(before.ledger, 100);
-
-        // Overwrite with mainnet
-        cache::save_estimate(
-            "h",
-            "f",
-            &["x".to_string()],
-            "mainnet",
-            200,
-            2000,
-            200,
-            100,
-            None,
-            true,
-        )
-        .expect("save mainnet");
-
-        let after = cache::load_estimate("h", "f", &["x".to_string()])
+        let tn = cache::load_estimate("h", "f", &args, "testnet")
             .unwrap()
             .unwrap();
         assert_eq!(
-            after.network, "mainnet",
-            "should return mainnet after overwrite"
+            tn.ledger, 300,
+            "testnet entry should hold the latest testnet run"
         );
-        assert_eq!(after.ledger, 200);
+        let mn = cache::load_estimate("h", "f", &args, "mainnet")
+            .unwrap()
+            .unwrap();
+        assert_eq!(mn.ledger, 200, "mainnet entry must not change");
 
-        // Verify the testnet list is now empty for this key.
-        let tn = cache::list_cached_estimates("testnet").unwrap();
+        assert_eq!(cache::list_cached_estimates("testnet").unwrap().len(), 1);
+        assert_eq!(cache::list_cached_estimates("mainnet").unwrap().len(), 1);
+    });
+}
+
+/// `estimate --history` only reports runs from the network being estimated.
+#[test]
+fn test_load_estimate_history_is_network_scoped() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h", "f", &[], "testnet", 1, 100, 10, 5, None, true).expect("tn 1");
+        cache::save_estimate("h", "f", &[], "mainnet", 2, 200, 20, 10, None, true).expect("mn");
+        cache::save_estimate("h", "f", &[], "testnet", 3, 300, 30, 15, None, true).expect("tn 2");
+
+        let tn = cache::load_estimate_history("h", "f", "testnet", 10).expect("tn history");
+        assert_eq!(tn.len(), 2);
+        assert!(tn.iter().all(|e| e.network == "testnet"));
+        assert_eq!(tn[0].ledger, 3, "newest first");
+
+        let mn = cache::load_estimate_history("h", "f", "mainnet", 10).expect("mn history");
+        assert_eq!(mn.len(), 1);
+        assert_eq!(mn[0].ledger, 2);
+
         assert!(
-            tn.is_empty(),
-            "testnet list should be empty after mainnet overwrite"
+            cache::load_estimate_history("h", "f", "futurenet", 10)
+                .expect("fn history")
+                .is_empty()
+        );
+    });
+}
+
+/// Deleting with a network filter removes only that network's copy of a
+/// call cached on several networks.
+#[test]
+fn test_delete_with_network_filter_keeps_other_networks() {
+    with_temp_home(|_tmp| {
+        let args = ["a".to_string()];
+        cache::save_estimate("h", "f", &args, "testnet", 1, 100, 10, 5, None, true).expect("tn");
+        cache::save_estimate("h", "f", &args, "mainnet", 2, 200, 20, 10, None, true).expect("mn");
+
+        let filter = cache::CacheFilter {
+            network: Some("testnet".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cache::delete_cached_estimates(&filter).expect("delete"), 1);
+
+        assert!(
+            cache::load_estimate("h", "f", &args, "testnet")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cache::load_estimate("h", "f", &args, "mainnet")
+                .unwrap()
+                .is_some()
         );
     });
 }
@@ -770,7 +773,7 @@ fn test_concurrent_save_and_load_estimates() {
                         .expect("concurrent save");
 
                         // Load back immediately; only this thread wrote this key.
-                        let loaded = cache::load_estimate(&wasm_hash, &function, &args)
+                        let loaded = cache::load_estimate(&wasm_hash, &function, &args, "testnet")
                             .expect("concurrent load")
                             .expect("estimate saved by this thread should load");
                         assert_eq!(loaded.ledger, j as u32);
@@ -839,6 +842,7 @@ fn test_concurrent_load_estimates() {
                             &format!("hash-{t}"),
                             &format!("func-{t}"),
                             &[format!("arg-{t}-{j}")],
+                            "testnet",
                         )
                         .expect("concurrent load")
                         .expect("seeded estimate should load");
@@ -1017,7 +1021,7 @@ fn test_clear_cache_never_touches_other_networks() {
 fn test_saved_entries_are_current_schema_version() {
     with_temp_home(|_tmp| {
         cache::save_estimate("h1", "f1", &[], "testnet", 3, 100, 10, 5, None, true).expect("save");
-        let loaded = cache::load_estimate("h1", "f1", &[])
+        let loaded = cache::load_estimate("h1", "f1", &[], "testnet")
             .expect("load")
             .expect("entry should exist");
         assert_eq!(loaded.version, current_schema_version());
@@ -1032,7 +1036,7 @@ fn test_load_legacy_entry_without_version_field() {
         // No `version` key, like entries written before versioning
         // was introduced.
         write_raw_entry(tmp, "legacy", "old_func", &["a"], None, 7);
-        let loaded = cache::load_estimate("legacy", "old_func", &["a".to_string()])
+        let loaded = cache::load_estimate("legacy", "old_func", &["a".to_string()], "testnet")
             .expect("legacy entry should load")
             .expect("entry should exist");
         assert_eq!(loaded.version, current_schema_version());
@@ -1109,7 +1113,7 @@ fn test_load_rejects_future_version_entry() {
             Some(current_schema_version() + 1),
             1,
         );
-        let result = cache::load_estimate("future", "new_func", &["b".to_string()]);
+        let result = cache::load_estimate("future", "new_func", &["b".to_string()], "testnet");
         assert!(
             result.is_err(),
             "future-version entries must fail to load, got {result:?}"
@@ -1203,7 +1207,7 @@ fn test_concurrent_same_key_saves_leave_valid_entry() {
         }
 
         // The surviving entry must be one of the written variants.
-        let loaded = cache::load_estimate("shared-hash", "shared-func", &args)
+        let loaded = cache::load_estimate("shared-hash", "shared-func", &args, "testnet")
             .expect("load shared key")
             .expect("shared key should exist after concurrent saves");
         assert_eq!(loaded.wasm_hash, "shared-hash");
@@ -1254,7 +1258,7 @@ fn test_is_cache_entry_fresh_within_ttl() {
         let now = chrono::Utc::now().to_rfc3339();
         write_raw_entry_with_timestamp(tmp, "h1", "f1", &["a"], &now);
 
-        let entry = cache::load_estimate("h1", "f1", &["a".to_string()])
+        let entry = cache::load_estimate("h1", "f1", &["a".to_string()], "testnet")
             .expect("load")
             .expect("entry should exist");
         assert!(
@@ -1271,7 +1275,7 @@ fn test_is_cache_entry_fresh_expired() {
         let two_hours_ago = (chrono::Utc::now() - chrono::TimeDelta::hours(2)).to_rfc3339();
         write_raw_entry_with_timestamp(tmp, "h1", "f1", &["a"], &two_hours_ago);
 
-        let entry = cache::load_estimate("h1", "f1", &["a".to_string()])
+        let entry = cache::load_estimate("h1", "f1", &["a".to_string()], "testnet")
             .expect("load")
             .expect("entry should exist");
         assert!(
@@ -1288,7 +1292,7 @@ fn test_is_cache_entry_fresh_unparseable_timestamp() {
     with_temp_home(|tmp| {
         write_raw_entry_with_timestamp(tmp, "h1", "f1", &["a"], "not-a-date");
 
-        let entry = cache::load_estimate("h1", "f1", &["a".to_string()])
+        let entry = cache::load_estimate("h1", "f1", &["a".to_string()], "testnet")
             .expect("load")
             .expect("entry should exist");
         assert!(
@@ -1306,6 +1310,7 @@ fn test_load_fresh_estimate_missing_entry() {
             "nope",
             "no_func",
             &[],
+            "testnet",
             std::time::Duration::from_secs(3600),
         )
         .expect("load fresh on empty cache");
@@ -1324,6 +1329,7 @@ fn test_load_fresh_estimate_returns_fresh_entry() {
             "h1",
             "f1",
             &["a".to_string()],
+            "testnet",
             std::time::Duration::from_secs(3600),
         )
         .expect("load fresh")
@@ -1350,7 +1356,7 @@ fn test_load_estimate_history_newest_first_and_limited() {
         cache::save_estimate("h", "other", &[], "testnet", 40, 400, 1, 1, None, true)
             .expect("save other");
 
-        let all = cache::load_estimate_history("h", "f", 5).expect("history");
+        let all = cache::load_estimate_history("h", "f", "testnet", 5).expect("history");
         assert_eq!(all.len(), 3, "three runs of `f` should be recorded");
         assert_eq!(all[0].total_stroops, 300, "newest run first");
         assert_eq!(all[1].total_stroops, 200);
@@ -1358,15 +1364,15 @@ fn test_load_estimate_history_newest_first_and_limited() {
         assert_eq!(all[0].ledger, 30);
         assert_eq!(all[0].function, "f");
 
-        let limited = cache::load_estimate_history("h", "f", 2).expect("history");
+        let limited = cache::load_estimate_history("h", "f", "testnet", 2).expect("history");
         assert_eq!(limited.len(), 2, "limit must cap the result");
         assert_eq!(limited[0].total_stroops, 300);
         assert_eq!(limited[1].total_stroops, 200);
 
-        let zero = cache::load_estimate_history("h", "f", 0).expect("history");
+        let zero = cache::load_estimate_history("h", "f", "testnet", 0).expect("history");
         assert!(zero.is_empty(), "a zero limit yields no rows");
 
-        let missing = cache::load_estimate_history("h", "missing", 5).expect("history");
+        let missing = cache::load_estimate_history("h", "missing", "testnet", 5).expect("history");
         assert!(missing.is_empty(), "unknown function has no history");
     });
 }
@@ -1377,7 +1383,7 @@ fn test_load_estimate_history_newest_first_and_limited() {
 fn test_save_estimate_appends_single_history_entry() {
     with_temp_home(|_tmp| {
         cache::save_estimate("h", "f", &[], "testnet", 1, 100, 10, 5, None, true).expect("save");
-        let history = cache::load_estimate_history("h", "f", 5).expect("history");
+        let history = cache::load_estimate_history("h", "f", "testnet", 5).expect("history");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].cpu_instructions, 10);
         assert_eq!(history[0].memory_bytes, 5);
@@ -1412,7 +1418,7 @@ fn test_history_records_io_footprint() {
         cache::save_estimate("h", "f", &[], "testnet", 2, 200, 20, 10, None, true)
             .expect("save without footprint");
 
-        let history = cache::load_estimate_history("h", "f", 5).expect("history");
+        let history = cache::load_estimate_history("h", "f", "testnet", 5).expect("history");
         assert_eq!(history.len(), 2);
         // Newest first: the second save recorded no footprint.
         assert_eq!(
@@ -1436,7 +1442,7 @@ fn test_load_fresh_estimate_expired_returns_none() {
         write_raw_entry_with_timestamp(tmp, "h1", "f1", &["a"], &two_hours_ago);
 
         // The entry exists and loads fine...
-        let loaded = cache::load_estimate("h1", "f1", &["a".to_string()])
+        let loaded = cache::load_estimate("h1", "f1", &["a".to_string()], "testnet")
             .expect("load")
             .expect("entry should exist");
         assert_eq!(loaded.ledger, 7);
@@ -1446,6 +1452,7 @@ fn test_load_fresh_estimate_expired_returns_none() {
             "h1",
             "f1",
             &["a".to_string()],
+            "testnet",
             std::time::Duration::from_secs(3600),
         )
         .expect("load fresh");
@@ -1617,7 +1624,7 @@ fn test_legacy_json_cache_is_imported_transparently() {
         write_legacy_cache_file(tmp, "abc-f.json", &legacy);
 
         // No explicit migration call: opening the cache does it transparently.
-        let loaded = cache::load_estimate("abc", "f", &[])
+        let loaded = cache::load_estimate("abc", "f", &[], "testnet")
             .expect("load migrated entry")
             .expect("legacy entry should have been imported");
         assert_eq!(loaded.total_stroops, 1234);
@@ -1703,7 +1710,7 @@ fn test_pre_v3_database_gains_last_accessed_column() {
         }
 
         // Opening through the library migrates the table in place.
-        let loaded = cache::load_estimate("h", "f", &[])
+        let loaded = cache::load_estimate("h", "f", &[], "testnet")
             .expect("load")
             .expect("row should survive the table migration");
         assert_eq!(loaded.version, cache::CACHE_SCHEMA_VERSION);
@@ -1729,6 +1736,99 @@ fn test_pre_v3_database_gains_last_accessed_column() {
     });
 }
 
+/// A database whose primary key predates network isolation (#337) is rebuilt
+/// in place: its rows survive under their original network, and a save for
+/// the same call on another network no longer replaces them.
+#[test]
+fn test_legacy_primary_key_migrates_to_network_scoped_key() {
+    with_temp_home(|tmp| {
+        let dir = data_dir(tmp);
+        std::fs::create_dir_all(&dir).expect("create data dir");
+        let db = dir.join("cache.db");
+        let args = ["a".to_string()];
+
+        {
+            let conn = rusqlite::Connection::open(&db).expect("open cache db");
+            conn.execute_batch(
+                "CREATE TABLE estimates (
+                     version INTEGER NOT NULL,
+                     wasm_hash TEXT NOT NULL,
+                     function TEXT NOT NULL,
+                     args_hash TEXT NOT NULL,
+                     network TEXT NOT NULL,
+                     ledger INTEGER NOT NULL,
+                     total_stroops INTEGER NOT NULL,
+                     cpu_instructions INTEGER NOT NULL,
+                     memory_bytes INTEGER NOT NULL,
+                     timestamp TEXT NOT NULL,
+                     duration_ms INTEGER,
+                     success INTEGER NOT NULL DEFAULT 1,
+                     last_accessed TEXT NOT NULL DEFAULT '',
+                     PRIMARY KEY (wasm_hash, function, args_hash)
+                 );",
+            )
+            .expect("create legacy table");
+            conn.execute(
+                "INSERT INTO estimates (version, wasm_hash, function, args_hash, network, ledger, \
+                 total_stroops, cpu_instructions, memory_bytes, timestamp) \
+                 VALUES (3, 'h', 'f', ?1, 'testnet', 7, 700, 10, 5, '2026-01-01T00:00:00Z')",
+                [args_hash_of(&["a"])],
+            )
+            .expect("insert legacy row");
+        }
+
+        // Saving the same call on mainnet goes through the migration first,
+        // so it must add a row instead of replacing the testnet one.
+        cache::save_estimate("h", "f", &args, "mainnet", 9, 900, 10, 5, None, true)
+            .expect("save mainnet");
+
+        let tn = cache::load_estimate("h", "f", &args, "testnet")
+            .expect("load testnet")
+            .expect("legacy testnet row must survive the key migration");
+        assert_eq!(tn.ledger, 7);
+        assert_eq!(tn.total_stroops, 700);
+        let mn = cache::load_estimate("h", "f", &args, "mainnet")
+            .expect("load mainnet")
+            .expect("mainnet row should exist");
+        assert_eq!(mn.ledger, 9);
+
+        let conn = rusqlite::Connection::open(&db).expect("reopen cache db");
+        let pk_columns: Vec<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(estimates)")
+                .expect("pragma");
+            let mut cols: Vec<(i64, String)> = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(5)?, row.get::<_, String>(1)?))
+                })
+                .expect("query columns")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect columns")
+                .into_iter()
+                .filter(|(pk, _)| *pk > 0)
+                .collect();
+            cols.sort();
+            cols.into_iter().map(|(_, name)| name).collect()
+        };
+        assert_eq!(
+            pk_columns,
+            ["wasm_hash", "function", "args_hash", "network"]
+        );
+        assert!(
+            !estimate_index_names(&conn).is_empty(),
+            "indexes must be recreated after the table rebuild"
+        );
+        let leftover: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'estimates_network_keyed'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count temp table");
+        assert_eq!(leftover, 0, "temporary rebuild table must not linger");
+    });
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Schema versioning & migration (#341)
 // ─────────────────────────────────────────────────────────────────────────
@@ -1740,7 +1840,7 @@ fn test_v0_unversioned_entry_migrates_to_current_schema() {
     with_temp_home(|tmp| {
         write_raw_entry(tmp, "legacy0", "old_func", &["a"], Some(0), 3);
 
-        let loaded = cache::load_estimate("legacy0", "old_func", &["a".to_string()])
+        let loaded = cache::load_estimate("legacy0", "old_func", &["a".to_string()], "testnet")
             .expect("v0 entry should load")
             .expect("entry should exist");
         assert_eq!(loaded.version, cache::CACHE_SCHEMA_VERSION);
@@ -1940,7 +2040,7 @@ fn test_eviction_protects_most_recently_accessed_entry() {
 
         // Reading f0 makes it the most recently accessed entry even though
         // it is the oldest by creation time.
-        cache::load_estimate("h", "f0", &[])
+        cache::load_estimate("h", "f0", &[], "testnet")
             .expect("load f0")
             .expect("f0 exists");
         pause();
@@ -2701,6 +2801,7 @@ fn test_query_cache_read_only() {
             "1111000011110000111100001111000011110000111100001111000011110000",
             "fn1",
             &[],
+            "testnet",
         )
         .expect("load")
         .expect("exists");
@@ -2728,7 +2829,7 @@ fn test_save_estimate_with_io_roundtrip() {
         cache::save_estimate_with_io("h", "f", &[], "testnet", 7, 500, 20, 10, io, Some(12), true)
             .expect("save with io");
 
-        let loaded = cache::load_estimate("h", "f", &[])
+        let loaded = cache::load_estimate("h", "f", &[], "testnet")
             .expect("load")
             .expect("entry should exist");
         assert_eq!(loaded.io, Some(io));
@@ -2742,7 +2843,7 @@ fn test_save_estimate_without_io_leaves_footprint_absent() {
     with_temp_home(|_tmp| {
         cache::save_estimate("h", "f", &[], "testnet", 1, 100, 10, 5, None, true).expect("save");
 
-        let loaded = cache::load_estimate("h", "f", &[])
+        let loaded = cache::load_estimate("h", "f", &[], "testnet")
             .expect("load")
             .expect("entry should exist");
         assert!(
@@ -2763,7 +2864,7 @@ fn test_save_estimate_with_io_updates_existing_entry() {
         cache::save_estimate_with_io("h", "f", &[], "testnet", 2, 200, 20, 10, io, None, true)
             .expect("second");
 
-        let loaded = cache::load_estimate("h", "f", &[])
+        let loaded = cache::load_estimate("h", "f", &[], "testnet")
             .expect("load")
             .expect("entry should exist");
         assert_eq!(loaded.ledger, 2);
@@ -2831,7 +2932,7 @@ fn test_legacy_database_without_io_column_still_loads() {
             .expect("insert legacy row");
         }
 
-        let loaded = cache::load_estimate("old", "legacy_fn", &["a".to_string()])
+        let loaded = cache::load_estimate("old", "legacy_fn", &["a".to_string()], "testnet")
             .expect("load legacy entry")
             .expect("legacy entry should exist");
         assert_eq!(loaded.total_stroops, 100);
@@ -2879,7 +2980,7 @@ fn test_legacy_history_table_without_io_column_still_loads() {
             .expect("insert legacy history row");
         }
 
-        let history = cache::load_estimate_history("h", "f", 5).expect("history");
+        let history = cache::load_estimate_history("h", "f", "testnet", 5).expect("history");
         assert_eq!(history.len(), 1, "the legacy row should still be readable");
         assert_eq!(history[0].total_stroops, 100);
         assert!(
@@ -3114,7 +3215,7 @@ fn test_save_estimate_with_metadata_roundtrip() {
         )
         .expect("save with metadata");
 
-        let loaded = cache::load_estimate("hash_meta", "test_fn", &[])
+        let loaded = cache::load_estimate("hash_meta", "test_fn", &[], "testnet")
             .expect("load")
             .expect("entry should exist");
         assert_eq!(loaded.execution_duration_ms, 45);

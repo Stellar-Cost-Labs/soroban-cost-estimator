@@ -127,6 +127,7 @@ fn bench_cache(c: &mut Criterion) {
                 black_box("hash-0250"),
                 black_box("func-0250"),
                 black_box(&[]),
+                black_box("testnet"),
             )
             .expect("sqlite lookup")
             .expect("seeded row");

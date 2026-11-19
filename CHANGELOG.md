@@ -138,6 +138,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The estimate cache now isolates networks strictly (#337). The network is
+  part of the cache key, so estimating the same call on `testnet` and
+  `mainnet` keeps both entries instead of the later run overwriting the
+  earlier one, and `--cache-ttl`, `--compare`, and `--history` only use data
+  recorded on the network being estimated. Existing caches are migrated in
+  place on first open. `cache::load_estimate`, `cache::load_fresh_estimate`,
+  and `cache::load_estimate_history` now take a `network` argument.
+
 - `cache list` now lists entries from **every** network unless `--network` is
   given (it used to default to `testnet` only), matching `cache query`. The
   `--json` output is unchanged: a JSON array of cached-estimate records.
