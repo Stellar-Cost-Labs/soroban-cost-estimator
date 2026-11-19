@@ -372,6 +372,75 @@ fn test_verify_cache_ignores_non_json_files() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// WASM-hash invalidation (#336)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Full hex SHA-256 of a WASM byte slice, as the estimator keys the cache.
+fn wasm_hash_of(bytes: &[u8]) -> String {
+    hex::encode(sha2::Sha256::digest(bytes))
+}
+
+/// Changing a single byte of the WASM binary changes the full 64-character
+/// SHA-256 the cache is keyed by, so the recompiled contract gets its own key.
+#[test]
+fn test_single_byte_wasm_change_produces_new_cache_key() {
+    let original = b"\0asm\x01\x00\x00\x00 byte-for-byte fixture".to_vec();
+    let mut modified = original.clone();
+    modified[13] ^= 0x01;
+
+    let hash_original = wasm_hash_of(&original);
+    let hash_modified = wasm_hash_of(&modified);
+
+    assert_eq!(hash_original.len(), 64, "the key uses the full SHA-256 hex");
+    assert_ne!(
+        hash_original, hash_modified,
+        "one flipped byte must produce a new cache key"
+    );
+}
+
+/// An estimate cached for one build is never served for a modified build:
+/// the lookup for the new hash is a miss, while the original build still hits.
+#[test]
+fn test_modifying_wasm_invalidates_previous_cache_hit() {
+    with_temp_home(|_tmp| {
+        let original = b"\0asm\x01\x00\x00\x00 contract build one".to_vec();
+        let mut modified = original.clone();
+        let last = modified.len() - 1;
+        modified[last] ^= 0x01;
+
+        let hash_original = wasm_hash_of(&original);
+        let hash_modified = wasm_hash_of(&modified);
+        let args = vec!["42".to_string()];
+
+        cache::save_estimate(
+            &hash_original,
+            "transfer",
+            &args,
+            "testnet",
+            10,
+            1_000,
+            100,
+            50,
+            None,
+            true,
+        )
+        .expect("save estimate for the original build");
+
+        let hit = cache::load_estimate(&hash_original, "transfer", &args)
+            .expect("load original")
+            .expect("the original build must still hit");
+        assert_eq!(hit.wasm_hash, hash_original);
+        assert_eq!(hit.total_stroops, 1_000);
+
+        let miss = cache::load_estimate(&hash_modified, "transfer", &args).expect("load modified");
+        assert!(
+            miss.is_none(),
+            "a modified WASM must not be served the previous build's estimate"
+        );
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Cross-network cache isolation
 // ─────────────────────────────────────────────────────────────────────────
 
