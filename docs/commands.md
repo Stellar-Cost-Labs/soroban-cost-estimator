@@ -703,6 +703,7 @@ soroban-cost-estimator cache verify [OPTIONS]
 
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
+| `--repair` (alias `--fix`) | No | `false` | Delete corrupted entries instead of only reporting them |
 | `--help` | `-h` | | Print help |
 
 **Behavior**
@@ -710,9 +711,12 @@ soroban-cost-estimator cache verify [OPTIONS]
 - Reads every row of the SQLite cache database
   (`~/.soroban-cost-estimator/cache.db`) and checks it parses as a valid
   `CachedEstimate` with a schema version this tool can read.
-- Prints a summary line per unreadable entry.
-- **Exit code 0** if the cache is empty or every entry is valid.
-- **Exit code 1** and lists the failing entries if any fail.
+- Prints one line per unreadable entry and a
+  `Verified X cache files: Y valid, Z corrupted` summary.
+- With `--repair` (or `--fix`), deletes the unreadable entries.
+- **Exit code 0** if the cache is empty, every entry is valid, or `--repair`
+  removed the failing entries.
+- **Exit code 1** and lists the failing entries if any fail without `--repair`.
 - Scripts and CI can treat a corrupt cache as an error condition.
 - No network calls are made — this is pure local I/O.
 
@@ -783,17 +787,16 @@ soroban-cost-estimator cache verify
 **Sample output (healthy cache)**
 
 ```text
-Checked 5 cache entries.
-All cache entries are valid.
+Verified 5 cache files: 5 valid, 0 corrupted
 ```
 
 **Sample output (corrupt cache)**
 
 ```text
-Checked 5 cache entries.
-2 of 5 cache entries failed verification:
-  - abc123_increment_step5.json
-  - def456_upload_.json
+Corrupted cache entry: abc123-increment-9f86d0….json
+Corrupted cache entry: def456-upload-e3b0c4….json
+Verified 5 cache files: 3 valid, 2 corrupted
+Run `cache verify --repair` to remove the corrupted files.
 ```
 
 ---

@@ -60,6 +60,7 @@ pub fn begin_snapshot(network: &str, ledger: u32) -> ConfigSnapshot {
         ledger,
         settings_last_modified: std::collections::BTreeMap::new(),
         protocol_version: None,
+        tags: Vec::new(),
         contract_compute: None,
         contract_ledger_cost: None,
         contract_historical_data: None,

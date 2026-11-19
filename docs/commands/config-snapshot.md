@@ -44,6 +44,8 @@ Commands:
 - `--skip-unchanged` compares the fetched configuration with the latest stored
   snapshot and writes nothing when they match (see
   [Skipping unchanged captures](#skipping-unchanged-captures)).
+- Compares the network protocol version with the latest stored snapshot for
+  the network (see [Protocol upgrades](#protocol-upgrades)).
 
 ## Example
 
@@ -186,6 +188,23 @@ Time:    2026-09-25T09:00:00.000000+00:00
   for redirecting a single capture.
 - `--retain` still runs after an unchanged capture, so a directory that grew
   before this mode was enabled is still trimmed.
+
+## Protocol upgrades
+
+Each capture records the network protocol version. When it is higher than
+the version in the latest stored snapshot for the same network, the new
+snapshot is tagged `protocol_upgrade_v{version}` (in its `tags` field) and
+the upgrade is announced on stderr, followed by a summary of what changed
+since the snapshot taken on the previous protocol:
+
+```text
+🎉 Stellar Protocol Upgrade detected (v22 -> v23). Created snapshot: ~/.soroban-cost-estimator/snapshots/testnet-2026-11-19T10-00-00Z.json
+```
+
+The first snapshot for a network, a snapshot without a recorded protocol
+version, and an unchanged or lower version never claim an upgrade. Untagged
+snapshots have no `tags` field, so older files load unchanged. `--quiet`
+suppresses the notice.
 
 ## Deleting snapshots
 

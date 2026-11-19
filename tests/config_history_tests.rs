@@ -16,6 +16,7 @@ fn make_snapshot(
         ledger,
         settings_last_modified: std::collections::BTreeMap::new(),
         protocol_version: None,
+        tags: Vec::new(),
         contract_compute: Some(ContractComputeV0 {
             ledger_max_instructions: 1_000_000,
             tx_max_instructions: 100_000,

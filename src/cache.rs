@@ -2113,6 +2113,38 @@ pub struct CacheEntryStatus {
     pub valid: bool,
 }
 
+/// Whether a cache row's identity carries a schema this tool can read.
+///
+/// A row counts as valid when it both parses as a `CachedEstimate` and
+/// carries a schema this tool can read. Entries from the future
+/// (version > current) parse fine but are not migratable, so they are
+/// flagged.
+fn cache_row_is_valid(
+    version: u32,
+    wasm_hash: String,
+    function: String,
+    args_hash: String,
+) -> bool {
+    let cached = CachedEstimate {
+        version,
+        wasm_hash,
+        function,
+        args_hash,
+        network: String::new(),
+        ledger: 0,
+        total_stroops: 0,
+        cpu_instructions: 0,
+        memory_bytes: 0,
+        timestamp: String::new(),
+        execution_duration_ms: 0,
+        success: true,
+        network_passphrase: None,
+        core_version: None,
+        io: None,
+    };
+    migrate_to_latest(cached).is_ok()
+}
+
 /// Verify the integrity of every entry in the estimate cache.
 ///
 /// Reads each row in the SQLite database and checks that it parses as a valid
@@ -2163,28 +2195,7 @@ pub fn verify_cache() -> AppResult<Vec<CacheEntryStatus>> {
         let (version, wasm_hash, function, args_hash) = row?;
         let filename = format!("{wasm_hash}-{function}-{args_hash}.json");
 
-        // A row counts as valid when it both parses as a `CachedEstimate` and
-        // carries a schema this tool can read. Entries from the future
-        // (version > current) parse fine but are not migratable, so they are
-        // flagged.
-        let cached = CachedEstimate {
-            version,
-            wasm_hash,
-            function,
-            args_hash,
-            network: String::new(),
-            ledger: 0,
-            total_stroops: 0,
-            cpu_instructions: 0,
-            memory_bytes: 0,
-            timestamp: String::new(),
-            execution_duration_ms: 0,
-            success: true,
-            network_passphrase: None,
-            core_version: None,
-            io: None,
-        };
-        let valid = migrate_to_latest(cached).is_ok();
+        let valid = cache_row_is_valid(version, wasm_hash, function, args_hash);
 
         if !valid {
             warn!(filename, "corrupt or unsupported cache entry");
@@ -2200,6 +2211,67 @@ pub fn verify_cache() -> AppResult<Vec<CacheEntryStatus>> {
     statuses.sort_by(|a, b| a.filename.cmp(&b.filename));
     debug!(total = statuses.len(), "cache verification complete");
     Ok(statuses)
+}
+
+/// Remove every corrupted entry that [`verify_cache`] reports.
+///
+/// Returns the sorted identities (in the same `{wasm_hash}-{function}-{args_hash}.json`
+/// form [`verify_cache`] reports) of the entries that were deleted. Entries
+/// written by a newer schema count as corrupted and are removed too, because
+/// this build cannot read them. A database that fails its integrity check is
+/// not repaired here; [`verify_cache`] reports it and `cache recover`
+/// quarantines it.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+pub fn repair_cache() -> AppResult<Vec<String>> {
+    // Runs the database integrity check first, so a corrupt file is reported
+    // rather than partially rewritten.
+    verify_cache()?;
+
+    let mut conn = open_db()?;
+    let tx = conn.transaction()?;
+    let corrupt: Vec<(String, String, String)> = {
+        let mut stmt =
+            tx.prepare("SELECT version, wasm_hash, function, args_hash FROM estimates")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, u32>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut corrupt = Vec::new();
+        for row in rows {
+            let (version, wasm_hash, function, args_hash) = row?;
+            if !cache_row_is_valid(
+                version,
+                wasm_hash.clone(),
+                function.clone(),
+                args_hash.clone(),
+            ) {
+                corrupt.push((wasm_hash, function, args_hash));
+            }
+        }
+        corrupt
+    };
+
+    let mut removed = Vec::with_capacity(corrupt.len());
+    for (wasm_hash, function, args_hash) in corrupt {
+        tx.execute(
+            "DELETE FROM estimates WHERE wasm_hash = ?1 AND function = ?2 AND args_hash = ?3",
+            rusqlite::params![wasm_hash, function, args_hash],
+        )?;
+        let filename = format!("{wasm_hash}-{function}-{args_hash}.json");
+        debug!(filename, "removed corrupted cache entry");
+        removed.push(filename);
+    }
+    tx.commit()?;
+
+    removed.sort();
+    debug!(removed = removed.len(), "cache repair complete");
+    Ok(removed)
 }
 
 /// Aggregate statistics for the estimate cache.

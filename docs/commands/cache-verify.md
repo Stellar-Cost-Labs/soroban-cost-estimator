@@ -10,18 +10,25 @@ i.e. nothing was corrupted by a crash or disk issue.
 Usage: soroban-cost-estimator cache verify [OPTIONS]
 
 Options:
-      --help  Print help
+      --repair  Delete corrupted cache entries instead of only reporting them [aliases: --fix]
+      --help    Print help
 ```
 
-No additional flags — this is a pure file I/O operation with no network calls.
+No network calls are made.
 
 ## Behavior
 
 - Reads every file in the cache directory and attempts to parse it as valid
   `CachedEstimate` JSON.
-- Prints a summary line per corrupted entry (filename).
-- **Exit code 0** if the cache is empty or every entry is valid.
-- **Exit code 1** and lists corrupted filenames if any entry fails.
+- Prints one `Corrupted cache entry: <name>` line per corrupted entry and a
+  `Verified X cache files: Y valid, Z corrupted` summary.
+- Entries written by a newer schema count as corrupted, because this build
+  cannot read them.
+- With `--repair` (or `--fix`), deletes the corrupted entries and keeps the
+  valid ones.
+- **Exit code 0** if the cache is empty, every entry is valid, or `--repair`
+  removed the corrupted entries.
+- **Exit code 1** if any entry fails and `--repair` was not given.
 - Scripts and CI can treat a corrupt cache as an error condition.
 - No network calls are made — this is pure file I/O.
 
@@ -34,17 +41,29 @@ soroban-cost-estimator cache verify
 Actual output (healthy cache):
 
 ```text
-Checked 5 cache entries.
-All cache entries are valid.
+Verified 5 cache files: 5 valid, 0 corrupted
 ```
 
 Actual output (corrupt cache):
 
 ```text
-Checked 5 cache entries.
-2 of 5 cache entries failed verification:
-  - abc123_increment_step5.json
-  - def456_upload_.json
+Corrupted cache entry: abc123-increment-9f86d0….json
+Corrupted cache entry: def456-upload-e3b0c4….json
+Verified 5 cache files: 3 valid, 2 corrupted
+Run `cache verify --repair` to remove the corrupted files.
+```
+
+Repairing it:
+
+```bash
+soroban-cost-estimator cache verify --repair
+```
+
+```text
+Corrupted cache entry: abc123-increment-9f86d0….json
+Corrupted cache entry: def456-upload-e3b0c4….json
+Removed 2 corrupted cache file(s).
+Verified 5 cache files: 3 valid, 2 corrupted (removed)
 ```
 
 Empty cache:

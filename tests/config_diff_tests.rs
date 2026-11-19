@@ -11,6 +11,7 @@ fn empty_snapshot() -> ConfigSnapshot {
         ledger: 100,
         settings_last_modified: std::collections::BTreeMap::new(),
         protocol_version: None,
+        tags: Vec::new(),
         contract_compute: None,
         contract_ledger_cost: None,
         contract_historical_data: None,
@@ -28,6 +29,7 @@ fn full_snapshot() -> ConfigSnapshot {
         ledger: 100,
         settings_last_modified: std::collections::BTreeMap::new(),
         protocol_version: None,
+        tags: Vec::new(),
         contract_compute: Some(ContractComputeV0 {
             ledger_max_instructions: 1_000_000,
             tx_max_instructions: 100_000,
@@ -94,6 +96,7 @@ fn snapshot_with(
         ledger: 100,
         settings_last_modified: std::collections::BTreeMap::new(),
         protocol_version: None,
+        tags: Vec::new(),
         contract_compute: if compute {
             Some(ContractComputeV0 {
                 ledger_max_instructions: 1_000_000,
@@ -178,6 +181,7 @@ fn make_snapshot(compute_fee: i64, bandwidth_fee: i64) -> ConfigSnapshot {
         ledger: 100,
         settings_last_modified: std::collections::BTreeMap::new(),
         protocol_version: None,
+        tags: Vec::new(),
         contract_compute: Some(ContractComputeV0 {
             ledger_max_instructions: 1_000_000,
             tx_max_instructions: 100_000,
