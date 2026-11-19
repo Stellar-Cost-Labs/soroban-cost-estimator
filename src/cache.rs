@@ -8,10 +8,21 @@
 //! # Storage layout
 //!
 //! A single `estimates` table with a composite primary key
-//! `(wasm_hash, function, args_hash)` plus secondary indexes for the lookup
+//! `(wasm_hash, function, args_hash, network)` plus secondary indexes for the lookup
 //! patterns the CLI uses (`network` + timestamp listings, LRU eviction by
 //! `last_accessed`). SQLite gives atomic transactions, indexed lookups, and
 //! a single compact file — no per-entry inode overhead.
+//!
+//! # Network isolation
+//!
+//! The network is part of every cache key (#337). An estimate saved against
+//! `testnet` is never returned to, overwritten by, or deleted by an operation
+//! on `mainnet` (or any other network), even when the WASM, function, and
+//! arguments are identical. Every keyed read ([`crate::cache::load_estimate`],
+//! [`crate::cache::load_fresh_estimate`], [`crate::cache::load_estimate_history`])
+//! therefore takes the network it is looking up. Databases created before
+//! this rule existed are rebuilt in place on open so their primary key
+//! includes the network.
 //!
 //! # Schema versioning
 //!
@@ -558,6 +569,103 @@ fn ensure_sidecar_permissions(db_path: &Path) {
 #[cfg(not(unix))]
 fn ensure_sidecar_permissions(_db_path: &Path) {}
 
+/// `CREATE TABLE` statement for the `estimates` table under `name`.
+///
+/// Shared by fresh databases and by [`migrate_estimates_primary_key`], which
+/// rebuilds an older table under a temporary name, so both always agree on
+/// the column set and on the network-scoped primary key (#337).
+fn estimates_table_ddl(name: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {name} (
+            version          INTEGER NOT NULL,
+            wasm_hash        TEXT NOT NULL,
+            function         TEXT NOT NULL,
+            args_hash        TEXT NOT NULL,
+            network          TEXT NOT NULL,
+            ledger           INTEGER NOT NULL,
+            total_stroops    INTEGER NOT NULL,
+            cpu_instructions INTEGER NOT NULL,
+            memory_bytes     INTEGER NOT NULL,
+            timestamp        TEXT NOT NULL,
+            duration_ms      INTEGER,
+            execution_duration_ms INTEGER NOT NULL DEFAULT 0,
+            network_passphrase TEXT,
+            core_version     TEXT,
+            success          INTEGER NOT NULL DEFAULT 1,
+            last_accessed    TEXT NOT NULL DEFAULT '',
+            io_json          TEXT,
+            PRIMARY KEY (wasm_hash, function, args_hash, network)
+        );"
+    )
+}
+
+/// Whether the `estimates` primary key already includes `network`.
+fn estimates_key_includes_network(conn: &Connection) -> AppResult<bool> {
+    let mut stmt = conn.prepare("PRAGMA table_info(estimates)")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let column: String = row.get(1)?;
+        let pk_position: i64 = row.get(5)?;
+        if column == "network" {
+            return Ok(pk_position > 0);
+        }
+    }
+    Ok(false)
+}
+
+/// Rebuild an `estimates` table whose primary key predates network isolation.
+///
+/// Releases before #337 keyed rows on `(wasm_hash, function, args_hash)`, so a
+/// save on one network silently replaced the same call's estimate on another.
+/// SQLite cannot alter a primary key in place, so the table is copied into a
+/// network-keyed replacement inside one `BEGIN IMMEDIATE` transaction and
+/// swapped in. Existing rows keep the network they were saved with; nothing
+/// is dropped, because the old key could hold at most one row per call.
+/// A no-op once the key includes `network`, including when another process
+/// finished the rebuild first.
+fn migrate_estimates_primary_key(conn: &Connection) -> AppResult<()> {
+    if estimates_key_includes_network(conn)? {
+        return Ok(());
+    }
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = (|| -> AppResult<()> {
+        // Re-check under the write lock: a concurrent opener may have won.
+        if estimates_key_includes_network(conn)? {
+            return Ok(());
+        }
+        conn.execute_batch("DROP TABLE IF EXISTS estimates_network_keyed;")?;
+        conn.execute_batch(&estimates_table_ddl("estimates_network_keyed"))?;
+        let mut columns = Vec::new();
+        {
+            let mut stmt = conn.prepare("PRAGMA table_info(estimates)")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let column: String = row.get(1)?;
+                if column_exists(conn, "estimates_network_keyed", &column)? {
+                    columns.push(column);
+                }
+            }
+        }
+        let columns = columns.join(", ");
+        conn.execute_batch(&format!(
+            "INSERT OR IGNORE INTO estimates_network_keyed ({columns}) \
+             SELECT {columns} FROM estimates;
+             DROP TABLE estimates;
+             ALTER TABLE estimates_network_keyed RENAME TO estimates;"
+        ))?;
+        info!("migrated estimate cache primary key to include network");
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT;")?,
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
 /// Create the `estimates` table and its indexes (and tune journal mode) on an
 /// already-open connection if it does not exist yet.
 ///
@@ -580,28 +688,7 @@ pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
     // when set before the first table is created, which is the case for new
     // databases; existing databases keep their current setting.
     conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS estimates (
-            version          INTEGER NOT NULL,
-            wasm_hash        TEXT NOT NULL,
-            function         TEXT NOT NULL,
-            args_hash        TEXT NOT NULL,
-            network          TEXT NOT NULL,
-            ledger           INTEGER NOT NULL,
-            total_stroops    INTEGER NOT NULL,
-            cpu_instructions INTEGER NOT NULL,
-            memory_bytes     INTEGER NOT NULL,
-            timestamp        TEXT NOT NULL,
-            duration_ms      INTEGER,
-            execution_duration_ms INTEGER NOT NULL DEFAULT 0,
-            network_passphrase TEXT,
-            core_version     TEXT,
-            success          INTEGER NOT NULL DEFAULT 1,
-            last_accessed    TEXT NOT NULL DEFAULT '',
-            io_json          TEXT,
-            PRIMARY KEY (wasm_hash, function, args_hash)
-        );",
-    )?;
+    conn.execute_batch(&estimates_table_ddl("estimates"))?;
     // Append-only log of every estimate ever saved, used by `estimate
     // --history` to show how a function's cost evolved across runs (#321).
     // The `estimates` table upserts on its primary key, so it cannot answer
@@ -620,7 +707,9 @@ pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
             io_json          TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_estimate_history_lookup
-            ON estimate_history (wasm_hash, function, timestamp DESC);",
+            ON estimate_history (wasm_hash, function, timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_estimate_history_network_lookup
+            ON estimate_history (wasm_hash, function, network, timestamp DESC);",
     )?;
     // The history log records the ledger I/O footprint of each run too, so a
     // later trend table can explain a fee change by the I/O it came from
@@ -635,6 +724,9 @@ pub fn ensure_cache_schema(conn: &Connection) -> AppResult<()> {
     ensure_column(conn, "execution_duration_ms", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "network_passphrase", "TEXT")?;
     ensure_column(conn, "core_version", "TEXT")?;
+    // Rebuild pre-#337 tables so the primary key isolates networks. Runs
+    // after the column backfills so every column is carried across.
+    migrate_estimates_primary_key(conn)?;
     let _ = conn.execute(
         "UPDATE estimates SET execution_duration_ms = duration_ms WHERE execution_duration_ms = 0 AND duration_ms IS NOT NULL",
         [],
@@ -1231,9 +1323,8 @@ pub fn save_estimate_with_limits_and_metadata(
           cpu_instructions, memory_bytes, timestamp, duration_ms, execution_duration_ms, \
           network_passphrase, core_version, success, last_accessed, io_json) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
-         ON CONFLICT(wasm_hash, function, args_hash) DO UPDATE SET \
+         ON CONFLICT(wasm_hash, function, args_hash, network) DO UPDATE SET \
             version = excluded.version, \
-            network = excluded.network, \
             ledger = excluded.ledger, \
             total_stroops = excluded.total_stroops, \
             cpu_instructions = excluded.cpu_instructions, \
@@ -1332,7 +1423,10 @@ pub struct EstimateHistoryEntry {
 }
 
 /// Load up to `limit` previous estimates for the same `(wasm_hash,
-/// function)`, newest first.
+/// function)` on `network`, newest first.
+///
+/// Runs recorded on other networks are excluded, so a trend table never mixes
+/// testnet and mainnet costs (#337).
 ///
 /// Reads the append-only history log written by [`save_estimate`]. Returns an
 /// empty vector when the function has never been estimated before. A `limit`
@@ -1343,18 +1437,19 @@ pub struct EstimateHistoryEntry {
 pub fn load_estimate_history(
     wasm_hash: &str,
     function: &str,
+    network: &str,
     limit: usize,
 ) -> AppResult<Vec<EstimateHistoryEntry>> {
     let conn = open_db()?;
     let mut stmt = conn.prepare(
         "SELECT wasm_hash, function, network, ledger, total_stroops, \
          cpu_instructions, memory_bytes, timestamp, io_json \
-         FROM estimate_history WHERE wasm_hash = ?1 AND function = ?2 \
-         ORDER BY timestamp DESC, id DESC LIMIT ?3",
+         FROM estimate_history WHERE wasm_hash = ?1 AND function = ?2 AND network = ?3 \
+         ORDER BY timestamp DESC, id DESC LIMIT ?4",
     )?;
 
     let rows = stmt.query_map(
-        rusqlite::params![wasm_hash, function, limit as i64],
+        rusqlite::params![wasm_hash, function, network, limit as i64],
         |row| {
             Ok(EstimateHistoryEntry {
                 wasm_hash: row.get(0)?,
@@ -1649,12 +1744,18 @@ fn migrate_one_step(migrated: CachedEstimate) -> CachedEstimate {
 /// Best-effort by design: a failed touch (e.g. the database is locked by
 /// another process) must never fail a cache read. The row simply keeps its
 /// previous access time and becomes a slightly earlier eviction candidate.
-fn touch_last_accessed(conn: &Connection, wasm_hash: &str, function: &str, args_hash: &str) {
+fn touch_last_accessed(
+    conn: &Connection,
+    wasm_hash: &str,
+    function: &str,
+    args_hash: &str,
+    network: &str,
+) {
     let now = chrono::Utc::now().to_rfc3339();
     let _ = conn.execute(
         "UPDATE estimates SET last_accessed = ?1 \
-         WHERE wasm_hash = ?2 AND function = ?3 AND args_hash = ?4",
-        rusqlite::params![now, wasm_hash, function, args_hash],
+         WHERE wasm_hash = ?2 AND function = ?3 AND args_hash = ?4 AND network = ?5",
+        rusqlite::params![now, wasm_hash, function, args_hash, network],
     );
 }
 
@@ -1668,11 +1769,16 @@ fn hash_args(args: &[String]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Load a cached estimate, if one exists.
+/// Load the cached estimate for this call on `network`, if one exists.
+///
+/// Only an entry saved against the same network is returned: an estimate for
+/// identical WASM, function, and arguments on a different network is a miss
+/// (#337).
 pub fn load_estimate(
     wasm_hash: &str,
     function: &str,
     args: &[String],
+    network: &str,
 ) -> AppResult<Option<CachedEstimate>> {
     let args_hash = hash_args(args);
 
@@ -1682,9 +1788,15 @@ pub fn load_estimate(
             "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
              cpu_instructions, memory_bytes, timestamp, execution_duration_ms, success, \
              io_json, network_passphrase, core_version \
-             FROM estimates WHERE wasm_hash = ?1 AND function = ?2 AND args_hash = ?3",
+             FROM estimates \
+             WHERE wasm_hash = ?1 AND function = ?2 AND args_hash = ?3 AND network = ?4",
         )?;
-        let mut rows = stmt.query(rusqlite::params![wasm_hash, function, args_hash.as_str()])?;
+        let mut rows = stmt.query(rusqlite::params![
+            wasm_hash,
+            function,
+            args_hash.as_str(),
+            network
+        ])?;
         match rows.next()? {
             None => None,
             Some(row) => Some(migrate_to_latest(estimate_from_row(row)?)?),
@@ -1693,7 +1805,7 @@ pub fn load_estimate(
 
     if cached.is_some() {
         // Mark the hit as most-recently-used so LRU eviction protects it.
-        touch_last_accessed(&conn, wasm_hash, function, &args_hash);
+        touch_last_accessed(&conn, wasm_hash, function, &args_hash, network);
     }
 
     Ok(cached)
@@ -1730,9 +1842,10 @@ pub fn load_fresh_estimate(
     wasm_hash: &str,
     function: &str,
     args: &[String],
+    network: &str,
     ttl: std::time::Duration,
 ) -> AppResult<Option<CachedEstimate>> {
-    let Some(cached) = load_estimate(wasm_hash, function, args)? else {
+    let Some(cached) = load_estimate(wasm_hash, function, args, network)? else {
         return Ok(None);
     };
     if is_cache_entry_fresh(&cached, ttl) {
@@ -1976,7 +2089,7 @@ pub fn delete_cached_estimates(filter: &CacheFilter) -> AppResult<usize> {
     let mut conn = open_db()?;
     let tx = conn.transaction()?;
 
-    let keys: Vec<(String, String, String)> = {
+    let keys: Vec<(String, String, String, String)> = {
         let mut stmt = tx.prepare(
             "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
              cpu_instructions, memory_bytes, timestamp, execution_duration_ms, success, io_json, \
@@ -1994,17 +2107,23 @@ pub fn delete_cached_estimates(filter: &CacheFilter) -> AppResult<usize> {
                 continue;
             };
             if filter.matches(&cached) {
-                keys.push((cached.wasm_hash, cached.function, cached.args_hash));
+                keys.push((
+                    cached.wasm_hash,
+                    cached.function,
+                    cached.args_hash,
+                    cached.network,
+                ));
             }
         }
         keys
     };
 
     let mut removed = 0usize;
-    for (wasm_hash, function, args_hash) in &keys {
+    for (wasm_hash, function, args_hash, network) in &keys {
         removed += tx.execute(
-            "DELETE FROM estimates WHERE wasm_hash = ?1 AND function = ?2 AND args_hash = ?3",
-            rusqlite::params![wasm_hash, function, args_hash],
+            "DELETE FROM estimates \
+             WHERE wasm_hash = ?1 AND function = ?2 AND args_hash = ?3 AND network = ?4",
+            rusqlite::params![wasm_hash, function, args_hash, network],
         )?;
     }
 
@@ -2028,7 +2147,7 @@ pub fn export_cached_estimates() -> AppResult<Vec<CachedEstimate>> {
         "SELECT version, wasm_hash, function, args_hash, network, ledger, total_stroops, \
          cpu_instructions, memory_bytes, timestamp, execution_duration_ms, success, \
          io_json, network_passphrase, core_version \
-         FROM estimates ORDER BY wasm_hash, function, args_hash",
+         FROM estimates ORDER BY wasm_hash, function, args_hash, network",
     )?;
 
     let rows = stmt.query_map([], estimate_from_row)?;

@@ -1582,7 +1582,7 @@ async fn cmd_estimate_repeat(
         let fresh = if no_cache {
             None
         } else {
-            fresh_cached_estimate(&wasm_hash, function_name, args, ttl_secs)?
+            fresh_cached_estimate(&wasm_hash, function_name, args, network, ttl_secs)?
         };
         if let Some(fresh) = fresh {
             let ttl_secs = ttl_secs.unwrap_or_default();
@@ -1971,7 +1971,7 @@ async fn estimate_once(
         // With `--compare`, read the estimate cached by the *previous* run
         // before the simulation below upserts this one away.
         let previous = if compare {
-            cache::load_estimate(&wasm_hash, function_name, args)?
+            cache::load_estimate(&wasm_hash, function_name, args, network)?
         } else {
             None
         };
@@ -1984,7 +1984,7 @@ async fn estimate_once(
             // Bypass every cache read, even under `--cache-ttl`.
             None
         } else {
-            fresh_cached_estimate(&wasm_hash, &function_name, args, ttl_secs)?
+            fresh_cached_estimate(&wasm_hash, &function_name, args, network, ttl_secs)?
         };
         if let Some(fresh) = fresh {
             let ttl_secs = ttl_secs.unwrap_or_default();
@@ -2098,6 +2098,7 @@ async fn estimate_once(
             let runs = cache::load_estimate_history(
                 &wasm_hash,
                 function_name,
+                network,
                 cache::DEFAULT_HISTORY_LIMIT,
             )?;
             let historical: Vec<report::cost_report::HistoricalRun> = runs
@@ -4841,6 +4842,7 @@ fn fresh_cached_estimate(
     wasm_hash: &str,
     function: &str,
     args: &[String],
+    network: &str,
     ttl_secs: Option<u64>,
 ) -> error::AppResult<Option<cache::CachedEstimate>> {
     let Some(ttl_secs) = ttl_secs else {
@@ -4850,6 +4852,7 @@ fn fresh_cached_estimate(
         wasm_hash,
         function,
         args,
+        network,
         std::time::Duration::from_secs(ttl_secs),
     )
 }
