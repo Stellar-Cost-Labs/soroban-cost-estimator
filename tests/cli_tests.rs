@@ -380,6 +380,70 @@ fn test_cache_verify_empty_cache_succeeds() {
     );
 }
 
+/// Insert a cache row written by a newer schema, which this build reports as
+/// corrupted because it cannot read it.
+fn seed_future_version_cache_entry(home: &Path) {
+    let dir = home.join(".soroban-cost-estimator");
+    std::fs::create_dir_all(&dir).expect("create data dir");
+    let conn = rusqlite::Connection::open(dir.join("cache.db")).expect("open cache db");
+    cache::ensure_cache_schema(&conn).expect("ensure cache schema");
+    conn.execute(
+        "INSERT OR REPLACE INTO estimates \
+         (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            i64::from(cache::CACHE_SCHEMA_VERSION + 1),
+            "garbage",
+            "garbage_func",
+            hex::encode(sha2::Sha256::digest(b"")),
+            "testnet",
+            1i64,
+            1_000i64,
+            500i64,
+            250i64,
+            "2026-01-01T00:00:00Z",
+        ],
+    )
+    .expect("seed future-version cache entry");
+}
+
+#[test]
+fn test_cache_verify_reports_then_repairs_corrupted_entries() {
+    let home = temp_home("cache-verify-repair");
+    seed_cache_entry(&home, "2026-01-01T00:00:00Z");
+    seed_future_version_cache_entry(&home);
+
+    let (stdout, stderr, code) = run_cli_quiet(&["cache", "verify"], Some(&home));
+    assert_eq!(code, 1, "a corrupted cache must exit 1; stderr: {stderr}");
+    assert!(
+        stdout.contains("Verified 2 cache files: 1 valid, 1 corrupted"),
+        "should print the verification summary: {stdout}"
+    );
+    assert!(
+        stdout.contains("Corrupted cache entry: garbage-garbage_func-"),
+        "should name the corrupted entry: {stdout}"
+    );
+    assert!(
+        stdout.contains("--repair"),
+        "should point at --repair: {stdout}"
+    );
+
+    let (stdout, stderr, code) = run_cli_quiet(&["cache", "verify", "--repair"], Some(&home));
+    assert_eq!(code, 0, "a repaired cache must exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("Removed 1 corrupted cache file(s)."),
+        "should report the removal: {stdout}"
+    );
+
+    let (stdout, stderr, code) = run_cli_quiet(&["cache", "verify", "--fix"], Some(&home));
+    let _ = std::fs::remove_dir_all(&home);
+    assert_eq!(code, 0, "the cache is clean after repair; stderr: {stderr}");
+    assert!(
+        stdout.contains("Verified 1 cache files: 1 valid, 0 corrupted"),
+        "only the valid entry remains: {stdout}"
+    );
+}
+
 #[test]
 fn test_cache_export_help() {
     let (stdout, stderr, code) = run_cli(&["cache", "export", "--help"]);

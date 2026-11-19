@@ -371,6 +371,51 @@ fn test_verify_cache_ignores_non_json_files() {
     });
 }
 
+#[test]
+fn test_repair_cache_removes_only_corrupted_entries() {
+    with_temp_home(|tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true)
+            .expect("save f1");
+        insert_raw_row(
+            tmp,
+            cache::CACHE_SCHEMA_VERSION + 1,
+            "garbage",
+            "garbage_func",
+            &[],
+            "testnet",
+            1,
+            "2026-01-01T00:00:00Z",
+        );
+
+        let removed = cache::repair_cache().expect("repair");
+        assert_eq!(removed.len(), 1, "only the corrupted entry is removed");
+        assert!(
+            removed[0].starts_with("garbage-garbage_func-"),
+            "the corrupted entry is reported: {removed:?}"
+        );
+
+        let statuses = cache::verify_cache().expect("verify after repair");
+        assert_eq!(statuses.len(), 1, "the valid entry is kept");
+        assert!(statuses[0].valid);
+        assert!(
+            cache::load_estimate("h1", "f1", &[])
+                .expect("load")
+                .is_some(),
+            "the valid entry still loads"
+        );
+    });
+}
+
+#[test]
+fn test_repair_cache_on_clean_cache_removes_nothing() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true)
+            .expect("save f1");
+        let removed = cache::repair_cache().expect("repair");
+        assert!(removed.is_empty(), "nothing to remove: {removed:?}");
+    });
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // WASM-hash invalidation (#336)
 // ─────────────────────────────────────────────────────────────────────────
