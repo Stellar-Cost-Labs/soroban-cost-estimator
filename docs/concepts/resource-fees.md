@@ -7,6 +7,11 @@ invocation implies. The RPC returns that total, but the total hides the
 structure. This tool splits it into two parts, using the network's own
 published rates.
 
+> For the exact formulas — every unit scale, the `ConfigSetting*` XDR fields
+the rates come from, the rental deposit math, and the integer-arithmetic rules
+that keep the split exact — see
+> [Fee Calculation Methodology](fee-calculation.md).
+
 ## Non-refundable vs refundable
 
 - **Non-refundable** — the cost of the resources you *consume*: CPU
@@ -39,6 +44,10 @@ portion is simply the remainder: `total − non_refundable`.
 | Write entry | `write_entries × fee_write_ledger_entry` | stroops per ledger entry |
 | Read bytes | `(read_bytes × fee_disk_read1_kb) / 1024` | stroops per 1 KB |
 | Bandwidth | `(tx_size × fee_tx_size1_kb) / 1024` | stroops per 1 KB of tx XDR |
+
+The full derivation — including why the fee total is taken from the simulation
+and never recomputed, and how the refundable rent deposit is sized — is in
+[Fee Calculation Methodology](fee-calculation.md).
 
 ## The real numbers
 

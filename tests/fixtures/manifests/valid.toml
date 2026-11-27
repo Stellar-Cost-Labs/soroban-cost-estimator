@@ -1,0 +1,16 @@
+version = 1
+
+[[contracts]]
+wasm = "../zeroarg.wasm"
+function = "ping"
+args = []
+id = "0000000000000000000000000000000000000000000000000000000000000000"
+network = "testnet"
+
+[[contracts]]
+wasm = "../zeroarg.wasm"
+function = "pong"
+args = []
+id = "0000000000000000000000000000000000000000000000000000000000000000"
+network = "local"
+rpc_url = "http://127.0.0.1:1"

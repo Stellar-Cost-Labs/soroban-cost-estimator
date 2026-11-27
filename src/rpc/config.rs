@@ -1,4 +1,7 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
+use tokio::sync::OnceCell;
 use tracing::{debug, trace};
 
 use crate::error::{AppError, AppResult};
@@ -10,11 +13,17 @@ use crate::rpc::client::RpcClient;
 /// resource pricing on the network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConfigSettingId {
+    /// CPU instruction limits and their fees.
     ContractComputeV0 = 0,
+    /// Disk read/write limits, fees, and state rent parameters.
     ContractLedgerCostV0 = 1,
+    /// Historical-data fees.
     ContractHistoricalDataV0 = 2,
+    /// Contract-event size limits and fees.
     ContractEventsV0 = 3,
+    /// Transaction bandwidth limits and fees.
     ContractBandwidthV0 = 4,
+    /// Entry TTLs, rent rates, and eviction scan settings.
     StateArchival = 5,
 }
 
@@ -74,6 +83,7 @@ impl ConfigSettingId {
 /// Request payload for `getLedgerEntries`.
 #[derive(Debug, Serialize)]
 pub struct GetLedgerEntriesParams {
+    /// Base64-encoded XDR ledger keys to fetch.
     pub keys: Vec<String>,
 }
 
@@ -83,11 +93,15 @@ pub struct GetLedgerEntriesParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LedgerEntryResult {
+    /// Base64-encoded XDR of the ledger key, echoed by the RPC.
     #[serde(default)]
     pub key: String,
+    /// Base64-encoded XDR of the entry's `LedgerEntryData`.
     pub xdr: String,
+    /// Ledger in which the entry last changed.
     #[serde(default)]
     pub last_modified_ledger_seq: Option<u32>,
+    /// Ledger at which the entry expires (TTL entries only).
     #[serde(default)]
     pub live_until_ledger_seq: Option<u32>,
 }
@@ -99,8 +113,13 @@ pub struct LedgerEntryResult {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetLedgerEntriesResponse {
+    /// Entries returned, in the order they were requested.
     pub entries: Vec<LedgerEntryResult>,
-    #[serde(default)]
+    /// Latest ledger known to the node when it answered.
+    #[serde(
+        default,
+        deserialize_with = "crate::rpc::simulate::deserialize_u64_flexible_opt"
+    )]
     pub latest_ledger: Option<u64>,
 }
 
@@ -109,8 +128,11 @@ pub struct GetLedgerEntriesResponse {
 /// The XDR bytes are decoded from the base64 `xdr` field of the ledger entry.
 #[derive(Debug, Clone)]
 pub struct ConfigSettingEntryRaw {
+    /// Which configuration setting this entry holds.
     pub id: ConfigSettingId,
+    /// Base64-encoded XDR of the setting's value.
     pub config_xdr: String,
+    /// Ledger in which the setting last changed.
     pub last_modified_ledger: u32,
 }
 
@@ -151,17 +173,202 @@ pub async fn fetch_config_setting(
     })
 }
 
+/// The result of a batched config setting fetch: the settings themselves plus
+/// the node's reported `latestLedger`.
+///
+/// The two ledgers mean different things and must not be confused. Each
+/// setting's `last_modified_ledger` is frozen at the last governance change
+/// that touched it, so for any given config entry it is typically thousands of
+/// ledgers behind the chain head. `latest_ledger` is the network's **current**
+/// ledger, which is what a caller recording "where the chain was" wants. See
+/// #267.
+#[derive(Debug, Clone)]
+pub struct ConfigSettingsFetch {
+    /// The six config setting entries, in canonical `ConfigSettingId` order.
+    pub entries: Vec<ConfigSettingEntryRaw>,
+    /// The node's `latestLedger`, or `None` if the node did not report one.
+    pub latest_ledger: Option<u64>,
+}
+
+/// Every config setting this tool knows how to read, in canonical order.
+///
+/// The order is stable so anything derived from a full fetch (snapshot
+/// building, entry iteration) is deterministic.
+pub const ALL_CONFIG_SETTING_IDS: [ConfigSettingId; 6] = [
+    ConfigSettingId::ContractComputeV0,
+    ConfigSettingId::ContractLedgerCostV0,
+    ConfigSettingId::ContractHistoricalDataV0,
+    ConfigSettingId::ContractEventsV0,
+    ConfigSettingId::ContractBandwidthV0,
+    ConfigSettingId::StateArchival,
+];
+
+/// The network's Soroban config settings, fetched once and held in memory.
+///
+/// Command runs such as `estimate-all` need the same config settings
+/// (`ContractComputeV0`, `ContractLedgerCostV0`, …) to price every function
+/// they evaluate. Fetching them per function is wasteful: one batched
+/// `getLedgerEntries` call covers all six settings, so a single [`NetworkConfig`]
+/// can be shared by reference across an entire run instead of one fetch per
+/// function.
+///
+/// Use [`ConfigCache`] to obtain a `NetworkConfig` that is guaranteed to be
+/// fetched at most once per command run.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkConfig {
+    entries: HashMap<ConfigSettingId, ConfigSettingEntryRaw>,
+}
+
+impl NetworkConfig {
+    /// Fetches every config setting in a single batched RPC call.
+    ///
+    /// All six `LedgerKey` values are sent in one `getLedgerEntries` request,
+    /// then returned entries are matched back to their config setting IDs by
+    /// re-encoding each key and matching against the response's `key` field.
+    /// A setting missing from the response is an error: a partially populated
+    /// config would silently price fees against the wrong rates.
+    ///
+    /// # Network calls
+    /// Makes 1 `getLedgerEntries` RPC call (all 6 keys batched).
+    pub async fn fetch(client: &RpcClient) -> AppResult<Self> {
+        debug!("fetching all config settings (batched)");
+
+        // Build all 6 keys
+        let mut id_keys: Vec<(ConfigSettingId, String)> =
+            Vec::with_capacity(ALL_CONFIG_SETTING_IDS.len());
+        for id in &ALL_CONFIG_SETTING_IDS {
+            let key = id.ledger_key_b64()?;
+            id_keys.push((*id, key));
+        }
+
+        let params = GetLedgerEntriesParams {
+            keys: id_keys.iter().map(|(_, k)| k.clone()).collect(),
+        };
+
+        let response: GetLedgerEntriesResponse = client
+            .call("getLedgerEntries", serde_json::to_value(params)?)
+            .await?;
+
+        // Build a lookup: entry key base64 → (xdr, last modified ledger)
+        let mut entry_by_key: HashMap<String, (String, u32)> = HashMap::new();
+        for entry in response.entries {
+            entry_by_key.insert(
+                entry.key,
+                (entry.xdr, entry.last_modified_ledger_seq.unwrap_or(0)),
+            );
+        }
+
+        // Match keys to IDs and collect in canonical order
+        let mut entries = HashMap::with_capacity(id_keys.len());
+        for (id, key_b64) in &id_keys {
+            let Some((config_xdr, last_modified_ledger)) = entry_by_key.remove(key_b64) else {
+                return Err(AppError::ConfigSettingNotFound(id.human_name().to_string()));
+            };
+            entries.insert(
+                *id,
+                ConfigSettingEntryRaw {
+                    id: *id,
+                    config_xdr,
+                    last_modified_ledger,
+                },
+            );
+        }
+
+        debug!(count = entries.len(), "all config settings fetched");
+        Ok(Self { entries })
+    }
+
+    /// Returns the raw entry for `setting_id`, or
+    /// [`AppError::ConfigSettingNotFound`] if it is not part of this config.
+    pub fn get(&self, setting_id: ConfigSettingId) -> AppResult<&ConfigSettingEntryRaw> {
+        self.entries
+            .get(&setting_id)
+            .ok_or_else(|| AppError::ConfigSettingNotFound(setting_id.human_name().to_string()))
+    }
+
+    /// Iterates the fetched entries in [`ALL_CONFIG_SETTING_IDS`] order,
+    /// skipping any setting that is absent.
+    pub fn iter(&self) -> impl Iterator<Item = &ConfigSettingEntryRaw> {
+        ALL_CONFIG_SETTING_IDS
+            .iter()
+            .filter_map(move |id| self.entries.get(id))
+    }
+
+    /// Number of settings present in this config.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether this config holds no settings at all.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Per-command-run, in-memory cache of the network's config settings.
+///
+/// `estimate-all` prices N functions against the same six config settings.
+/// Without a cache each function pays for its own `getLedgerEntries` round
+/// trip; with one, the settings are fetched once and every function reuses
+/// them, taking the run from `2 * N` network round trips down to `N + 1`.
+///
+/// The cache lives for as long as the command that created it, so a fresh
+/// `estimate-all` still picks up a ledger's latest config — this is not a
+/// persistent or cross-process cache.
+///
+/// A failed fetch is *not* cached: the next caller retries, so a transient RPC
+/// error does not pin the run to a missing config.
+#[derive(Debug, Default)]
+pub struct ConfigCache {
+    config: OnceCell<NetworkConfig>,
+}
+
+impl ConfigCache {
+    /// Creates an empty cache; the first [`Self::get_or_fetch`] populates it.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the cached config, fetching it on first use.
+    ///
+    /// # Network calls
+    /// Makes 1 `getLedgerEntries` RPC call the first time it is called for the
+    /// lifetime of this cache; zero on every subsequent call.
+    pub async fn get_or_fetch(&self, client: &RpcClient) -> AppResult<&NetworkConfig> {
+        if let Some(cached) = self.config.get() {
+            trace!("config settings served from in-memory cache");
+            return Ok(cached);
+        }
+        self.config
+            .get_or_try_init(|| NetworkConfig::fetch(client))
+            .await
+    }
+
+    /// Returns the already-cached config, if one has been fetched.
+    ///
+    /// Never touches the network — a `None` here means nothing has populated the
+    /// cache yet (or the fetch failed), which callers can handle without
+    /// triggering a second request.
+    pub fn peek(&self) -> Option<&NetworkConfig> {
+        self.config.get()
+    }
+
+    /// Whether the config has already been fetched into this cache.
+    pub fn is_populated(&self) -> bool {
+        self.config.initialized()
+    }
+}
+
 /// Fetches all 6 Soroban config setting entries in a single batched RPC call.
 ///
-/// Sends all 6 `LedgerKey` values in one `getLedgerEntries` request, then
-/// matches returned entries back to their config setting IDs by re-encoding
-/// each key and matching against the response's `key` field.
+/// Also returns the node's `latestLedger` — the network's **current** ledger —
+/// so callers stamping a snapshot can record where the chain actually was,
+/// rather than inferring it from the settings' `last_modified_ledger_seq`
+/// (which is frozen between governance events, see #267).
 ///
 /// # Network calls
 /// Makes 1 `getLedgerEntries` RPC call (all 6 keys batched).
-pub async fn fetch_all_config_settings(
-    client: &RpcClient,
-) -> AppResult<Vec<ConfigSettingEntryRaw>> {
+pub async fn fetch_all_config_settings(client: &RpcClient) -> AppResult<ConfigSettingsFetch> {
     debug!("fetching all config settings (batched)");
     let ids = [
         ConfigSettingId::ContractComputeV0,
@@ -187,6 +394,8 @@ pub async fn fetch_all_config_settings(
         .call("getLedgerEntries", serde_json::to_value(params)?)
         .await?;
 
+    let latest_ledger = response.latest_ledger;
+
     // Build a lookup: entry key base64 → ConfigSettingEntryRaw
     let mut entry_by_key: std::collections::HashMap<String, ConfigSettingEntryRaw> =
         std::collections::HashMap::new();
@@ -210,13 +419,295 @@ pub async fn fetch_all_config_settings(
         }
     }
 
-    debug!(count = results.len(), "all config settings fetched");
-    Ok(results)
+    debug!(
+        count = results.len(),
+        ?latest_ledger,
+        "all config settings fetched"
+    );
+    Ok(ConfigSettingsFetch {
+        entries: results,
+        latest_ledger,
+    })
+}
+
+/// Response from `getLatestLedger`.
+///
+/// The Soroban RPC returns JSON fields in camelCase.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetLatestLedgerResponse {
+    /// Sequence number of the latest closed ledger.
+    pub sequence: u32,
+    /// Protocol version the network is running.
+    pub protocol_version: u32,
+}
+
+/// Fetches the protocol version the network is currently running.
+///
+/// # Network calls
+/// Makes 1 `getLatestLedger` RPC call.
+pub async fn fetch_protocol_version(client: &RpcClient) -> AppResult<u32> {
+    let response: GetLatestLedgerResponse = client
+        .call("getLatestLedger", serde_json::json!({}))
+        .await?;
+    debug!(
+        protocol_version = response.protocol_version,
+        sequence = response.sequence,
+        "fetched latest ledger"
+    );
+    Ok(response.protocol_version)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
     use super::*;
+
+    #[test]
+    fn test_get_latest_ledger_response_parses_protocol_version() {
+        // Shape returned by Stellar RPC's `getLatestLedger`.
+        let body = r#"{"id":"c73c5eac58a441d4eb733c35253ae85f783e018f7be5ef974258fed067aabb36","protocolVersion":22,"sequence":2539605}"#;
+        let resp: GetLatestLedgerResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(resp.protocol_version, 22);
+        assert_eq!(resp.sequence, 2_539_605);
+    }
+
+    #[test]
+    fn test_get_latest_ledger_response_requires_protocol_version() {
+        assert!(serde_json::from_str::<GetLatestLedgerResponse>(r#"{"sequence":1}"#).is_err());
+    }
+
+    /// Base64 XDR for a `ContractComputeV0` ledger entry, small enough to
+    /// inline. Only its presence matters here — the tests below assert on
+    /// request counts, key round-tripping, and ledgers, not on decoded values.
+    const DUMMY_ENTRY_XDR: &str = "AAAAAAAAAAEAAAAH";
+
+    /// The ledger values a stub reports by default.
+    const DEFAULT_LAST_MODIFIED: u32 = 42;
+    const DEFAULT_LATEST_LEDGER: u64 = 100;
+
+    /// Spawns a JSON-RPC stub that answers `getLedgerEntries` by echoing back
+    /// every requested key with a dummy payload, and counts the requests it
+    /// received. Echoing the keys lets the client match entries back to config
+    /// setting IDs the way a real node would.
+    ///
+    /// `last_modified` becomes each entry's `lastModifiedLedgerSeq` and
+    /// `latest` the response's `latestLedger`; passing `None` for `latest`
+    /// omits the field entirely, so the "node does not report it" case is
+    /// genuinely absent from the payload.
+    async fn spawn_ledger_entries_stub_with(
+        last_modified: u32,
+        latest: Option<u64>,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind stub server");
+        let addr = listener.local_addr().expect("no local address");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let server_counter = Arc::clone(&counter);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let counter = Arc::clone(&server_counter);
+                tokio::spawn(async move {
+                    let _ =
+                        handle_ledger_entries_conn(stream, counter, last_modified, latest).await;
+                });
+            }
+        });
+
+        (format!("http://{addr}"), counter)
+    }
+
+    /// [`spawn_ledger_entries_stub_with`] with the default ledger values.
+    #[allow(dead_code)]
+    async fn spawn_ledger_entries_stub() -> (String, Arc<AtomicUsize>) {
+        spawn_ledger_entries_stub_with(DEFAULT_LAST_MODIFIED, Some(DEFAULT_LATEST_LEDGER)).await
+    }
+
+    async fn handle_ledger_entries_conn(
+        mut stream: TcpStream,
+        counter: Arc<AtomicUsize>,
+        last_modified: u32,
+        latest: Option<u64>,
+    ) -> std::io::Result<()> {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut tmp).await?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let request = String::from_utf8_lossy(&buf).to_string();
+        let body = request
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+
+        let entries: Vec<serde_json::Value> = parsed["params"]["keys"]
+            .as_array()
+            .map(|keys| {
+                keys.iter()
+                    .map(|key| {
+                        serde_json::json!({
+                            "key": key.as_str().unwrap_or_default(),
+                            "xdr": DUMMY_ENTRY_XDR,
+                            "lastModifiedLedgerSeq": last_modified,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        counter.fetch_add(1, Ordering::SeqCst);
+
+        let mut result = serde_json::json!({ "entries": entries });
+        // Only present the field when the scenario asks for it, so the
+        // "node omits latestLedger" case really is missing from the payload.
+        if let Some(latest) = latest {
+            result["latestLedger"] = serde_json::json!(latest);
+        }
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": result,
+        })
+        .to_string();
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await?;
+        stream.flush().await
+    }
+
+    #[tokio::test]
+    async fn test_network_config_fetch_uses_a_single_batched_call() {
+        let (url, counter) = spawn_ledger_entries_stub().await;
+        let client = RpcClient::new(&url);
+
+        let config = NetworkConfig::fetch(&client)
+            .await
+            .expect("fetch should succeed");
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "all six settings must arrive in one batched getLedgerEntries call"
+        );
+        assert_eq!(config.len(), ALL_CONFIG_SETTING_IDS.len());
+    }
+
+    #[tokio::test]
+    async fn test_network_config_maps_entries_to_their_setting_ids() {
+        let (url, _counter) = spawn_ledger_entries_stub().await;
+        let client = RpcClient::new(&url);
+
+        let config = NetworkConfig::fetch(&client)
+            .await
+            .expect("fetch should succeed");
+
+        for id in ALL_CONFIG_SETTING_IDS {
+            let entry = config
+                .get(id)
+                .unwrap_or_else(|e| panic!("{} should be present: {e}", id.human_name()));
+            assert_eq!(entry.id, id, "entry should carry its own setting id");
+            assert_eq!(entry.config_xdr, DUMMY_ENTRY_XDR);
+            assert_eq!(entry.last_modified_ledger, 42);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_network_config_iterates_in_canonical_order() {
+        let (url, _counter) = spawn_ledger_entries_stub().await;
+        let client = RpcClient::new(&url);
+
+        let config = NetworkConfig::fetch(&client)
+            .await
+            .expect("fetch should succeed");
+        let seen: Vec<ConfigSettingId> = config.iter().map(|e| e.id).collect();
+
+        assert_eq!(seen, ALL_CONFIG_SETTING_IDS.to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_config_cache_fetches_once_across_repeated_lookups() {
+        let (url, counter) = spawn_ledger_entries_stub().await;
+        let client = RpcClient::new(&url);
+        let cache = ConfigCache::new();
+
+        assert!(!cache.is_populated(), "cache starts empty");
+
+        // Stand in for N function fee evaluations reading the same config.
+        for _ in 0..5 {
+            cache
+                .get_or_fetch(&client)
+                .await
+                .expect("cached fetch should succeed");
+        }
+
+        assert!(
+            cache.is_populated(),
+            "cache should be populated after the first fetch"
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "repeated lookups must not re-issue getLedgerEntries"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_config_cache_shares_one_value_across_callers() {
+        let (url, counter) = spawn_ledger_entries_stub().await;
+        let client = RpcClient::new(&url);
+        let cache = ConfigCache::new();
+
+        let first = cache
+            .get_or_fetch(&client)
+            .await
+            .expect("first fetch should succeed");
+        let second = cache
+            .get_or_fetch(&client)
+            .await
+            .expect("second fetch should succeed");
+
+        assert!(
+            std::ptr::eq(first, second),
+            "callers must observe the same in-memory config"
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_config_cache_is_not_populated_until_fetched() {
+        let (_url, counter) = spawn_ledger_entries_stub().await;
+        let cache = ConfigCache::new();
+
+        // A cache that has never been asked for anything sends no traffic.
+        assert!(!cache.is_populated());
+        assert!(cache.peek().is_none());
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
 
     /// Verify that the XDR key encoding produces the expected base64 output
     /// for `ConfigSettingId::ContractComputeV0`.
@@ -246,6 +737,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_default_network_config_is_empty() {
+        let config = NetworkConfig::default();
+        assert!(config.is_empty());
+        assert_eq!(config.len(), 0);
+        assert_eq!(config.iter().count(), 0);
+        assert!(
+            config.get(ConfigSettingId::ContractComputeV0).is_err(),
+            "an empty config has no settings to hand out"
+        );
+    }
+
     /// Verify each config setting ID produces a unique, non-empty key.
     #[test]
     fn test_all_config_setting_keys_are_unique() {
@@ -268,5 +771,97 @@ mod tests {
             );
             keys.push(key);
         }
+    }
+
+    /// Regression test for #267: the batched fetch must surface the node's
+    /// `latestLedger` (the network's *current* ledger) alongside the entries,
+    /// and must keep the entries' much older `last_modified_ledger` separate
+    /// rather than conflating the two.
+    #[tokio::test]
+    async fn test_fetch_surfaces_current_ledger_distinct_from_last_modified() {
+        // The values observed on testnet in #267.
+        const LAST_MODIFIED: u32 = 3_470_630;
+        const CURRENT: u64 = 4_635_340;
+
+        let (url, _counter) = spawn_ledger_entries_stub_with(LAST_MODIFIED, Some(CURRENT)).await;
+        let client = RpcClient::new(&url);
+
+        let fetched = fetch_all_config_settings(&client)
+            .await
+            .expect("fetch should succeed");
+
+        assert_eq!(
+            fetched.latest_ledger,
+            Some(CURRENT),
+            "the node's current ledger must be reported verbatim"
+        );
+        assert!(
+            fetched
+                .entries
+                .iter()
+                .all(|e| e.last_modified_ledger == LAST_MODIFIED),
+            "per-setting last_modified_ledger must be preserved as-is"
+        );
+        assert!(
+            CURRENT > u64::from(LAST_MODIFIED),
+            "the test is only meaningful while the two values differ"
+        );
+    }
+
+    /// The current ledger cannot be reconstructed from the entries: two
+    /// fetches against an advanced chain return different ledgers even though
+    /// the settings themselves have not changed.
+    #[tokio::test]
+    async fn test_current_ledger_varies_while_settings_stay_frozen() {
+        const LAST_MODIFIED: u32 = 3_470_630;
+
+        let (url_a, _c1) = spawn_ledger_entries_stub_with(LAST_MODIFIED, Some(4_635_340)).await;
+        let (url_b, _c2) = spawn_ledger_entries_stub_with(LAST_MODIFIED, Some(4_635_412)).await;
+
+        let first = fetch_all_config_settings(&RpcClient::new(&url_a))
+            .await
+            .expect("first fetch should succeed");
+        let second = fetch_all_config_settings(&RpcClient::new(&url_b))
+            .await
+            .expect("second fetch should succeed");
+
+        assert_eq!(first.latest_ledger, Some(4_635_340));
+        assert_eq!(second.latest_ledger, Some(4_635_412));
+        assert_ne!(
+            first.latest_ledger, second.latest_ledger,
+            "the current ledger must move as the chain advances"
+        );
+
+        // The frozen per-setting values are identical, which is precisely why
+        // they cannot stand in for the current ledger.
+        let frozen: Vec<u32> = first
+            .entries
+            .iter()
+            .map(|e| e.last_modified_ledger)
+            .collect();
+        let frozen_again: Vec<u32> = second
+            .entries
+            .iter()
+            .map(|e| e.last_modified_ledger)
+            .collect();
+        assert_eq!(frozen, frozen_again);
+    }
+
+    /// A node that omits `latestLedger` must yield `None` rather than a
+    /// fabricated value, so the caller can fall back explicitly.
+    #[tokio::test]
+    async fn test_missing_latest_ledger_is_reported_as_none() {
+        let (url, _counter) = spawn_ledger_entries_stub_with(3_470_630, None).await;
+        let client = RpcClient::new(&url);
+
+        let fetched = fetch_all_config_settings(&client)
+            .await
+            .expect("fetch should still succeed");
+
+        assert_eq!(
+            fetched.latest_ledger, None,
+            "an absent latestLedger must not be guessed at"
+        );
+        assert_eq!(fetched.entries.len(), 6);
     }
 }

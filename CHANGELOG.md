@@ -7,8 +7,119 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Removed a supply-chain payload that entered the repository through PR #669
+  (merged 2026-10-29): a VS Code task that ran on folder open, two files named
+  as web fonts whose contents were obfuscated JavaScript, a `.gitignore`
+  rewritten with NUL bytes so its diff rendered as binary, and roughly 149 MB
+  of committed build output. The published crate `0.1.0` and the `v0.1.0` tag
+  predate the change, and no source, build input, or workflow file was
+  modified by it. Details and indicators of compromise are in
+  [docs/INCIDENT-REPORT.md](docs/INCIDENT-REPORT.md).
+- Added `scripts/security-scan.sh`, a structural scanner that fails on text
+  hidden behind a binary extension, NUL bytes in text or config files,
+  committed ELF/PE binaries, editor auto-run hooks, and download-and-execute
+  patterns. It scans a commit range (`--diff <base>..<head>`) or every ref and
+  blob (`--history`).
+- Added `.github/workflows/security.yml`: a pull-request gate that runs the
+  scanner **from the base branch** against the PR range, with `contents: read`
+  permissions, no `pull_request_target`, actions pinned to commit SHAs, and
+  `cargo deny` plus `cargo audit`.
+- Added `.github/CODEOWNERS`, `.gitattributes`, `.github/dependabot.yml`, and a
+  pull-request template with a supply-chain checklist.
+- Added `scripts/assert-no-known-bad.sh` and a `known-bad guard` CI job: the
+  build fails if either incident blob (the obfuscated fonts, the NUL-poisoned
+  `.gitignore`) or any removed path (`.vscode/`, `public/`, `test_comfy/`,
+  `target2/`) is reachable from **any** ref. The banned IDs are embedded in the
+  script and CI runs it from the base branch, so a pull request cannot widen the
+  allowlist.
+
 ### Added
 
+- `config snapshot --skip-unchanged` — compare the fetched configuration with
+  the latest stored snapshot and skip the write when nothing changed.
+  Timestamps, ledgers and schema versions are ignored for the comparison, the
+  command exits `0` either way, and `--json` reports
+  `"status": "unchanged"` when it skipped (#509).
+- Config snapshots now carry an explicit `schema_version` (the initial schema
+  is version `1`). Unversioned files from older releases are read as that
+  version and are never rewritten by a read; files written by a newer release
+  are rejected with the file name and an upgrade hint (#508).
+- `wasm info --json` now includes a `function_signatures` block with each exported
+  function's spec presence, raw WASM param/result counts, and parameter and
+  return types; names and types are explicit `null`s when the contract spec is
+  absent (#495).
+- `estimate --history` — compare the current run against up to 5 previous
+  cached runs of the same contract function, rendered as a trend table
+  (regressions in red, improvements in green) with a `history` array in
+  `--json` output (#321).
+- `estimate --history` also reports per-resource ledger I/O deltas — read and
+  write entries and bytes — whenever both the historical and the current run
+  recorded a footprint, in a second table and as a `footprint_delta` object in
+  `--json` output. Runs without a recorded footprint are reported as
+  `unavailable`, never as zero usage (#530).
+- `--format summary` — exactly one tab-delimited result line per successful
+  `estimate` (`function`, `network`, `ledger`, `total_stroops`, `total_xlm`,
+  `cpu_instructions`, `read_entries`, `write_entries`, `read_bytes`,
+  `write_bytes`, `tx_size`), with documented escaping and no ANSI codes, for
+  shell pipelines and batch logs (#533).
+- Simulation failures now retain the RPC's machine-readable error code and a
+  bounded copy of its structured details: `AppError::SimulationFailed` wraps
+  `rpc::simulate::SimulationError`, whose `Display` stays a concise human
+  message and whose serialized form is a stable, size-limited JSON document
+  (#532).
+- `docs/concepts/fee-calculation.md` — the complete fee methodology: every
+  formula and unit scale, the `ConfigSetting*` XDR fields behind each rate,
+  the refundable rent deposit, and the integer-arithmetic rules that keep the
+  estimate in step with Stellar Core (#375).
+- Resource-limit warnings — `estimate` and `estimate-all` now warn when CPU
+  instructions, ledger read/write entries or bytes, or transaction size reach
+  80% of the network's protocol limits, with a `warnings` array in JSON output
+  (#322).
+- `estimate-all --format csv` — RFC 4180-compliant CSV export with one row per
+  function (`Function,Status,CPU_Instructions,...`, #324).
+- `estimate-all --format markdown` — GitHub-flavored Markdown summary table,
+  fee statistics, and collapsible per-function detail sections for CI PR
+  comments (#325).
+- `config diff --against-previous` — diff the two most recent on-disk
+  snapshots against each other without contacting the live network. Works
+  offline, honors `--summary` and `--json`, and errors with the snapshot count
+  when fewer than two exist for the network.
+
+### Removed
+
+- `.vscode/`, `public/` (unrelated Font Awesome assets and a README for an
+  application that does not exist in this repository), and `test_comfy/` (a
+  nested crate with committed `target/` output, ~149 MB).
+- `config snapshot --retain <N>` — keep only the N most recent snapshots for a
+  network, pruning older ones after the new snapshot is safely on disk.
+- `config snapshot prune --older-than <DAYS>` — delete snapshots recorded more
+  than D days ago. Pure file I/O, so it is safe offline and in a cron job.
+- `cache list` — the read-only cache listing now accepts the same filters as
+  `cache query` (`--network`, `--fn`, `--wasm-hash`, `--since`, `--to`, plus a
+  new `--older-than` age filter) and is paginated with `--limit` (default 50,
+  capped at 1000) and `--offset`. Without `--network` it lists entries from
+  every network.
+- `cache delete` — remove cached estimates by network, function, WASM hash,
+  time range or age instead of clearing a whole network. Supports `--dry-run`
+  (report the count, change nothing), an interactive confirmation prompt
+  (skippable with `--yes`) and `--all` for an explicit whole-cache removal. A
+  filter is required otherwise. Selection and deletion run in one transaction.
+- Config diffs now model setting **presence** explicitly: added, removed and
+  unrecognized settings are reported distinctly from numeric value changes,
+  and a missing setting is never treated as a zero value.
+- Unrecognized top-level fields in a stored snapshot are captured and
+  surfaced in `config diff` instead of being ignored silently.
+- Snapshot listings and "latest snapshot" selection are ordered by the
+  timestamp embedded in the file name, so snapshots taken with different UTC
+  offsets are ordered chronologically.
+
+- `--timeout` global flag — configurable HTTP request timeout for RPC calls
+  in seconds (default 30).
+- `--max-retries` global flag — configurable maximum number of retry attempts
+  for transient RPC failures (default 3). 0 disables retries, so CI runs can
+  opt into aggressive retries while interactive use can fail fast.
 - `config diff --summary` — print a single-line summary
   (`X pricing changes, Y non-pricing changes`) instead of the full diff, for CI
   status lines. Exit code and auto-save side effects are unchanged.
@@ -17,6 +128,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stellar contract invoke --cost`.
 - End-to-end integration tests in `tests/cli_tests.rs` covering every CLI
   command, its flags, and its offline error paths.
+- CI build matrix running fmt, clippy, build, and tests on Linux, macOS, and
+  Windows for cross-platform compatibility.
+- `estimate-all` prints a fee/CPU **distribution box** (min/max/mean/median/
+  standard deviation of fees and min/max/mean CPU instructions) and exposes the
+  same statistics as a `fee_distribution` object in `--json` output.
+- Report headers show `Simulated at ledger sequence: <n>` and JSON reports
+  serialize the ledger as `ledger_sequence`.
+
+### Changed
+
+- `cache list` now lists entries from **every** network unless `--network` is
+  given (it used to default to `testnet` only), matching `cache query`. The
+  `--json` output is unchanged: a JSON array of cached-estimate records.
+- `estimate-all --json` now emits an object (`{ "functions": [...],
+  "fee_distribution": { ... } }`) instead of a bare array; the per-function
+  records moved under the `functions` key.
+- Renamed the report field `rpc_latency_ms` to `simulation_duration_ms`
+  (JSON key, CSV column, and Markdown/table labels) to match the simulation
+  round-trip semantics it measures.
+
+### Deprecated
+
+- No public APIs were deprecated in this release cycle.
+
+### Removed
+
+- No public APIs were removed in this release cycle.
+
+### Fixed
+
+- `config snapshot` no longer prints its four summary lines twice in table
+  mode, and `--quiet` is now honoured for them. CSV and Markdown output no
+  longer has the human-readable summary mixed into it, so each format stays
+  parseable.
+- The CLI no longer overflows the stack on Windows. `clap`'s derive macros
+  build the whole command tree on the stack, which needs close to a megabyte
+  in an unoptimized build, while the main thread of a Windows process is
+  capped at 1 MiB by the linker. Every invocation — even `--help` — aborted
+  with a stack overflow. The CLI now runs on a dedicated thread with an 8 MiB
+  stack; output and exit codes are unchanged.
+- `cache delete --all` can no longer be combined with a filter. `--all` means
+  "every cached estimate on every network", and a stray `--network` used to
+  silently narrow it; the combination is now rejected and nothing is deleted.
+- Snapshot retention never deletes the newest snapshot for a network, however
+  old it is or however small `--retain` is, so a `config diff` always has a
+  pair left to compare.
+- `webpki-roots`, `webpki-root-certs` and `rustls-webpki` bumped to their
+  patched releases, which drop the distrusted `emSign ECC Root CA - G3`
+  certificate (RUSTSEC-2026-0381/0382/0383) and clear the `cargo deny`
+  advisory check.
+- Restore the `cache stats` subcommand wiring that a CLI refactor merge
+  dropped, leaving `cmd_cache_stats` unreachable dead code.
+- WASM function signatures are now resolved against the *defined* function
+  index space, so export arities stay correct for modules that import
+  functions.
+- Malformed `contractspecv0` / `contractmetav0` custom sections now fail with
+  the section name in the error instead of being silently discarded.
+- Invalid WebAssembly input reports `not a valid WebAssembly binary` instead
+  of a bare validator message.
+- Restore the WebSocket RPC client (`rpc::ws`) after the merge of `main`
+  dropped its `AppError` variants and `resolve_ws_endpoint`, which broke
+  compilation and red-flagged every CI job.
+
+### Security
+
+- Sensitive RPC headers supplied with `--header` / `-H` (`Authorization`,
+  `X-API-Key`, `Cookie`, and similar names) are redacted from verbose logs and
+  tracing output, so bearer tokens never leak into terminal or CI logs.
 
 ## [0.1.0] - 2026-08-13
 

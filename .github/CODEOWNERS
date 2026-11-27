@@ -1,0 +1,47 @@
+# Code owners for soroban-cost-estimator.
+#
+# IMPORTANT: this repository currently has a single maintainer, so CODEOWNERS
+# cannot by itself block a merge — GitHub does not let the author of a PR
+# satisfy their own required review. See the "solo maintainer" note at the
+# bottom of this file and docs/MAINTAINER-CHECKLIST.md for the settings that
+# actually do the blocking (ruleset + required status checks).
+
+# Everything, by default.
+*                                   @aigbagbobila
+
+# Anything that can make a clone execute code, or that changes how the build
+# resolves dependencies.
+/.github/                           @aigbagbobila
+/.github/workflows/                 @aigbagbobila
+/.github/CODEOWNERS                 @aigbagbobila
+/scripts/                           @aigbagbobila
+/.cargo/                            @aigbagbobila
+/.githooks/                         @aigbagbobila
+/.vscode/                           @aigbagbobila
+/.devcontainer/                     @aigbagbobila
+/.idea/                             @aigbagbobila
+/.cursor/                           @aigbagbobila
+/.claude/                           @aigbagbobila
+/.zed/                              @aigbagbobila
+
+# Supply chain surface.
+/Cargo.toml                         @aigbagbobila
+/Cargo.lock                         @aigbagbobila
+/build.rs                           @aigbagbobila
+/deny.toml                          @aigbagbobila
+/rust-toolchain.toml                @aigbagbobila
+/.gitignore                         @aigbagbobila
+/.gitattributes                     @aigbagbobila
+
+# Release plumbing.
+/release.toml                       @aigbagbobila
+/CHANGELOG.md                       @aigbagbobila
+
+# Security policy and incident record.
+/SECURITY.md                        @aigbagbobila
+/docs/INCIDENT-REPORT.md            @aigbagbobila
+
+# Note on solo-maintainer limits: with one owner, GitHub skips required review
+# for that owner's own PRs. Protect main with a ruleset instead — require the
+# `build` and `structural scan` status checks for everyone, require a pull
+# request for everyone, and never enable ruleset bypass for the owner account.
