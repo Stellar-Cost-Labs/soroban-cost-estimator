@@ -201,6 +201,11 @@ pub fn compute_fee_breakdown(
         format!("{:.1}%", permilles[4] as f64 / 10.0),
     );
 
+    // Combined storage I/O fee for the report breakdown.
+    let storage_fee = read_entry_fee
+        .saturating_add(write_entry_fee)
+        .saturating_add(read_bytes_fee);
+
     FeeBreakdown {
         non_refundable_stroops: non_refundable,
         refundable_stroops: refundable,
@@ -263,6 +268,56 @@ pub fn stroops_to_xlm(stroops: i64, precision: u32) -> String {
     let sign = if negative { "-" } else { "" };
     let width = precision as usize;
     format!("{sign}{whole_part}.{frac_part:0width$}")
+}
+
+/// Min/max/average fee summary across a set of estimates.
+///
+/// All values are in stroops. The average uses integer division — stroops
+/// are integers and floats are never used near fee math.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeeRange {
+    /// Number of estimates included in the summary.
+    pub count: usize,
+    /// Lowest fee, in stroops.
+    pub min_stroops: i64,
+    /// Highest fee, in stroops.
+    pub max_stroops: i64,
+    /// Average fee, in stroops (integer division, truncated toward zero).
+    pub avg_stroops: i64,
+}
+
+/// Compute the min/max/average fee over a slice of fees in stroops.
+///
+/// Returns `None` when the slice is empty — a fee range is undefined for
+/// zero estimates. The sum accumulates in `i128` so a large batch cannot
+/// overflow the accumulator, then the average is cast back to `i64`
+/// (which is always lossless: `avg <= max <= i64::MAX`).
+///
+/// # Network calls
+/// None — pure computation.
+#[must_use]
+pub fn fee_range(fees: &[i64]) -> Option<FeeRange> {
+    let count = fees.len();
+    if count == 0 {
+        return None;
+    }
+
+    let mut min_stroops = i64::MAX;
+    let mut max_stroops = i64::MIN;
+    let mut sum: i128 = 0;
+    for &fee in fees {
+        min_stroops = min_stroops.min(fee);
+        max_stroops = max_stroops.max(fee);
+        sum += i128::from(fee);
+    }
+
+    let avg_stroops = (sum / i128::from(count as u64)) as i64;
+    Some(FeeRange {
+        count,
+        min_stroops,
+        max_stroops,
+        avg_stroops,
+    })
 }
 
 /// Parse an XLM string to stroops (i64).
@@ -336,56 +391,6 @@ pub fn xlm_to_stroops(xlm: &str) -> AppResult<i64> {
     let signed = if negative { -magnitude } else { magnitude };
 
     i64::try_from(signed).map_err(|_| out_of_range())
-}
-
-/// Min/max/average fee summary across a set of estimates.
-///
-/// All values are in stroops. The average uses integer division — stroops
-/// are integers and floats are never used near fee math.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FeeRange {
-    /// Number of estimates included in the summary.
-    pub count: usize,
-    /// Lowest fee, in stroops.
-    pub min_stroops: i64,
-    /// Highest fee, in stroops.
-    pub max_stroops: i64,
-    /// Average fee, in stroops (integer division, truncated toward zero).
-    pub avg_stroops: i64,
-}
-
-/// Compute the min/max/average fee over a slice of fees in stroops.
-///
-/// Returns `None` when the slice is empty — a fee range is undefined for
-/// zero estimates. The sum accumulates in `i128` so a large batch cannot
-/// overflow the accumulator, then the average is cast back to `i64`
-/// (which is always lossless: `avg <= max <= i64::MAX`).
-///
-/// # Network calls
-/// None — pure computation.
-#[must_use]
-pub fn fee_range(fees: &[i64]) -> Option<FeeRange> {
-    let count = fees.len();
-    if count == 0 {
-        return None;
-    }
-
-    let mut min_stroops = i64::MAX;
-    let mut max_stroops = i64::MIN;
-    let mut sum: i128 = 0;
-    for &fee in fees {
-        min_stroops = min_stroops.min(fee);
-        max_stroops = max_stroops.max(fee);
-        sum += i128::from(fee);
-    }
-
-    let avg_stroops = (sum / i128::from(count as u64)) as i64;
-    Some(FeeRange {
-        count,
-        min_stroops,
-        max_stroops,
-        avg_stroops,
-    })
 }
 
 #[cfg(test)]

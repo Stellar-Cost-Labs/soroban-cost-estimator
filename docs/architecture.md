@@ -176,6 +176,7 @@ sequenceDiagram
     CLI->>Fee: formatter_by_name(format).format(report)
     Fee-->>User: cost report on stdout
 ```
+
 src/
 ├── main.rs               # CLI entry point, command dispatch, top-level orchestration
 ├── lib.rs                # Crate root — re-exports public modules

@@ -149,7 +149,8 @@ pub struct Cli {
     #[arg(long, global = true, value_enum)]
     pub format: Option<OutputFormat>,
 
-    /// Cap RPC requests at N per second. 0 disables.
+    /// Cap RPC requests at N per second (fixed-rate spacing; applies to
+    /// every network call, e.g. batch runs like estimate-all). 0 disables.
     #[arg(long, global = true, value_name = "N")]
     pub rps: Option<u64>,
 

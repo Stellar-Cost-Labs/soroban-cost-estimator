@@ -1119,11 +1119,6 @@ pub fn save_estimate_with_io(
 /// Identical to [`save_estimate`] except that the caller supplies the
 /// [`CacheLimits`] to enforce, which keeps eviction tests independent of the
 /// process-wide configuration. The insert and the eviction pass run in a
-/// Save an estimate result to the cache with an explicit eviction quota.
-///
-/// Identical to [`save_estimate`] except that the caller supplies the
-/// [`CacheLimits`] to enforce, which keeps eviction tests independent of the
-/// process-wide configuration. The insert and the eviction pass run in a
 /// single `BEGIN IMMEDIATE` transaction, so a crash can never leave the
 /// cache over quota, and concurrent writers serialize on SQLite's write
 /// lock (the in-process `WRITE_LOCK` additionally serializes threads).

@@ -788,6 +788,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "031b47cf1a3c6cc8bc2fc76cd437f521619387907d469316e7c0bc278f1f5432"
 dependencies = [
  "futures-core",
+ "futures-sink",
  "futures-task",
  "futures-util",
 ]

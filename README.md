@@ -22,7 +22,7 @@
 
 # Soroban Cost Estimator
 
-[📚 Documentation](https://soroban-cost-estimator.gitbook.io/soroban-cost_estimator-docs) · [📖 CLI Reference](docs/commands/reference.md) · [🔄 Migration Guide](docs/migration-guide.md) · [🩺 Troubleshooting](docs/troubleshooting.md)
+[📚 Documentation](https://soroban-cost-estimator.gitbook.io/soroban-cost_estimator-docs) · [📖 CLI Reference](docs/commands/reference.md) · [🔄 Migration Guide](docs/migration.md) · [🩺 Troubleshooting](docs/troubleshooting.md)
 
 **Estimate Soroban contract resource costs & track network pricing changes over time.**
 
@@ -354,28 +354,8 @@ instead of the full diff, handy for CI status lines:
 soroban-cost-estimator config diff --network testnet --summary
 ```
 
-- Use `--threshold-percent N` with `config diff` or `watch` to treat only
-  pricing changes whose absolute relative change is at least `N` percent as
-  significant. For example, `--threshold-percent 10` flags changes of 10% or
-  more. The threshold accepts finite, non-negative values; values above 100
-  are useful when only unusually large repricing events should be reported.
-  In `watch`, pricing changes below the threshold are not printed, while
-  non-pricing changes continue to be reported. JSON config diffs include a
-  `significant_pricing_changes` field when a threshold is supplied.
-
-- Exits **0** if no pricing changes, **1** with a detailed field-by-field
-  diff if pricing changed (default behavior)
-- `--ignore-pricing-exit` forces exit **0** even if pricing changed
-  (informative CI reports that must not fail the build)
-- `--fail-on-any-change` exits **1** if *any* config setting changed, even
-  non-pricing settings
-- Add `--against-previous` to diff the **two newest snapshots on disk** against
-  each other instead of the live network. It makes no network calls, so it works
-  offline and stays meaningful after the endpoint has moved on:
-
-  ```bash
-  soroban-cost-estimator config diff --network testnet --against-previous
-  ```
+- Exits **0** if no changes detected
+- Exits **1** with a detailed field-by-field diff if pricing changed
 - **Auto-saves a snapshot of the new config** when a protocol upgrade is
   detected (pricing changed), so it becomes the baseline for future diffs —
   no separate `config snapshot` run needed
@@ -422,169 +402,7 @@ soroban-cost-estimator cache verify
 ```
 
 - Exits **0** if the cache is empty or every entry is valid
-- Exits **1** and lists the affected entries if any fail
-
-### `cache stats`
-
-Show cache size and composition against the configured quotas.
-
-```bash
-soroban-cost-estimator cache stats
-```
-
-```text
-Cache Statistics
-================
-  Total entries:  128
-  Disk usage:     96.0 KB
-  Live size:      88.0 KB
-  Oldest entry:   2026-09-01T10:00:00+00:00
-  Newest entry:   2026-09-27T08:30:00+00:00
-  Byte quota:     50.0 MB
-  Entry quota:    10000
-```
-
-### `cache prune`
-
-Evict least-recently-accessed entries until the cache fits its quota. Every
-`estimate` already prunes automatically as it writes; this exposes the same
-pass on demand.
-
-```bash
-soroban-cost-estimator cache prune --max-cache-size-mb 10
-```
-
-- Prints how many entries were evicted (0 when already within quota)
-- Evicts down to 90% of the quota so pruning is not needed on every write
-
-### Cache quotas
-
-Two global flags bound the on-disk cache (defaults: 50 MB / 10,000 entries):
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--max-cache-size-mb <MB>` | `50` | Maximum live cache size; `0` disables the byte quota |
-| `--max-cache-entries <N>` | `10000` | Maximum number of cached estimates; `0` disables the entry quota |
-
-Eviction is least-recently-*used*: reading a cached estimate refreshes its
-recency, and the oldest-accessed entries are deleted first. The cache is a
-single SQLite database, so deletes are transactional and safe under
-concurrent tool invocations.
-
-### `cache clear`
-
-Wipe every cached estimate recorded for a network without hunting through
-`~/.soroban-cost-estimator/cache/` by hand.
-
-```bash
-soroban-cost-estimator cache clear              # clears testnet entries
-soroban-cost-estimator cache clear --network mainnet
-```
-
-- Defaults to `testnet`; pass `--network` to target another network
-- Prints `Cleared N cached estimate(s) for <network>.`
-- Only the requested network's entries are removed — other networks are
-  untouched
-- The same clearing logic backs the `estimate --clear-cache` flag, so both
-  paths behave identically
-
-### `cache list`
-
-Audit what is stored in the estimate cache without opening the SQLite
-database by hand.
-
-```bash
-soroban-cost-estimator cache list                       # every network
-soroban-cost-estimator cache list --network testnet     # one network
-soroban-cost-estimator cache list --fn transfer         # by function name
-soroban-cost-estimator cache list --wasm-hash aabbcc    # by WASM hash prefix
-soroban-cost-estimator cache list --since 2026-01-01 --to 2026-12-31
-soroban-cost-estimator cache list --older-than 30d      # only stale entries
-soroban-cost-estimator cache list --limit 20 --offset 40
-soroban-cost-estimator cache list --json
-```
-
-- Without `--network`, entries from **every** network are listed
-- `--fn` matches the function name exactly, `--wasm-hash` matches a
-  hexadecimal prefix, `--since`/`--to` bound the entry timestamp
-  (RFC 3339 or `YYYY-MM-DD`)
-- Results are paginated: `--limit` defaults to 50 and is capped at 1000,
-  `--offset` skips matches. The footer reports
-  `Showing X of Y matching estimate(s) (offset Z).`
-- `--json` prints the matching records as a JSON array. The cache only ever
-  stores a hash of the simulated arguments — never the argument values
-
-### `cache delete`
-
-Remove selected cache entries — by network, function, WASM hash, time range
-or age — instead of clearing a whole network.
-
-```bash
-soroban-cost-estimator cache delete --network testnet --dry-run   # count only
-soroban-cost-estimator cache delete --network testnet             # asks first
-soroban-cost-estimator cache delete --network testnet --yes       # no prompt
-soroban-cost-estimator cache delete --older-than 90d --dry-run
-soroban-cost-estimator cache delete --all --yes                   # everything
-```
-
-- Uses **exactly** the same matching rules as `cache list` / `cache query`
-- `--dry-run` prints how many entries would be removed and changes nothing
-- A deletion without `--yes` prompts for confirmation; a non-interactive run
-  (or a declined prompt) aborts without deleting
-- A filter is required — `cache delete` without one is refused unless
-  `--all` is given
-- `--all` removes every entry on every network and cannot be combined with a
-  filter, so a whole-cache deletion is never silently narrowed
-- Selection and deletion happen in a single transaction, so the reported
-  count always matches the number of removed rows
-
-### `cache export`
-
-Dump cached estimates to a single versioned JSON document (schema version,
-export timestamp, and estimate records) for backup or sharing across
-workstations.
-
-```bash
-soroban-cost-estimator cache export --out backup.json
-# → Exported 12 cache entries to backup.json.
-
-soroban-cost-estimator cache export --network testnet --out testnet-backup.json
-```
-
-- Without `--out`, the export is printed to standard output
-- `--network` restricts the export to one network (default: all networks)
-- An unwritable destination fails with an error naming the path
-
-### `config cache query`
-
-Search and filter cached simulation estimates by WASM hash, function name, network, fee range, or date.
-
-```bash
-# Query with search filters
-soroban-cost-estimator config cache query --network testnet --min-fee 100000
-
-# Filter by function name and date, outputting JSON
-soroban-cost-estimator config cache query --fn transfer --since 2026-01-01 --json
-```
-
-- When run with no filters, returns all cached estimates
-- Combines multiple filters using logical AND semantics
-- Supports `--wasm-hash`, `--fn`, `--network`, `--min-fee`, `--max-fee`, `--since`, and `--json`
-
-## Global flags
-
-Accepted by every command, before or after the subcommand:
-
-| Flag | Purpose |
-| --- | --- |
-| `--rps N` | Cap outbound RPC requests at N/second (0 disables) |
-| `--timeout SECS` | Per-request HTTP timeout (default `30`) |
-| `--max-retries N` | Retry transient RPC failures N times with backoff (default `3`, `0` disables) |
-| `--rpc-fallback-url URL` | Secondary endpoint used when the primary is unreachable |
-| `--header/-H KEY=VALUE` | Custom HTTP header sent with every RPC request (repeatable) |
-| `--quiet` | Drop advisory output (optimization tips/suggestions) while keeping the measured cost data |
-| `--verbose/-v` | Debug-level logging, including RPC payloads |
-| `--wasm-info` | Print the WASM structure summary (memory, imports, exports) |
+- Exits **1** and lists the corrupted filenames if any entry fails
 
 ## Installation
 
@@ -713,9 +531,7 @@ All data is stored locally in `~/.soroban-cost-estimator/`:
 | `cache/` | Legacy per-entry JSON cache (only present after upgrading; imported into `cache.db` transparently on the first run, then removed) |
 | `snapshots/` | Timestamped config snapshots (JSON) |
 
-SQLite gives atomic reads and writes (no file-locking races), indexed lookups
-and listings instead of directory scans, and compact single-file storage. The
-cache enables `config diff` to tell you *which* of your past estimates are
+The cache enables `config diff` to tell you *which* of your past estimates are
 now stale after a network pricing change. Run `cache verify` to check the
 cache has not been corrupted.
 
@@ -817,53 +633,3 @@ holds scoped issues with Summary / Acceptance Criteria / Tech Stack — good
 first tasks for the Drips Stellar Wave contributor sprints.
 
 Fixing issue 112
-
-### Versioned batch manifests
-
-Run a reproducible suite with `soroban-cost-estimator estimate --manifest suite.toml`.
-Use `--format json` for CI, or `--dry-run` to validate offline and print the
-resolved entries. Version 1 uses TOML:
-
-```toml
-version = 1
-
-[[contracts]]
-wasm = "build/counter.wasm"
-function = "increment"
-args = ["5"]
-id = "0000000000000000000000000000000000000000000000000000000000000000"
-network = "testnet"
-
-[[contracts]]
-wasm = "build/other.wasm"
-function = "ping"
-args = []
-id = "0000000000000000000000000000000000000000000000000000000000000000"
-network = "local"
-rpc_url = "http://localhost:8000"
-```
-
-Replace the example IDs with deployed contract IDs. Each entry requires `wasm`,
-`function`, and `args` (including `[]` for no arguments). Invocation also requires
-`id`, accepting the same hex or Stellar contract address as `--id`. Arguments
-are ordered strings using the existing `--arg` syntax and validation; no scripting
-expressions are evaluated. Duplicate WASM paths are allowed for different calls.
-Relative WASM paths resolve from the manifest's parent directory, never the
-working directory. Absolute paths are also accepted.
-
-Optional `network` and `rpc_url` override the command's resolved defaults for that
-entry. An explicit entry network uses its standard endpoint unless the entry also
-sets `rpc_url`; it does not inherit an endpoint for another network. Custom
-networks such as `local` require an RPC URL. Unknown fields and versions, empty
-suites, invalid WASM, unknown functions, invalid arguments, and malformed endpoints
-are rejected before any RPC call. Diagnostics include the manifest path, line,
-column, and one-based `contracts[N]` entry location. Validation stops at the first
-error; execution starts only once all entries pass.
-
-Execution preserves manifest order and uses the existing batch upload/invocation
-simulation and summary formats. The summary's network label is `manifest` because
-entries may use different networks. Runtime contract failures appear in the batch
-summary and cause a nonzero exit. Manifest input conflicts with direct WASM and
-invocation flags and single-estimate options such as watch, repeat, and cache
-controls. Global RPC transport and output options remain available. This schema
-is independent of `config.toml`.

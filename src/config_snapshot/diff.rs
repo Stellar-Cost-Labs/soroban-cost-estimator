@@ -317,6 +317,17 @@ impl FieldDiff {
     }
 }
 
+/// Identity of one snapshot inside a [`ConfigDiff`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SnapshotInfo {
+    /// Network the snapshot was captured from.
+    pub network: String,
+    /// RFC 3339 timestamp of when the snapshot was taken.
+    pub timestamp: String,
+    /// Ledger sequence at capture time.
+    pub ledger: u32,
+}
+
 /// The result of comparing two config snapshots.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConfigDiff {
@@ -421,17 +432,6 @@ pub fn resolve_exit_code(
         None => diff.has_pricing_changes(),
     };
     i32::from(pricing_changed)
-}
-
-/// Identity of one snapshot inside a [`ConfigDiff`].
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct SnapshotInfo {
-    /// Network the snapshot was captured from.
-    pub network: String,
-    /// RFC 3339 timestamp of when the snapshot was taken.
-    pub timestamp: String,
-    /// Ledger sequence at capture time.
-    pub ledger: u32,
 }
 
 /// Compares two config snapshots and returns a detailed diff.

@@ -18,7 +18,6 @@ management**.
 - [Cache Management](#cache-management)
   - [`cache stats`](#cache-stats) — cache health overview
   - [`cache verify`](#cache-verify) — check cache integrity
-  - [`cache stats`](#cache-stats) — show cache size and quotas
   - [`cache prune`](#cache-prune) — evict least-recently-accessed entries
   - [`cache warm`](#cache-warm) — pre-populate cache
   - [`cache clear`](#cache-clear) — wipe cached estimates for a network
@@ -772,28 +771,6 @@ soroban-cost-estimator cache prune [OPTIONS]
 ```bash
 soroban-cost-estimator cache prune
 soroban-cost-estimator --max-cache-entries 100 cache prune
-```
-
-**Examples**
-
-```bash
-soroban-cost-estimator cache verify
-```
-
-**Sample output (healthy cache)**
-
-```text
-Checked 5 cache entries.
-All cache entries are valid.
-```
-
-**Sample output (corrupt cache)**
-
-```text
-Checked 5 cache entries.
-2 of 5 cache entries failed verification:
-  - abc123_increment_step5.json
-  - def456_upload_.json
 ```
 
 ---
